@@ -14,10 +14,14 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use fast_image_resize::Resizer;
+
 use crate::cache::PageCache;
 use crate::config;
+use crate::decode::decode_and_downscale;
 use crate::gpu::Gpu;
 use crate::layout::{self, Layout};
+use crate::library::{cover_bytes, Library};
 use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
@@ -35,6 +39,9 @@ const FWD_MAX: usize = 40;
 const SCROLL_WHEEL_PX: f32 = 110.0;
 /// Height/width estimate for not-yet-decoded pages in the scroll strip.
 const DEFAULT_ASPECT: f32 = 1.5;
+/// Library cover thumbnail height, and how many to decode per frame.
+const THUMB_H: u32 = 360;
+const THUMB_BUDGET: usize = 2;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -94,6 +101,10 @@ struct State {
     settings: config::Settings,
     volume_key: Option<String>,
     tex_pool: Arc<TexturePool>,
+
+    library: Library,
+    library_view: bool,
+    thumb_resizer: Resizer,
 }
 
 fn fit_from_u8(v: u8) -> FitMode {
@@ -166,6 +177,13 @@ impl ApplicationHandler for App {
             ui.pending_open = Some(p);
         }
 
+        let library = match &settings.library_root {
+            Some(r) => Library::scan(std::path::Path::new(r)),
+            None => Library::empty(),
+        };
+        // Open straight into the grid if nothing was passed to read.
+        let library_view = ui.pending_open.is_none() && !library.volumes.is_empty();
+
         window.request_redraw();
         self.state = Some(State {
             window,
@@ -207,6 +225,9 @@ impl ApplicationHandler for App {
             settings,
             volume_key: None,
             tex_pool,
+            library,
+            library_view,
+            thumb_resizer: Resizer::new(),
         });
     }
 
@@ -734,6 +755,37 @@ impl State {
         quads
     }
 
+    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
+    /// and register them with egui.
+    fn decode_thumbnails(&mut self, budget: usize) {
+        let mut done = 0;
+        for i in 0..self.library.volumes.len() {
+            if done >= budget {
+                break;
+            }
+            if self.library.volumes[i].thumb_tried {
+                continue;
+            }
+            self.library.volumes[i].thumb_tried = true;
+            done += 1;
+            let Some(bytes) = cover_bytes(&self.library.volumes[i]) else {
+                continue;
+            };
+            let img = match decode_and_downscale(&bytes, THUMB_H, &mut self.thumb_resizer) {
+                Ok(img) => img,
+                Err(_) => continue,
+            };
+            let pt = PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.tex_pool);
+            let id = self.egui_renderer.register_native_texture(
+                &self.gpu.device,
+                &pt.view,
+                wgpu::FilterMode::Linear,
+            );
+            self.library.volumes[i].thumb = Some(id);
+            self.library.volumes[i].thumb_tex = Some(pt);
+        }
+    }
+
     /// Forward look-ahead distance, widened when flipping quickly.
     fn dynamic_fwd(&mut self) -> usize {
         let now = Instant::now();
@@ -850,8 +902,10 @@ impl State {
         }
         self.prefetch();
 
-        // Decide what to draw this frame (scroll strip, or single/spread flip).
-        let quads = if self.scroll_mode {
+        // Decide what to draw this frame (library grid hides the page).
+        let quads = if self.library_view {
+            Vec::new()
+        } else if self.scroll_mode {
             self.build_scroll_quads()
         } else {
             self.build_quads()
@@ -948,9 +1002,16 @@ impl State {
         }
 
         // egui chrome.
+        if self.library_view {
+            self.decode_thumbnails(THUMB_BUDGET);
+        }
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ui_state = &mut self.ui;
-        let full_output = self.egui_ctx.run(raw_input, |ctx| ui::chrome(ctx, ui_state));
+        let lib = &self.library;
+        let library_view = self.library_view;
+        let full_output = self
+            .egui_ctx
+            .run(raw_input, |ctx| ui::chrome(ctx, ui_state, lib, library_view));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -966,6 +1027,29 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_present) {
             self.apply_action(Action::TogglePresent);
+        }
+        if let Some(root) = self.ui.pending_library.take() {
+            for v in &self.library.volumes {
+                if let Some(id) = v.thumb {
+                    self.egui_renderer.free_texture(&id);
+                }
+            }
+            self.library = Library::scan(&root);
+            self.library_view = true;
+            self.settings.library_root = Some(root.to_string_lossy().into_owned());
+            config::save(&self.settings);
+        }
+        if std::mem::take(&mut self.ui.req_toggle_library) {
+            if !self.library.volumes.is_empty() {
+                self.library_view = !self.library_view;
+            }
+        }
+        if let Some(i) = self.ui.clicked_volume.take() {
+            if let Some(v) = self.library.volumes.get(i) {
+                let path = v.path.clone();
+                self.library_view = false;
+                self.open(&path);
+            }
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);

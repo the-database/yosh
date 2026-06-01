@@ -7,6 +7,7 @@ mod config;
 mod decode;
 mod gpu;
 mod layout;
+mod library;
 mod page;
 mod pool;
 mod prefetch;
