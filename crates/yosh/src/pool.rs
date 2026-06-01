@@ -7,7 +7,7 @@
 //! workers always pick the highest-priority page relative to the latest position.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -51,7 +51,7 @@ impl DecodePool {
         tex_pool: Arc<TexturePool>,
         downscaler: Arc<Downscaler>,
         gpu_flag: Arc<AtomicBool>,
-        target_h: u32,
+        target_h: Arc<AtomicU32>,
         workers: usize,
     ) -> Self {
         let shared = Arc::new((
@@ -73,6 +73,7 @@ impl DecodePool {
             let tex_pool = tex_pool.clone();
             let downscaler = downscaler.clone();
             let gpu_flag = gpu_flag.clone();
+            let target_h = target_h.clone();
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
@@ -95,23 +96,24 @@ impl DecodePool {
                     };
 
                     let gpu = gpu_flag.load(Ordering::Relaxed);
+                    let th = target_h.load(Ordering::Relaxed);
                     let page: Option<PageTexture> = match source.read_page(index) {
                         Ok(bytes) if gpu && GPU_DOWNSCALE_ENABLED => decode_full(&bytes).ok().map(|img| {
                             // Upload full-res, downscale on the GPU into a display texture.
                             let src = tex_pool.get(&device, img.gray, img.w, img.h);
                             texpool::write_pixels(&queue, &src, &img.pixels, img.w, img.h, img.gray);
                             let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
-                            let tw = (((img.w as f64) * (target_h as f64) / (img.h as f64)).round()
+                            let tw = (((img.w as f64) * (th as f64) / (img.h as f64)).round()
                                 as u32)
                                 .max(1);
-                            let dst = tex_pool.get(&device, img.gray, tw, target_h);
+                            let dst = tex_pool.get(&device, img.gray, tw, th);
                             let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
                             downscaler.blit(&device, &queue, &src_view, &dst_view, img.gray);
                             drop(src_view);
                             tex_pool.put(src, img.gray, img.w, img.h);
-                            PageTexture::from_pooled(dst, tw, target_h, img.gray)
+                            PageTexture::from_pooled(dst, tw, th, img.gray)
                         }),
-                        Ok(bytes) => decode_and_downscale(&bytes, target_h, &mut resizer)
+                        Ok(bytes) => decode_and_downscale(&bytes, th, &mut resizer)
                             .ok()
                             .map(|img| PagePipeline::upload(&device, &queue, &img, &tex_pool)),
                         Err(_) => None,

@@ -5,7 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,14 @@ use crate::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSou
 use crate::texpool::TexturePool;
 use crate::ui::{self, UiState};
 
-const TARGET_H: u32 = 2160;
+// Decode target height tracks the on-screen page size (see `desired_target_h`)
+// so the high-quality linear-light downscale does the *full* reduction in one
+// pass. Otherwise pages decode larger than shown and the GPU re-downscales them
+// with a plain bilinear (no mipmaps) → halftone aliasing/moiré.
+const TARGET_H_DEFAULT: u32 = 1440;
+const MIN_TARGET: u32 = 480;
+const MAX_TARGET: u32 = 3840;
+const TARGET_QUANTUM: u32 = 128;
 const WORKERS: usize = 8;
 const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
@@ -106,6 +113,11 @@ struct State {
     tex_pool: Arc<TexturePool>,
     downscaler: Arc<Downscaler>,
     gpu_flag: Arc<AtomicBool>,
+    /// Decode resolution (page height in px), tracked to the display size so the
+    /// CPU linear-light resize is the only downscale. Read by pool workers.
+    target_h: Arc<AtomicU32>,
+    /// Last-computed desired target, for debouncing re-decode across resize/zoom.
+    pending_target: u32,
 
     library: Library,
     library_view: bool,
@@ -269,6 +281,8 @@ impl ApplicationHandler for App {
             tex_pool,
             downscaler,
             gpu_flag,
+            target_h: Arc::new(AtomicU32::new(TARGET_H_DEFAULT)),
+            pending_target: 0,
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -977,7 +991,7 @@ impl State {
             self.tex_pool.clone(),
             self.downscaler.clone(),
             self.gpu_flag.clone(),
-            TARGET_H,
+            self.target_h.clone(),
             WORKERS,
         ));
         self.cache.clear();
@@ -990,6 +1004,34 @@ impl State {
         self.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
         self.prefetch();
+    }
+
+    /// Desired decode height: the page's on-screen height (window height × zoom),
+    /// quantized to avoid churn and clamped. Per-page it's further capped to the
+    /// source height in `decode_and_downscale` (never upscale a page).
+    fn desired_target_h(&self) -> u32 {
+        let h = (self.gpu.config.height as f32 * self.zoom).round() as u32;
+        let q = ((h + TARGET_QUANTUM / 2) / TARGET_QUANTUM) * TARGET_QUANTUM;
+        q.clamp(MIN_TARGET, MAX_TARGET)
+    }
+
+    /// Re-point the decode target at the current display size. Debounced: only
+    /// acts once the desired value settles (so a resize/zoom drag re-decodes once,
+    /// not every frame). Clears the cache so visible pages re-decode at the new
+    /// resolution; normal page-flipping never changes the target, so it never
+    /// triggers a re-decode.
+    fn update_target_h(&mut self) {
+        let desired = self.desired_target_h();
+        if desired != self.pending_target {
+            self.pending_target = desired; // still settling
+            return;
+        }
+        if self.target_h.load(Ordering::Relaxed) != desired {
+            self.target_h.store(desired, Ordering::Relaxed);
+            self.cache.clear();
+            self.failed.clear();
+            self.last_drawn = None;
+        }
     }
 
     /// Recompute the desired prefetch window and hand it to the pool.
@@ -1025,6 +1067,8 @@ impl State {
                 }
             }
         }
+        // Track the decode resolution to the display size (debounced re-decode).
+        self.update_target_h();
         // Keep the scroll anchor valid as page heights resolve, then refresh work.
         if self.scroll_mode {
             self.normalize();
