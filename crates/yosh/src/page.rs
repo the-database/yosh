@@ -103,6 +103,19 @@ pub struct PageTexture {
 }
 
 impl PageTexture {
+    /// Wrap a texture that already holds page pixels (e.g. a GPU-downscale
+    /// target) as a `PageTexture`.
+    pub fn from_pooled(texture: wgpu::Texture, w: u32, h: u32, gray: bool) -> PageTexture {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        PageTexture {
+            texture,
+            view,
+            w,
+            h,
+            gray,
+        }
+    }
+
     /// Return the GPU texture to the pool for reuse (drops the view first).
     pub fn recycle(self, pool: &TexturePool) {
         let PageTexture {

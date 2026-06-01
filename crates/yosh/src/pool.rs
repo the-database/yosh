@@ -7,16 +7,18 @@
 //! workers always pick the highest-priority page relative to the latest position.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use fast_image_resize::Resizer;
 
-use crate::decode::decode_and_downscale;
+use crate::decode::{decode_and_downscale, decode_full};
+use crate::downscale::Downscaler;
 use crate::page::{PagePipeline, PageTexture};
 use crate::source::PageSource;
-use crate::texpool::TexturePool;
+use crate::texpool::{self, TexturePool};
 
 pub enum Msg {
     Done { index: usize, page: PageTexture },
@@ -41,6 +43,8 @@ impl DecodePool {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         tex_pool: Arc<TexturePool>,
+        downscaler: Arc<Downscaler>,
+        gpu_flag: Arc<AtomicBool>,
         target_h: u32,
         workers: usize,
     ) -> Self {
@@ -61,6 +65,8 @@ impl DecodePool {
             let device = device.clone();
             let queue = queue.clone();
             let tex_pool = tex_pool.clone();
+            let downscaler = downscaler.clone();
+            let gpu_flag = gpu_flag.clone();
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
@@ -82,22 +88,37 @@ impl DecodePool {
                         }
                     };
 
-                    let result = source
-                        .read_page(index)
-                        .map_err(|e| e.to_string())
-                        .and_then(|bytes| decode_and_downscale(&bytes, target_h, &mut resizer));
+                    let gpu = gpu_flag.load(Ordering::Relaxed);
+                    let page: Option<PageTexture> = match source.read_page(index) {
+                        Ok(bytes) if gpu => decode_full(&bytes).ok().map(|img| {
+                            // Upload full-res, downscale on the GPU into a display texture.
+                            let src = tex_pool.get(&device, img.gray, img.w, img.h);
+                            texpool::write_pixels(&queue, &src, &img.pixels, img.w, img.h, img.gray);
+                            let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
+                            let tw = (((img.w as f64) * (target_h as f64) / (img.h as f64)).round()
+                                as u32)
+                                .max(1);
+                            let dst = tex_pool.get(&device, img.gray, tw, target_h);
+                            let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
+                            downscaler.blit(&device, &queue, &src_view, &dst_view, img.gray);
+                            drop(src_view);
+                            tex_pool.put(src, img.gray, img.w, img.h);
+                            PageTexture::from_pooled(dst, tw, target_h, img.gray)
+                        }),
+                        Ok(bytes) => decode_and_downscale(&bytes, target_h, &mut resizer)
+                            .ok()
+                            .map(|img| PagePipeline::upload(&device, &queue, &img, &tex_pool)),
+                        Err(_) => None,
+                    };
 
                     {
                         let (m, _) = &*shared;
                         m.lock().unwrap().inflight.remove(&index);
                     }
 
-                    let msg = match result {
-                        Ok(img) => Msg::Done {
-                            index,
-                            page: PagePipeline::upload(&device, &queue, &img, &tex_pool),
-                        },
-                        Err(_) => Msg::Failed { index },
+                    let msg = match page {
+                        Some(page) => Msg::Done { index, page },
+                        None => Msg::Failed { index },
                     };
                     if tx.send(msg).is_err() {
                         return; // receiver gone

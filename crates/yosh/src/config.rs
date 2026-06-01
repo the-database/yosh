@@ -17,6 +17,8 @@ pub struct Settings {
     pub scroll: bool,
     /// Uncapped present (Immediate) instead of vsync (Fifo).
     pub turbo: bool,
+    /// Downscale pages on the GPU instead of on the CPU.
+    pub gpu: bool,
     /// Last library root folder (browse grid).
     pub library_root: Option<String>,
     /// Volume path (folder or archive) → last-read page index.
@@ -31,6 +33,7 @@ impl Default for Settings {
             layout_spread: false,
             scroll: false,
             turbo: false,
+            gpu: false,
             library_root: None,
             last_pages: HashMap::new(),
         }

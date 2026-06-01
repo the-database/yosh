@@ -75,19 +75,30 @@ fn decode_other(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
     Ok((w, h, false, rgba.into_raw()))
 }
 
-/// Decode page bytes (any supported format) and downscale to `target_h`.
+/// Decode to full resolution (no resize), normalized to gray (1ch) or RGBA8.
+fn decode_raw(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
+    if bytes.starts_with(&PNG_SIG) {
+        decode_png(bytes)
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        decode_jpeg(bytes)
+    } else {
+        decode_other(bytes)
+    }
+}
+
+/// Decode at full resolution (for the GPU-downscale path).
+pub fn decode_full(bytes: &[u8]) -> Result<DecodedImage, String> {
+    let (w, h, gray, pixels) = decode_raw(bytes)?;
+    Ok(DecodedImage { w, h, gray, pixels })
+}
+
+/// Decode page bytes (any supported format) and downscale to `target_h` on CPU.
 pub fn decode_and_downscale(
     bytes: &[u8],
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
-    let (w, h, gray, full) = if bytes.starts_with(&PNG_SIG) {
-        decode_png(bytes)?
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        decode_jpeg(bytes)?
-    } else {
-        decode_other(bytes)?
-    };
+    let (w, h, gray, full) = decode_raw(bytes)?;
 
     let pt = if gray { PixelType::U8 } else { PixelType::U8x4 };
     let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);

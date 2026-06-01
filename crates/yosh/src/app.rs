@@ -5,6 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ use fast_image_resize::Resizer;
 use crate::cache::PageCache;
 use crate::config;
 use crate::decode::decode_and_downscale;
+use crate::downscale::Downscaler;
 use crate::gpu::Gpu;
 use crate::layout::{self, Layout};
 use crate::library::{cover_bytes, Library};
@@ -101,6 +103,8 @@ struct State {
     settings: config::Settings,
     volume_key: Option<String>,
     tex_pool: Arc<TexturePool>,
+    downscaler: Arc<Downscaler>,
+    gpu_flag: Arc<AtomicBool>,
 
     library: Library,
     library_view: bool,
@@ -170,6 +174,8 @@ impl ApplicationHandler for App {
         let settings = config::load();
         gpu.set_turbo(settings.turbo);
         let tex_pool = Arc::new(TexturePool::new());
+        let downscaler = Arc::new(Downscaler::new(&gpu.device));
+        let gpu_flag = Arc::new(AtomicBool::new(settings.gpu));
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -225,6 +231,8 @@ impl ApplicationHandler for App {
             settings,
             volume_key: None,
             tex_pool,
+            downscaler,
+            gpu_flag,
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -290,6 +298,7 @@ enum Action {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ToggleGpu,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -312,6 +321,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
+            KeyCode::KeyG => return Some(Action::ToggleGpu),
             _ => {}
         }
     }
@@ -411,6 +421,16 @@ impl State {
                 self.settings.turbo = !self.settings.turbo;
                 self.gpu.set_turbo(self.settings.turbo);
                 config::save(&self.settings);
+            }
+            Action::ToggleGpu => {
+                let on = !self.gpu_flag.load(Ordering::Relaxed);
+                self.gpu_flag.store(on, Ordering::Relaxed);
+                self.settings.gpu = on;
+                config::save(&self.settings);
+                // Re-decode the visible window through the newly-selected path.
+                self.cache.clear();
+                self.failed.clear();
+                self.prefetch();
             }
         }
     }
@@ -849,6 +869,8 @@ impl State {
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
             self.tex_pool.clone(),
+            self.downscaler.clone(),
+            self.gpu_flag.clone(),
             TARGET_H,
             WORKERS,
         ));

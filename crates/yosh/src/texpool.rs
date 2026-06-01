@@ -38,6 +38,30 @@ impl TexturePool {
     }
 }
 
+/// Upload single-channel (gray) or RGBA8 pixels into an existing texture.
+pub fn write_pixels(queue: &wgpu::Queue, tex: &wgpu::Texture, pixels: &[u8], w: u32, h: u32, gray: bool) {
+    let bpp = if gray { 1 } else { 4 };
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        pixels,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(w * bpp),
+            rows_per_image: Some(h),
+        },
+        wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 pub fn create_page_texture(device: &wgpu::Device, gray: bool, w: u32, h: u32) -> wgpu::Texture {
     let format = if gray {
         wgpu::TextureFormat::R8Unorm
@@ -55,7 +79,9 @@ pub fn create_page_texture(device: &wgpu::Device, gray: bool, w: u32, h: u32) ->
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     })
 }
