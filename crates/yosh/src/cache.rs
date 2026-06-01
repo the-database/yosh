@@ -1,21 +1,26 @@
 //! Bounded page-texture cache — the "ring buffer" of decoded display-res frames.
 //! Eviction is distance-based around the current page (a reader re-reads nearby
-//! pages, so keep a window centered on `current`).
+//! pages, so keep a window centered on `current`). Evicted textures are returned
+//! to the pool for reuse.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::page::PageTexture;
+use crate::texpool::TexturePool;
 
 pub struct PageCache {
     map: HashMap<usize, PageTexture>,
     cap: usize,
+    pool: Arc<TexturePool>,
 }
 
 impl PageCache {
-    pub fn new(cap: usize) -> Self {
+    pub fn new(cap: usize, pool: Arc<TexturePool>) -> Self {
         Self {
             map: HashMap::new(),
             cap,
+            pool,
         }
     }
 
@@ -28,12 +33,16 @@ impl PageCache {
     }
 
     pub fn clear(&mut self) {
-        self.map.clear();
+        for (_, page) in self.map.drain() {
+            page.recycle(&self.pool);
+        }
     }
 
     /// Insert a page, evicting the entries furthest from `current` if over cap.
     pub fn insert(&mut self, index: usize, page: PageTexture, current: usize) {
-        self.map.insert(index, page);
+        if let Some(old) = self.map.insert(index, page) {
+            old.recycle(&self.pool);
+        }
         while self.map.len() > self.cap {
             let victim = self
                 .map
@@ -43,7 +52,9 @@ impl PageCache {
                 .max_by_key(|&k| (k as i64 - current as i64).abs());
             match victim {
                 Some(k) => {
-                    self.map.remove(&k);
+                    if let Some(page) = self.map.remove(&k) {
+                        page.recycle(&self.pool);
+                    }
                 }
                 None => break,
             }

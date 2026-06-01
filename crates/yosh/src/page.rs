@@ -4,6 +4,7 @@
 //! via independent per-slot uniform buffers.
 
 use crate::decode::DecodedImage;
+use crate::texpool::TexturePool;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FitMode {
@@ -94,11 +95,26 @@ struct Uniforms {
 
 /// A decoded page resident on the GPU.
 pub struct PageTexture {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     pub view: wgpu::TextureView,
     pub w: u32,
     pub h: u32,
     pub gray: bool,
+}
+
+impl PageTexture {
+    /// Return the GPU texture to the pool for reuse (drops the view first).
+    pub fn recycle(self, pool: &TexturePool) {
+        let PageTexture {
+            texture,
+            view,
+            w,
+            h,
+            gray,
+        } = self;
+        drop(view);
+        pool.put(texture, gray, w, h);
+    }
 }
 
 pub struct PagePipeline {
@@ -197,27 +213,15 @@ impl PagePipeline {
         }
     }
 
-    /// Upload a decoded page to a GPU texture.
-    pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, img: &DecodedImage) -> PageTexture {
-        let (format, bpp) = if img.gray {
-            (wgpu::TextureFormat::R8Unorm, 1u32)
-        } else {
-            (wgpu::TextureFormat::Rgba8Unorm, 4u32)
-        };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("page_tex"),
-            size: wgpu::Extent3d {
-                width: img.w,
-                height: img.h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    /// Upload a decoded page to a GPU texture (reusing one from the pool).
+    pub fn upload(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        img: &DecodedImage,
+        pool: &TexturePool,
+    ) -> PageTexture {
+        let bpp = if img.gray { 1u32 } else { 4u32 };
+        let texture = pool.get(device, img.gray, img.w, img.h);
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &texture,
@@ -239,7 +243,7 @@ impl PagePipeline {
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         PageTexture {
-            _texture: texture,
+            texture,
             view,
             w: img.w,
             h: img.h,

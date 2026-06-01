@@ -11,6 +11,7 @@ mod page;
 mod pool;
 mod prefetch;
 mod source;
+mod texpool;
 mod ui;
 
 use winit::event_loop::{ControlFlow, EventLoop};
