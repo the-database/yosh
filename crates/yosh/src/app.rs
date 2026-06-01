@@ -118,6 +118,8 @@ struct State {
     target_h: Arc<AtomicU32>,
     /// Last-computed desired target, for debouncing re-decode across resize/zoom.
     pending_target: u32,
+    /// Page index the Tab info overlay text was built for (None = rebuild needed).
+    info_for: Option<usize>,
 
     library: Library,
     library_view: bool,
@@ -128,6 +130,7 @@ fn fit_from_u8(v: u8) -> FitMode {
     match v {
         1 => FitMode::Width,
         2 => FitMode::Height,
+        3 => FitMode::Actual,
         _ => FitMode::Window,
     }
 }
@@ -137,7 +140,97 @@ fn fit_to_u8(f: FitMode) -> u8 {
         FitMode::Window => 0,
         FitMode::Width => 1,
         FitMode::Height => 2,
+        FitMode::Actual => 3,
     }
+}
+
+/// Human-readable byte size for the info overlay.
+fn human_size(n: u64) -> String {
+    const KB: u64 = 1 << 10;
+    const MB: u64 = 1 << 20;
+    if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// Probe an encoded image's header for `(width, height, "FORMAT · detail")`
+/// without a full decode. Returns `(0, 0, ...)` if dimensions can't be read.
+fn probe(b: &[u8]) -> (u32, u32, String) {
+    let be16 = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as u32;
+    let le16 = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as u32;
+    // PNG
+    if b.len() >= 26 && b[..4] == [0x89, 0x50, 0x4E, 0x47] {
+        let w = u32::from_be_bytes([b[16], b[17], b[18], b[19]]);
+        let h = u32::from_be_bytes([b[20], b[21], b[22], b[23]]);
+        let color = match b[25] {
+            0 => "grayscale",
+            2 => "RGB",
+            3 => "indexed",
+            4 => "grayscale+alpha",
+            6 => "RGBA",
+            _ => "?",
+        };
+        return (w, h, format!("PNG · {}-bit {}", b[24], color));
+    }
+    // JPEG: scan for a Start-Of-Frame marker.
+    if b.len() >= 4 && b[0] == 0xFF && b[1] == 0xD8 {
+        let mut i = 2;
+        while i + 9 < b.len() {
+            if b[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let m = b[i + 1];
+            let is_sof = (0xC0..=0xCF).contains(&m) && m != 0xC4 && m != 0xC8 && m != 0xCC;
+            if is_sof {
+                let kind = match b[i + 9] {
+                    1 => "grayscale",
+                    3 => "YCbCr",
+                    4 => "CMYK",
+                    _ => "?",
+                };
+                return (be16(i + 7), be16(i + 5), format!("JPEG · {}-bit {}", b[i + 4], kind));
+            }
+            if i + 3 >= b.len() {
+                break;
+            }
+            i += 2 + u16::from_be_bytes([b[i + 2], b[i + 3]]) as usize;
+        }
+        return (0, 0, "JPEG".to_string());
+    }
+    // GIF
+    if b.len() >= 10 && &b[0..3] == b"GIF" {
+        return (le16(6), le16(8), "GIF".to_string());
+    }
+    // BMP
+    if b.len() >= 26 && &b[0..2] == b"BM" {
+        let w = i32::from_le_bytes([b[18], b[19], b[20], b[21]]).unsigned_abs();
+        let h = i32::from_le_bytes([b[22], b[23], b[24], b[25]]).unsigned_abs();
+        return (w, h, "BMP".to_string());
+    }
+    // WebP (RIFF container)
+    if b.len() >= 30 && &b[0..4] == b"RIFF" && &b[8..12] == b"WEBP" {
+        match &b[12..16] {
+            b"VP8X" => {
+                let w = 1 + (b[24] as u32 | (b[25] as u32) << 8 | (b[26] as u32) << 16);
+                let h = 1 + (b[27] as u32 | (b[28] as u32) << 8 | (b[29] as u32) << 16);
+                return (w, h, "WebP".to_string());
+            }
+            b"VP8 " => {
+                return (le16(26) & 0x3FFF, le16(28) & 0x3FFF, "WebP".to_string());
+            }
+            _ => return (0, 0, "WebP".to_string()),
+        }
+    }
+    // AVIF / HEIF (ISO-BMFF): dimensions need a box walk; report the format only.
+    if b.len() >= 12 && &b[4..8] == b"ftyp" {
+        return (0, 0, "AVIF".to_string());
+    }
+    (0, 0, "image".to_string())
 }
 
 /// Best-effort: load a system CJK font so Japanese/Chinese/Korean text (paths,
@@ -283,6 +376,7 @@ impl ApplicationHandler for App {
             gpu_flag,
             target_h: Arc::new(AtomicU32::new(TARGET_H_DEFAULT)),
             pending_target: 0,
+            info_for: None,
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -303,11 +397,13 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => state.gpu.resize(size.width, size.height),
             WindowEvent::DroppedFile(path) => state.ui.pending_open = Some(path),
             WindowEvent::RedrawRequested => state.render(),
-            WindowEvent::KeyboardInput { event, .. }
-                if event.state == ElementState::Pressed && !response.consumed =>
-            {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(action) = action_from(&event) {
-                    state.apply_action(action);
+                    // Tab (info overlay) fires even if egui would consume it for
+                    // focus traversal; everything else respects egui consumption.
+                    if matches!(action, Action::ToggleInfo) || !response.consumed {
+                        state.apply_action(action);
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -352,6 +448,7 @@ enum Action {
     ToggleHelp,
     ToggleFullscreen,
     ToggleSpreadOffset,
+    ToggleInfo,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -376,6 +473,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
             KeyCode::F1 => return Some(Action::ToggleHelp),
+            KeyCode::Tab => return Some(Action::ToggleInfo),
             KeyCode::F11 => return Some(Action::ToggleFullscreen),
             _ => {}
         }
@@ -492,6 +590,10 @@ impl State {
                 config::save(&self.settings);
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
+            Action::ToggleInfo => {
+                self.ui.info_open = !self.ui.info_open;
+                self.info_for = None; // rebuild the overlay text next render
+            }
             Action::ToggleFullscreen => {
                 let fs = match self.window.fullscreen() {
                     Some(_) => None,
@@ -997,6 +1099,7 @@ impl State {
         self.cache.clear();
         self.failed.clear();
         self.last_drawn = None;
+        self.info_for = None;
         self.nav_times.clear();
         self.index = idx.min(source.len() - 1);
         self.volume_key = Some(key);
@@ -1009,7 +1112,43 @@ impl State {
     /// Desired decode height: the page's on-screen height (window height × zoom),
     /// quantized to avoid churn and clamped. Per-page it's further capped to the
     /// source height in `decode_and_downscale` (never upscale a page).
+    /// Gather display info for page `index` (Tab overlay): reads the page bytes
+    /// once and probes the header for resolution + format. Only called on a page
+    /// change while the overlay is open, so the extra read is cheap.
+    fn build_page_info(&self, index: usize) -> Vec<(String, String)> {
+        let Some(src) = &self.source else {
+            return Vec::new();
+        };
+        let name = src.name(index).to_string();
+        let bytes = src.read_page(index).ok();
+        let (res, fmt, size) = match &bytes {
+            Some(b) => {
+                let (w, h, detail) = probe(b);
+                let res = if w == 0 || h == 0 {
+                    "—".to_string()
+                } else {
+                    format!("{w} × {h}")
+                };
+                (res, detail, human_size(b.len() as u64))
+            }
+            None => ("—".to_string(), "—".to_string(), "—".to_string()),
+        };
+        let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
+        vec![
+            ("File".to_string(), name),
+            ("Size".to_string(), size),
+            ("Modified".to_string(), modified),
+            ("Resolution".to_string(), res),
+            ("Format".to_string(), fmt),
+        ]
+    }
+
     fn desired_target_h(&self) -> u32 {
+        // 1:1 mode wants full source resolution; a huge target makes the per-page
+        // `target_h.min(source_h)` clamp decode each page at its native height.
+        if self.fit == FitMode::Actual && !self.scroll_mode {
+            return u32::MAX;
+        }
         let h = (self.gpu.config.height as f32 * self.zoom).round() as u32;
         let q = ((h + TARGET_QUANTUM / 2) / TARGET_QUANTUM) * TARGET_QUANTUM;
         q.clamp(MIN_TARGET, MAX_TARGET)
@@ -1091,6 +1230,11 @@ impl State {
             self.layout.label()
         };
         self.ui.turbo_label = if self.settings.turbo { "turbo" } else { "vsync" };
+        // Build the Tab info overlay text, reading the source once per page change.
+        if self.ui.info_open && !self.library_view && self.info_for != Some(self.index) {
+            self.ui.info = self.build_page_info(self.index);
+            self.info_for = Some(self.index);
+        }
         // Hide the top bar in fullscreen, revealing it when the cursor is at the top edge.
         let fullscreen = self.window.fullscreen().is_some();
         let reveal = 48.0 * self.window.scale_factor() as f32;

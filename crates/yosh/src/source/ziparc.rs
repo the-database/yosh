@@ -17,22 +17,38 @@ fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
 pub struct ZipSource {
     path: PathBuf,
     names: Vec<String>,
+    modified: Vec<Option<String>>,
 }
 
 impl ZipSource {
     pub fn new(path: &Path) -> io::Result<Self> {
         let mut zip = ZipArchive::new(File::open(path)?).map_err(to_io)?;
-        let mut names: Vec<String> = (0..zip.len())
+        let mut entries: Vec<(String, Option<String>)> = (0..zip.len())
             .filter_map(|i| {
                 let f = zip.by_index(i).ok()?;
                 let name = f.name().to_string();
-                (f.is_file() && is_image_name(&name)).then_some(name)
+                if !(f.is_file() && is_image_name(&name)) {
+                    return None;
+                }
+                let modified = f.last_modified().map(|dt| {
+                    format!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}",
+                        dt.year(),
+                        dt.month(),
+                        dt.day(),
+                        dt.hour(),
+                        dt.minute()
+                    )
+                });
+                Some((name, modified))
             })
             .collect();
-        names.sort_by(|a, b| natord::compare(a, b));
+        entries.sort_by(|a, b| natord::compare(&a.0, &b.0));
+        let (names, modified) = entries.into_iter().unzip();
         Ok(Self {
             path: path.to_path_buf(),
             names,
+            modified,
         })
     }
 }
@@ -52,5 +68,9 @@ impl PageSource for ZipSource {
         let mut buf = Vec::with_capacity(entry.size() as usize);
         entry.read_to_end(&mut buf)?;
         Ok(buf)
+    }
+
+    fn modified(&self, index: usize) -> Option<String> {
+        self.modified.get(index).cloned().flatten()
     }
 }

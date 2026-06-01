@@ -33,6 +33,10 @@ pub struct UiState {
     /// Whether to draw the top chrome bar (hidden in fullscreen unless the
     /// cursor is at the top edge). Set by the app each frame.
     pub show_bar: bool,
+    /// Tab info overlay: whether it's shown, and its (label, value) lines (built
+    /// by the app for the current page).
+    pub info_open: bool,
+    pub info: Vec<(String, String)>,
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -135,7 +139,8 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("C   continuous vertical scroll");
                 ui.separator();
                 ui.heading("View");
-                ui.label("F   fit mode  (window / width / height)");
+                ui.label("F   fit mode  (window / width / height / 1:1)");
+                ui.label("Tab   show image info overlay");
                 ui.label("+ / − / 0   zoom in / out / reset;   drag — pan");
                 ui.label("T   present  vsync ↔ turbo");
                 ui.label("F11   fullscreen");
@@ -144,6 +149,36 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("Open folder / Open file / Library;  Grid ↔ Reader");
                 ui.label("drag a folder, archive, or image onto the window");
                 ui.label("F1   toggle this help");
+            });
+    }
+
+    if st.info_open && !library_view && !st.info.is_empty() {
+        egui::Area::new(egui::Id::new("info_overlay"))
+            .fixed_pos(egui::pos2(12.0, 44.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(190))
+                    .inner_margin(egui::Margin::same(8))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .show(ui, |ui| {
+                        egui::Grid::new("info_grid")
+                            .num_columns(2)
+                            .spacing([14.0, 3.0])
+                            .show(ui, |ui| {
+                                for (k, v) in &st.info {
+                                    ui.label(
+                                        egui::RichText::new(k).color(egui::Color32::from_gray(150)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(v)
+                                            .color(egui::Color32::WHITE)
+                                            .monospace(),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    });
             });
     }
 

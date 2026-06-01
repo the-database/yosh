@@ -232,6 +232,13 @@ pub fn decode_and_downscale(
     // Never upscale a page beyond its own resolution (target tracks display size,
     // which can exceed a low-res source).
     let target_h = target_h.min(h).max(1);
+
+    // No downscale needed (1:1 / "Actual" mode, or a source already <= target):
+    // show the decoded pixels unaltered — no resampling, no tone remap.
+    if target_h == h {
+        return Ok(DecodedImage { w, h, gray: gray_by_channels, pixels: full });
+    }
+
     let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);
 
     if gray_by_channels {

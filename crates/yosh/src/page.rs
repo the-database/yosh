@@ -11,6 +11,9 @@ pub enum FitMode {
     Window,
     Width,
     Height,
+    /// 1:1 — one image pixel per device pixel, no resize (DPI ignored). Pages
+    /// are decoded at full source resolution (see `decode_and_downscale`).
+    Actual,
 }
 
 impl FitMode {
@@ -18,7 +21,8 @@ impl FitMode {
         match self {
             FitMode::Window => FitMode::Width,
             FitMode::Width => FitMode::Height,
-            FitMode::Height => FitMode::Window,
+            FitMode::Height => FitMode::Actual,
+            FitMode::Actual => FitMode::Window,
         }
     }
     pub fn label(self) -> &'static str {
@@ -26,6 +30,7 @@ impl FitMode {
             FitMode::Window => "fit",
             FitMode::Width => "width",
             FitMode::Height => "height",
+            FitMode::Actual => "1:1",
         }
     }
 }
@@ -36,6 +41,7 @@ pub fn fit_scale(fit: FitMode, sw: f32, sh: f32, pw: f32, ph: f32) -> f32 {
         FitMode::Window => (sw / pw).min(sh / ph),
         FitMode::Width => sw / pw,
         FitMode::Height => sh / ph,
+        FitMode::Actual => 1.0, // 1 page pixel → 1 device pixel
     }
 }
 
