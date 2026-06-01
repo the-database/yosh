@@ -76,9 +76,14 @@ struct State {
 
     fit: FitMode,
     layout: Layout,
+    zoom: f32,       // page-flip zoom factor (1.0 = fit)
+    pan_x: f32,      // page-flip pan offset in screen px (from centered)
     pan_y: f32,
     direction: Direction,
     cursor_x: f64,
+    cursor_y: f64,
+    mouse_down: bool,
+    drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     nav_times: VecDeque<Instant>,
 
     // Continuous-scroll mode (M2.1).
@@ -183,7 +188,12 @@ impl ApplicationHandler for App {
             } else {
                 Layout::Single
             },
+            zoom: 1.0,
+            pan_x: 0.0,
             pan_y: 0.0,
+            cursor_y: 0.0,
+            mouse_down: false,
+            drag_dist: 0.0,
             direction: if settings.direction_rtl {
                 Direction::Rtl
             } else {
@@ -220,13 +230,15 @@ impl ApplicationHandler for App {
                     state.apply_action(action);
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => state.cursor_x = position.x,
+            WindowEvent::CursorMoved { position, .. } => {
+                state.on_cursor_moved(position.x, position.y)
+            }
             WindowEvent::MouseWheel { delta, .. } if !response.consumed => state.on_wheel(delta),
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
+                state: btn,
                 button: MouseButton::Left,
                 ..
-            } if !response.consumed => state.on_click(),
+            } if !response.consumed => state.on_left_button(btn == ElementState::Pressed),
             _ => {}
         }
 
@@ -254,6 +266,9 @@ enum Action {
     ToggleLayout,
     ToggleScroll,
     TogglePresent,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -273,6 +288,9 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyS => return Some(Action::ToggleLayout),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyT => return Some(Action::TogglePresent),
+            KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
+            KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
+            KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
             _ => {}
         }
     }
@@ -325,9 +343,24 @@ impl State {
             }
             Action::CycleFit => {
                 self.fit = self.fit.cycle();
+                self.zoom = 1.0;
+                self.pan_x = 0.0;
                 self.pan_y = 0.0;
                 self.settings.fit = fit_to_u8(self.fit);
                 config::save(&self.settings);
+            }
+            Action::ZoomIn => {
+                self.zoom = (self.zoom * 1.25).min(8.0);
+                self.clamp_pan();
+            }
+            Action::ZoomOut => {
+                self.zoom = (self.zoom / 1.25).max(1.0);
+                self.clamp_pan();
+            }
+            Action::ZoomReset => {
+                self.zoom = 1.0;
+                self.pan_x = 0.0;
+                self.pan_y = 0.0;
             }
             Action::ToggleDir => {
                 self.direction = match self.direction {
@@ -380,7 +413,8 @@ impl State {
 
     fn goto(&mut self, index: usize) {
         self.index = index;
-        self.pan_y = 0.0; // start new page at the top
+        self.pan_x = 0.0;
+        self.pan_y = 0.0; // start new page centered
         self.top_offset = 0.0;
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), index);
@@ -420,22 +454,18 @@ impl State {
             self.step(if dy < 0.0 { 1 } else { -1 });
             return;
         }
-        let before = self.pan_y;
-        self.pan_y -= dy * 0.15;
-        if self.pan_y < 0.0 {
-            if before <= 0.0005 {
-                self.step(-1);
-                self.pan_y = 1.0;
-            } else {
-                self.pan_y = 0.0;
-            }
-        } else if self.pan_y > 1.0 {
-            if before >= 0.9995 {
-                self.step(1);
-                self.pan_y = 0.0;
-            } else {
-                self.pan_y = 1.0;
-            }
+        // Vertical pan in px; flip pages at the top/bottom edges.
+        let sh = self.gpu.config.height.max(1) as f32;
+        let maxp = ((self.current_display_h() - sh) / 2.0).max(0.0);
+        let next = self.pan_y.clamp(-maxp, maxp) + dy * 80.0;
+        if next > maxp + 0.5 {
+            self.step(-1); // panned above the top -> previous page, land at its bottom
+            self.pan_y = -1.0e6;
+        } else if next < -maxp - 0.5 {
+            self.step(1); // panned below the bottom -> next page, land at its top
+            self.pan_y = 1.0e6;
+        } else {
+            self.pan_y = next;
         }
     }
 
@@ -448,23 +478,80 @@ impl State {
         }
     }
 
+    fn on_cursor_moved(&mut self, x: f64, y: f64) {
+        let dx = (x - self.cursor_x) as f32;
+        let dy = (y - self.cursor_y) as f32;
+        self.cursor_x = x;
+        self.cursor_y = y;
+        // Drag to pan when a page overflows (page-flip mode).
+        if self.mouse_down && !self.scroll_mode {
+            self.drag_dist += dx.abs() + dy.abs();
+            self.pan_x += dx;
+            self.pan_y += dy;
+            self.clamp_pan();
+        }
+    }
+
+    /// Left button: a clean press/release (little movement) flips; a press +
+    /// drag pans instead.
+    fn on_left_button(&mut self, pressed: bool) {
+        if pressed {
+            self.mouse_down = true;
+            self.drag_dist = 0.0;
+        } else {
+            if self.mouse_down && self.drag_dist < 6.0 {
+                self.on_click();
+            }
+            self.mouse_down = false;
+        }
+    }
+
     /// Does the current page overflow the window vertically under the active fit?
     fn current_overflows(&self) -> bool {
         let Some(pt) = self.cache.get(self.index) else {
             return false;
         };
         let (sw, sh) = (self.gpu.config.width.max(1) as f32, self.gpu.config.height.max(1) as f32);
-        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32);
+        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32) * self.zoom;
         pt.h as f32 * s > sh + 0.5
     }
 
-    /// Top edge of a page (screen px, 0 = window top): centered if it fits,
-    /// else panned by `pan_y` (0 = page top aligned, 1 = page bottom aligned).
+    /// Top edge (screen px): centered, then panned by `pan_y`, clamped so the
+    /// page can't pull away from the viewport edge when larger than it.
     fn vertical_top(&self, dh: f32, sh: f32) -> f32 {
-        if dh <= sh + 0.5 {
-            (sh - dh) / 2.0
-        } else {
-            -self.pan_y.clamp(0.0, 1.0) * (dh - sh)
+        let maxp = ((dh - sh) / 2.0).max(0.0);
+        (sh - dh) / 2.0 + self.pan_y.clamp(-maxp, maxp)
+    }
+
+    /// Left edge (screen px): centered, then panned by `pan_x`, clamped.
+    fn horizontal_left(&self, dw: f32, sw: f32) -> f32 {
+        let maxp = ((dw - sw) / 2.0).max(0.0);
+        (sw - dw) / 2.0 + self.pan_x.clamp(-maxp, maxp)
+    }
+
+    /// Displayed height of the current page under the active fit + zoom.
+    fn current_display_h(&self) -> f32 {
+        let sw = self.gpu.config.width.max(1) as f32;
+        let sh = self.gpu.config.height.max(1) as f32;
+        match self.cache.get(self.index) {
+            Some(t) => {
+                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
+            }
+            None => sh,
+        }
+    }
+
+    /// Clamp stored pan to the current page's overflow so dragging/zooming can't
+    /// strand the view in an empty region.
+    fn clamp_pan(&mut self) {
+        let sw = self.gpu.config.width.max(1) as f32;
+        let sh = self.gpu.config.height.max(1) as f32;
+        if let Some(t) = self.cache.get(self.index) {
+            let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom;
+            let mx = ((t.w as f32 * s - sw) / 2.0).max(0.0);
+            let my = ((t.h as f32 * s - sh) / 2.0).max(0.0);
+            self.pan_x = self.pan_x.clamp(-mx, mx);
+            self.pan_y = self.pan_y.clamp(-my, my);
         }
     }
 
@@ -487,10 +574,18 @@ impl State {
     }
 
     fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
-        let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32);
+        let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom;
         let (dw, dh) = (t.w as f32 * s, t.h as f32 * s);
-        let x = (sw - dw) / 2.0;
-        Self::quad_from_px(0, idx, x, self.vertical_top(dh, sh), dw, dh, sw, sh)
+        Self::quad_from_px(
+            0,
+            idx,
+            self.horizontal_left(dw, sw),
+            self.vertical_top(dh, sh),
+            dw,
+            dh,
+            sw,
+            sh,
+        )
     }
 
     /// Compute the quads to draw this frame (1 for single/last-held, 2 for a
@@ -517,8 +612,8 @@ impl State {
             (Some(ta), Some((bi, tb))) => {
                 let combined_w = ta.w as f32 + tb.w as f32;
                 let max_h = ta.h.max(tb.h) as f32;
-                let s = fit_scale(self.fit, sw, sh, combined_w, max_h);
-                let x0 = (sw - combined_w * s) / 2.0;
+                let s = fit_scale(self.fit, sw, sh, combined_w, max_h) * self.zoom;
+                let x0 = self.horizontal_left(combined_w * s, sw);
                 // Screen order: LTR puts the lower index on the left; RTL reverses.
                 let (l_idx, l_t, r_idx, r_t) = match self.direction {
                     Direction::Ltr => (a, ta, bi, tb),
