@@ -1055,6 +1055,10 @@ impl State {
             self.layout.label()
         };
         self.ui.turbo_label = if self.settings.turbo { "turbo" } else { "vsync" };
+        // Hide the top bar in fullscreen, revealing it when the cursor is at the top edge.
+        let fullscreen = self.window.fullscreen().is_some();
+        let reveal = 48.0 * self.window.scale_factor() as f32;
+        self.ui.show_bar = !fullscreen || (self.cursor_y as f32) < reveal;
         if let Some(src) = &self.source {
             let len = src.len();
             let anchor = if self.scroll_mode {
