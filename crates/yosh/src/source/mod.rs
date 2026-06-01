@@ -3,9 +3,11 @@
 
 mod folder;
 mod rar;
+mod sevenz;
 mod ziparc;
 pub use folder::FolderSource;
 pub use rar::RarSource;
+pub use sevenz::SevenzSource;
 pub use ziparc::ZipSource;
 
 use std::io;

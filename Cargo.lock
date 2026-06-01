@@ -311,6 +311,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "block2"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -430,6 +439,15 @@ dependencies = [
  "rustix 1.1.4",
  "wayland-backend",
  "wayland-client",
+]
+
+[[package]]
+name = "cbc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
+dependencies = [
+ "cipher",
 ]
 
 [[package]]
@@ -1459,6 +1477,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
+ "block-padding",
  "hybrid-array",
 ]
 
@@ -2984,6 +3003,24 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "sevenz-rust2"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbbd24232798280d6bc896e3429a3469174de008ec8b1b591a96618b46664195"
+dependencies = [
+ "aes",
+ "bzip2",
+ "cbc",
+ "crc32fast",
+ "getrandom 0.4.2",
+ "js-sys",
+ "lzma-rust2",
+ "ppmd-rust",
+ "sha2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4556,6 +4593,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "sevenz-rust2",
  "unrar",
  "wgpu",
  "winit",
