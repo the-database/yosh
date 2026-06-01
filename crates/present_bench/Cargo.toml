@@ -1,0 +1,11 @@
+[package]
+name = "present_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30.13"
+wgpu = "29.0.3"
+pollster = "0.4"
+png = "0.18"
+fast_image_resize = "6"

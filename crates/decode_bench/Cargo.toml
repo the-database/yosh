@@ -1,0 +1,9 @@
+[package]
+name = "decode_bench"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zune-png = "0.5"
+png = "0.18"
+fast_image_resize = "6"
