@@ -23,6 +23,8 @@ pub struct Settings {
     pub library_root: Option<String>,
     /// Volume path (folder or archive) → last-read page index.
     pub last_pages: HashMap<String, usize>,
+    /// Volume path → spread pairing parity offset (0 or 1).
+    pub spread_offsets: HashMap<String, u8>,
 }
 
 impl Default for Settings {
@@ -36,6 +38,7 @@ impl Default for Settings {
             gpu: false,
             library_root: None,
             last_pages: HashMap::new(),
+            spread_offsets: HashMap::new(),
         }
     }
 }

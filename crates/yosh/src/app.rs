@@ -85,6 +85,7 @@ struct State {
 
     fit: FitMode,
     layout: Layout,
+    spread_offset: usize, // spread pairing parity (0 or 1), per-volume
     zoom: f32,       // page-flip zoom factor (1.0 = fit)
     pan_x: f32,      // page-flip pan offset in screen px (from centered)
     pan_y: f32,
@@ -242,6 +243,7 @@ impl ApplicationHandler for App {
             } else {
                 Layout::Single
             },
+            spread_offset: 0,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
@@ -331,6 +333,7 @@ enum Action {
     ToggleGpu,
     ToggleHelp,
     ToggleFullscreen,
+    ToggleSpreadOffset,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -348,6 +351,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyF => return Some(Action::CycleFit),
             KeyCode::KeyD => return Some(Action::ToggleDir),
             KeyCode::KeyS => return Some(Action::ToggleLayout),
+            KeyCode::KeyO => return Some(Action::ToggleSpreadOffset),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyT => return Some(Action::TogglePresent),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
@@ -439,7 +443,7 @@ impl State {
             Action::ToggleLayout => {
                 self.layout = self.layout.toggled();
                 // Snap to the current view's anchor so pairing is consistent.
-                self.index = layout::view_start(self.layout, self.index);
+                self.index = layout::view_start(self.layout, self.index, self.spread_offset);
                 self.pan_y = 0.0;
                 self.settings.layout_spread = self.layout == Layout::Spread;
                 config::save(&self.settings);
@@ -475,6 +479,18 @@ impl State {
                 };
                 self.window.set_fullscreen(fs);
             }
+            Action::ToggleSpreadOffset => {
+                self.spread_offset ^= 1;
+                if let Some(k) = &self.volume_key {
+                    self.settings
+                        .spread_offsets
+                        .insert(k.clone(), self.spread_offset as u8);
+                    config::save(&self.settings);
+                }
+                // Re-anchor so the current view re-pairs with the new parity.
+                self.index = layout::view_start(self.layout, self.index, self.spread_offset);
+                self.prefetch();
+            }
         }
     }
 
@@ -485,9 +501,9 @@ impl State {
             return;
         }
         let next = if dir > 0 {
-            layout::next_view(self.layout, self.index, len)
+            layout::next_view(self.layout, self.index, len, self.spread_offset)
         } else {
-            layout::prev_view(self.layout, self.index)
+            layout::prev_view(self.layout, self.index, len, self.spread_offset)
         };
         if next != self.index {
             self.nav_times.push_back(Instant::now());
@@ -685,7 +701,7 @@ impl State {
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
 
-        let (a, b) = layout::view_pages(self.layout, self.index, len);
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
         let ta = self.cache.get(a);
         // Wide (landscape) page is a double-spread image → show it alone.
         let force_single = ta.map_or(false, |t| t.w > t.h);
@@ -899,6 +915,7 @@ impl State {
         }
         let key = path.to_string_lossy().into_owned();
         let resume = self.settings.last_pages.get(&key).copied().unwrap_or(0);
+        self.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
         // CLI start index (if given) wins over the saved position.
         let idx = if self.start_index > 0 {
             self.start_index
@@ -988,7 +1005,7 @@ impl State {
             let anchor = if self.scroll_mode {
                 self.index
             } else {
-                layout::view_pages(self.layout, self.index, len).0
+                layout::view_pages(self.layout, self.index, len, self.spread_offset).0
             };
             let loading = !self.cache.contains(anchor);
             if !loading {
