@@ -217,6 +217,8 @@ impl ApplicationHandler for App {
         };
         // Open straight into the grid if nothing was passed to read.
         let library_view = ui.pending_open.is_none() && !library.volumes.is_empty();
+        // Show the keys overlay on a blank launch (nothing to read, no library).
+        ui.help_open = ui.pending_open.is_none() && !library_view;
 
         window.request_redraw();
         self.state = Some(State {
@@ -327,6 +329,7 @@ enum Action {
     ZoomOut,
     ZoomReset,
     ToggleGpu,
+    ToggleHelp,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -350,6 +353,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
             KeyCode::KeyG => return Some(Action::ToggleGpu),
+            KeyCode::F1 => return Some(Action::ToggleHelp),
             _ => {}
         }
     }
@@ -361,6 +365,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             NamedKey::ArrowLeft => return Some(Action::Left),
             NamedKey::Home => return Some(Action::First),
             NamedKey::End => return Some(Action::Last),
+            NamedKey::F1 => return Some(Action::ToggleHelp),
             _ => {}
         }
     }
@@ -460,6 +465,7 @@ impl State {
                 self.failed.clear();
                 self.prefetch();
             }
+            Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
         }
     }
 

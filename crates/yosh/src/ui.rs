@@ -29,6 +29,7 @@ pub struct UiState {
     pub req_toggle_present: bool,
     pub req_toggle_library: bool,
     pub clicked_volume: Option<usize>,
+    pub help_open: bool,
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -84,6 +85,9 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             if ui.button(format!("Present: {}", st.turbo_label)).clicked() {
                 st.req_toggle_present = true;
             }
+            if ui.button("? Help").clicked() {
+                st.help_open = !st.help_open;
+            }
             ui.separator();
             if !st.status.is_empty() {
                 ui.label(&st.status);
@@ -101,6 +105,37 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             };
         });
     });
+
+    if st.help_open {
+        egui::Window::new("yosh — keys")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut st.help_open)
+            .show(ctx, |ui| {
+                ui.heading("Navigate");
+                ui.label("← →   flip (reading-direction aware)");
+                ui.label("↑ ↓ / Space / PgUp PgDn   flip");
+                ui.label("Home / End   first / last page");
+                ui.label("click left·right half — flip;   wheel — flip or pan");
+                ui.separator();
+                ui.heading("Layout");
+                ui.label("S   single ↔ two-page spread");
+                ui.label("O   shift spread pairing (fix wrong pairing)");
+                ui.label("D   reading direction  RTL ↔ LTR");
+                ui.label("C   continuous vertical scroll");
+                ui.separator();
+                ui.heading("View");
+                ui.label("F   fit mode  (window / width / height)");
+                ui.label("+ / − / 0   zoom in / out / reset;   drag — pan");
+                ui.label("T   present  vsync ↔ turbo");
+                ui.label("G   GPU downscale on/off");
+                ui.label("F11   fullscreen");
+                ui.separator();
+                ui.heading("Files");
+                ui.label("Open folder / Open archive / Library;  Grid ↔ Reader");
+                ui.label("F1   toggle this help");
+            });
+    }
 
     if library_view {
         egui::CentralPanel::default().show(ctx, |ui| {
