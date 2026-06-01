@@ -15,6 +15,8 @@ use std::path::Path;
 /// from it concurrently (folder/zip read in parallel; rar serializes internally).
 pub trait PageSource: Send + Sync {
     fn len(&self) -> usize;
+    /// Entry name for page `index` (kept for future UI/title use).
+    #[allow(dead_code)]
     fn name(&self, index: usize) -> &str;
     /// Read the encoded image bytes for page `index`. May block (rar).
     fn read_page(&self, index: usize) -> io::Result<Vec<u8>>;

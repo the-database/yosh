@@ -15,6 +15,7 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::cache::PageCache;
+use crate::config;
 use crate::gpu::Gpu;
 use crate::layout::{self, Layout};
 use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture};
@@ -74,6 +75,25 @@ struct State {
     direction: Direction,
     cursor_x: f64,
     nav_times: VecDeque<Instant>,
+
+    settings: config::Settings,
+    volume_key: Option<String>,
+}
+
+fn fit_from_u8(v: u8) -> FitMode {
+    match v {
+        1 => FitMode::Width,
+        2 => FitMode::Height,
+        _ => FitMode::Window,
+    }
+}
+
+fn fit_to_u8(f: FitMode) -> u8 {
+    match f {
+        FitMode::Window => 0,
+        FitMode::Width => 1,
+        FitMode::Height => 2,
+    }
 }
 
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
@@ -120,6 +140,7 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
+        let settings = config::load();
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -143,12 +164,22 @@ impl ApplicationHandler for App {
             index: 0,
             start_index: self.start_index,
             last_drawn: None,
-            fit: FitMode::Window,
-            layout: Layout::Single,
+            fit: fit_from_u8(settings.fit),
+            layout: if settings.layout_spread {
+                Layout::Spread
+            } else {
+                Layout::Single
+            },
             pan_y: 0.0,
-            direction: Direction::Rtl, // manga default; toggle with D
+            direction: if settings.direction_rtl {
+                Direction::Rtl
+            } else {
+                Direction::Ltr
+            },
             cursor_x: 0.0,
             nav_times: VecDeque::new(),
+            settings,
+            volume_key: None,
         });
     }
 
@@ -159,7 +190,10 @@ impl ApplicationHandler for App {
         let response = state.egui_state.on_window_event(&state.window, &event);
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                state.persist();
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => state.gpu.resize(size.width, size.height),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. }
@@ -252,18 +286,24 @@ impl State {
             Action::CycleFit => {
                 self.fit = self.fit.cycle();
                 self.pan_y = 0.0;
+                self.settings.fit = fit_to_u8(self.fit);
+                config::save(&self.settings);
             }
             Action::ToggleDir => {
                 self.direction = match self.direction {
                     Direction::Ltr => Direction::Rtl,
                     Direction::Rtl => Direction::Ltr,
                 };
+                self.settings.direction_rtl = self.direction == Direction::Rtl;
+                config::save(&self.settings);
             }
             Action::ToggleLayout => {
                 self.layout = self.layout.toggled();
                 // Snap to the current view's anchor so pairing is consistent.
                 self.index = layout::view_start(self.layout, self.index);
                 self.pan_y = 0.0;
+                self.settings.layout_spread = self.layout == Layout::Spread;
+                config::save(&self.settings);
                 self.prefetch();
             }
         }
@@ -289,7 +329,18 @@ impl State {
     fn goto(&mut self, index: usize) {
         self.index = index;
         self.pan_y = 0.0; // start new page at the top
+        if let Some(k) = &self.volume_key {
+            self.settings.last_pages.insert(k.clone(), index);
+        }
         self.prefetch();
+    }
+
+    /// Persist the current position + settings (called on close).
+    fn persist(&mut self) {
+        if let Some(k) = &self.volume_key {
+            self.settings.last_pages.insert(k.clone(), self.index);
+        }
+        config::save(&self.settings);
     }
 
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
@@ -483,6 +534,20 @@ impl State {
     }
 
     fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path) {
+        // Persist the previous volume's position before switching.
+        if let Some(k) = self.volume_key.take() {
+            self.settings.last_pages.insert(k, self.index);
+        }
+        let key = path.to_string_lossy().into_owned();
+        let resume = self.settings.last_pages.get(&key).copied().unwrap_or(0);
+        // CLI start index (if given) wins over the saved position.
+        let idx = if self.start_index > 0 {
+            self.start_index
+        } else {
+            resume
+        };
+        self.start_index = 0;
+
         self.pool = Some(DecodePool::new(
             source.clone(),
             self.gpu.device.clone(),
@@ -494,8 +559,8 @@ impl State {
         self.failed.clear();
         self.last_drawn = None;
         self.nav_times.clear();
-        self.index = self.start_index.min(source.len() - 1);
-        self.start_index = 0;
+        self.index = idx.min(source.len() - 1);
+        self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
         self.source = Some(source);
         self.prefetch();
@@ -514,6 +579,7 @@ impl State {
         pool.set_jobs(desired);
     }
 
+    #[allow(deprecated)]
     fn render(&mut self) {
         if let Some(p) = self.ui.pending_open.take() {
             self.open(&p);
@@ -535,6 +601,9 @@ impl State {
 
         // Decide what to draw this frame (single page or two-page spread).
         let quads = self.build_quads();
+        self.ui.dir_label = self.direction.label();
+        self.ui.fit_label = self.fit.label();
+        self.ui.layout_label = self.layout.label();
         if let Some(src) = &self.source {
             let len = src.len();
             let (anchor, _) = layout::view_pages(self.layout, self.index, len);
@@ -543,12 +612,9 @@ impl State {
                 self.last_drawn = Some(anchor);
             }
             self.ui.status = format!(
-                "{}/{}  {} {} {}{}",
+                "{}/{}{}",
                 self.index + 1,
                 len,
-                self.layout.label(),
-                self.fit.label(),
-                self.direction.label(),
                 if loading { "  …" } else { "" }
             );
         }
@@ -623,6 +689,17 @@ impl State {
         let full_output = self.egui_ctx.run(raw_input, |ctx| ui::chrome(ctx, ui_state));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
+
+        // Apply toggle-button requests (take effect next frame).
+        if std::mem::take(&mut self.ui.req_toggle_dir) {
+            self.apply_action(Action::ToggleDir);
+        }
+        if std::mem::take(&mut self.ui.req_cycle_fit) {
+            self.apply_action(Action::CycleFit);
+        }
+        if std::mem::take(&mut self.ui.req_toggle_layout) {
+            self.apply_action(Action::ToggleLayout);
+        }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
         let screen = egui_wgpu::ScreenDescriptor {

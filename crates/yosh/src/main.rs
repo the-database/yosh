@@ -3,6 +3,7 @@
 
 mod app;
 mod cache;
+mod config;
 mod decode;
 mod gpu;
 mod layout;

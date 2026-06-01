@@ -8,6 +8,7 @@ use super::{is_image_ext, PageSource};
 
 pub struct FolderSource {
     paths: Vec<PathBuf>,
+    #[allow(dead_code)]
     names: Vec<String>,
 }
 
