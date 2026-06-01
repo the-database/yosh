@@ -18,7 +18,7 @@ use crate::cache::PageCache;
 use crate::config;
 use crate::gpu::Gpu;
 use crate::layout::{self, Layout};
-use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture};
+use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
 use crate::source::{FolderSource, PageSource, RarSource, ZipSource};
@@ -30,6 +30,10 @@ const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
 const BACK: usize = 6;
 const FWD_MAX: usize = 40;
+/// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
+const SCROLL_WHEEL_PX: f32 = 110.0;
+/// Height/width estimate for not-yet-decoded pages in the scroll strip.
+const DEFAULT_ASPECT: f32 = 1.5;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -75,6 +79,11 @@ struct State {
     direction: Direction,
     cursor_x: f64,
     nav_times: VecDeque<Instant>,
+
+    // Continuous-scroll mode (M2.1).
+    scroll_mode: bool,
+    top_offset: f32,  // pixels the anchor page (self.index) is scrolled above the viewport top
+    est_aspect: f32,  // h/w estimate for undecoded pages in the strip
 
     settings: config::Settings,
     volume_key: Option<String>,
@@ -178,6 +187,9 @@ impl ApplicationHandler for App {
             },
             cursor_x: 0.0,
             nav_times: VecDeque::new(),
+            scroll_mode: settings.scroll,
+            top_offset: 0.0,
+            est_aspect: DEFAULT_ASPECT,
             settings,
             volume_key: None,
         });
@@ -235,6 +247,7 @@ enum Action {
     CycleFit,
     ToggleDir,
     ToggleLayout,
+    ToggleScroll,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -252,6 +265,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyF => return Some(Action::CycleFit),
             KeyCode::KeyD => return Some(Action::ToggleDir),
             KeyCode::KeyS => return Some(Action::ToggleLayout),
+            KeyCode::KeyC => return Some(Action::ToggleScroll),
             _ => {}
         }
     }
@@ -272,11 +286,30 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
 impl State {
     fn apply_action(&mut self, action: Action) {
         match action {
-            Action::Forward => self.step(1),
-            Action::Backward => self.step(-1),
-            // In RTL, "left" advances the story; in LTR, "right" does.
-            Action::Right => self.step(if self.direction == Direction::Ltr { 1 } else { -1 }),
-            Action::Left => self.step(if self.direction == Direction::Ltr { -1 } else { 1 }),
+            Action::Forward => {
+                if self.scroll_mode {
+                    let vh = self.gpu.config.height as f32;
+                    self.scroll_by(vh * 0.9);
+                } else {
+                    self.step(1);
+                }
+            }
+            Action::Backward => {
+                if self.scroll_mode {
+                    let vh = self.gpu.config.height as f32;
+                    self.scroll_by(-vh * 0.9);
+                } else {
+                    self.step(-1);
+                }
+            }
+            // In RTL, "left" advances the story; in LTR, "right" does. (Page-flip only.)
+            Action::Right if !self.scroll_mode => {
+                self.step(if self.direction == Direction::Ltr { 1 } else { -1 })
+            }
+            Action::Left if !self.scroll_mode => {
+                self.step(if self.direction == Direction::Ltr { -1 } else { 1 })
+            }
+            Action::Right | Action::Left => {}
             Action::First => self.goto(0),
             Action::Last => {
                 if let Some(s) = &self.source {
@@ -306,6 +339,13 @@ impl State {
                 config::save(&self.settings);
                 self.prefetch();
             }
+            Action::ToggleScroll => {
+                self.scroll_mode = !self.scroll_mode;
+                self.top_offset = 0.0;
+                self.settings.scroll = self.scroll_mode;
+                config::save(&self.settings);
+                self.prefetch();
+            }
         }
     }
 
@@ -329,6 +369,7 @@ impl State {
     fn goto(&mut self, index: usize) {
         self.index = index;
         self.pan_y = 0.0; // start new page at the top
+        self.top_offset = 0.0;
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), index);
         }
@@ -346,6 +387,14 @@ impl State {
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
     /// the page already fits.
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.scroll_mode {
+            let dy_px = match delta {
+                MouseScrollDelta::LineDelta(_, y) => y * SCROLL_WHEEL_PX,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32,
+            };
+            self.scroll_by(-dy_px); // wheel down (y<0) scrolls the strip down
+            return;
+        }
         let dy = match delta {
             MouseScrollDelta::LineDelta(_, y) => y,
             MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 50.0,
@@ -492,6 +541,92 @@ impl State {
         }
     }
 
+    fn page_display_h(&self, i: usize, sw: f32) -> f32 {
+        match self.cache.get(i) {
+            Some(t) => sw * (t.h as f32 / t.w as f32),
+            None => sw * self.est_aspect,
+        }
+    }
+
+    fn scroll_by(&mut self, dy: f32) {
+        if self.source.is_none() {
+            return;
+        }
+        self.top_offset += dy;
+        let before = self.index;
+        self.normalize();
+        if self.index != before {
+            self.nav_times.push_back(Instant::now());
+        }
+        self.prefetch();
+    }
+
+    /// Keep (index, top_offset) in range using best-known page heights, so the
+    /// anchor stays valid as nearby pages decode (and their real heights land).
+    fn normalize(&mut self) {
+        let len = match &self.source {
+            Some(s) => s.len(),
+            None => return,
+        };
+        if len == 0 {
+            return;
+        }
+        let sw = self.gpu.config.width.max(1) as f32;
+        while self.index + 1 < len {
+            let h = self.page_display_h(self.index, sw);
+            if self.top_offset >= h {
+                self.top_offset -= h;
+                self.index += 1;
+            } else {
+                break;
+            }
+        }
+        while self.top_offset < 0.0 && self.index > 0 {
+            self.index -= 1;
+            self.top_offset += self.page_display_h(self.index, sw);
+        }
+        if self.index == 0 && self.top_offset < 0.0 {
+            self.top_offset = 0.0;
+        }
+        if self.index + 1 >= len {
+            let vh = self.gpu.config.height as f32;
+            let max_off = (self.page_display_h(len - 1, sw) - vh).max(0.0);
+            if self.top_offset > max_off {
+                self.top_offset = max_off;
+            }
+        }
+    }
+
+    /// Build the visible vertical-strip quads (width-fit, stacked top to bottom).
+    fn build_scroll_quads(&self) -> Vec<Quad> {
+        let Some(src) = &self.source else {
+            return Vec::new();
+        };
+        let len = src.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let sw = self.gpu.config.width.max(1) as f32;
+        let sh = self.gpu.config.height.max(1) as f32;
+        let mut quads = Vec::new();
+        let mut y = -self.top_offset;
+        let mut i = self.index;
+        let mut slot = 0;
+        while i < len && y < sh && slot < MAX_QUADS {
+            let dh_layout = self.page_display_h(i, sw);
+            if y + dh_layout > 0.0 {
+                if let Some(t) = self.cache.get(i) {
+                    let dh = sw * (t.h as f32 / t.w as f32);
+                    quads.push(Self::quad_from_px(slot, i, 0.0, y, sw, dh, sw, sh));
+                    slot += 1;
+                }
+            }
+            y += dh_layout;
+            i += 1;
+        }
+        quads
+    }
+
     /// Forward look-ahead distance, widened when flipping quickly.
     fn dynamic_fwd(&mut self) -> usize {
         let now = Instant::now();
@@ -589,24 +724,42 @@ impl State {
         if let Some(pool) = &self.pool {
             for msg in pool.poll() {
                 match msg {
-                    Msg::Done { index, page } => self.cache.insert(index, page, self.index),
+                    Msg::Done { index, page } => {
+                        self.est_aspect = page.h as f32 / page.w as f32;
+                        self.cache.insert(index, page, self.index);
+                    }
                     Msg::Failed { index } => {
                         self.failed.insert(index);
                     }
                 }
             }
         }
-        // Refresh the work list against the updated cache.
+        // Keep the scroll anchor valid as page heights resolve, then refresh work.
+        if self.scroll_mode {
+            self.normalize();
+        }
         self.prefetch();
 
-        // Decide what to draw this frame (single page or two-page spread).
-        let quads = self.build_quads();
+        // Decide what to draw this frame (scroll strip, or single/spread flip).
+        let quads = if self.scroll_mode {
+            self.build_scroll_quads()
+        } else {
+            self.build_quads()
+        };
         self.ui.dir_label = self.direction.label();
         self.ui.fit_label = self.fit.label();
-        self.ui.layout_label = self.layout.label();
+        self.ui.layout_label = if self.scroll_mode {
+            "scroll"
+        } else {
+            self.layout.label()
+        };
         if let Some(src) = &self.source {
             let len = src.len();
-            let (anchor, _) = layout::view_pages(self.layout, self.index, len);
+            let anchor = if self.scroll_mode {
+                self.index
+            } else {
+                layout::view_pages(self.layout, self.index, len).0
+            };
             let loading = !self.cache.contains(anchor);
             if !loading {
                 self.last_drawn = Some(anchor);

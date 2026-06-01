@@ -38,8 +38,9 @@ pub fn fit_scale(fit: FitMode, sw: f32, sh: f32, pw: f32, ph: f32) -> f32 {
     }
 }
 
-/// Max quads drawn in one frame (single page or two-page spread).
-pub const MAX_QUADS: usize = 2;
+/// Max quads drawn in one frame. Page-flip uses ≤2 (single / spread); the
+/// continuous-scroll strip can show several partial pages at once.
+pub const MAX_QUADS: usize = 8;
 
 const SHADER: &str = r#"
 struct Uniforms {
@@ -104,7 +105,7 @@ pub struct PagePipeline {
     pub pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    ubos: [wgpu::Buffer; MAX_QUADS],
+    ubos: Vec<wgpu::Buffer>,
 }
 
 impl PagePipeline {
@@ -192,7 +193,7 @@ impl PagePipeline {
             pipeline,
             bgl,
             sampler,
-            ubos: [make_ubo(), make_ubo()],
+            ubos: (0..MAX_QUADS).map(|_| make_ubo()).collect(),
         }
     }
 
