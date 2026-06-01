@@ -106,12 +106,22 @@ pub struct PageTexture {
     pub w: u32,
     pub h: u32,
     pub gray: bool,
+    /// Decode target height this page was produced for (the `target_h` the pool
+    /// used). Lets the cache detect pages decoded at a stale resolution after a
+    /// zoom/resize and re-decode them in place without blanking the display.
+    pub target_h: u32,
 }
 
 impl PageTexture {
     /// Wrap a texture that already holds page pixels (e.g. a GPU-downscale
     /// target) as a `PageTexture`.
-    pub fn from_pooled(texture: wgpu::Texture, w: u32, h: u32, gray: bool) -> PageTexture {
+    pub fn from_pooled(
+        texture: wgpu::Texture,
+        w: u32,
+        h: u32,
+        gray: bool,
+        target_h: u32,
+    ) -> PageTexture {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         PageTexture {
             texture,
@@ -119,6 +129,7 @@ impl PageTexture {
             w,
             h,
             gray,
+            target_h,
         }
     }
 
@@ -130,6 +141,7 @@ impl PageTexture {
             w,
             h,
             gray,
+            target_h: _,
         } = self;
         drop(view);
         pool.put(texture, gray, w, h);
@@ -238,6 +250,7 @@ impl PagePipeline {
         queue: &wgpu::Queue,
         img: &DecodedImage,
         pool: &TexturePool,
+        target_h: u32,
     ) -> PageTexture {
         let bpp = if img.gray { 1u32 } else { 4u32 };
         let texture = pool.get(device, img.gray, img.w, img.h);
@@ -267,6 +280,7 @@ impl PagePipeline {
             w: img.w,
             h: img.h,
             gray: img.gray,
+            target_h,
         }
     }
 

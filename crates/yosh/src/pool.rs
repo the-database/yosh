@@ -111,11 +111,11 @@ impl DecodePool {
                             downscaler.blit(&device, &queue, &src_view, &dst_view, img.gray);
                             drop(src_view);
                             tex_pool.put(src, img.gray, img.w, img.h);
-                            PageTexture::from_pooled(dst, tw, th, img.gray)
+                            PageTexture::from_pooled(dst, tw, th, img.gray, th)
                         }),
                         Ok(bytes) => decode_and_downscale(&bytes, th, &mut resizer)
                             .ok()
-                            .map(|img| PagePipeline::upload(&device, &queue, &img, &tex_pool)),
+                            .map(|img| PagePipeline::upload(&device, &queue, &img, &tex_pool, th)),
                         Err(_) => None,
                     };
 
