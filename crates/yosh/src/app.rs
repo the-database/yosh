@@ -411,6 +411,19 @@ impl State {
                     self.goto(s.len().saturating_sub(1));
                 }
             }
+            Action::CycleFit if self.scroll_mode => {
+                // In scroll: toggle width-fit (zoom 1) vs height-fit (a typical
+                // page ~fills the viewport height).
+                self.pan_x = 0.0;
+                if (self.zoom - 1.0).abs() < 0.01 {
+                    let sw = self.gpu.config.width.max(1) as f32;
+                    let sh = self.gpu.config.height.max(1) as f32;
+                    let cw = sh / self.est_aspect.max(0.1);
+                    self.zoom = (cw / sw).clamp(0.2, 8.0);
+                } else {
+                    self.zoom = 1.0;
+                }
+            }
             Action::CycleFit => {
                 self.fit = self.fit.cycle();
                 self.zoom = 1.0;
@@ -583,9 +596,17 @@ impl State {
         let dy = (y - self.cursor_y) as f32;
         self.cursor_x = x;
         self.cursor_y = y;
-        // Drag to pan when a page overflows (page-flip mode).
-        if self.mouse_down && !self.scroll_mode {
-            self.drag_dist += dx.abs() + dy.abs();
+        if !self.mouse_down {
+            return;
+        }
+        self.drag_dist += dx.abs() + dy.abs();
+        if self.scroll_mode {
+            // Grab the strip: pan horizontally, scroll vertically.
+            self.pan_x += dx;
+            self.top_offset -= dy;
+            self.clamp_pan();
+            self.normalize();
+        } else {
             self.pan_x += dx;
             self.pan_y += dy;
             self.clamp_pan();
@@ -646,6 +667,12 @@ impl State {
     fn clamp_pan(&mut self) {
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
+        if self.scroll_mode {
+            let cw = sw * self.zoom;
+            let mx = ((cw - sw) / 2.0).max(0.0);
+            self.pan_x = self.pan_x.clamp(-mx, mx);
+            return;
+        }
         if let Some(t) = self.cache.get(self.index) {
             let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom;
             let mx = ((t.w as f32 * s - sw) / 2.0).max(0.0);
@@ -749,9 +776,10 @@ impl State {
     }
 
     fn page_display_h(&self, i: usize, sw: f32) -> f32 {
+        let cw = sw * self.zoom; // strip content width (zoomable)
         match self.cache.get(i) {
-            Some(t) => sw * (t.h as f32 / t.w as f32),
-            None => sw * self.est_aspect,
+            Some(t) => cw * (t.h as f32 / t.w as f32),
+            None => cw * self.est_aspect,
         }
     }
 
@@ -816,19 +844,20 @@ impl State {
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
         let mut quads = Vec::new();
+        let cw = sw * self.zoom; // strip width (zoom); centered with horizontal pan
+        let x = self.horizontal_left(cw, sw);
         let mut y = -self.top_offset;
         let mut i = self.index;
         let mut slot = 0;
         while i < len && y < sh && slot < MAX_QUADS {
-            let dh_layout = self.page_display_h(i, sw);
-            if y + dh_layout > 0.0 {
-                if let Some(t) = self.cache.get(i) {
-                    let dh = sw * (t.h as f32 / t.w as f32);
-                    quads.push(Self::quad_from_px(slot, i, 0.0, y, sw, dh, sw, sh));
+            let dh = self.page_display_h(i, sw);
+            if y + dh > 0.0 {
+                if self.cache.get(i).is_some() {
+                    quads.push(Self::quad_from_px(slot, i, x, y, cw, dh, sw, sh));
                     slot += 1;
                 }
             }
-            y += dh_layout;
+            y += dh;
             i += 1;
         }
         quads
