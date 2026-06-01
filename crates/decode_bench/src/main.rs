@@ -24,23 +24,55 @@ enum Dec {
     Png,
 }
 
+/// Resize quality. `Bilinear` is the old baseline; `Hq` mirrors the real app's
+/// content-aware path: Catmull-Rom + a Dot Gain tone LUT round-trip for gray
+/// (1ch), Lanczos3 + a loose grayscale-detection scan for color.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Quality {
+    Bilinear,
+    Hq,
+}
+
 struct Cfg {
     folder: PathBuf,
     target_h: u32,
     decoders: Vec<Dec>,
     resize: bool,
+    quality: Quality,
     threads: Option<usize>,
+}
+
+/// Loose grayscale detector (mirror of the app's `rgba_is_grayscale`), generic
+/// over channel stride so the bench can scan native-channel decode buffers.
+fn is_gray_scan(pix: &[u8], ch: usize, t: i32) -> bool {
+    let mut diff_sum: u64 = 0;
+    let mut non_bw: u64 = 0;
+    for px in pix.chunks_exact(ch) {
+        let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+        if (r == 0 && g == 0 && b == 0) || (r == 255 && g == 255 && b == 255) {
+            continue;
+        }
+        non_bw += 1;
+        diff_sum += (((r - g).abs() - t).max(0)
+            + ((r - b).abs() - t).max(0)
+            + ((g - b).abs() - t).max(0)) as u64;
+    }
+    if non_bw == 0 {
+        return false;
+    }
+    diff_sum as f64 / (non_bw as f64 * 3.0) <= t as f64 / 12.0
 }
 
 fn parse() -> Cfg {
     const USAGE: &str =
         "usage: decode_bench <folder> [--target-height H] [--decoder zune|png|both] \
-         [--resize on|off] [--threads N]";
+         [--resize on|off] [--quality bilinear|hq] [--threads N]";
     let mut a = std::env::args().skip(1);
     let mut folder = None;
     let mut target_h = 2160u32;
     let mut decoders = vec![Dec::Zune, Dec::Png];
     let mut resize = true;
+    let mut quality = Quality::Bilinear;
     let mut threads = None;
     while let Some(arg) = a.next() {
         match arg.as_str() {
@@ -54,6 +86,13 @@ fn parse() -> Cfg {
                 }
             }
             "--resize" => resize = a.next().expect(USAGE) == "on",
+            "--quality" => {
+                quality = match a.next().expect(USAGE).as_str() {
+                    "bilinear" => Quality::Bilinear,
+                    "hq" => Quality::Hq,
+                    other => panic!("unknown quality {other:?}; {USAGE}"),
+                }
+            }
             "--threads" => threads = Some(a.next().expect(USAGE).parse().expect("bad N")),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -73,6 +112,7 @@ fn parse() -> Cfg {
         target_h,
         decoders,
         resize,
+        quality,
         threads,
     }
 }
@@ -170,7 +210,10 @@ fn main() {
             dec,
             cfg.resize,
             if cfg.resize {
-                format!(" (-> {}px tall, single-channel-aware)", cfg.target_h)
+                format!(
+                    " ({:?} -> {}px tall, single-channel-aware)",
+                    cfg.quality, cfg.target_h
+                )
             } else {
                 String::new()
             }
@@ -202,8 +245,23 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
         for _ in 0..n {
             s.spawn(|| {
                 let mut resizer = Resizer::new();
-                let opts =
+                let opts_bilinear =
                     ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear));
+                let opts_catmull =
+                    ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom));
+                let opts_lanczos =
+                    ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
+                // Tone LUTs for the HQ gray round-trip. The exact values don't
+                // affect timing (any 256-entry map costs the same), so use a
+                // representative gamma curve rather than the real dot-gain table.
+                let mut to_lin = [0u8; 256];
+                let mut to_enc = [0u8; 256];
+                for i in 0..256 {
+                    let x = i as f32 / 255.0;
+                    to_lin[i] = (x.powf(2.2) * 255.0).round() as u8;
+                    to_enc[i] = (x.powf(1.0 / 2.2) * 255.0).round() as u8;
+                }
+                let mut lin: Vec<u8> = Vec::new();
                 let mut dbuf: Vec<u8> = Vec::new();
                 // Reused destination, rebuilt only if target dims / pixel type change.
                 let mut dst: Option<(Image, u32, PixelType)> = None;
@@ -244,10 +302,33 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                     };
 
                     if cfg.resize {
-                        let pt = pixel_type(ch);
-                        let src = ImageRef::new(w, h, pix, pt).expect("src view");
-                        let tw =
-                            ((w as f64) * (cfg.target_h as f64) / (h as f64)).round() as u32;
+                        let tw = ((w as f64) * (cfg.target_h as f64) / (h as f64)).round() as u32;
+                        let hq_gray = cfg.quality == Quality::Hq && ch == 1;
+                        // Pick pixel type + filter; for HQ color, also pay the
+                        // loose grayscale-detection scan (as the real app does).
+                        let (pt, opts) = match cfg.quality {
+                            Quality::Bilinear => (pixel_type(ch), &opts_bilinear),
+                            Quality::Hq if ch == 1 => (PixelType::U8, &opts_catmull),
+                            Quality::Hq => {
+                                if ch >= 3 {
+                                    black_box(is_gray_scan(pix, ch, 12));
+                                }
+                                (pixel_type(ch), &opts_lanczos)
+                            }
+                        };
+                        // HQ gray: linearize the source through the tone LUT first.
+                        let src_pix: &[u8] = if hq_gray {
+                            if lin.len() < pix.len() {
+                                lin.resize(pix.len(), 0);
+                            }
+                            for (d, &s) in lin[..pix.len()].iter_mut().zip(pix) {
+                                *d = to_lin[s as usize];
+                            }
+                            &lin[..pix.len()]
+                        } else {
+                            pix
+                        };
+                        let src = ImageRef::new(w, h, src_pix, pt).expect("src view");
                         let need_new = match &dst {
                             Some((_, dw, dpt)) => *dw != tw || *dpt != pt,
                             None => true,
@@ -256,8 +337,17 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                             dst = Some((Image::new(tw, cfg.target_h, pt), tw, pt));
                         }
                         let d = dst.as_mut().unwrap();
-                        resizer.resize(&src, &mut d.0, &opts).expect("resize");
-                        black_box(d.0.buffer());
+                        resizer.resize(&src, &mut d.0, opts).expect("resize");
+                        if hq_gray {
+                            // Re-encode the output through the inverse tone LUT.
+                            let mut acc = 0u64;
+                            for &b in d.0.buffer() {
+                                acc += to_enc[b as usize] as u64;
+                            }
+                            black_box(acc);
+                        } else {
+                            black_box(d.0.buffer());
+                        }
                     } else {
                         black_box(pix);
                     }

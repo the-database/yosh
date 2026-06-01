@@ -2,12 +2,24 @@
 //!
 //! Routes by magic bytes: PNG → `png`, JPEG → `jpeg-decoder`, else → `image`
 //! crate fallback (WebP/GIF/BMP/…). Normalizes to single-channel R8 (gray) or
-//! RGBA8 (color), then downscales (single-channel-aware) with a reused `Resizer`.
+//! RGBA8 (color), then downscales with a high-quality, content-aware filter
+//! (copied from MangaJaNaiConverterGui's final-resize strategy):
+//!   - **color** → Lanczos3 in gamma space (no color conversion),
+//!   - **grayscale** → linear-light Catmull-Rom: linearize via the Dot Gain 20%
+//!     → Gamma 1.0 LUT, resample, then re-encode (see `tone.rs`).
+//! Color decodes that are *visually* grayscale (within a threshold) are detected
+//! and routed through the grayscale path, matching MangaJaNai's behavior.
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 
+use crate::tone::{self, DOTGAIN20_TO_GAMMA1, GAMMA1_TO_DOTGAIN20};
+
 const PNG_SIG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
+
+/// MangaJaNai's default `GrayscaleDetectionThreshold` (its slider spans 0..24).
+/// Higher = more tolerant of slight color casts when deciding "is this gray?".
+const GRAYSCALE_THRESHOLD: i32 = 12;
 
 /// A decoded, downscaled page ready for GPU upload.
 pub struct DecodedImage {
@@ -111,31 +123,110 @@ pub fn decode_full(bytes: &[u8]) -> Result<DecodedImage, String> {
     Ok(DecodedImage { w, h, gray, pixels })
 }
 
-/// Decode page bytes (any supported format) and downscale to `target_h` on CPU.
+/// Decide whether an RGBA buffer is *effectively* grayscale within `threshold`.
+/// Port of MangaJaNai's `cv_image_is_grayscale` (run_upscale.py): for every pixel
+/// that isn't pure black or pure white, sum the (saturating) channel-pair
+/// differences beyond `threshold`; the image is gray if the mean per-channel
+/// difference is `<= threshold / 12`. Channel order is irrelevant (all pairs).
+fn rgba_is_grayscale(rgba: &[u8], threshold: i32) -> bool {
+    let mut diff_sum: u64 = 0;
+    let mut non_bw: u64 = 0;
+    for px in rgba.chunks_exact(4) {
+        let (r, g, b) = (px[0] as i32, px[1] as i32, px[2] as i32);
+        if (r == 0 && g == 0 && b == 0) || (r == 255 && g == 255 && b == 255) {
+            continue; // exclude pure black / pure white
+        }
+        non_bw += 1;
+        // cv2.subtract saturates at 0: max(|a-b| - threshold, 0).
+        let rg = ((r - g).abs() - threshold).max(0);
+        let rb = ((r - b).abs() - threshold).max(0);
+        let gb = ((g - b).abs() - threshold).max(0);
+        diff_sum += (rg + rb + gb) as u64;
+    }
+    if non_bw == 0 {
+        return false; // entirely pure black/white → treat as color (MJN does)
+    }
+    let ratio = diff_sum as f64 / (non_bw as f64 * 3.0);
+    ratio <= threshold as f64 / 12.0
+}
+
+/// Collapse RGBA to a single luminance channel (ITU-R 601, matching cv2's
+/// `COLOR_BGR2GRAY`): `Y = 0.299R + 0.587G + 0.114B`.
+fn rgba_to_luma(rgba: &[u8]) -> Vec<u8> {
+    rgba.chunks_exact(4)
+        .map(|px| {
+            let y = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
+            y.round().clamp(0.0, 255.0) as u8
+        })
+        .collect()
+}
+
+/// Grayscale strategy (MangaJaNai `dotgain20_resize`, minus the Gaussian
+/// pre-blur which is a no-op when downscaling): linearize Dot Gain 20% → Gamma
+/// 1.0, Catmull-Rom resample in linear light, then re-encode back. `gray` is
+/// consumed and linearized in place to avoid an extra full-res copy.
+fn downscale_gray(
+    mut gray: Vec<u8>,
+    w: u32,
+    h: u32,
+    tw: u32,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    tone::apply_lut(&mut gray, &DOTGAIN20_TO_GAMMA1);
+    let src = ImageRef::new(w, h, &gray, PixelType::U8).map_err(|e| format!("resize src: {e}"))?;
+    let mut dst = Image::new(tw, target_h, PixelType::U8);
+    resizer
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
+        )
+        .map_err(|e| format!("resize: {e}"))?;
+    let mut pixels = dst.into_vec();
+    tone::apply_lut(&mut pixels, &GAMMA1_TO_DOTGAIN20);
+    Ok(DecodedImage { w: tw, h: target_h, gray: true, pixels })
+}
+
+/// Color strategy (MangaJaNai `standard_resize`): Lanczos3 in gamma space, no
+/// color conversion.
+fn downscale_color(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let src = ImageRef::new(w, h, rgba, PixelType::U8x4).map_err(|e| format!("resize src: {e}"))?;
+    let mut dst = Image::new(tw, target_h, PixelType::U8x4);
+    resizer
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)),
+        )
+        .map_err(|e| format!("resize: {e}"))?;
+    Ok(DecodedImage { w: tw, h: target_h, gray: false, pixels: dst.into_vec() })
+}
+
+/// Decode page bytes (any supported format) and downscale to `target_h` on CPU,
+/// picking the grayscale or color resize strategy.
 pub fn decode_and_downscale(
     bytes: &[u8],
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
-    let (w, h, gray, full) = decode_raw(bytes)?;
-
-    let pt = if gray { PixelType::U8 } else { PixelType::U8x4 };
+    let (w, h, gray_by_channels, full) = decode_raw(bytes)?;
     let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);
 
-    let src = ImageRef::new(w, h, &full, pt).map_err(|e| format!("resize src: {e}"))?;
-    let mut dst = Image::new(tw, target_h, pt);
-    resizer
-        .resize(
-            &src,
-            &mut dst,
-            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
-        )
-        .map_err(|e| format!("resize: {e}"))?;
-
-    Ok(DecodedImage {
-        w: tw,
-        h: target_h,
-        gray,
-        pixels: dst.into_vec(),
-    })
+    if gray_by_channels {
+        // Already single-channel (1ch / GA PNG, L8 JPEG) — no scan needed.
+        downscale_gray(full, w, h, tw, target_h, resizer)
+    } else if rgba_is_grayscale(&full, GRAYSCALE_THRESHOLD) {
+        // Color-stored but visually gray → collapse to luma, gray strategy.
+        downscale_gray(rgba_to_luma(&full), w, h, tw, target_h, resizer)
+    } else {
+        downscale_color(&full, w, h, tw, target_h, resizer)
+    }
 }

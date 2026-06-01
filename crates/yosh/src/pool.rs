@@ -20,6 +20,12 @@ use crate::page::{PagePipeline, PageTexture};
 use crate::source::PageSource;
 use crate::texpool::{self, TexturePool};
 
+/// GPU-side downscale is disabled: a single bilinear blit can't match the HQ
+/// CPU resize (Lanczos / Catmull-Rom + dot-gain). The path below is kept intact
+/// behind this flag for a future high-quality GPU rewrite. While `false`, every
+/// page goes through the HQ CPU path.
+const GPU_DOWNSCALE_ENABLED: bool = false;
+
 pub enum Msg {
     Done { index: usize, page: PageTexture },
     Failed { index: usize },
@@ -90,7 +96,7 @@ impl DecodePool {
 
                     let gpu = gpu_flag.load(Ordering::Relaxed);
                     let page: Option<PageTexture> = match source.read_page(index) {
-                        Ok(bytes) if gpu => decode_full(&bytes).ok().map(|img| {
+                        Ok(bytes) if gpu && GPU_DOWNSCALE_ENABLED => decode_full(&bytes).ok().map(|img| {
                             // Upload full-res, downscale on the GPU into a display texture.
                             let src = tex_pool.get(&device, img.gray, img.w, img.h);
                             texpool::write_pixels(&queue, &src, &img.pixels, img.w, img.h, img.gray);

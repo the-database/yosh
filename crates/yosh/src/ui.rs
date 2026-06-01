@@ -138,7 +138,6 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("F   fit mode  (window / width / height)");
                 ui.label("+ / − / 0   zoom in / out / reset;   drag — pan");
                 ui.label("T   present  vsync ↔ turbo");
-                ui.label("G   GPU downscale on/off");
                 ui.label("F11   fullscreen");
                 ui.separator();
                 ui.heading("Files");
