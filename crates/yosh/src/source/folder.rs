@@ -53,4 +53,15 @@ impl PageSource for FolderSource {
     fn read_page(&self, index: usize) -> io::Result<Vec<u8>> {
         std::fs::read(&self.paths[index])
     }
+
+    fn modified(&self, index: usize) -> Option<String> {
+        let secs = std::fs::metadata(self.paths.get(index)?)
+            .ok()?
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some(super::fmt_unix(secs))
+    }
 }
