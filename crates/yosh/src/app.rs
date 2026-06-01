@@ -1004,7 +1004,10 @@ impl State {
                 Ok(img) => crate::decode::to_rgba_image(img), // egui samples RGBA
                 Err(_) => continue,
             };
-            let pt = PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.tex_pool);
+            // Library thumbnail (registered with egui, not stored in the page
+            // cache) — its decode-target stamp is unused, so pass 0.
+            let pt =
+                PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.tex_pool, 0);
             let id = self.egui_renderer.register_native_texture(
                 &self.gpu.device,
                 &pt.view,
@@ -1189,33 +1192,36 @@ impl State {
     }
 
     /// Re-point the decode target at the current display size. Debounced: only
-    /// acts once the desired value settles (so a resize/zoom drag re-decodes once,
-    /// not every frame). Clears the cache so visible pages re-decode at the new
-    /// resolution; normal page-flipping never changes the target, so it never
-    /// triggers a re-decode.
+    /// acts once the desired value settles (so a resize/zoom drag re-points once,
+    /// not every frame). Does NOT clear the cache: `prefetch` re-decodes pages
+    /// whose stamp is now stale while the old-resolution textures keep displaying,
+    /// so there's no black frame (the swap is in place). Normal page-flipping
+    /// never changes the target, so it never triggers a re-decode.
     fn update_target_h(&mut self) {
         let desired = self.desired_target_h();
         if desired != self.pending_target {
             self.pending_target = desired; // still settling
             return;
         }
-        if self.target_h.load(Ordering::Relaxed) != desired {
-            self.target_h.store(desired, Ordering::Relaxed);
-            self.cache.clear();
-            self.failed.clear();
-            self.last_drawn = None;
-        }
+        self.target_h.store(desired, Ordering::Relaxed);
     }
 
-    /// Recompute the desired prefetch window and hand it to the pool.
+    /// Recompute the desired prefetch window and hand it to the pool. Queues a
+    /// page if it's missing OR cached at a stale decode target (after a
+    /// zoom/resize), so stale pages re-decode at the new resolution and overwrite
+    /// in place — the old texture keeps displaying until the new one lands.
     fn prefetch(&mut self) {
         let fwd = self.dynamic_fwd();
+        let cur = self.target_h.load(Ordering::Relaxed);
         let (Some(src), Some(pool)) = (&self.source, &self.pool) else {
             return;
         };
         let desired: Vec<usize> = desired_window(self.index, src.len(), fwd, BACK)
             .into_iter()
-            .filter(|i| !self.cache.contains(*i) && !self.failed.contains(i))
+            .filter(|i| {
+                !self.failed.contains(i)
+                    && self.cache.get(*i).map_or(true, |p| p.target_h != cur)
+            })
             .collect();
         pool.set_jobs(desired);
     }
