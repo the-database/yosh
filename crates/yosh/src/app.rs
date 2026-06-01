@@ -398,12 +398,12 @@ impl ApplicationHandler for App {
             WindowEvent::DroppedFile(path) => state.ui.pending_open = Some(path),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if let Some(action) = action_from(&event) {
-                    // Tab (info overlay) fires even if egui would consume it for
-                    // focus traversal; everything else respects egui consumption.
-                    if matches!(action, Action::ToggleInfo) || !response.consumed {
-                        state.apply_action(action);
-                    }
+                // Tab (info overlay) fires even if egui would consume it for focus
+                // traversal; everything else respects egui consumption.
+                if let Some(action) = action_from(&event)
+                    && (matches!(action, Action::ToggleInfo) || !response.consumed)
+                {
+                    state.apply_action(action);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -886,10 +886,10 @@ impl State {
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
             _ => {
                 // Anchor not decoded yet: hold the last-drawn page if still cached.
-                if let Some(li) = self.last_drawn {
-                    if let Some(t) = self.cache.get(li) {
-                        return vec![self.single_quad(li, t, sw, sh)];
-                    }
+                if let Some(li) = self.last_drawn
+                    && let Some(t) = self.cache.get(li)
+                {
+                    return vec![self.single_quad(li, t, sw, sh)];
                 }
                 Vec::new()
             }
@@ -1399,12 +1399,12 @@ impl State {
                 self.library_view = !self.library_view;
             }
         }
-        if let Some(i) = self.ui.clicked_volume.take() {
-            if let Some(v) = self.library.volumes.get(i) {
-                let path = v.path.clone();
-                self.library_view = false;
-                self.open(&path);
-            }
+        if let Some(i) = self.ui.clicked_volume.take()
+            && let Some(v) = self.library.volumes.get(i)
+        {
+            let path = v.path.clone();
+            self.library_view = false;
+            self.open(&path);
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
