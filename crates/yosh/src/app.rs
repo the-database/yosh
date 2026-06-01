@@ -13,7 +13,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowId};
 
 use fast_image_resize::Resizer;
 
@@ -330,6 +330,7 @@ enum Action {
     ZoomReset,
     ToggleGpu,
     ToggleHelp,
+    ToggleFullscreen,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -354,6 +355,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
             KeyCode::KeyG => return Some(Action::ToggleGpu),
             KeyCode::F1 => return Some(Action::ToggleHelp),
+            KeyCode::F11 => return Some(Action::ToggleFullscreen),
             _ => {}
         }
     }
@@ -466,6 +468,13 @@ impl State {
                 self.prefetch();
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
+            Action::ToggleFullscreen => {
+                let fs = match self.window.fullscreen() {
+                    Some(_) => None,
+                    None => Some(Fullscreen::Borderless(None)),
+                };
+                self.window.set_fullscreen(fs);
+            }
         }
     }
 
