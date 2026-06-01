@@ -13,6 +13,8 @@ pub struct Settings {
     /// 0 = fit window, 1 = fit width, 2 = fit height.
     pub fit: u8,
     pub layout_spread: bool,
+    /// Continuous vertical-strip scroll mode (overrides page-flip layout).
+    pub scroll: bool,
     /// Volume path (folder or archive) → last-read page index.
     pub last_pages: HashMap<String, usize>,
 }
@@ -23,6 +25,7 @@ impl Default for Settings {
             direction_rtl: true, // manga default
             fit: 0,
             layout_spread: false,
+            scroll: false,
             last_pages: HashMap::new(),
         }
     }
