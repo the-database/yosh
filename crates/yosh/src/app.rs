@@ -132,7 +132,7 @@ impl ApplicationHandler for App {
             .with_title("yosh")
             .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1500.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let gpu = Gpu::new(window.clone());
+        let mut gpu = Gpu::new(window.clone());
 
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(
@@ -150,6 +150,7 @@ impl ApplicationHandler for App {
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
         let settings = config::load();
+        gpu.set_turbo(settings.turbo);
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -248,6 +249,7 @@ enum Action {
     ToggleDir,
     ToggleLayout,
     ToggleScroll,
+    TogglePresent,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -266,6 +268,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyD => return Some(Action::ToggleDir),
             KeyCode::KeyS => return Some(Action::ToggleLayout),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
+            KeyCode::KeyT => return Some(Action::TogglePresent),
             _ => {}
         }
     }
@@ -345,6 +348,11 @@ impl State {
                 self.settings.scroll = self.scroll_mode;
                 config::save(&self.settings);
                 self.prefetch();
+            }
+            Action::TogglePresent => {
+                self.settings.turbo = !self.settings.turbo;
+                self.gpu.set_turbo(self.settings.turbo);
+                config::save(&self.settings);
             }
         }
     }
@@ -755,6 +763,7 @@ impl State {
         } else {
             self.layout.label()
         };
+        self.ui.turbo_label = if self.settings.turbo { "turbo" } else { "vsync" };
         if let Some(src) = &self.source {
             let len = src.len();
             let anchor = if self.scroll_mode {
@@ -854,6 +863,9 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_layout) {
             self.apply_action(Action::ToggleLayout);
+        }
+        if std::mem::take(&mut self.ui.req_toggle_present) {
+            self.apply_action(Action::TogglePresent);
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);

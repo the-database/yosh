@@ -15,11 +15,13 @@ pub struct UiState {
     pub dir_label: &'static str,
     pub fit_label: &'static str,
     pub layout_label: &'static str,
+    pub turbo_label: &'static str,
 
     // Requests raised by button clicks, consumed by the app after the frame.
     pub req_toggle_dir: bool,
     pub req_cycle_fit: bool,
     pub req_toggle_layout: bool,
+    pub req_toggle_present: bool,
 }
 
 #[allow(deprecated)]
@@ -50,6 +52,9 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState) {
             }
             if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
                 st.req_toggle_layout = true;
+            }
+            if ui.button(format!("Present: {}", st.turbo_label)).clicked() {
+                st.req_toggle_present = true;
             }
             ui.separator();
             if !st.status.is_empty() {

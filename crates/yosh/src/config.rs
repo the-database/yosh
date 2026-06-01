@@ -15,6 +15,8 @@ pub struct Settings {
     pub layout_spread: bool,
     /// Continuous vertical-strip scroll mode (overrides page-flip layout).
     pub scroll: bool,
+    /// Uncapped present (Immediate) instead of vsync (Fifo).
+    pub turbo: bool,
     /// Volume path (folder or archive) → last-read page index.
     pub last_pages: HashMap<String, usize>,
 }
@@ -26,6 +28,7 @@ impl Default for Settings {
             fit: 0,
             layout_spread: false,
             scroll: false,
+            turbo: false,
             last_pages: HashMap::new(),
         }
     }
