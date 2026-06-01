@@ -1,5 +1,7 @@
 //! Page-quad rendering: upload a decoded page to a GPU texture (R8 for gray,
-//! RGBA8 for color) and draw it as a fit-to-window textured quad.
+//! RGBA8 for color) and draw it as a textured quad at a caller-computed
+//! placement. Supports up to 2 quads per frame (single page or two-page spread)
+//! via independent per-slot uniform buffers.
 
 use crate::decode::DecodedImage;
 
@@ -27,6 +29,18 @@ impl FitMode {
     }
 }
 
+/// Screen-pixels per page-pixel for a fit mode (given page/content dims).
+pub fn fit_scale(fit: FitMode, sw: f32, sh: f32, pw: f32, ph: f32) -> f32 {
+    match fit {
+        FitMode::Window => (sw / pw).min(sh / ph),
+        FitMode::Width => sw / pw,
+        FitMode::Height => sh / ph,
+    }
+}
+
+/// Max quads drawn in one frame (single page or two-page spread).
+pub const MAX_QUADS: usize = 2;
+
 const SHADER: &str = r#"
 struct Uniforms {
     scale: vec2<f32>,
@@ -51,8 +65,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     );
     let c = corners[vi];
     var out: VsOut;
-    // Map the unit quad into NDC via scale/offset. offset is the top-left corner
-    // in NDC; +x right, +y up; uv.y=0 is the top of the page.
+    // offset = top-left corner in NDC (+x right, +y up); uv.y=0 is the page top.
     let ndc = vec2<f32>(u.offset.x + c.x * u.scale.x, u.offset.y - c.y * u.scale.y);
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
     out.uv = c;
@@ -68,15 +81,6 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     return vec4<f32>(s.rgb, 1.0);
 }
 "#;
-
-/// Screen-pixels per page-pixel for a fit mode.
-pub fn fit_scale(fit: FitMode, sw: f32, sh: f32, pw: f32, ph: f32) -> f32 {
-    match fit {
-        FitMode::Window => (sw / pw).min(sh / ph),
-        FitMode::Width => sw / pw,
-        FitMode::Height => sh / ph,
-    }
-}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -100,7 +104,7 @@ pub struct PagePipeline {
     pub pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    ubo: wgpu::Buffer,
+    ubos: [wgpu::Buffer; MAX_QUADS],
 }
 
 impl PagePipeline {
@@ -176,26 +180,24 @@ impl PagePipeline {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let ubo = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("page_ubo"),
-            size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let make_ubo = || {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("page_ubo"),
+                size: std::mem::size_of::<Uniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         Self {
             pipeline,
             bgl,
             sampler,
-            ubo,
+            ubos: [make_ubo(), make_ubo()],
         }
     }
 
     /// Upload a decoded page to a GPU texture.
-    pub fn upload(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        img: &DecodedImage,
-    ) -> PageTexture {
+    pub fn upload(device: &wgpu::Device, queue: &wgpu::Queue, img: &DecodedImage) -> PageTexture {
         let (format, bpp) = if img.gray {
             (wgpu::TextureFormat::R8Unorm, 1u32)
         } else {
@@ -244,48 +246,31 @@ impl PagePipeline {
         }
     }
 
-    /// Write the uniform for a draw of `page` (with fit mode + vertical pan) and
-    /// return its bind group, ready to bind and `draw(0..6)`. (M1.5 generalizes
-    /// for spreads.)
-    ///
-    /// Note: shares a single ubo, so this is only correct for one draw per frame.
-    pub fn prepare(
+    /// Write quad `slot`'s uniform (NDC scale + top-left offset) and return its
+    /// bind group, ready to bind and `draw(0..6)`.
+    pub fn prepare_quad(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
+        slot: usize,
         page: &PageTexture,
-        screen_w: u32,
-        screen_h: u32,
-        fit: FitMode,
-        pan_y: f32,
+        scale: [f32; 2],
+        offset: [f32; 2],
     ) -> wgpu::BindGroup {
-        let (sw, sh) = (screen_w.max(1) as f32, screen_h.max(1) as f32);
-        let (pw, ph) = (page.w as f32, page.h as f32);
-        let s = fit_scale(fit, sw, sh, pw, ph);
-        let scale = [2.0 * pw * s / sw, 2.0 * ph * s / sh];
-        // Horizontal: centered. Vertical: centered if it fits, else pan in [0,1]
-        // (0 = page top at screen top, 1 = page bottom at screen bottom).
-        let offset_y = if scale[1] <= 2.0 {
-            scale[1] / 2.0
-        } else {
-            1.0 + pan_y.clamp(0.0, 1.0) * (scale[1] - 2.0)
-        };
-        let offset = [-scale[0] / 2.0, offset_y];
         let u = Uniforms {
             scale,
             offset,
             gray: page.gray as u32,
             _pad: [0; 3],
         };
-        queue.write_buffer(&self.ubo, 0, bytemuck::bytes_of(&u));
-
+        queue.write_buffer(&self.ubos[slot], 0, bytemuck::bytes_of(&u));
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("page_bg"),
             layout: &self.bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.ubo.as_entire_binding(),
+                    resource: self.ubos[slot].as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,

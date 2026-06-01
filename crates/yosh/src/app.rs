@@ -16,7 +16,8 @@ use winit::window::{Window, WindowId};
 
 use crate::cache::PageCache;
 use crate::gpu::Gpu;
-use crate::page::{fit_scale, FitMode, PagePipeline};
+use crate::layout::{self, Layout};
+use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
 use crate::source::{FolderSource, PageSource};
@@ -68,10 +69,19 @@ struct State {
     last_drawn: Option<usize>,
 
     fit: FitMode,
+    layout: Layout,
     pan_y: f32,
     direction: Direction,
     cursor_x: f64,
     nav_times: VecDeque<Instant>,
+}
+
+/// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
+struct Quad {
+    slot: usize,
+    page_index: usize,
+    scale: [f32; 2],
+    offset: [f32; 2],
 }
 
 impl App {
@@ -134,6 +144,7 @@ impl ApplicationHandler for App {
             start_index: self.start_index,
             last_drawn: None,
             fit: FitMode::Window,
+            layout: Layout::Single,
             pan_y: 0.0,
             direction: Direction::Rtl, // manga default; toggle with D
             cursor_x: 0.0,
@@ -189,6 +200,7 @@ enum Action {
     Last,
     CycleFit,
     ToggleDir,
+    ToggleLayout,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -205,6 +217,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::End => return Some(Action::Last),
             KeyCode::KeyF => return Some(Action::CycleFit),
             KeyCode::KeyD => return Some(Action::ToggleDir),
+            KeyCode::KeyS => return Some(Action::ToggleLayout),
             _ => {}
         }
     }
@@ -246,16 +259,27 @@ impl State {
                     Direction::Rtl => Direction::Ltr,
                 };
             }
+            Action::ToggleLayout => {
+                self.layout = self.layout.toggled();
+                // Snap to the current view's anchor so pairing is consistent.
+                self.index = layout::view_start(self.layout, self.index);
+                self.pan_y = 0.0;
+                self.prefetch();
+            }
         }
     }
 
-    fn step(&mut self, delta: i64) {
+    fn step(&mut self, dir: i64) {
         let Some(src) = &self.source else { return };
-        let len = src.len() as i64;
+        let len = src.len();
         if len == 0 {
             return;
         }
-        let next = (self.index as i64 + delta).clamp(0, len - 1) as usize;
+        let next = if dir > 0 {
+            layout::next_view(self.layout, self.index, len)
+        } else {
+            layout::prev_view(self.layout, self.index)
+        };
         if next != self.index {
             self.nav_times.push_back(Instant::now());
             self.goto(next);
@@ -320,6 +344,101 @@ impl State {
         let (sw, sh) = (self.gpu.config.width.max(1) as f32, self.gpu.config.height.max(1) as f32);
         let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32);
         pt.h as f32 * s > sh + 0.5
+    }
+
+    /// Top edge of a page (screen px, 0 = window top): centered if it fits,
+    /// else panned by `pan_y` (0 = page top aligned, 1 = page bottom aligned).
+    fn vertical_top(&self, dh: f32, sh: f32) -> f32 {
+        if dh <= sh + 0.5 {
+            (sh - dh) / 2.0
+        } else {
+            -self.pan_y.clamp(0.0, 1.0) * (dh - sh)
+        }
+    }
+
+    fn quad_from_px(
+        slot: usize,
+        page_index: usize,
+        x_px: f32,
+        y_px: f32,
+        dw: f32,
+        dh: f32,
+        sw: f32,
+        sh: f32,
+    ) -> Quad {
+        Quad {
+            slot,
+            page_index,
+            scale: [2.0 * dw / sw, 2.0 * dh / sh],
+            offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
+        }
+    }
+
+    fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
+        let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32);
+        let (dw, dh) = (t.w as f32 * s, t.h as f32 * s);
+        let x = (sw - dw) / 2.0;
+        Self::quad_from_px(0, idx, x, self.vertical_top(dh, sh), dw, dh, sw, sh)
+    }
+
+    /// Compute the quads to draw this frame (1 for single/last-held, 2 for a
+    /// ready spread). Only includes pages present in the cache.
+    fn build_quads(&self) -> Vec<Quad> {
+        let Some(src) = &self.source else {
+            return Vec::new();
+        };
+        let len = src.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let sw = self.gpu.config.width.max(1) as f32;
+        let sh = self.gpu.config.height.max(1) as f32;
+
+        let (a, b) = layout::view_pages(self.layout, self.index, len);
+        let ta = self.cache.get(a);
+        // Wide (landscape) page is a double-spread image → show it alone.
+        let force_single = ta.map_or(false, |t| t.w > t.h);
+        let b = if force_single { None } else { b };
+        let tb = b.and_then(|bi| self.cache.get(bi).map(|t| (bi, t)));
+
+        match (ta, tb) {
+            (Some(ta), Some((bi, tb))) => {
+                let combined_w = ta.w as f32 + tb.w as f32;
+                let max_h = ta.h.max(tb.h) as f32;
+                let s = fit_scale(self.fit, sw, sh, combined_w, max_h);
+                let x0 = (sw - combined_w * s) / 2.0;
+                // Screen order: LTR puts the lower index on the left; RTL reverses.
+                let (l_idx, l_t, r_idx, r_t) = match self.direction {
+                    Direction::Ltr => (a, ta, bi, tb),
+                    Direction::Rtl => (bi, tb, a, ta),
+                };
+                let (dwl, dhl) = (l_t.w as f32 * s, l_t.h as f32 * s);
+                let (dwr, dhr) = (r_t.w as f32 * s, r_t.h as f32 * s);
+                vec![
+                    Self::quad_from_px(0, l_idx, x0, self.vertical_top(dhl, sh), dwl, dhl, sw, sh),
+                    Self::quad_from_px(
+                        1,
+                        r_idx,
+                        x0 + dwl,
+                        self.vertical_top(dhr, sh),
+                        dwr,
+                        dhr,
+                        sw,
+                        sh,
+                    ),
+                ]
+            }
+            (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
+            _ => {
+                // Anchor not decoded yet: hold the last-drawn page if still cached.
+                if let Some(li) = self.last_drawn {
+                    if let Some(t) = self.cache.get(li) {
+                        return vec![self.single_quad(li, t, sw, sh)];
+                    }
+                }
+                Vec::new()
+            }
+        }
     }
 
     /// Forward look-ahead distance, widened when flipping quickly.
@@ -396,25 +515,40 @@ impl State {
         // Refresh the work list against the updated cache.
         self.prefetch();
 
-        // Pick the page to draw: the current page if ready, else hold last-drawn.
-        let draw_index = if self.cache.contains(self.index) {
-            self.last_drawn = Some(self.index);
-            Some(self.index)
-        } else {
-            self.last_drawn.filter(|i| self.cache.contains(*i))
-        };
-
+        // Decide what to draw this frame (single page or two-page spread).
+        let quads = self.build_quads();
         if let Some(src) = &self.source {
-            let loading = !self.cache.contains(self.index);
+            let len = src.len();
+            let (anchor, _) = layout::view_pages(self.layout, self.index, len);
+            let loading = !self.cache.contains(anchor);
+            if !loading {
+                self.last_drawn = Some(anchor);
+            }
             self.ui.status = format!(
-                "{}/{}  {} {}{}",
+                "{}/{}  {} {} {}{}",
                 self.index + 1,
-                src.len(),
+                len,
+                self.layout.label(),
                 self.fit.label(),
                 self.direction.label(),
                 if loading { "  …" } else { "" }
             );
         }
+        let page_bgs: Vec<wgpu::BindGroup> = quads
+            .iter()
+            .filter_map(|q| {
+                self.cache.get(q.page_index).map(|t| {
+                    self.page_pipeline.prepare_quad(
+                        &self.gpu.device,
+                        &self.gpu.queue,
+                        q.slot,
+                        t,
+                        q.scale,
+                        q.offset,
+                    )
+                })
+            })
+            .collect();
 
         let frame = match self.gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
@@ -433,18 +567,6 @@ impl State {
             .gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-
-        let page_bg = draw_index.and_then(|i| self.cache.get(i)).map(|pt| {
-            self.page_pipeline.prepare(
-                &self.gpu.device,
-                &self.gpu.queue,
-                pt,
-                self.gpu.config.width,
-                self.gpu.config.height,
-                self.fit,
-                self.pan_y,
-            )
-        });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -468,10 +590,12 @@ impl State {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            if let Some(bg) = &page_bg {
+            if !page_bgs.is_empty() {
                 pass.set_pipeline(&self.page_pipeline.pipeline);
-                pass.set_bind_group(0, bg, &[]);
-                pass.draw(0..6, 0..1);
+                for bg in &page_bgs {
+                    pass.set_bind_group(0, bg, &[]);
+                    pass.draw(0..6, 0..1);
+                }
             }
         }
 

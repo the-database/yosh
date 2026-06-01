@@ -5,6 +5,7 @@ mod app;
 mod cache;
 mod decode;
 mod gpu;
+mod layout;
 mod page;
 mod pool;
 mod prefetch;
