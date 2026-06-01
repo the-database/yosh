@@ -22,6 +22,7 @@ use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
 use crate::source::{FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
+use crate::texpool::TexturePool;
 use crate::ui::{self, UiState};
 
 const TARGET_H: u32 = 2160;
@@ -87,6 +88,7 @@ struct State {
 
     settings: config::Settings,
     volume_key: Option<String>,
+    tex_pool: Arc<TexturePool>,
 }
 
 fn fit_from_u8(v: u8) -> FitMode {
@@ -151,6 +153,7 @@ impl ApplicationHandler for App {
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
         let settings = config::load();
         gpu.set_turbo(settings.turbo);
+        let tex_pool = Arc::new(TexturePool::new());
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -169,7 +172,7 @@ impl ApplicationHandler for App {
             page_pipeline,
             source: None,
             pool: None,
-            cache: PageCache::new(CACHE_CAP),
+            cache: PageCache::new(CACHE_CAP, tex_pool.clone()),
             failed: HashSet::new(),
             index: 0,
             start_index: self.start_index,
@@ -193,6 +196,7 @@ impl ApplicationHandler for App {
             est_aspect: DEFAULT_ASPECT,
             settings,
             volume_key: None,
+            tex_pool,
         });
     }
 
@@ -697,6 +701,7 @@ impl State {
             source.clone(),
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
+            self.tex_pool.clone(),
             TARGET_H,
             WORKERS,
         ));

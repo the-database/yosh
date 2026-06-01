@@ -16,6 +16,7 @@ use fast_image_resize::Resizer;
 use crate::decode::decode_and_downscale;
 use crate::page::{PagePipeline, PageTexture};
 use crate::source::PageSource;
+use crate::texpool::TexturePool;
 
 pub enum Msg {
     Done { index: usize, page: PageTexture },
@@ -39,6 +40,7 @@ impl DecodePool {
         source: Arc<dyn PageSource>,
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
+        tex_pool: Arc<TexturePool>,
         target_h: u32,
         workers: usize,
     ) -> Self {
@@ -58,6 +60,7 @@ impl DecodePool {
             let source = source.clone();
             let device = device.clone();
             let queue = queue.clone();
+            let tex_pool = tex_pool.clone();
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
@@ -92,7 +95,7 @@ impl DecodePool {
                     let msg = match result {
                         Ok(img) => Msg::Done {
                             index,
-                            page: PagePipeline::upload(&device, &queue, &img),
+                            page: PagePipeline::upload(&device, &queue, &img, &tex_pool),
                         },
                         Err(_) => Msg::Failed { index },
                     };
