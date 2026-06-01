@@ -19,6 +19,7 @@ mod pool;
 mod prefetch;
 mod source;
 mod texpool;
+mod tone;
 mod ui;
 
 use winit::event_loop::{ControlFlow, EventLoop};

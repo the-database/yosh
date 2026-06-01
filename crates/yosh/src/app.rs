@@ -5,7 +5,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -204,7 +204,11 @@ impl ApplicationHandler for App {
         gpu.set_turbo(settings.turbo);
         let tex_pool = Arc::new(TexturePool::new());
         let downscaler = Arc::new(Downscaler::new(&gpu.device));
-        let gpu_flag = Arc::new(AtomicBool::new(settings.gpu));
+        // GPU downscale is disabled for now (the single-bilinear-blit path can't
+        // match the HQ CPU resize); the code is kept dormant behind
+        // `pool::GPU_DOWNSCALE_ENABLED` for a future HQ-GPU rewrite. Forced off
+        // here regardless of the persisted `settings.gpu`.
+        let gpu_flag = Arc::new(AtomicBool::new(false));
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -331,7 +335,6 @@ enum Action {
     ZoomIn,
     ZoomOut,
     ZoomReset,
-    ToggleGpu,
     ToggleHelp,
     ToggleFullscreen,
     ToggleSpreadOffset,
@@ -358,7 +361,6 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
-            KeyCode::KeyG => return Some(Action::ToggleGpu),
             KeyCode::F1 => return Some(Action::ToggleHelp),
             KeyCode::F11 => return Some(Action::ToggleFullscreen),
             _ => {}
@@ -474,16 +476,6 @@ impl State {
                 self.settings.turbo = !self.settings.turbo;
                 self.gpu.set_turbo(self.settings.turbo);
                 config::save(&self.settings);
-            }
-            Action::ToggleGpu => {
-                let on = !self.gpu_flag.load(Ordering::Relaxed);
-                self.gpu_flag.store(on, Ordering::Relaxed);
-                self.settings.gpu = on;
-                config::save(&self.settings);
-                // Re-decode the visible window through the newly-selected path.
-                self.cache.clear();
-                self.failed.clear();
-                self.prefetch();
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
             Action::ToggleFullscreen => {
