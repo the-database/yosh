@@ -20,10 +20,10 @@ impl TexturePool {
 
     /// Reuse a matching texture if available, else create one.
     pub fn get(&self, device: &wgpu::Device, gray: bool, w: u32, h: u32) -> wgpu::Texture {
-        if let Some(v) = self.buckets.lock().unwrap().get_mut(&(gray, w, h)) {
-            if let Some(t) = v.pop() {
-                return t;
-            }
+        if let Some(v) = self.buckets.lock().unwrap().get_mut(&(gray, w, h))
+            && let Some(t) = v.pop()
+        {
+            return t;
         }
         create_page_texture(device, gray, w, h)
     }
