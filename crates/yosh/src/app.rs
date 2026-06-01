@@ -305,7 +305,7 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
-        let settings = config::load();
+        let mut settings = config::load();
         gpu.set_turbo(settings.turbo);
         let tex_pool = Arc::new(TexturePool::new());
         let downscaler = Arc::new(Downscaler::new(&gpu.device));
@@ -327,8 +327,13 @@ impl ApplicationHandler for App {
         };
         // Open straight into the grid if nothing was passed to read.
         let library_view = ui.pending_open.is_none() && !library.volumes.is_empty();
-        // Show the keys overlay on a blank launch (nothing to read, no library).
-        ui.help_open = ui.pending_open.is_none() && !library_view;
+        // Show the keys overlay once, on the first launch ever, then persist so it
+        // never auto-opens again (F1 / "? Help" reopen it on demand).
+        if !settings.help_seen {
+            ui.help_open = true;
+            settings.help_seen = true;
+            config::save(&settings);
+        }
 
         window.request_redraw();
         self.state = Some(State {

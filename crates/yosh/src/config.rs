@@ -25,6 +25,8 @@ pub struct Settings {
     pub last_pages: HashMap<String, usize>,
     /// Volume path → spread pairing parity offset (0 or 1).
     pub spread_offsets: HashMap<String, u8>,
+    /// Whether the keys overlay has been shown once (first-launch onboarding).
+    pub help_seen: bool,
 }
 
 impl Default for Settings {
@@ -39,6 +41,7 @@ impl Default for Settings {
             library_root: None,
             last_pages: HashMap::new(),
             spread_offsets: HashMap::new(),
+            help_seen: false,
         }
     }
 }
