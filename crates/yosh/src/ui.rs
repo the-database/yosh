@@ -52,10 +52,16 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                     st.pending_open = Some(p);
                 }
             }
-            if ui.button("Open archive…").clicked() {
+            if ui.button("Open file…").clicked() {
                 if let Some(p) = rfd::FileDialog::new()
-                    .set_title("Open comic archive")
-                    .add_filter("Comic archives", &["cbz", "cbr", "zip", "rar", "7z", "cb7"])
+                    .set_title("Open comic archive or image")
+                    .add_filter(
+                        "Comics & images",
+                        &[
+                            "cbz", "cbr", "zip", "rar", "7z", "cb7", "png", "jpg", "jpeg", "webp",
+                            "gif", "bmp", "avif",
+                        ],
+                    )
                     .pick_file()
                 {
                     st.pending_open = Some(p);
@@ -132,7 +138,8 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("F11   fullscreen");
                 ui.separator();
                 ui.heading("Files");
-                ui.label("Open folder / Open archive / Library;  Grid ↔ Reader");
+                ui.label("Open folder / Open file / Library;  Grid ↔ Reader");
+                ui.label("drag a folder, archive, or image onto the window");
                 ui.label("F1   toggle this help");
             });
     }

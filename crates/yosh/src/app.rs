@@ -27,7 +27,7 @@ use crate::library::{cover_bytes, Library};
 use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
-use crate::source::{FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
+use crate::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use crate::texpool::TexturePool;
 use crate::ui::{self, UiState};
 
@@ -909,9 +909,11 @@ impl State {
     }
 
     fn open(&mut self, path: &Path) {
-        let built: Result<Arc<dyn PageSource>, String> = if path.is_dir() {
+        // (source, volume-key path, explicit start index)
+        type Built = Result<(Arc<dyn PageSource>, PathBuf, Option<usize>), String>;
+        let built: Built = if path.is_dir() {
             FolderSource::new(path)
-                .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
                 .map_err(|e| e.to_string())
         } else {
             let ext = path
@@ -920,37 +922,59 @@ impl State {
                 .map(|s| s.to_ascii_lowercase());
             match ext.as_deref() {
                 Some("cbz") | Some("zip") => ZipSource::new(path)
-                    .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                    .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
                     .map_err(|e| e.to_string()),
                 Some("cbr") | Some("rar") => RarSource::new(path)
-                    .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                    .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
                     .map_err(|e| e.to_string()),
                 Some("7z") | Some("cb7") => SevenzSource::new(path)
-                    .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                    .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
                     .map_err(|e| e.to_string()),
-                _ => Err("unsupported file type (open a folder, CBZ, CBR, or 7z)".to_string()),
+                // A single image opens its containing folder, positioned at that
+                // image, so you can seek forward/back within the folder.
+                _ if is_image_ext(path) => {
+                    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                    FolderSource::new(parent)
+                        .map(|s| {
+                            let start = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .and_then(|n| s.index_of_name(n));
+                            (Arc::new(s) as Arc<dyn PageSource>, parent.to_path_buf(), start)
+                        })
+                        .map_err(|e| e.to_string())
+                }
+                _ => Err(
+                    "unsupported file type (open a folder, image, CBZ, CBR, or 7z)".to_string(),
+                ),
             }
         };
         match built {
-            Ok(source) if source.len() > 0 => self.set_source(source, path),
+            Ok((source, key, start)) if source.len() > 0 => self.set_source(source, &key, start),
             Ok(_) => self.ui.status = "no images found".into(),
             Err(e) => self.ui.status = format!("open failed: {e}"),
         }
     }
 
-    fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path) {
+    fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path, start: Option<usize>) {
         // Persist the previous volume's position before switching.
         if let Some(k) = self.volume_key.take() {
             self.settings.last_pages.insert(k, self.index);
         }
         let key = path.to_string_lossy().into_owned();
-        let resume = self.settings.last_pages.get(&key).copied().unwrap_or(0);
         self.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
-        // CLI start index (if given) wins over the saved position.
-        let idx = if self.start_index > 0 {
-            self.start_index
-        } else {
-            resume
+        // Explicit start (e.g. a specific dropped image) wins; else CLI start
+        // index; else the saved position.
+        let idx = match start {
+            Some(i) => i,
+            None => {
+                let resume = self.settings.last_pages.get(&key).copied().unwrap_or(0);
+                if self.start_index > 0 {
+                    self.start_index
+                } else {
+                    resume
+                }
+            }
         };
         self.start_index = 0;
 

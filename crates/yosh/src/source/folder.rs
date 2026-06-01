@@ -8,7 +8,6 @@ use super::{is_image_ext, PageSource};
 
 pub struct FolderSource {
     paths: Vec<PathBuf>,
-    #[allow(dead_code)]
     names: Vec<String>,
 }
 
@@ -34,6 +33,11 @@ impl FolderSource {
             })
             .collect();
         Ok(Self { paths, names })
+    }
+
+    /// Index of the entry with the given file name, if present.
+    pub fn index_of_name(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
     }
 }
 
