@@ -38,6 +38,7 @@ impl Volume {
 }
 
 pub struct Library {
+    #[allow(dead_code)] // kept for future rescan / display
     pub root: Option<PathBuf>,
     pub volumes: Vec<Volume>,
 }
