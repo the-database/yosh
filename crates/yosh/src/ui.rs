@@ -30,6 +30,9 @@ pub struct UiState {
     pub req_toggle_library: bool,
     pub clicked_volume: Option<usize>,
     pub help_open: bool,
+    /// Whether to draw the top chrome bar (hidden in fullscreen unless the
+    /// cursor is at the top edge). Set by the app each frame.
+    pub show_bar: bool,
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -44,7 +47,8 @@ fn elide(s: &str, max: usize) -> String {
 
 #[allow(deprecated)]
 pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view: bool) {
-    egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+    let show_bar = st.show_bar;
+    egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
         ui.horizontal(|ui| {
             if ui.button("Open folder…").clicked() {
                 if let Some(p) = rfd::FileDialog::new().set_title("Open page folder").pick_folder()
