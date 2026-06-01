@@ -283,6 +283,7 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => state.gpu.resize(size.width, size.height),
+            WindowEvent::DroppedFile(path) => state.ui.pending_open = Some(path),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !response.consumed =>
@@ -971,6 +972,7 @@ impl State {
         self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
         self.source = Some(source);
+        self.library_view = false; // opening anything switches to the reader
         self.prefetch();
     }
 
