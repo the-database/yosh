@@ -127,6 +127,33 @@ fn fit_to_u8(f: FitMode) -> u8 {
     }
 }
 
+/// Best-effort: load a system CJK font so Japanese/Chinese/Korean text (paths,
+/// filenames, library titles) renders in the egui chrome. Appended as a
+/// fallback so Latin keeps the default look; silently skipped if none found.
+fn install_cjk_font(ctx: &egui::Context) {
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\YuGothR.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
+        "/Library/Fonts/Hiragino Sans GB.ttc",
+    ];
+    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "cjk".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push("cjk".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
+
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
 struct Quad {
     slot: usize,
@@ -157,6 +184,7 @@ impl ApplicationHandler for App {
         let mut gpu = Gpu::new(window.clone());
 
         let egui_ctx = egui::Context::default();
+        install_cjk_font(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -792,7 +820,7 @@ impl State {
                 continue;
             };
             let img = match decode_and_downscale(&bytes, THUMB_H, &mut self.thumb_resizer) {
-                Ok(img) => img,
+                Ok(img) => crate::decode::to_rgba_image(img), // egui samples RGBA
                 Err(_) => continue,
             };
             let pt = PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.tex_pool);

@@ -75,6 +75,25 @@ fn decode_other(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
     Ok((w, h, false, rgba.into_raw()))
 }
 
+/// Expand a grayscale (R8) image to RGBA8 (r=g=b, a=255). Used for egui
+/// thumbnails, since egui samples textures as RGBA (an R8 texture would render
+/// red). No-op for images that are already color.
+pub fn to_rgba_image(img: DecodedImage) -> DecodedImage {
+    if !img.gray {
+        return img;
+    }
+    let mut pixels = Vec::with_capacity(img.pixels.len() * 4);
+    for &g in &img.pixels {
+        pixels.extend_from_slice(&[g, g, g, 255]);
+    }
+    DecodedImage {
+        w: img.w,
+        h: img.h,
+        gray: false,
+        pixels,
+    }
+}
+
 /// Decode to full resolution (no resize), normalized to gray (1ch) or RGBA8.
 fn decode_raw(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
     if bytes.starts_with(&PNG_SIG) {
