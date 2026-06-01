@@ -251,15 +251,17 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                     ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom));
                 let opts_lanczos =
                     ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3));
-                // Tone LUTs for the HQ gray round-trip. The exact values don't
-                // affect timing (any 256-entry map costs the same), so use a
-                // representative gamma curve rather than the real dot-gain table.
-                let mut to_lin = [0u8; 256];
-                let mut to_enc = [0u8; 256];
-                for i in 0..256 {
-                    let x = i as f32 / 255.0;
-                    to_lin[i] = (x.powf(2.2) * 255.0).round() as u8;
-                    to_enc[i] = (x.powf(1.0 / 2.2) * 255.0).round() as u8;
+                // HQ gray resamples in 16-bit linear light (see decode.rs):
+                // 8-bit device -> u16 linear, U16 resize, then a 16-bit -> 8-bit
+                // re-encode LUT. Exact curve values don't affect timing, so use a
+                // representative gamma curve rather than the real tone tables.
+                let mut to_lin = [0u16; 256];
+                for (i, v) in to_lin.iter_mut().enumerate() {
+                    *v = ((i as f32 / 255.0).powf(2.2) * 65535.0).round() as u16;
+                }
+                let mut enc = vec![0u8; 65536];
+                for (i, e) in enc.iter_mut().enumerate() {
+                    *e = ((i as f32 / 65535.0).powf(1.0 / 2.2) * 255.0).round() as u8;
                 }
                 let mut lin: Vec<u8> = Vec::new();
                 let mut dbuf: Vec<u8> = Vec::new();
@@ -308,7 +310,7 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                         // loose grayscale-detection scan (as the real app does).
                         let (pt, opts) = match cfg.quality {
                             Quality::Bilinear => (pixel_type(ch), &opts_bilinear),
-                            Quality::Hq if ch == 1 => (PixelType::U8, &opts_catmull),
+                            Quality::Hq if ch == 1 => (PixelType::U16, &opts_catmull),
                             Quality::Hq => {
                                 if ch >= 3 {
                                     black_box(is_gray_scan(pix, ch, 12));
@@ -316,15 +318,15 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                                 (pixel_type(ch), &opts_lanczos)
                             }
                         };
-                        // HQ gray: linearize the source through the tone LUT first.
+                        // HQ gray: linearize 8-bit device -> 16-bit linear (bytes).
                         let src_pix: &[u8] = if hq_gray {
-                            if lin.len() < pix.len() {
-                                lin.resize(pix.len(), 0);
+                            if lin.len() < pix.len() * 2 {
+                                lin.resize(pix.len() * 2, 0);
                             }
-                            for (d, &s) in lin[..pix.len()].iter_mut().zip(pix) {
-                                *d = to_lin[s as usize];
+                            for (c, &s) in lin[..pix.len() * 2].chunks_exact_mut(2).zip(pix) {
+                                c.copy_from_slice(&to_lin[s as usize].to_ne_bytes());
                             }
-                            &lin[..pix.len()]
+                            &lin[..pix.len() * 2]
                         } else {
                             pix
                         };
@@ -339,10 +341,10 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                         let d = dst.as_mut().unwrap();
                         resizer.resize(&src, &mut d.0, opts).expect("resize");
                         if hq_gray {
-                            // Re-encode the output through the inverse tone LUT.
+                            // Re-encode 16-bit linear -> 8-bit device.
                             let mut acc = 0u64;
-                            for &b in d.0.buffer() {
-                                acc += to_enc[b as usize] as u64;
+                            for c in d.0.buffer().chunks_exact(2) {
+                                acc += enc[u16::from_ne_bytes([c[0], c[1]]) as usize] as u64;
                             }
                             black_box(acc);
                         } else {

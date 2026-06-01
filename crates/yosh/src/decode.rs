@@ -3,17 +3,19 @@
 //! Routes by magic bytes: PNG → `png`, JPEG → `jpeg-decoder`, else → `image`
 //! crate fallback (WebP/GIF/BMP/…). Normalizes to single-channel R8 (gray) or
 //! RGBA8 (color), then downscales with a high-quality, content-aware filter
-//! (copied from MangaJaNaiConverterGui's final-resize strategy):
+//! (inspired by MangaJaNaiConverterGui's final-resize strategy):
 //!   - **color** → Lanczos3 in gamma space (no color conversion),
-//!   - **grayscale** → linear-light Catmull-Rom: linearize via the Dot Gain 20%
-//!     → Gamma 1.0 LUT, resample, then re-encode (see `tone.rs`).
+//!   - **grayscale** → Catmull-Rom in **true 16-bit linear light**: linearize
+//!     sRGB → linear luminance, resample, then re-encode through the Dot Gain 20%
+//!     curve so screentones stay inky (see `tone.rs`). Linear-light resampling is
+//!     what suppresses halftone moiré.
 //! Color decodes that are *visually* grayscale (within a threshold) are detected
 //! and routed through the grayscale path, matching MangaJaNai's behavior.
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 
-use crate::tone::{self, DOTGAIN20_TO_GAMMA1, GAMMA1_TO_DOTGAIN20};
+use crate::tone;
 
 const PNG_SIG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
 
@@ -161,21 +163,25 @@ fn rgba_to_luma(rgba: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-/// Grayscale strategy (MangaJaNai `dotgain20_resize`, minus the Gaussian
-/// pre-blur which is a no-op when downscaling): linearize Dot Gain 20% → Gamma
-/// 1.0, Catmull-Rom resample in linear light, then re-encode back. `gray` is
-/// consumed and linearized in place to avoid an extra full-res copy.
+/// Grayscale strategy: resample in **true linear light** to kill halftone moiré.
+/// Linearize the sRGB-encoded source to 16-bit linear luminance, Catmull-Rom
+/// resample in that space, then re-encode through the Dot Gain 20% curve (which
+/// darkens, keeping screentones inky). 16-bit intermediate avoids shadow banding.
 fn downscale_gray(
-    mut gray: Vec<u8>,
+    gray: &[u8],
     w: u32,
     h: u32,
     tw: u32,
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
-    tone::apply_lut(&mut gray, &DOTGAIN20_TO_GAMMA1);
-    let src = ImageRef::new(w, h, &gray, PixelType::U8).map_err(|e| format!("resize src: {e}"))?;
-    let mut dst = Image::new(tw, target_h, PixelType::U8);
+    // sRGB device → 16-bit linear luminance (native-endian U16 byte buffer).
+    let mut lin = Vec::with_capacity(gray.len() * 2);
+    for &v in gray {
+        lin.extend_from_slice(&tone::SRGB_TO_LINEAR[v as usize].to_ne_bytes());
+    }
+    let src = ImageRef::new(w, h, &lin, PixelType::U16).map_err(|e| format!("resize src: {e}"))?;
+    let mut dst = Image::new(tw, target_h, PixelType::U16);
     resizer
         .resize(
             &src,
@@ -183,8 +189,13 @@ fn downscale_gray(
             &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom)),
         )
         .map_err(|e| format!("resize: {e}"))?;
-    let mut pixels = dst.into_vec();
-    tone::apply_lut(&mut pixels, &GAMMA1_TO_DOTGAIN20);
+    // Linear luminance → Dot Gain 20% device (8-bit).
+    let enc = tone::linear_to_dotgain();
+    let bytes = dst.into_vec();
+    let pixels: Vec<u8> = bytes
+        .chunks_exact(2)
+        .map(|c| enc[u16::from_ne_bytes([c[0], c[1]]) as usize])
+        .collect();
     Ok(DecodedImage { w: tw, h: target_h, gray: true, pixels })
 }
 
@@ -222,10 +233,10 @@ pub fn decode_and_downscale(
 
     if gray_by_channels {
         // Already single-channel (1ch / GA PNG, L8 JPEG) — no scan needed.
-        downscale_gray(full, w, h, tw, target_h, resizer)
+        downscale_gray(&full, w, h, tw, target_h, resizer)
     } else if rgba_is_grayscale(&full, GRAYSCALE_THRESHOLD) {
         // Color-stored but visually gray → collapse to luma, gray strategy.
-        downscale_gray(rgba_to_luma(&full), w, h, tw, target_h, resizer)
+        downscale_gray(&rgba_to_luma(&full), w, h, tw, target_h, resizer)
     } else {
         downscale_color(&full, w, h, tw, target_h, resizer)
     }
