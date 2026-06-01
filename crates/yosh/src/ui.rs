@@ -1,4 +1,5 @@
-//! egui chrome (M1.1: open buttons + status line; grows in M1.7).
+//! egui chrome: open buttons, reading-mode toggles, page indicator.
+//! The toggle buttons set request flags the app consumes after the egui frame.
 
 use std::path::PathBuf;
 
@@ -9,8 +10,19 @@ pub struct UiState {
     /// Currently-open volume path, for display.
     pub opened: Option<PathBuf>,
     pub status: String,
+
+    // Current mode labels, set by the app each frame for the toggle buttons.
+    pub dir_label: &'static str,
+    pub fit_label: &'static str,
+    pub layout_label: &'static str,
+
+    // Requests raised by button clicks, consumed by the app after the frame.
+    pub req_toggle_dir: bool,
+    pub req_cycle_fit: bool,
+    pub req_toggle_layout: bool,
 }
 
+#[allow(deprecated)]
 pub fn chrome(ctx: &egui::Context, st: &mut UiState) {
     egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
         ui.horizontal(|ui| {
@@ -28,6 +40,16 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState) {
                 {
                     st.pending_open = Some(p);
                 }
+            }
+            ui.separator();
+            if ui.button(format!("Dir: {}", st.dir_label)).clicked() {
+                st.req_toggle_dir = true;
+            }
+            if ui.button(format!("Fit: {}", st.fit_label)).clicked() {
+                st.req_cycle_fit = true;
+            }
+            if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
+                st.req_toggle_layout = true;
             }
             ui.separator();
             if !st.status.is_empty() {
