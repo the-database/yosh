@@ -2,7 +2,11 @@
 //! index, for the decode pool. Implementations: folder (M1.2), zip + rar (M1.6).
 
 mod folder;
+mod rar;
+mod ziparc;
 pub use folder::FolderSource;
+pub use rar::RarSource;
+pub use ziparc::ZipSource;
 
 use std::io;
 use std::path::Path;
@@ -25,4 +29,9 @@ pub fn is_image_ext(p: &Path) -> bool {
             .as_deref(),
         Some("png" | "jpg" | "jpeg" | "jpe" | "webp" | "gif" | "bmp" | "avif" | "jxl")
     )
+}
+
+/// Is this archive entry name an image? (Handles `/`-separated archive paths.)
+pub fn is_image_name(name: &str) -> bool {
+    is_image_ext(Path::new(name))
 }

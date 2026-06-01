@@ -20,7 +20,7 @@ use crate::layout::{self, Layout};
 use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
-use crate::source::{FolderSource, PageSource};
+use crate::source::{FolderSource, PageSource, RarSource, ZipSource};
 use crate::ui::{self, UiState};
 
 const TARGET_H: u32 = 2160;
@@ -455,32 +455,50 @@ impl State {
     }
 
     fn open(&mut self, path: &Path) {
-        if path.is_dir() {
-            match FolderSource::new(path) {
-                Ok(src) if src.len() > 0 => {
-                    let source: Arc<dyn PageSource> = Arc::new(src);
-                    self.pool = Some(DecodePool::new(
-                        source.clone(),
-                        self.gpu.device.clone(),
-                        self.gpu.queue.clone(),
-                        TARGET_H,
-                        WORKERS,
-                    ));
-                    self.cache.clear();
-                    self.failed.clear();
-                    self.last_drawn = None;
-                    self.index = self.start_index.min(source.len() - 1);
-                    self.start_index = 0;
-                    self.ui.opened = Some(path.to_path_buf());
-                    self.source = Some(source);
-                    self.prefetch();
-                }
-                Ok(_) => self.ui.status = "no images in folder".into(),
-                Err(e) => self.ui.status = format!("open failed: {e}"),
-            }
+        let built: Result<Arc<dyn PageSource>, String> = if path.is_dir() {
+            FolderSource::new(path)
+                .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                .map_err(|e| e.to_string())
         } else {
-            self.ui.status = "archives supported in M1.6 — open a folder for now".into();
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase());
+            match ext.as_deref() {
+                Some("cbz") | Some("zip") => ZipSource::new(path)
+                    .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                    .map_err(|e| e.to_string()),
+                Some("cbr") | Some("rar") => RarSource::new(path)
+                    .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                    .map_err(|e| e.to_string()),
+                Some("7z") | Some("cb7") => Err("7z support is planned for M2".to_string()),
+                _ => Err("unsupported file type (open a folder, CBZ, or CBR)".to_string()),
+            }
+        };
+        match built {
+            Ok(source) if source.len() > 0 => self.set_source(source, path),
+            Ok(_) => self.ui.status = "no images found".into(),
+            Err(e) => self.ui.status = format!("open failed: {e}"),
         }
+    }
+
+    fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path) {
+        self.pool = Some(DecodePool::new(
+            source.clone(),
+            self.gpu.device.clone(),
+            self.gpu.queue.clone(),
+            TARGET_H,
+            WORKERS,
+        ));
+        self.cache.clear();
+        self.failed.clear();
+        self.last_drawn = None;
+        self.nav_times.clear();
+        self.index = self.start_index.min(source.len() - 1);
+        self.start_index = 0;
+        self.ui.opened = Some(path.to_path_buf());
+        self.source = Some(source);
+        self.prefetch();
     }
 
     /// Recompute the desired prefetch window and hand it to the pool.

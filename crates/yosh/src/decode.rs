@@ -1,11 +1,13 @@
 //! Decode + downscale a page's encoded bytes to a display-resolution buffer.
 //!
-//! M1.2: PNG only (the folder asset). Normalizes to single-channel R8 (gray) or
-//! RGBA8 (color). M1.6 adds JPEG (`jpeg-decoder`) + an `image`-crate fallback via
-//! `infer` routing. The decode pool (M1.3) reuses a per-thread `Resizer`/scratch.
+//! Routes by magic bytes: PNG → `png`, JPEG → `jpeg-decoder`, else → `image`
+//! crate fallback (WebP/GIF/BMP/…). Normalizes to single-channel R8 (gray) or
+//! RGBA8 (color), then downscales (single-channel-aware) with a reused `Resizer`.
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+
+const PNG_SIG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
 
 /// A decoded, downscaled page ready for GPU upload.
 pub struct DecodedImage {
@@ -32,12 +34,8 @@ fn ga_to_gray(ga: &[u8]) -> Vec<u8> {
     ga.iter().step_by(2).copied().collect()
 }
 
-/// Decode PNG bytes and downscale to `target_h` (preserving aspect).
-pub fn decode_and_downscale(
-    bytes: &[u8],
-    target_h: u32,
-    resizer: &mut Resizer,
-) -> Result<DecodedImage, String> {
+/// Returns (w, h, gray, normalized pixels [1ch gray or 4ch rgba]).
+fn decode_png(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
         .read_info()
         .map_err(|e| format!("png read_info: {e}"))?;
@@ -47,15 +45,48 @@ pub fn decode_and_downscale(
         .next_frame(&mut buf)
         .map_err(|e| format!("png next_frame: {e}"))?;
     let (w, h) = (info.width, info.height);
-    let px = (w as usize) * (h as usize);
-    let ch = info.buffer_size() / px;
+    let ch = info.buffer_size() / ((w as usize) * (h as usize));
+    match ch {
+        1 => Ok((w, h, true, buf)),
+        2 => Ok((w, h, true, ga_to_gray(&buf))),
+        3 => Ok((w, h, false, rgb_to_rgba(&buf, w, h))),
+        4 => Ok((w, h, false, buf)),
+        other => Err(format!("png: unsupported channel count {other}")),
+    }
+}
 
-    let (gray, full): (bool, Vec<u8>) = match ch {
-        1 => (true, buf),
-        2 => (true, ga_to_gray(&buf)),
-        3 => (false, rgb_to_rgba(&buf, w, h)),
-        4 => (false, buf),
-        other => return Err(format!("unsupported channel count {other}")),
+fn decode_jpeg(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
+    use jpeg_decoder::PixelFormat;
+    let mut d = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    let pixels = d.decode().map_err(|e| format!("jpeg decode: {e}"))?;
+    let info = d.info().ok_or("jpeg: no info")?;
+    let (w, h) = (info.width as u32, info.height as u32);
+    match info.pixel_format {
+        PixelFormat::L8 => Ok((w, h, true, pixels)),
+        PixelFormat::RGB24 => Ok((w, h, false, rgb_to_rgba(&pixels, w, h))),
+        other => Err(format!("jpeg: unsupported pixel format {other:?}")),
+    }
+}
+
+fn decode_other(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
+    let img = image::load_from_memory(bytes).map_err(|e| format!("image: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Ok((w, h, false, rgba.into_raw()))
+}
+
+/// Decode page bytes (any supported format) and downscale to `target_h`.
+pub fn decode_and_downscale(
+    bytes: &[u8],
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let (w, h, gray, full) = if bytes.starts_with(&PNG_SIG) {
+        decode_png(bytes)?
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        decode_jpeg(bytes)?
+    } else {
+        decode_other(bytes)?
     };
 
     let pt = if gray { PixelType::U8 } else { PixelType::U8x4 };
