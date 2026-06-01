@@ -5,6 +5,7 @@ mod app;
 mod cache;
 mod config;
 mod decode;
+mod downscale;
 mod gpu;
 mod layout;
 mod library;
