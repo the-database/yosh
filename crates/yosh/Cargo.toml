@@ -23,3 +23,9 @@ sevenz-rust2 = "0.21"
 directories = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[features]
+# AVIF decode via the image crate's native (dav1d) backend. OFF by default so
+# the standard `cargo build` needs no C toolchain. Enabling it requires nasm +
+# dav1d (or a vendored build): `cargo build --release -p yosh --features avif`.
+avif = ["image/avif-native"]
