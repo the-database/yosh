@@ -21,7 +21,7 @@ use crate::layout::{self, Layout};
 use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
-use crate::source::{FolderSource, PageSource, RarSource, ZipSource};
+use crate::source::{FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use crate::ui::{self, UiState};
 
 const TARGET_H: u32 = 2160;
@@ -657,8 +657,10 @@ impl State {
                 Some("cbr") | Some("rar") => RarSource::new(path)
                     .map(|s| Arc::new(s) as Arc<dyn PageSource>)
                     .map_err(|e| e.to_string()),
-                Some("7z") | Some("cb7") => Err("7z support is planned for M2".to_string()),
-                _ => Err("unsupported file type (open a folder, CBZ, or CBR)".to_string()),
+                Some("7z") | Some("cb7") => SevenzSource::new(path)
+                    .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+                    .map_err(|e| e.to_string()),
+                _ => Err("unsupported file type (open a folder, CBZ, CBR, or 7z)".to_string()),
             }
         };
         match built {
