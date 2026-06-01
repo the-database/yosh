@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/decode_bench", "crates/present_bench", "crates/yosh"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

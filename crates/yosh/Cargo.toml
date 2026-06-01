@@ -1,0 +1,17 @@
+[package]
+name = "yosh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.30.13"
+wgpu = "29.0.3"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+egui = "0.34.3"
+egui-wgpu = "0.34.3"
+egui-winit = "0.34.3"
+rfd = "0.17"
+png = "0.18"
+fast_image_resize = "6"
+natord = "1"
