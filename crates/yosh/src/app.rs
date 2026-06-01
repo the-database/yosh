@@ -444,7 +444,12 @@ enum Action {
     TogglePresent,
     ZoomIn,
     ZoomOut,
-    ZoomReset,
+    // View presets (number keys): each sets a complete page-flip view at once.
+    PresetWindow,
+    PresetWidth,
+    PresetActual,
+    PresetSpreadLtr,
+    PresetSpreadRtl,
     ToggleHelp,
     ToggleFullscreen,
     ToggleSpreadOffset,
@@ -463,7 +468,6 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::ArrowLeft => return Some(Action::Left),
             KeyCode::Home => return Some(Action::First),
             KeyCode::End => return Some(Action::Last),
-            KeyCode::KeyF => return Some(Action::CycleFit),
             KeyCode::KeyD => return Some(Action::ToggleDir),
             KeyCode::KeyS => return Some(Action::ToggleLayout),
             KeyCode::KeyO => return Some(Action::ToggleSpreadOffset),
@@ -471,7 +475,11 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyT => return Some(Action::TogglePresent),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
-            KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::ZoomReset),
+            KeyCode::Digit9 | KeyCode::Numpad9 => return Some(Action::PresetWindow),
+            KeyCode::Digit8 | KeyCode::Numpad8 => return Some(Action::PresetWidth),
+            KeyCode::Digit7 | KeyCode::Numpad7 => return Some(Action::PresetSpreadLtr),
+            KeyCode::Digit6 | KeyCode::Numpad6 => return Some(Action::PresetSpreadRtl),
+            KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::PresetActual),
             KeyCode::F1 => return Some(Action::ToggleHelp),
             KeyCode::Tab => return Some(Action::ToggleInfo),
             KeyCode::F11 => return Some(Action::ToggleFullscreen),
@@ -555,10 +563,14 @@ impl State {
                 self.zoom = (self.zoom / 1.25).max(1.0);
                 self.clamp_pan();
             }
-            Action::ZoomReset => {
-                self.zoom = 1.0;
-                self.pan_x = 0.0;
-                self.pan_y = 0.0;
+            Action::PresetWindow => self.apply_view(FitMode::Window, false, None),
+            Action::PresetWidth => self.apply_view(FitMode::Width, false, None),
+            Action::PresetActual => self.apply_view(FitMode::Actual, false, None),
+            Action::PresetSpreadLtr => {
+                self.apply_view(FitMode::Window, true, Some(Direction::Ltr))
+            }
+            Action::PresetSpreadRtl => {
+                self.apply_view(FitMode::Window, true, Some(Direction::Rtl))
             }
             Action::ToggleDir => {
                 self.direction = match self.direction {
@@ -1112,6 +1124,28 @@ impl State {
     /// Desired decode height: the page's on-screen height (window height × zoom),
     /// quantized to avoid churn and clamped. Per-page it's further capped to the
     /// source height in `decode_and_downscale` (never upscale a page).
+    /// Apply a view preset (number keys): set fit + layout (+ optional reading
+    /// direction) at once, leave scroll, reset zoom/pan, re-anchor the spread
+    /// pairing, persist, and refresh the prefetch window.
+    fn apply_view(&mut self, fit: FitMode, spread: bool, dir: Option<Direction>) {
+        self.scroll_mode = false;
+        self.fit = fit;
+        self.layout = if spread { Layout::Spread } else { Layout::Single };
+        if let Some(d) = dir {
+            self.direction = d;
+        }
+        self.index = layout::view_start(self.layout, self.index, self.spread_offset);
+        self.zoom = 1.0;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+        self.settings.fit = fit_to_u8(self.fit);
+        self.settings.layout_spread = self.layout == Layout::Spread;
+        self.settings.direction_rtl = self.direction == Direction::Rtl;
+        self.settings.scroll = false;
+        config::save(&self.settings);
+        self.prefetch();
+    }
+
     /// Gather display info for page `index` (Tab overlay): reads the page bytes
     /// once and probes the header for resolution + format. Only called on a page
     /// change while the overlay is open, so the extra read is cheap.
