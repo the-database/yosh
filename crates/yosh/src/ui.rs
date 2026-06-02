@@ -40,6 +40,10 @@ pub struct UiState {
     /// Whether to show the centered loading spinner (the current page's decode
     /// has been pending long enough to warrant feedback). Set by the app.
     pub loading: bool,
+    /// Edge navigation arrows: set true while the cursor hovers the left/right
+    /// page-flip strip (page-flip reader mode only). Set by the app.
+    pub hover_left: bool,
+    pub hover_right: bool,
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -50,6 +54,27 @@ fn elide(s: &str, max: usize) -> String {
         t.push('…');
         t
     }
+}
+
+/// Draw a translucent navigation chevron in a non-interactable, foreground Area
+/// anchored to a window edge. Painted with line segments over a soft backdrop so
+/// it stays visible on any page and doesn't depend on font glyph coverage.
+fn nav_arrow(ctx: &egui::Context, id: &str, align: egui::Align2, offset: egui::Vec2, left: bool) {
+    egui::Area::new(egui::Id::new(id))
+        .anchor(align, offset)
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(54.0, 84.0), egui::Sense::hover());
+            let p = ui.painter();
+            let c = rect.center();
+            p.circle_filled(c, 27.0, egui::Color32::from_black_alpha(96));
+            let stroke = egui::Stroke::new(5.0, egui::Color32::from_white_alpha(205));
+            let (dx, dy) = (10.0, 18.0);
+            let (tip, back) = if left { (-dx, dx) } else { (dx, -dx) };
+            p.line_segment([c + egui::vec2(back, -dy), c + egui::vec2(tip, 0.0)], stroke);
+            p.line_segment([c + egui::vec2(tip, 0.0), c + egui::vec2(back, dy)], stroke);
+        });
 }
 
 #[allow(deprecated)]
@@ -133,7 +158,8 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("← →   flip (reading-direction aware)");
                 ui.label("↑ ↓ / Space / PgUp PgDn   flip");
                 ui.label("Home / End   first / last page");
-                ui.label("click left·right half — flip;   wheel — flip or pan");
+                ui.label("click left/right edge — flip;   wheel — flip or pan");
+                ui.label("double-click the middle — fullscreen");
                 ui.separator();
                 ui.heading("View presets");
                 ui.label("9  fit window      8  fit width      0  100% (1:1)");
@@ -147,9 +173,9 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.separator();
                 ui.heading("View");
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
-                ui.label("Tab   show image info overlay");
+                ui.label("I   show image info overlay");
                 ui.label("T   present  vsync ↔ turbo");
-                ui.label("F11   fullscreen");
+                ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();
                 ui.heading("Files");
                 ui.label("Open folder / Open file / Library;  Grid ↔ Reader");
@@ -212,6 +238,14 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                         });
                     });
             });
+    }
+
+    // Page-flip affordance: a chevron at whichever edge the cursor hovers.
+    if st.hover_left {
+        nav_arrow(ctx, "nav_arrow_left", egui::Align2::LEFT_CENTER, egui::vec2(20.0, 0.0), true);
+    }
+    if st.hover_right {
+        nav_arrow(ctx, "nav_arrow_right", egui::Align2::RIGHT_CENTER, egui::vec2(-20.0, 0.0), false);
     }
 
     if library_view {

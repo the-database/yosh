@@ -55,6 +55,11 @@ const THUMB_BUDGET: usize = 2;
 /// loads don't flash an indicator on every flip — only genuinely slow decodes
 /// (e.g. seeking fast through very high-res pages) cross it.
 const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(150);
+/// Fraction of the window width on each side that flips pages on click (and
+/// shows a hover arrow). The middle is reserved for double-click → fullscreen.
+const EDGE_FRAC: f32 = 0.15;
+/// Max gap between two middle-zone clicks to count as a double-click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -105,6 +110,8 @@ struct State {
     cursor_y: f64,
     mouse_down: bool,
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
+    cursor_in_window: bool, // gates the edge-hover navigation arrows
+    last_mid_click: Option<Instant>, // middle-zone double-click → fullscreen
     nav_times: VecDeque<Instant>,
 
     // Continuous-scroll mode (M2.1).
@@ -261,7 +268,12 @@ fn install_cjk_font(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
         "cjk".to_owned(),
-        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+        // The CJK fallback's glyphs render above the Latin baseline; nudge them
+        // down so mixed JP/EN lines (top bar, info overlay, titles) line up.
+        std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
+            y_offset_factor: 0.18,
+            ..Default::default()
+        })),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
         fonts.families.entry(family).or_default().push("cjk".to_owned());
@@ -373,6 +385,8 @@ impl ApplicationHandler for App {
             cursor_y: 0.0,
             mouse_down: false,
             drag_dist: 0.0,
+            cursor_in_window: false,
+            last_mid_click: None,
             direction: if settings.direction_rtl {
                 Direction::Rtl
             } else {
@@ -413,12 +427,13 @@ impl ApplicationHandler for App {
             WindowEvent::DroppedFile(path) => state.ui.pending_open = Some(path),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                // Tab (info overlay) fires even if egui would consume it for focus
-                // traversal; everything else respects egui consumption.
-                if let Some(action) = action_from(&event)
-                    && (matches!(action, Action::ToggleInfo) || !response.consumed)
-                {
-                    state.apply_action(action);
+                if let Some(action) = action_from(&event) && !response.consumed {
+                    if matches!(action, Action::Quit) {
+                        state.persist();
+                        event_loop.exit();
+                    } else {
+                        state.apply_action(action);
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -430,6 +445,14 @@ impl ApplicationHandler for App {
                 button: MouseButton::Left,
                 ..
             } if !response.consumed => state.on_left_button(btn == ElementState::Pressed),
+            WindowEvent::CursorEntered { .. } => state.cursor_in_window = true,
+            WindowEvent::CursorLeft { .. } => state.cursor_in_window = false,
+            // CursorLeft isn't guaranteed on focus loss / occlusion (alt-tab, a
+            // fast monitor switch), which would otherwise strand a hover arrow
+            // on screen. A later CursorMoved / CursorEntered re-arms the flag.
+            WindowEvent::Focused(false) | WindowEvent::Occluded(true) => {
+                state.cursor_in_window = false
+            }
             _ => {}
         }
 
@@ -469,6 +492,7 @@ enum Action {
     ToggleFullscreen,
     ToggleSpreadOffset,
     ToggleInfo,
+    Quit,
 }
 
 /// Map a key event to an action, preferring the physical key but falling back to
@@ -496,8 +520,9 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::Digit6 | KeyCode::Numpad6 => return Some(Action::PresetSpreadRtl),
             KeyCode::Digit0 | KeyCode::Numpad0 => return Some(Action::PresetActual),
             KeyCode::F1 => return Some(Action::ToggleHelp),
-            KeyCode::Tab => return Some(Action::ToggleInfo),
+            KeyCode::KeyI => return Some(Action::ToggleInfo),
             KeyCode::F11 => return Some(Action::ToggleFullscreen),
+            KeyCode::Escape => return Some(Action::Quit),
             _ => {}
         }
     }
@@ -510,6 +535,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             NamedKey::Home => return Some(Action::First),
             NamedKey::End => return Some(Action::Last),
             NamedKey::F1 => return Some(Action::ToggleHelp),
+            NamedKey::Escape => return Some(Action::Quit),
             _ => {}
         }
     }
@@ -640,6 +666,9 @@ impl State {
                 self.index = layout::view_start(self.layout, self.index, self.spread_offset);
                 self.prefetch();
             }
+            // Esc → quit is intercepted in `window_event` (needs the event loop),
+            // so it never reaches here.
+            Action::Quit => {}
         }
     }
 
@@ -718,12 +747,28 @@ impl State {
         }
     }
 
+    /// A clean click: the left/right edge strips flip pages; the wide middle
+    /// does nothing on a single click but toggles fullscreen on a double-click.
     fn on_click(&mut self) {
-        let half = self.gpu.config.width as f64 / 2.0;
-        if self.cursor_x < half {
+        let w = self.gpu.config.width.max(1) as f64;
+        let edge = (w * EDGE_FRAC as f64).max(1.0);
+        if self.cursor_x < edge {
+            self.last_mid_click = None;
             self.apply_action(Action::Left);
-        } else {
+        } else if self.cursor_x > w - edge {
+            self.last_mid_click = None;
             self.apply_action(Action::Right);
+        } else {
+            let now = Instant::now();
+            let is_double = self
+                .last_mid_click
+                .is_some_and(|t| now.duration_since(t) < DOUBLE_CLICK);
+            if is_double {
+                self.last_mid_click = None;
+                self.apply_action(Action::ToggleFullscreen);
+            } else {
+                self.last_mid_click = Some(now);
+            }
         }
     }
 
@@ -732,6 +777,7 @@ impl State {
         let dy = (y - self.cursor_y) as f32;
         self.cursor_x = x;
         self.cursor_y = y;
+        self.cursor_in_window = true;
         if !self.mouse_down {
             return;
         }
@@ -1294,6 +1340,16 @@ impl State {
         let fullscreen = self.window.fullscreen().is_some();
         let reveal = 48.0 * self.window.scale_factor() as f32;
         self.ui.show_bar = !fullscreen || (self.cursor_y as f32) < reveal;
+        // Edge hover arrows: only in page-flip reader mode, below the top bar,
+        // while the cursor is inside the window.
+        let win_w = self.gpu.config.width.max(1) as f32;
+        let edge = win_w * EDGE_FRAC;
+        let in_reader = self.source.is_some() && !self.library_view && !self.scroll_mode;
+        let below_bar = (self.cursor_y as f32) >= reveal;
+        let cx = self.cursor_x as f32;
+        self.ui.hover_left = in_reader && self.cursor_in_window && below_bar && cx < edge;
+        self.ui.hover_right =
+            in_reader && self.cursor_in_window && below_bar && cx > win_w - edge;
         if let Some(src) = &self.source {
             let len = src.len();
             let anchor = if self.scroll_mode {
