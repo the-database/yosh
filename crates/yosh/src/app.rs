@@ -919,29 +919,30 @@ impl State {
 
         match (ta, tb) {
             (Some(ta), Some((bi, tb))) => {
-                let combined_w = ta.w as f32 + tb.w as f32;
-                let max_h = ta.h.max(tb.h) as f32;
-                let s = fit_scale(self.fit, sw, sh, combined_w, max_h) * self.zoom;
+                // Facing pages share a display height. Size each to a common
+                // reference height (its width following its own aspect ratio)
+                // before fitting the pair to the window. Aspect ratios are
+                // stable across decode resolutions, so if the two pages are
+                // momentarily decoded at different heights — e.g. mid re-decode
+                // after a fullscreen toggle / resize, where one updates a frame
+                // before the other — neither page jumps size. (Identical to
+                // per-pixel sizing when both heights already match.)
+                let h_ref = ta.h.max(tb.h) as f32;
+                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
+                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
+                let combined_w = wa + wb;
+                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref) * self.zoom;
                 let x0 = self.horizontal_left(combined_w * s, sw);
+                let dh = h_ref * s;
                 // Screen order: LTR puts the lower index on the left; RTL reverses.
-                let (l_idx, l_t, r_idx, r_t) = match self.direction {
-                    Direction::Ltr => (a, ta, bi, tb),
-                    Direction::Rtl => (bi, tb, a, ta),
+                let (l_idx, wl, r_idx, wr) = match self.direction {
+                    Direction::Ltr => (a, wa, bi, wb),
+                    Direction::Rtl => (bi, wb, a, wa),
                 };
-                let (dwl, dhl) = (l_t.w as f32 * s, l_t.h as f32 * s);
-                let (dwr, dhr) = (r_t.w as f32 * s, r_t.h as f32 * s);
+                let (dwl, dwr) = (wl * s, wr * s);
                 vec![
-                    Self::quad_from_px(0, l_idx, x0, self.vertical_top(dhl, sh), dwl, dhl, sw, sh),
-                    Self::quad_from_px(
-                        1,
-                        r_idx,
-                        x0 + dwl,
-                        self.vertical_top(dhr, sh),
-                        dwr,
-                        dhr,
-                        sw,
-                        sh,
-                    ),
+                    Self::quad_from_px(0, l_idx, x0, self.vertical_top(dh, sh), dwl, dh, sw, sh),
+                    Self::quad_from_px(1, r_idx, x0 + dwl, self.vertical_top(dh, sh), dwr, dh, sw, sh),
                 ]
             }
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
