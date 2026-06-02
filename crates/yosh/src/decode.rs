@@ -14,7 +14,9 @@
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use image::ImageDecoder;
 
+use crate::icc;
 use crate::tone;
 
 const PNG_SIG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
@@ -48,8 +50,11 @@ fn ga_to_gray(ga: &[u8]) -> Vec<u8> {
     ga.iter().step_by(2).copied().collect()
 }
 
-/// Returns (w, h, gray, normalized pixels [1ch gray or 4ch rgba]).
-fn decode_png(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
+/// Returns (w, h, gray, normalized pixels [1ch gray or 4ch rgba], icc profile).
+/// The ICC profile (if any) is read from the same decode — no second parse.
+type Decoded = (u32, u32, bool, Vec<u8>, Option<Vec<u8>>);
+
+fn decode_png(bytes: &[u8]) -> Result<Decoded, String> {
     let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
         .read_info()
         .map_err(|e| format!("png read_info: {e}"))?;
@@ -60,33 +65,40 @@ fn decode_png(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
         .map_err(|e| format!("png next_frame: {e}"))?;
     let (w, h) = (info.width, info.height);
     let ch = info.buffer_size() / ((w as usize) * (h as usize));
+    let icc = reader.info().icc_profile.as_deref().map(<[u8]>::to_vec);
     match ch {
-        1 => Ok((w, h, true, buf)),
-        2 => Ok((w, h, true, ga_to_gray(&buf))),
-        3 => Ok((w, h, false, rgb_to_rgba(&buf, w, h))),
-        4 => Ok((w, h, false, buf)),
+        1 => Ok((w, h, true, buf, icc)),
+        2 => Ok((w, h, true, ga_to_gray(&buf), icc)),
+        3 => Ok((w, h, false, rgb_to_rgba(&buf, w, h), icc)),
+        4 => Ok((w, h, false, buf, icc)),
         other => Err(format!("png: unsupported channel count {other}")),
     }
 }
 
-fn decode_jpeg(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
+fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     use jpeg_decoder::PixelFormat;
     let mut d = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
     let pixels = d.decode().map_err(|e| format!("jpeg decode: {e}"))?;
     let info = d.info().ok_or("jpeg: no info")?;
     let (w, h) = (info.width as u32, info.height as u32);
+    let icc = d.icc_profile();
     match info.pixel_format {
-        PixelFormat::L8 => Ok((w, h, true, pixels)),
-        PixelFormat::RGB24 => Ok((w, h, false, rgb_to_rgba(&pixels, w, h))),
+        PixelFormat::L8 => Ok((w, h, true, pixels, icc)),
+        PixelFormat::RGB24 => Ok((w, h, false, rgb_to_rgba(&pixels, w, h), icc)),
         other => Err(format!("jpeg: unsupported pixel format {other:?}")),
     }
 }
 
-fn decode_other(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
-    let img = image::load_from_memory(bytes).map_err(|e| format!("image: {e}"))?;
+fn decode_other(bytes: &[u8]) -> Result<Decoded, String> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("image: {e}"))?;
+    let mut decoder = reader.into_decoder().map_err(|e| format!("image: {e}"))?;
+    let icc = decoder.icc_profile().ok().flatten();
+    let img = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("image: {e}"))?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    Ok((w, h, false, rgba.into_raw()))
+    Ok((w, h, false, rgba.into_raw(), icc))
 }
 
 /// Expand a grayscale (R8) image to RGBA8 (r=g=b, a=255). Used for egui
@@ -109,7 +121,7 @@ pub fn to_rgba_image(img: DecodedImage) -> DecodedImage {
 }
 
 /// Decode to full resolution (no resize), normalized to gray (1ch) or RGBA8.
-fn decode_raw(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
+fn decode_raw(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.starts_with(&PNG_SIG) {
         decode_png(bytes)
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -119,9 +131,9 @@ fn decode_raw(bytes: &[u8]) -> Result<(u32, u32, bool, Vec<u8>), String> {
     }
 }
 
-/// Decode at full resolution (for the GPU-downscale path).
+/// Decode at full resolution (for the dormant GPU-downscale path; not color-managed).
 pub fn decode_full(bytes: &[u8]) -> Result<DecodedImage, String> {
-    let (w, h, gray, pixels) = decode_raw(bytes)?;
+    let (w, h, gray, pixels, _icc) = decode_raw(bytes)?;
     Ok(DecodedImage { w, h, gray, pixels })
 }
 
@@ -228,7 +240,19 @@ pub fn decode_and_downscale(
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
-    let (w, h, gray_by_channels, full) = decode_raw(bytes)?;
+    let (w, h, gray_by_channels, mut full, profile) = decode_raw(bytes)?;
+    // Color-manage to sRGB before any resampling: a color page tagged with a
+    // wider profile (e.g. Display P3) would otherwise render desaturated. The
+    // profile comes from the same decode (no second parse); only color images
+    // carrying a non-sRGB profile pay the transform — grayscale/untagged pages
+    // are untouched, so seek throughput is unaffected.
+    if !gray_by_channels {
+        if let Some(p) = &profile {
+            if !icc::is_srgb(p) {
+                icc::to_srgb_rgba(p, &mut full);
+            }
+        }
+    }
     // Never upscale a page beyond its own resolution (target tracks display size,
     // which can exceed a low-res source).
     let target_h = target_h.min(h).max(1);
