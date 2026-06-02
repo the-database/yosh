@@ -80,6 +80,23 @@ impl Library {
     }
 }
 
+/// Sibling volumes of `of` (same parent directory) that are the same *kind* —
+/// folders if `of` is a folder, archives if `of` is an archive — in natural-sort
+/// order. Used for prev/next-volume navigation (`[` / `]`); folders and archives
+/// never mix. Includes `of` itself when it is a valid volume. Returns paths.
+pub fn sibling_volumes(of: &Path) -> Vec<PathBuf> {
+    let Some(parent) = of.parent() else {
+        return Vec::new();
+    };
+    let want_folder = of.is_dir();
+    Library::scan(parent)
+        .volumes
+        .into_iter()
+        .filter(|v| (v.kind == VolKind::Folder) == want_folder)
+        .map(|v| v.path)
+        .collect()
+}
+
 fn dir_has_image(dir: &Path) -> bool {
     std::fs::read_dir(dir).map_or(false, |rd| {
         rd.flatten().any(|e| {

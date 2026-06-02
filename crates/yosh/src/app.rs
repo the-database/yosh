@@ -492,6 +492,8 @@ enum Action {
     ToggleFullscreen,
     ToggleSpreadOffset,
     ToggleInfo,
+    PrevVolume,
+    NextVolume,
     Quit,
 }
 
@@ -523,6 +525,8 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyI => return Some(Action::ToggleInfo),
             KeyCode::F11 => return Some(Action::ToggleFullscreen),
             KeyCode::Escape => return Some(Action::Quit),
+            KeyCode::BracketLeft => return Some(Action::PrevVolume),
+            KeyCode::BracketRight => return Some(Action::NextVolume),
             _ => {}
         }
     }
@@ -666,6 +670,8 @@ impl State {
                 self.index = layout::view_start(self.layout, self.index, self.spread_offset);
                 self.prefetch();
             }
+            Action::PrevVolume => self.jump_volume(-1),
+            Action::NextVolume => self.jump_volume(1),
             // Esc → quit is intercepted in `window_event` (needs the event loop),
             // so it never reaches here.
             Action::Quit => {}
@@ -698,6 +704,29 @@ impl State {
             self.settings.last_pages.insert(k.clone(), index);
         }
         self.prefetch();
+    }
+
+    /// Open the previous (`delta < 0`) or next (`delta > 0`) sibling volume of
+    /// the same kind — folder ↔ folder, archive ↔ archive — in natural-sort
+    /// order within the current volume's parent directory (`[` / `]`). The
+    /// reading mode/position of the current volume is persisted by `open`; the
+    /// new one resumes its own saved page. No-op at the ends or with nothing open.
+    fn jump_volume(&mut self, delta: i64) {
+        let Some(key) = self.volume_key.clone() else {
+            return;
+        };
+        let cur = PathBuf::from(&key);
+        let sibs = crate::library::sibling_volumes(&cur);
+        let cur_name = cur.file_name();
+        let Some(idx) = sibs.iter().position(|p| p.file_name() == cur_name) else {
+            return;
+        };
+        let Ok(target) = usize::try_from(idx as i64 + delta) else {
+            return; // before the first
+        };
+        if let Some(path) = sibs.get(target).cloned() {
+            self.open(&path);
+        }
     }
 
     /// Persist the current position + settings (called on close).

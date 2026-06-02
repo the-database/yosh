@@ -158,6 +158,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("← →   flip (reading-direction aware)");
                 ui.label("↑ ↓ / Space / PgUp PgDn   flip");
                 ui.label("Home / End   first / last page");
+                ui.label("[  ]   previous / next book (folder or archive)");
                 ui.label("click left/right edge — flip;   wheel — flip or pan");
                 ui.label("double-click the middle — fullscreen");
                 ui.separator();
