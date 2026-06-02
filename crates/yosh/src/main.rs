@@ -12,6 +12,7 @@ mod config;
 mod decode;
 mod downscale;
 mod gpu;
+mod icc;
 mod layout;
 mod library;
 mod page;

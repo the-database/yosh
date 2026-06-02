@@ -1,6 +1,6 @@
 [package]
 name = "yosh"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,7 @@ png = "0.18"
 jpeg-decoder = "0.3"
 image = "0.25"
 fast_image_resize = "6"
+qcms = "0.3"
 natord = "1"
 zip = "8"
 unrar = "0.5"

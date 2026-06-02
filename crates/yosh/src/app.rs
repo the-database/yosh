@@ -1249,7 +1249,7 @@ impl State {
         };
         let name = src.name(index).to_string();
         let bytes = src.read_page(index).ok();
-        let (res, fmt, size) = match &bytes {
+        let (res, fmt, size, color) = match &bytes {
             Some(b) => {
                 let (w, h, detail) = probe(b);
                 let res = if w == 0 || h == 0 {
@@ -1257,17 +1257,28 @@ impl State {
                 } else {
                     format!("{w} × {h}")
                 };
-                (res, detail, human_size(b.len() as u64))
+                let color = crate::icc::extract_icc(b)
+                    .as_deref()
+                    .and_then(|p| crate::icc::describe(p))
+                    .unwrap_or_else(|| "—".to_string());
+                (res, detail, human_size(b.len() as u64), color)
             }
-            None => ("—".to_string(), "—".to_string(), "—".to_string()),
+            None => (
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+            ),
         };
         let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
         vec![
             ("File".to_string(), name),
+            ("Page".to_string(), format!("{} / {}", index + 1, src.len())),
             ("Size".to_string(), size),
             ("Modified".to_string(), modified),
             ("Resolution".to_string(), res),
             ("Format".to_string(), fmt),
+            ("Color".to_string(), color),
         ]
     }
 
