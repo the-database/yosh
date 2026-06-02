@@ -37,6 +37,9 @@ pub struct UiState {
     /// by the app for the current page).
     pub info_open: bool,
     pub info: Vec<(String, String)>,
+    /// Whether to show the centered loading spinner (the current page's decode
+    /// has been pending long enough to warrant feedback). Set by the app.
+    pub loading: bool,
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -181,6 +184,32 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                                     ui.end_row();
                                 }
                             });
+                    });
+            });
+    }
+
+    // Centered loading indicator: shown while the current page is still decoding
+    // (e.g. seeking quickly through very high-resolution pages). The previous
+    // page stays on screen beneath it; this just signals the next one is coming.
+    if st.loading && !library_view {
+        egui::Area::new(egui::Id::new("loading_overlay"))
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(180))
+                    .inner_margin(egui::Margin::same(16))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(22.0));
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("Loading…")
+                                    .color(egui::Color32::WHITE)
+                                    .size(15.0),
+                            );
+                        });
                     });
             });
     }

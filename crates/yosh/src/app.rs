@@ -51,6 +51,10 @@ const DEFAULT_ASPECT: f32 = 1.5;
 /// Library cover thumbnail height, and how many to decode per frame.
 const THUMB_H: u32 = 360;
 const THUMB_BUDGET: usize = 2;
+/// Grace period before the centered loading spinner appears, so quick page
+/// loads don't flash an indicator on every flip — only genuinely slow decodes
+/// (e.g. seeking fast through very high-res pages) cross it.
+const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -120,6 +124,11 @@ struct State {
     pending_target: u32,
     /// Page index the Tab info overlay text was built for (None = rebuild needed).
     info_for: Option<usize>,
+    /// The anchor page currently waiting to decode and when that wait began,
+    /// used to delay the loading spinner *per page* (so a fast page reached at
+    /// the end of a slow-seek streak still gets its own grace period). None as
+    /// soon as the anchor is ready.
+    loading_pending: Option<(usize, Instant)>,
 
     library: Library,
     library_view: bool,
@@ -382,6 +391,7 @@ impl ApplicationHandler for App {
             target_h: Arc::new(AtomicU32::new(TARGET_H_DEFAULT)),
             pending_target: 0,
             info_for: None,
+            loading_pending: None,
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -1301,6 +1311,24 @@ impl State {
                 len,
                 if loading { "  …" } else { "" }
             );
+            // Show the centered spinner only after this page's decode has been
+            // pending a beat, so fast flips don't flash it. The timer restarts
+            // whenever the anchor changes, so a quick page reached at the end of
+            // a slow-seek streak still gets its full grace period.
+            if loading {
+                let since = match self.loading_pending {
+                    Some((a, t)) if a == anchor => t,
+                    _ => {
+                        let t = Instant::now();
+                        self.loading_pending = Some((anchor, t));
+                        t
+                    }
+                };
+                self.ui.loading = since.elapsed() >= LOADING_INDICATOR_DELAY;
+            } else {
+                self.loading_pending = None;
+                self.ui.loading = false;
+            }
         }
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
