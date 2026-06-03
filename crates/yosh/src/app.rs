@@ -112,6 +112,7 @@ struct State {
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     cursor_in_window: bool, // gates the edge-hover navigation arrows
     last_mid_click: Option<Instant>, // middle-zone double-click → fullscreen
+    jump: bool, // seek mode (key J): true = "jump" (skip ahead), false = "step" (see every page, default)
     nav_times: VecDeque<Instant>,
 
     // Continuous-scroll mode (M2.1).
@@ -387,6 +388,7 @@ impl ApplicationHandler for App {
             drag_dist: 0.0,
             cursor_in_window: false,
             last_mid_click: None,
+            jump: settings.jump,
             direction: if settings.direction_rtl {
                 Direction::Rtl
             } else {
@@ -494,6 +496,7 @@ enum Action {
     ToggleInfo,
     PrevVolume,
     NextVolume,
+    ToggleJump,
     Quit,
 }
 
@@ -514,6 +517,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyO => return Some(Action::ToggleSpreadOffset),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyT => return Some(Action::TogglePresent),
+            KeyCode::KeyJ => return Some(Action::ToggleJump),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit9 | KeyCode::Numpad9 => return Some(Action::PresetWindow),
@@ -672,6 +676,11 @@ impl State {
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
+            Action::ToggleJump => {
+                self.jump = !self.jump;
+                self.settings.jump = self.jump;
+                config::save(&self.settings);
+            }
             // Esc → quit is intercepted in `window_event` (needs the event loop),
             // so it never reaches here.
             Action::Quit => {}
@@ -683,6 +692,15 @@ impl State {
         let len = src.len();
         if len == 0 {
             return;
+        }
+        // "Step" seek (default; toggle "jump" with J): don't flip while the
+        // current page is still decoding, so you see every page instead of
+        // skipping past it. "Jump" skips ahead for fast long-distance seeks.
+        if !self.jump {
+            let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
+            if !self.cache.contains(cur) {
+                return;
+            }
         }
         let next = if dir > 0 {
             layout::next_view(self.layout, self.index, len, self.spread_offset)
@@ -1403,10 +1421,11 @@ impl State {
                 self.last_drawn = Some(anchor);
             }
             self.ui.status = format!(
-                "{}/{}{}",
+                "{}/{}{}{}",
                 self.index + 1,
                 len,
-                if loading { "  …" } else { "" }
+                if loading { "  …" } else { "" },
+                if self.jump { "  [jump]" } else { "  [step]" }
             );
             // Show the centered spinner only after this page's decode has been
             // pending a beat, so fast flips don't flash it. The timer restarts

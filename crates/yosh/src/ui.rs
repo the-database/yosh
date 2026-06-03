@@ -170,6 +170,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("S   single ↔ two-page spread");
                 ui.label("D   reading direction  RTL ↔ LTR");
                 ui.label("C   continuous vertical scroll");
+                ui.label("J   jump (skip ahead) ↔ step (see every page, default)");
                 ui.label("O   shift spread pairing (fix wrong pairing)");
                 ui.separator();
                 ui.heading("View");
