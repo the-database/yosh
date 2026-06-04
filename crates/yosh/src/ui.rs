@@ -44,6 +44,12 @@ pub struct UiState {
     /// page-flip strip (page-flip reader mode only). Set by the app.
     pub hover_left: bool,
     pub hover_right: bool,
+    /// Auto-update: the available newer version (None if up to date), whether an
+    /// update is in progress / failed, and the click request. Set by the app.
+    pub update_version: Option<String>,
+    pub updating: bool,
+    pub update_failed: bool,
+    pub req_update: bool,
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -130,6 +136,29 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             if ui.button("? Help").clicked() {
                 st.help_open = !st.help_open;
             }
+            if let Some(v) = st.update_version.clone() {
+                if st.updating {
+                    ui.label(
+                        egui::RichText::new("Updating…")
+                            .color(egui::Color32::from_rgb(130, 200, 130)),
+                    );
+                } else if st.update_failed {
+                    ui.label(
+                        egui::RichText::new("Update failed")
+                            .color(egui::Color32::from_rgb(220, 130, 130)),
+                    )
+                    .on_hover_text("Couldn't install the update — grab it from the releases page.");
+                } else if ui
+                    .button(
+                        egui::RichText::new(format!("Update to v{v}"))
+                            .color(egui::Color32::from_rgb(140, 225, 140)),
+                    )
+                    .on_hover_text(format!("Download yosh v{v} and restart"))
+                    .clicked()
+                {
+                    st.req_update = true;
+                }
+            }
             ui.separator();
             if !st.status.is_empty() {
                 ui.label(&st.status);
@@ -154,6 +183,10 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             .resizable(false)
             .open(&mut st.help_open)
             .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(concat!("yosh ", env!("CARGO_PKG_VERSION")))
+                        .color(egui::Color32::from_gray(140)),
+                );
                 ui.heading("Navigate");
                 ui.label("← →   flip (reading-direction aware)");
                 ui.label("↑ ↓ / Space / PgUp PgDn   flip");

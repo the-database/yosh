@@ -22,11 +22,13 @@ mod source;
 mod texpool;
 mod tone;
 mod ui;
+mod update;
 
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() {
     reattach_console();
+    set_app_user_model_id();
     if std::env::args().any(|a| a == "--version" || a == "-V") {
         println!("yosh {}", env!("CARGO_PKG_VERSION"));
         return;
@@ -96,3 +98,19 @@ fn reattach_console() {
 
 #[cfg(not(windows))]
 fn reattach_console() {}
+
+/// Give the process an explicit AppUserModelID so the Windows taskbar treats yosh
+/// as its own app — a clean identity (not the exe path) so it groups correctly and
+/// shows the window's icon rather than a stale per-path cached one. Must run before
+/// any window is created.
+#[cfg(windows)]
+fn set_app_user_model_id() {
+    use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    let id: Vec<u16> = "the-database.yosh\0".encode_utf16().collect();
+    unsafe {
+        let _ = SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
+    }
+}
+
+#[cfg(not(windows))]
+fn set_app_user_model_id() {}

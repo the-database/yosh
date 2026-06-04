@@ -47,10 +47,13 @@ Name: "assoc_images"; Description: "&Images  (.png, .jpg, .jpeg, .webp, .gif, .b
 Source: "..\..\..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\yosh.ico"; DestDir: "{app}"; Flags: ignoreversion
 
+; AppUserModelID must match the ID the app sets at runtime
+; (SetCurrentProcessExplicitAppUserModelID) so the taskbar resolves the running
+; window to this shortcut — enables pinning and a stable taskbar icon.
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"
+Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "the-database.yosh"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon
+Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon; AppUserModelID: "the-database.yosh"
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch yosh"; Flags: nowait postinstall skipifsilent
