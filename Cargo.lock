@@ -4931,7 +4931,7 @@ dependencies = [
 
 [[package]]
 name = "yosh"
-version = "0.1.19"
+version = "0.1.20"
 dependencies = [
  "bytemuck",
  "directories",
