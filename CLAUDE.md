@@ -102,7 +102,9 @@ cargo test  -p yosh spread                             # run a subset of tests b
   `git -c user.name="the-database" -c user.email="25811902+the-database@users.noreply.github.com" commit ...`.
 - **To cut a release**: bump `version` in `crates/yosh/Cargo.toml`, commit, then
   `git tag -a vX.Y.Z -m "..."`. Push `main` and the tag as **two separate commands**
-  (`git push origin main` then `git push origin vX.Y.Z`).
+  (`git push origin main` then `git push origin vX.Y.Z`). The tag **must** match the
+  `Cargo.toml` version — CI fails the release build otherwise (see below), so don't
+  tag without bumping.
 - **CI** (`.github/workflows/release.yml`) builds + publishes a GitHub Release (Windows installer + portable
   zip + bare exe, and the Linux binary) **only on `v*` tags**. `workflow_dispatch` builds artifacts **without**
   releasing. Pushing to `main` alone runs **no** CI. **Be sparing with CI runs** — don't tag/dispatch to "test";
