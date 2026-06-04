@@ -218,6 +218,42 @@ fn human_size(n: u64) -> String {
 
 /// Probe an encoded image's header for `(width, height, "FORMAT · detail")`
 /// without a full decode. Returns `(0, 0, ...)` if dimensions can't be read.
+/// Walk an ISO-BMFF (AVIF/HEIF) box tree to the first `ispe` (image spatial
+/// extents) box and return its (width, height) — pure parsing, no decode, so it
+/// works regardless of the `avif` feature. `meta` is a FullBox (4-byte
+/// version/flags before its children); `iprp`/`ipco` are plain containers; the
+/// `ispe` payload is version/flags(4) + width(4) + height(4), all big-endian.
+fn iso_box_dims(b: &[u8]) -> Option<(u32, u32)> {
+    // Find a child box by 4-byte type, returning its payload (after the header).
+    fn find<'a>(mut b: &'a [u8], want: &[u8; 4]) -> Option<&'a [u8]> {
+        while b.len() >= 8 {
+            let size = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+            let (header, end) = match size {
+                1 => {
+                    // 64-bit largesize follows the type.
+                    let s = u64::from_be_bytes(b.get(8..16)?.try_into().ok()?) as usize;
+                    (16, s)
+                }
+                0 => (8, b.len()), // extends to end
+                s => (8, s),
+            };
+            if end < header || end > b.len() {
+                return None;
+            }
+            if &b[4..8] == want {
+                return Some(&b[header..end]);
+            }
+            b = &b[end..];
+        }
+        None
+    }
+    let meta = find(b, b"meta")?.get(4..)?; // skip meta's FullBox version/flags
+    let ispe = find(find(find(meta, b"iprp")?, b"ipco")?, b"ispe")?;
+    let w = u32::from_be_bytes(ispe.get(4..8)?.try_into().ok()?);
+    let h = u32::from_be_bytes(ispe.get(8..12)?.try_into().ok()?);
+    Some((w, h))
+}
+
 fn probe(b: &[u8]) -> (u32, u32, String) {
     let be16 = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as u32;
     let le16 = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as u32;
@@ -282,6 +318,18 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
             b"VP8 " => {
                 return (le16(26) & 0x3FFF, le16(28) & 0x3FFF, "WebP".to_string());
             }
+            b"VP8L" => {
+                // After the 0x2F signature byte: 14-bit (width-1) then 14-bit
+                // (height-1), LSB-first, packed across b[21..25].
+                if b.len() >= 25 {
+                    let bits = b[21] as u32
+                        | (b[22] as u32) << 8
+                        | (b[23] as u32) << 16
+                        | (b[24] as u32) << 24;
+                    return ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1, "WebP".to_string());
+                }
+                return (0, 0, "WebP".to_string());
+            }
             _ => return (0, 0, "WebP".to_string()),
         }
     }
@@ -301,9 +349,11 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
         }
         return (0, 0, "JPEG XL".to_string());
     }
-    // AVIF / HEIF (ISO-BMFF): dimensions need a box walk; report the format only.
+    // AVIF / HEIF (ISO-BMFF): walk the box tree to the `ispe` for dimensions.
     if b.len() >= 12 && &b[4..8] == b"ftyp" {
-        return (0, 0, "AVIF".to_string());
+        let (w, h) = iso_box_dims(b).unwrap_or((0, 0));
+        let label = if matches!(&b[8..12], b"avif" | b"avis") { "AVIF" } else { "HEIF" };
+        return (w, h, label.to_string());
     }
     (0, 0, "image".to_string())
 }
