@@ -48,8 +48,74 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # --- AVIF needs dav1d (C). Build it from source + statically link so the
+      # shipped binaries are self-contained; local/default builds stay C-free and
+      # only CI passes --features avif. dav1d is pinned + cached, so it builds
+      # once per OS then restores in seconds. Recipe mirrors dav1d-rs's own CI,
+      # plus static + (Windows) /MT to match the +crt-static Rust build. ---
+      - name: Set up MSVC env (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install nasm
+        uses: ilammy/setup-nasm@v1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install meson + ninja
+        run: pip install -U meson ninja
+
+      - name: dav1d env (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          echo "PKG_CONFIG_PATH=$HOME/dav1d_install/lib/x86_64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
+          echo "SYSTEM_DEPS_DAV1D_LINK=static" >> "$GITHUB_ENV"
+      - name: dav1d env (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo 'PKG_CONFIG=C:\build\bin\pkg-config.exe' >> "$GITHUB_ENV"
+          echo 'PKG_CONFIG_PATH=C:\build\lib\pkgconfig' >> "$GITHUB_ENV"
+          echo 'C:\build\bin' >> "$GITHUB_PATH"
+          echo 'SYSTEM_DEPS_DAV1D_LINK=static' >> "$GITHUB_ENV"
+
+      - name: Cache dav1d (Linux)
+        if: runner.os == 'Linux'
+        id: dav1d_linux
+        uses: actions/cache@v4
+        with:
+          path: ~/dav1d_install
+          key: dav1d-linux-1.5.0-static
+      - name: Cache dav1d + pkg-config (Windows)
+        if: runner.os == 'Windows'
+        id: dav1d_windows
+        uses: actions/cache@v4
+        with:
+          path: C:\build
+          key: dav1d-windows-1.5.0-static-mt
+
+      - name: Build dav1d static (Linux)
+        if: runner.os == 'Linux' && steps.dav1d_linux.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch 1.5.0 --depth 1 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --prefix="$HOME/dav1d_install" -Ddefault_library=static -Denable_tools=false -Denable_examples=false --buildtype=release
+          ninja -C build install
+      - name: Build pkg-config + dav1d static (Windows)
+        if: runner.os == 'Windows' && steps.dav1d_windows.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch meson-glib-subproject --depth 1 https://gitlab.freedesktop.org/tpm/pkg-config.git
+          cd pkg-config
+          meson setup build --prefix=C:\build --buildtype=release
+          ninja -C build install
+          cd ..
+          git clone --branch 1.5.0 --depth 1 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --prefix=C:\build -Ddefault_library=static -Denable_tools=false -Denable_examples=false -Db_vscrt=mt --buildtype=release
+          ninja -C build install
+
       - name: Build
-        run: cargo build --release -p yosh
+        run: cargo build --release -p yosh --features avif
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
 
