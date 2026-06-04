@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-const REPO: &str = "the-database/yosh-rust";
+const REPO: &str = "the-database/yosh";
 
 /// The release asset to download for this platform (the bare executable).
 #[cfg(windows)]

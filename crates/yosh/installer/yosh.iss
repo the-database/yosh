@@ -8,7 +8,7 @@
 #define AppName "yosh"
 #define AppExe "yosh.exe"
 #define AppPublisher "the-database"
-#define AppUrl "https://github.com/the-database/yosh-rust"
+#define AppUrl "https://github.com/the-database/yosh"
 
 [Setup]
 AppId={{6E9B4F2C-1A7D-4B3E-9C82-5D0A1F6E3B4D}
