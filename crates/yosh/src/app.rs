@@ -30,6 +30,7 @@ use crate::prefetch::desired_window;
 use crate::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use crate::texpool::TexturePool;
 use crate::ui::{self, UiState};
+use crate::update;
 
 // Decode target height tracks the on-screen page size (see `desired_target_h`)
 // so the high-quality linear-light downscale does the *full* reduction in one
@@ -141,6 +142,14 @@ struct State {
     library: Library,
     library_view: bool,
     thumb_resizer: Resizer,
+
+    // Auto-update: a background thread checks the latest public release on
+    // launch; the UI offers a one-click in-place update.
+    update_rx: Option<std::sync::mpsc::Receiver<update::Update>>,
+    update: Option<update::Update>,
+    update_apply_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    updating: bool,
+    update_error: Option<String>,
 }
 
 fn fit_from_u8(v: u8) -> FitMode {
@@ -293,6 +302,56 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
+/// Bind the exe's own embedded icon to the window on Windows — the real taskbar fix.
+///
+/// `with_window_icon` / `with_taskbar_icon` build the icon from `yosh.png`, which
+/// is 256x255 (non-square) and shares one HICON for both the small (title-bar) and
+/// big (taskbar) slots. The small slot tolerates it; the taskbar's large slot does
+/// not and falls back to the generic app icon. The `.ico` the build script embeds
+/// in the exe is square and multi-resolution — the exact icon Explorer, the title
+/// bar, and the installer already render correctly — so we pull it straight out of
+/// the running exe with `ExtractIconExW` (large + small at the system icon sizes)
+/// and set it as ICON_BIG / ICON_SMALL, plus the window-class icons as a backstop.
+#[cfg(windows)]
+fn bind_exe_icon(window: &Window) {
+    use std::os::windows::ffi::OsStrExt;
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::UI::Shell::ExtractIconExW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GCLP_HICON, GCLP_HICONSM, ICON_BIG, ICON_SMALL, SendMessageW, SetClassLongPtrW, WM_SETICON,
+    };
+
+    let hwnd = match window.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(h)) => h.hwnd.get() as *mut core::ffi::c_void,
+        _ => return,
+    };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let wide: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+
+    let mut large: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut small: *mut core::ffi::c_void = std::ptr::null_mut();
+    // Icon group 0 = the application icon embedded by the build script.
+    if unsafe { ExtractIconExW(wide.as_ptr(), 0, &mut large, &mut small, 1) } == 0 {
+        return;
+    }
+    // The extracted HICONs are handed to the window (WM_SETICON / class icon) and
+    // must outlive bind_exe_icon — the window references them, it doesn't copy. So
+    // they are intentionally not destroyed here; this single, process-lifetime
+    // window owns them and the OS reclaims them at exit.
+    unsafe {
+        if !large.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, large as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICON, large as isize);
+        }
+        if !small.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
+            SetClassLongPtrW(hwnd, GCLP_HICONSM, small as isize);
+        }
+    }
+}
+
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
 struct Quad {
     slot: usize,
@@ -320,7 +379,18 @@ impl ApplicationHandler for App {
             .with_title("yosh")
             .with_window_icon(window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1500.0));
+        // `with_window_icon` sets only the small (title-bar) icon; the taskbar
+        // reads ICON_BIG, which winit exposes separately on Windows.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_taskbar_icon(window_icon())
+        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // Override winit's PNG-derived icon with the exe's square embedded .ico so
+        // the taskbar (ICON_BIG) shows the logo instead of the generic app icon.
+        #[cfg(windows)]
+        bind_exe_icon(&window);
         let mut gpu = Gpu::new(window.clone());
 
         let egui_ctx = egui::Context::default();
@@ -370,6 +440,13 @@ impl ApplicationHandler for App {
         }
 
         window.request_redraw();
+        // Kick off a background update check against the public GitHub releases.
+        let (update_tx, update_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Some(u) = update::check() {
+                let _ = update_tx.send(u);
+            }
+        });
         self.state = Some(State {
             window,
             gpu,
@@ -423,6 +500,11 @@ impl ApplicationHandler for App {
             library,
             library_view,
             thumb_resizer: Resizer::new(),
+            update_rx: Some(update_rx),
+            update: None,
+            update_apply_rx: None,
+            updating: false,
+            update_error: None,
         });
     }
 
@@ -765,6 +847,20 @@ impl State {
             self.settings.last_pages.insert(k.clone(), self.index);
         }
         config::save(&self.settings);
+    }
+
+    /// After a successful self-update: persist, launch the freshly-replaced exe
+    /// (reopening the current volume), and exit.
+    fn relaunch(&mut self) -> ! {
+        self.persist();
+        if let Ok(exe) = std::env::current_exe() {
+            let mut cmd = std::process::Command::new(exe);
+            if let Some(k) = &self.volume_key {
+                cmd.arg(k);
+            }
+            let _ = cmd.spawn();
+        }
+        std::process::exit(0);
     }
 
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
@@ -1378,6 +1474,31 @@ impl State {
                 }
             }
         }
+        // Auto-update: pick up the background check result and any apply result.
+        if let Some(rx) = self.update_rx.take() {
+            match rx.try_recv() {
+                Ok(u) => self.update = Some(u),
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.update_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some(rx) = self.update_apply_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(())) => self.relaunch(),
+                Ok(Err(e)) => {
+                    self.updating = false;
+                    self.update_error = Some(e);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.update_apply_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.updating = false;
+                    self.update_error = Some("update interrupted".into());
+                }
+            }
+        }
+        self.ui.update_version = self.update.as_ref().map(|u| u.version.clone());
+        self.ui.updating = self.updating;
+        self.ui.update_failed = self.update_error.is_some();
         // Track the decode resolution to the display size (debounced re-decode).
         self.update_target_h();
         // Keep the scroll anchor valid as page heights resolve, then refresh work.
@@ -1549,6 +1670,17 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_present) {
             self.apply_action(Action::TogglePresent);
+        }
+        if std::mem::take(&mut self.ui.req_update) && !self.updating {
+            if let Some(u) = self.update.clone() {
+                self.updating = true;
+                self.update_error = None;
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(update::apply(&u));
+                });
+                self.update_apply_rx = Some(rx);
+            }
         }
         if let Some(root) = self.ui.pending_library.take() {
             for v in &self.library.volumes {
