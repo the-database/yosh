@@ -307,10 +307,13 @@ pub fn decode_and_downscale(
     // wider profile (e.g. Display P3) would otherwise render desaturated. The
     // profile comes from the same decode (no second parse); only color images
     // carrying a non-sRGB profile pay the transform — grayscale/untagged pages
-    // are untouched, so seek throughput is unaffected.
+    // are untouched, so seek throughput is unaffected. A *grayscale* ICC (e.g. a
+    // Dot Gain profile on a monochrome AVIF) is skipped: it can't be applied to
+    // the RGBA buffer (channel mismatch → white), and the gray resize path below
+    // handles its tone instead.
     if !gray_by_channels {
         if let Some(p) = &profile {
-            if !icc::is_srgb(p) {
+            if !icc::is_srgb(p) && !icc::is_gray(p) {
                 icc::to_srgb_rgba(p, &mut full);
             }
         }

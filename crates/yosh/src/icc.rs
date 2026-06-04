@@ -29,6 +29,16 @@ pub fn is_srgb(profile: &[u8]) -> bool {
     describe(profile).is_some_and(|d| d.to_ascii_lowercase().contains("srgb"))
 }
 
+/// True if the profile's data colour space is grayscale (`GRAY`, at ICC header
+/// offset 16) — e.g. a "Dot Gain" output profile on a monochrome (yuv400) AVIF.
+/// Such a profile must NOT be fed to `to_srgb_rgba`: it builds an RGBA8 qcms
+/// transform, and a 1-channel gray profile against 4-channel data corrupts the
+/// image (renders white). Grayscale pages get their tone from the gray decode
+/// path instead, so the right move is to skip color management here.
+pub fn is_gray(profile: &[u8]) -> bool {
+    profile.get(16..20) == Some(b"GRAY")
+}
+
 /// Human-readable profile name (e.g. "Display P3") from the ICC `desc` tag.
 /// Handles the v2 `textDescriptionType` (ASCII) and v4 `mluc`
 /// (multiLocalizedUnicodeType, UTF-16BE) encodings.
