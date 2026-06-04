@@ -627,6 +627,7 @@ enum Action {
     ToggleFullscreen,
     ToggleSpreadOffset,
     ToggleInfo,
+    ToggleSeekbar,
     PrevVolume,
     NextVolume,
     ToggleJump,
@@ -651,6 +652,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyT => return Some(Action::TogglePresent),
             KeyCode::KeyJ => return Some(Action::ToggleJump),
+            KeyCode::KeyB => return Some(Action::ToggleSeekbar),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit9 | KeyCode::Numpad9 => return Some(Action::PresetWindow),
@@ -787,6 +789,10 @@ impl State {
             Action::ToggleInfo => {
                 self.ui.info_open = !self.ui.info_open;
                 self.info_for = None; // rebuild the overlay text next render
+            }
+            Action::ToggleSeekbar => {
+                self.settings.seekbar_enabled = !self.settings.seekbar_enabled;
+                config::save(&self.settings);
             }
             Action::ToggleFullscreen => {
                 let fs = match self.window.fullscreen() {
@@ -1610,6 +1616,10 @@ impl State {
         self.ui.hover_left = in_reader && self.cursor_in_window && below_bar && cx < edge;
         self.ui.hover_right =
             in_reader && self.cursor_in_window && below_bar && cx > win_w - edge;
+        // Bottom seekbar: hidden by default, revealed when the cursor nears the
+        // bottom edge (a touch taller than the floating pill so a drag stays in
+        // the reveal zone). Cleared here so it vanishes when no volume is open.
+        self.ui.seek_show = false;
         if let Some(src) = &self.source {
             let len = src.len();
             let anchor = if self.scroll_mode {
@@ -1646,6 +1656,15 @@ impl State {
                 self.loading_pending = None;
                 self.ui.loading = false;
             }
+            self.ui.seek_index = self.index;
+            self.ui.seek_total = len;
+            self.ui.seek_rtl = self.direction == Direction::Rtl;
+            self.ui.seek_style = ui::SeekbarStyle::Bar;
+            let win_h = self.gpu.config.height.max(1) as f32;
+            let near_bottom =
+                self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
+            self.ui.seek_show =
+                self.settings.seekbar_enabled && !self.library_view && len > 1 && near_bottom;
         }
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
@@ -1738,6 +1757,16 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_present) {
             self.apply_action(Action::TogglePresent);
+        }
+        // Seekbar jump: re-clamp against the live source, skip a redundant goto
+        // (which would needlessly reset pan when landing on the current page).
+        if let Some(page) = self.ui.seek_request.take()
+            && let Some(src) = &self.source
+        {
+            let page = page.min(src.len().saturating_sub(1));
+            if page != self.index {
+                self.goto(page);
+            }
         }
         if std::mem::take(&mut self.ui.req_update) && !self.updating {
             if let Some(u) = self.update.clone() {

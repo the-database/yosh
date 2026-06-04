@@ -50,6 +50,25 @@ pub struct UiState {
     pub updating: bool,
     pub update_failed: bool,
     pub req_update: bool,
+
+    /// Seekbar (bottom progress scrubber). Display fields set by the app each
+    /// frame; `seek_request` is the page the user clicked/dragged to, drained
+    /// by the app after the frame.
+    pub seek_show: bool,
+    pub seek_index: usize,
+    pub seek_total: usize,
+    pub seek_rtl: bool,
+    pub seek_style: SeekbarStyle,
+    pub seek_request: Option<usize>,
+}
+
+/// Which seekbar to draw. Only `Bar` is implemented today; the variant exists so
+/// a richer (e.g. thumbnail) style can slot in behind a single `match` later.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SeekbarStyle {
+    #[default]
+    Bar, // BandiView-style track + handle
+         // Thumbnails, // YACReader-style — future
 }
 
 fn elide(s: &str, max: usize) -> String {
@@ -80,6 +99,84 @@ fn nav_arrow(ctx: &egui::Context, id: &str, align: egui::Align2, offset: egui::V
             let (tip, back) = if left { (-dx, dx) } else { (dx, -dx) };
             p.line_segment([c + egui::vec2(back, -dy), c + egui::vec2(tip, 0.0)], stroke);
             p.line_segment([c + egui::vec2(tip, 0.0), c + egui::vec2(back, dy)], stroke);
+        });
+}
+
+/// BandiView-style seekbar: a translucent pill floating above the bottom edge
+/// with a track, a filled progress segment, and a circular handle. Click or drag
+/// anywhere to jump; hovering previews the target page as "page / total". The
+/// horizontal axis follows the reading direction — in RTL, page 0 is at the right
+/// edge and the last page at the left (progress flows right-to-left).
+fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
+    if st.seek_total <= 1 {
+        return; // nothing to scrub
+    }
+    let total = st.seek_total;
+    let last = (total - 1) as f32; // >= 1, so no divide-by-zero
+    let rtl = st.seek_rtl;
+    let index = st.seek_index.min(total - 1);
+
+    egui::Area::new(egui::Id::new("seekbar"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            let bar_w = (ctx.content_rect().width() * 0.7).clamp(240.0, 1100.0);
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(150))
+                .inner_margin(egui::Margin::symmetric(14, 10))
+                .corner_radius(egui::CornerRadius::same(8))
+                .show(ui, |ui| {
+                    let (rect, resp) = ui
+                        .allocate_exact_size(egui::vec2(bar_w, 18.0), egui::Sense::click_and_drag());
+
+                    let r = 8.0_f32; // handle radius
+                    let x0 = rect.left() + r; // handle-center span, inset by the radius
+                    let x1 = rect.right() - r;
+                    let span = (x1 - x0).max(1.0);
+                    let cy = rect.center().y;
+
+                    // Direction-aware mapping between a page fraction and an x.
+                    let x_of = |frac: f32| if rtl { x1 - frac * span } else { x0 + frac * span };
+                    let page_at = |px: f32| {
+                        let t = ((px - x0) / span).clamp(0.0, 1.0); // LTR fraction
+                        let frac = if rtl { 1.0 - t } else { t };
+                        (frac * last).round() as usize
+                    };
+                    let handle_x = x_of(index as f32 / last);
+
+                    let p = ui.painter();
+                    p.line_segment(
+                        [egui::pos2(x0, cy), egui::pos2(x1, cy)],
+                        egui::Stroke::new(5.0, egui::Color32::from_white_alpha(60)),
+                    );
+                    let start_x = if rtl { x1 } else { x0 };
+                    p.line_segment(
+                        [egui::pos2(start_x, cy), egui::pos2(handle_x, cy)],
+                        egui::Stroke::new(5.0, egui::Color32::from_white_alpha(190)),
+                    );
+                    p.circle_filled(egui::pos2(handle_x, cy), r, egui::Color32::WHITE);
+                    p.circle_stroke(
+                        egui::pos2(handle_x, cy),
+                        r,
+                        egui::Stroke::new(1.5, egui::Color32::from_black_alpha(120)),
+                    );
+
+                    // Click or drag (live scrub) jumps to the page under the pointer.
+                    if (resp.clicked() || resp.dragged())
+                        && let Some(pos) = resp.interact_pointer_pos()
+                    {
+                        st.seek_request = Some(page_at(pos.x));
+                    }
+                    // Hover previews the *target* page (what a click would jump to),
+                    // not the current one. The closure re-runs each frame, so the
+                    // number tracks the pointer as it moves along the bar.
+                    let hover_target = resp.hover_pos().map(|pos| page_at(pos.x));
+                    if let Some(target) = hover_target {
+                        resp.on_hover_ui_at_pointer(move |ui| {
+                            ui.label(format!("{} / {}", target + 1, total));
+                        });
+                    }
+                });
         });
 }
 
@@ -209,6 +306,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.heading("View");
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
                 ui.label("I   show image info overlay");
+                ui.label("B   toggle bottom seekbar");
                 ui.label("T   present  vsync ↔ turbo");
                 ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();
@@ -281,6 +379,12 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
     }
     if st.hover_right {
         nav_arrow(ctx, "nav_arrow_right", egui::Align2::RIGHT_CENTER, egui::vec2(-20.0, 0.0), false);
+    }
+
+    if st.seek_show {
+        match st.seek_style {
+            SeekbarStyle::Bar => seekbar_bar(ctx, st),
+        }
     }
 
     if library_view {

@@ -45,12 +45,13 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `J` | seek mode: **step** (see every page) ↔ **jump** (skip ahead) |
 | `+` `-` | zoom; drag to pan |
 | `I` | image info overlay |
+| `B` | bottom seekbar (reveals near the bottom edge; click/drag to jump) |
 | `T` | present mode vsync ↔ turbo (uncapped) |
 | double-click | fullscreen (middle of the page); `F11` also toggles |
 | `Esc` | quit |
 
-Reading position (per volume), reading direction, fit, layout, spread offset, scroll, and seek mode
-are persisted.
+Reading position (per volume), reading direction, fit, layout, spread offset, scroll, seek mode,
+and seekbar visibility are persisted.
 
 ## AVIF (optional)
 AVIF decode uses the `image` crate's native (dav1d) backend, gated behind an off-by-default feature so
