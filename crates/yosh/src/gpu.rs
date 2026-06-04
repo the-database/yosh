@@ -14,7 +14,6 @@ pub struct Gpu {
     pub surface: wgpu::Surface<'static>,
     pub config: wgpu::SurfaceConfiguration,
     pub adapter_info: wgpu::AdapterInfo,
-    has_immediate: bool,
 }
 
 impl Gpu {
@@ -51,9 +50,6 @@ impl Gpu {
             .copied()
             .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
-        let has_immediate = caps
-            .present_modes
-            .contains(&wgpu::PresentMode::Immediate);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -73,19 +69,7 @@ impl Gpu {
             surface,
             config,
             adapter_info,
-            has_immediate,
         }
-    }
-
-    /// Switch present mode: Immediate (uncapped, may tear) when `on` and
-    /// supported, else Fifo (vsync).
-    pub fn set_turbo(&mut self, on: bool) {
-        self.config.present_mode = if on && self.has_immediate {
-            wgpu::PresentMode::Immediate
-        } else {
-            wgpu::PresentMode::Fifo
-        };
-        self.surface.configure(&self.device, &self.config);
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {

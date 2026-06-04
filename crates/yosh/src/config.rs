@@ -28,8 +28,6 @@ pub struct Settings {
     pub layout_spread: bool,
     /// Continuous vertical-strip scroll mode (overrides page-flip layout).
     pub scroll: bool,
-    /// Uncapped present (Immediate) instead of vsync (Fifo).
-    pub turbo: bool,
     /// Downscale pages on the GPU instead of on the CPU.
     pub gpu: bool,
     /// Last library root folder (browse grid).
@@ -57,7 +55,6 @@ impl Default for Settings {
             fit: 0,
             layout_spread: false,
             scroll: false,
-            turbo: false,
             gpu: false,
             library_root: None,
             last_pages: HashMap::new(),

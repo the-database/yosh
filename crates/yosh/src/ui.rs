@@ -20,13 +20,11 @@ pub struct UiState {
     pub dir_label: &'static str,
     pub fit_label: &'static str,
     pub layout_label: &'static str,
-    pub turbo_label: &'static str,
 
     // Requests raised by clicks, consumed by the app after the frame.
     pub req_toggle_dir: bool,
     pub req_cycle_fit: bool,
     pub req_toggle_layout: bool,
-    pub req_toggle_present: bool,
     pub req_toggle_library: bool,
     pub clicked_volume: Option<usize>,
     pub help_open: bool,
@@ -60,6 +58,10 @@ pub struct UiState {
     pub seek_rtl: bool,
     pub seek_style: SeekbarStyle,
     pub seek_request: Option<usize>,
+    /// Pointer is over the seekbar this frame. Lets the app keep routing the
+    /// mouse wheel to the reader (the bar isn't scrollable) while egui still
+    /// gets clicks/drags for seeking.
+    pub seek_hovered: bool,
 }
 
 /// Which seekbar to draw. Only `Bar` is implemented today; the variant exists so
@@ -120,16 +122,20 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -16.0))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            let bar_w = (ctx.content_rect().width() * 0.7).clamp(240.0, 1100.0);
+            let bar_w = (ctx.content_rect().width() * 0.5).clamp(280.0, 640.0);
             egui::Frame::new()
                 .fill(egui::Color32::from_black_alpha(150))
-                .inner_margin(egui::Margin::symmetric(14, 10))
-                .corner_radius(egui::CornerRadius::same(8))
+                .inner_margin(egui::Margin::symmetric(16, 9))
+                .corner_radius(egui::CornerRadius::same(10))
                 .show(ui, |ui| {
+                    // A tall hit-rect: the whole bar is clickable/draggable, so
+                    // height is the vertical click target — keep it generous.
                     let (rect, resp) = ui
-                        .allocate_exact_size(egui::vec2(bar_w, 18.0), egui::Sense::click_and_drag());
+                        .allocate_exact_size(egui::vec2(bar_w, 30.0), egui::Sense::click_and_drag());
+                    // Let the wheel keep scrolling the reader while over the bar.
+                    st.seek_hovered = resp.contains_pointer();
 
-                    let r = 8.0_f32; // handle radius
+                    let r = 11.0_f32; // handle radius
                     let x0 = rect.left() + r; // handle-center span, inset by the radius
                     let x1 = rect.right() - r;
                     let span = (x1 - x0).max(1.0);
@@ -147,18 +153,18 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     let p = ui.painter();
                     p.line_segment(
                         [egui::pos2(x0, cy), egui::pos2(x1, cy)],
-                        egui::Stroke::new(5.0, egui::Color32::from_white_alpha(60)),
+                        egui::Stroke::new(8.0, egui::Color32::from_white_alpha(60)),
                     );
                     let start_x = if rtl { x1 } else { x0 };
                     p.line_segment(
                         [egui::pos2(start_x, cy), egui::pos2(handle_x, cy)],
-                        egui::Stroke::new(5.0, egui::Color32::from_white_alpha(190)),
+                        egui::Stroke::new(8.0, egui::Color32::from_white_alpha(190)),
                     );
                     p.circle_filled(egui::pos2(handle_x, cy), r, egui::Color32::WHITE);
                     p.circle_stroke(
                         egui::pos2(handle_x, cy),
                         r,
-                        egui::Stroke::new(1.5, egui::Color32::from_black_alpha(120)),
+                        egui::Stroke::new(2.0, egui::Color32::from_black_alpha(120)),
                     );
 
                     // Click or drag (live scrub) jumps to the page under the pointer.
@@ -167,14 +173,31 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     {
                         st.seek_request = Some(page_at(pos.x));
                     }
-                    // Hover previews the *target* page (what a click would jump to),
-                    // not the current one. The closure re-runs each frame, so the
-                    // number tracks the pointer as it moves along the bar.
-                    let hover_target = resp.hover_pos().map(|pos| page_at(pos.x));
-                    if let Some(target) = hover_target {
-                        resp.on_hover_ui_at_pointer(move |ui| {
-                            ui.label(format!("{} / {}", target + 1, total));
-                        });
+                    // Hover previews the *target* page (what a click would jump
+                    // to). Drawn as our own overlay rather than egui's hover
+                    // tooltip so it appears instantly (no hover delay) and the
+                    // "N / total" text always stays on a single line.
+                    if let Some(pos) = resp.hover_pos() {
+                        let text = format!("{} / {}", page_at(pos.x) + 1, total);
+                        egui::Area::new(egui::Id::new("seekbar_tip"))
+                            .order(egui::Order::Tooltip)
+                            .interactable(false)
+                            .fixed_pos(pos + egui::vec2(10.0, -30.0))
+                            .show(ctx, |ui| {
+                                egui::Frame::new()
+                                    .fill(egui::Color32::from_black_alpha(220))
+                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                    .corner_radius(egui::CornerRadius::same(5))
+                                    .show(ui, |ui| {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(text)
+                                                    .color(egui::Color32::WHITE),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                        );
+                                    });
+                            });
                     }
                 });
         });
@@ -226,9 +249,6 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             }
             if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
                 st.req_toggle_layout = true;
-            }
-            if ui.button(format!("Present: {}", st.turbo_label)).clicked() {
-                st.req_toggle_present = true;
             }
             if ui.button("? Help").clicked() {
                 st.help_open = !st.help_open;
@@ -307,7 +327,6 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");
-                ui.label("T   present  vsync ↔ turbo");
                 ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();
                 ui.heading("Files");

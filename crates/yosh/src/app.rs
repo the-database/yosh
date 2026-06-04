@@ -426,7 +426,7 @@ impl ApplicationHandler for App {
         // the taskbar (ICON_BIG) shows the logo instead of the generic app icon.
         #[cfg(windows)]
         bind_exe_icon(&window);
-        let mut gpu = Gpu::new(window.clone());
+        let gpu = Gpu::new(window.clone());
 
         let egui_ctx = egui::Context::default();
         install_cjk_font(&egui_ctx);
@@ -444,7 +444,6 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
-        gpu.set_turbo(settings.turbo);
         let tex_pool = Arc::new(TexturePool::new());
         let downscaler = Arc::new(Downscaler::new(&gpu.device));
         // GPU downscale is disabled for now (the single-bilinear-blit path can't
@@ -574,7 +573,11 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.on_cursor_moved(position.x, position.y)
             }
-            WindowEvent::MouseWheel { delta, .. } if !response.consumed => state.on_wheel(delta),
+            // The seekbar isn't scrollable, so don't let hovering it swallow the
+            // wheel — keep routing it to the reader (clicks/drags still seek).
+            WindowEvent::MouseWheel { delta, .. } if !response.consumed || state.ui.seek_hovered => {
+                state.on_wheel(delta)
+            }
             WindowEvent::MouseInput {
                 state: btn,
                 button: MouseButton::Left,
@@ -614,7 +617,6 @@ enum Action {
     ToggleDir,
     ToggleLayout,
     ToggleScroll,
-    TogglePresent,
     ZoomIn,
     ZoomOut,
     // View presets (number keys): each sets a complete page-flip view at once.
@@ -650,7 +652,6 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyS => return Some(Action::ToggleLayout),
             KeyCode::KeyO => return Some(Action::ToggleSpreadOffset),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
-            KeyCode::KeyT => return Some(Action::TogglePresent),
             KeyCode::KeyJ => return Some(Action::ToggleJump),
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
@@ -779,11 +780,6 @@ impl State {
                 self.settings.scroll = self.scroll_mode;
                 config::save(&self.settings);
                 self.prefetch();
-            }
-            Action::TogglePresent => {
-                self.settings.turbo = !self.settings.turbo;
-                self.gpu.set_turbo(self.settings.turbo);
-                config::save(&self.settings);
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
             Action::ToggleInfo => {
@@ -1596,7 +1592,6 @@ impl State {
         } else {
             self.layout.label()
         };
-        self.ui.turbo_label = if self.settings.turbo { "turbo" } else { "vsync" };
         // Build the Tab info overlay text, reading the source once per page change.
         if self.ui.info_open && !self.library_view && self.info_for != Some(self.index) {
             self.ui.info = self.build_page_info(self.index);
@@ -1620,6 +1615,7 @@ impl State {
         // bottom edge (a touch taller than the floating pill so a drag stays in
         // the reveal zone). Cleared here so it vanishes when no volume is open.
         self.ui.seek_show = false;
+        self.ui.seek_hovered = false;
         if let Some(src) = &self.source {
             let len = src.len();
             let anchor = if self.scroll_mode {
@@ -1754,9 +1750,6 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_layout) {
             self.apply_action(Action::ToggleLayout);
-        }
-        if std::mem::take(&mut self.ui.req_toggle_present) {
-            self.apply_action(Action::TogglePresent);
         }
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
