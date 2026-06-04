@@ -185,6 +185,9 @@ struct State {
     anim_origin: Instant,
     /// Mini play/pause/step controls for the animation (GIF/WebP) currently in view.
     playback: Playback,
+    /// Last window title pushed to the OS, so `render()` only calls `set_title`
+    /// when the computed title actually changes (it's recomputed every frame).
+    last_title: String,
 
     library: Library,
     library_view: bool,
@@ -661,6 +664,7 @@ impl ApplicationHandler for App {
             pan_edge_at: None,
             anim_origin: Instant::now(),
             playback: Playback::default(),
+            last_title: String::new(),
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -1826,6 +1830,40 @@ impl State {
         self.playback.frame = frame.min(frames - 1);
     }
 
+    /// The dynamic window title: `{book} > {file} [ pg / total ] - yosh` in the
+    /// reader, `Library - yosh` in the grid, plain `yosh` when nothing is open.
+    fn title(&self) -> String {
+        if self.library_view {
+            return "Library - yosh".to_string();
+        }
+        let Some(src) = &self.source else {
+            return "yosh".to_string();
+        };
+        let len = src.len();
+        if len == 0 {
+            return "yosh".to_string();
+        }
+        // The page actually shown (anchor): `index` in single/scroll, the first
+        // page of the pair in a two-page spread.
+        let anchor = if self.scroll_mode {
+            self.index
+        } else {
+            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+        }
+        .min(len - 1);
+        let name = src.name(anchor);
+        // Just the basename — archive entries can carry a subfolder path.
+        let file = std::path::Path::new(name)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(name);
+        let pos = format!("[ {} / {} ] - yosh", anchor + 1, len);
+        match self.ui.opened.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
+            Some(book) => format!("{book} > {file} {pos}"),
+            None => format!("{file} {pos}"),
+        }
+    }
+
     #[allow(deprecated)]
     fn render(&mut self) {
         if let Some(p) = self.ui.pending_open.take() {
@@ -1880,6 +1918,12 @@ impl State {
         self.prefetch();
         // Advance the in-view animation's frame and refresh its control panel.
         self.update_playback();
+        // Keep the OS titlebar in sync with the open book + page (change-only).
+        let title = self.title();
+        if title != self.last_title {
+            self.window.set_title(&title);
+            self.last_title = title;
+        }
 
         // Decide what to draw this frame (library grid hides the page).
         let quads = if self.library_view {
