@@ -46,7 +46,6 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `+` `-` | zoom; drag to pan |
 | `I` | image info overlay |
 | `B` | bottom seekbar (reveals near the bottom edge; click/drag to jump) |
-| `T` | present mode vsync ↔ turbo (uncapped) |
 | double-click | fullscreen (middle of the page); `F11` also toggles |
 | `Esc` | quit |
 
