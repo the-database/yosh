@@ -67,6 +67,22 @@ pub struct UiState {
     /// mouse wheel to the reader (the bar isn't scrollable) while egui still
     /// gets clicks/drags for seeking.
     pub seek_hovered: bool,
+
+    /// Animation control panel (bottom-left), shown for animated GIF/WebP pages.
+    /// Display fields set by the app each frame; the `anim_req_*` fields are
+    /// drained by the app after the frame.
+    pub anim_show: bool,
+    pub anim_playing: bool,
+    pub anim_frame: usize,
+    pub anim_total: usize,
+    /// Set when the user clicks play/pause.
+    pub anim_req_toggle_play: bool,
+    /// −1 / +1 when the user clicks the step buttons (drained).
+    pub anim_req_step: i32,
+    /// Frame the user clicked on the animation progress bar (drained).
+    pub anim_req_seek: Option<usize>,
+    /// Set when the user hides the panel via its close button.
+    pub anim_req_hide: bool,
 }
 
 /// Which seekbar to draw. Only `Bar` is implemented today; the variant exists so
@@ -208,6 +224,80 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
         });
 }
 
+/// BandiView-style mini controls for the animation in view (GIF or WebP): a small
+/// translucent panel in the bottom-left with play/pause, frame stepping, a
+/// `frame / total` readout, a click-to-seek progress bar, and a close button.
+/// Playback continues while hidden; the `G` key (or this button) toggles it.
+fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
+    if st.anim_total <= 1 {
+        return; // a single-frame page has nothing to control
+    }
+    let total = st.anim_total;
+    let frame = st.anim_frame.min(total - 1);
+    let last = (total - 1) as f32; // >= 1
+
+    egui::Area::new(egui::Id::new("anim_panel"))
+        .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(16.0, -16.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_black_alpha(160))
+                .inner_margin(egui::Margin::symmetric(10, 6))
+                .corner_radius(egui::CornerRadius::same(9))
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::from_white_alpha(235));
+                    ui.horizontal(|ui| {
+                        if ui.button(if st.anim_playing { "Pause" } else { "Play" }).clicked() {
+                            st.anim_req_toggle_play = true;
+                        }
+                        if ui.button("<").on_hover_text("Previous frame").clicked() {
+                            st.anim_req_step = -1;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{} / {}", frame + 1, total))
+                                .monospace()
+                                .color(egui::Color32::WHITE),
+                        );
+                        if ui.button(">").on_hover_text("Next frame").clicked() {
+                            st.anim_req_step = 1;
+                        }
+
+                        // Click/drag the progress track to seek to a frame.
+                        let (rect, resp) = ui
+                            .allocate_exact_size(egui::vec2(96.0, 14.0), egui::Sense::click_and_drag());
+                        let x0 = rect.left() + 3.0;
+                        let x1 = rect.right() - 3.0;
+                        let span = (x1 - x0).max(1.0);
+                        let cy = rect.center().y;
+                        let hx = x0 + (frame as f32 / last) * span;
+                        {
+                            let p = ui.painter();
+                            p.line_segment(
+                                [egui::pos2(x0, cy), egui::pos2(x1, cy)],
+                                egui::Stroke::new(5.0, egui::Color32::from_white_alpha(55)),
+                            );
+                            p.line_segment(
+                                [egui::pos2(x0, cy), egui::pos2(hx, cy)],
+                                egui::Stroke::new(5.0, egui::Color32::from_white_alpha(200)),
+                            );
+                            p.circle_filled(egui::pos2(hx, cy), 5.0, egui::Color32::WHITE);
+                        }
+                        if (resp.clicked() || resp.dragged())
+                            && let Some(pos) = resp.interact_pointer_pos()
+                        {
+                            let t = ((pos.x - x0) / span).clamp(0.0, 1.0);
+                            st.anim_req_seek = Some((t * last).round() as usize);
+                        }
+
+                        if ui.button("×").on_hover_text("Hide (G)").clicked() {
+                            st.anim_req_hide = true;
+                        }
+                    });
+                });
+        });
+}
+
 #[allow(deprecated)]
 pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view: bool) {
     let show_bar = st.show_bar;
@@ -332,6 +422,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");
+                ui.label("G   show/hide the animation panel (animated GIF / WebP)");
                 ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();
                 ui.heading("Files");
@@ -441,6 +532,10 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
         match st.seek_style {
             SeekbarStyle::Bar => seekbar_bar(ctx, st),
         }
+    }
+
+    if st.anim_show && !library_view {
+        anim_panel(ctx, st);
     }
 
     if library_view {

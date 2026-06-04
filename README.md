@@ -32,7 +32,10 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 
 ## Formats
 - Sources: image folders, CBZ/ZIP, CBR/RAR (UnRAR), 7z/CB7.
-- Images: PNG, JPEG, WebP, GIF, BMP, JPEG XL (.jxl). AVIF is **opt-in** (see below).
+- Images: PNG, JPEG, WebP, GIF, BMP, JPEG XL (.jxl), PSD. AVIF is **opt-in** (see below).
+  - Animated GIF and animated WebP play back, with a mini panel for play/pause and frame stepping.
+  - PSD shows the flattened composite (8-bit RGB); it's browsable in folders/archives but is **not**
+    registered as a default `.psd` handler (a "View with yosh" right-click entry is offered instead).
 
 ## Controls (press <kbd>F1</kbd> in-app for the full list)
 | | |
@@ -46,6 +49,7 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `+` `-` | zoom; drag to pan |
 | `I` | image info overlay |
 | `B` | bottom seekbar (reveals near the bottom edge; click/drag to jump) |
+| `G` | show/hide the animation panel (animated GIF / WebP) |
 | double-click | fullscreen (middle of the page); `F11` also toggles |
 | `Esc` | quit |
 

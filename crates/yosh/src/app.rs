@@ -90,6 +90,29 @@ pub struct App {
     state: Option<State>,
 }
 
+/// Playback state for the animation (GIF/WebP) currently in view (BandiView-style
+/// mini controls). `page` binds the controls to one page; when the viewed
+/// animation changes it rebinds and resets. Non-controlled animations keep
+/// free-running on the wall clock.
+struct Playback {
+    /// User hid the control panel (toggle with the key); playback continues.
+    hidden: bool,
+    /// Play/pause. Paused (or stepping) freezes on `frame`.
+    playing: bool,
+    /// The page index these controls govern (None when no animation is in view).
+    page: Option<usize>,
+    /// Current frame index (0-based).
+    frame: usize,
+    /// When `frame` was last advanced — drives play timing against frame delays.
+    last: Instant,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Playback { hidden: false, playing: true, page: None, frame: 0, last: Instant::now() }
+    }
+}
+
 struct State {
     window: Arc<Window>,
     gpu: Gpu,
@@ -156,6 +179,12 @@ struct State {
     /// When the zoomed-page wheel-pan first parked at the top/bottom edge (None
     /// when not at an edge). Gates the hard-stop dwell before flipping pages.
     pan_edge_at: Option<Instant>,
+    /// Fixed origin for animation timing. A single shared clock is correct —
+    /// every animated page derives its current frame from the same wall time, so
+    /// all animations loop in step and the render loop stays stateless per page.
+    anim_origin: Instant,
+    /// Mini play/pause/step controls for the animation (GIF/WebP) currently in view.
+    playback: Playback,
 
     library: Library,
     library_view: bool,
@@ -300,6 +329,25 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
     // GIF
     if b.len() >= 10 && &b[0..3] == b"GIF" {
         return (le16(6), le16(8), "GIF".to_string());
+    }
+    // PSD / PSB (Photoshop): header is big-endian — rows@14, cols@18 (u32),
+    // depth@22 and color mode@24 (u16).
+    if b.len() >= 26 && &b[0..4] == b"8BPS" {
+        let be32 = |i: usize| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let h = be32(14);
+        let w = be32(18);
+        let mode = match be16(24) {
+            0 => "bitmap",
+            1 => "grayscale",
+            2 => "indexed",
+            3 => "RGB",
+            4 => "CMYK",
+            7 => "multichannel",
+            8 => "duotone",
+            9 => "Lab",
+            _ => "?",
+        };
+        return (w, h, format!("PSD · {}-bit {}", be16(22), mode));
     }
     // BMP
     if b.len() >= 26 && &b[0..2] == b"BM" {
@@ -611,6 +659,8 @@ impl ApplicationHandler for App {
             loading_pending: None,
             toast: None,
             pan_edge_at: None,
+            anim_origin: Instant::now(),
+            playback: Playback::default(),
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -710,6 +760,7 @@ enum Action {
     ToggleSpreadOffset,
     ToggleInfo,
     ToggleSeekbar,
+    ToggleAnimBar,
     PrevVolume,
     NextVolume,
     ToggleJump,
@@ -734,6 +785,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyJ => return Some(Action::ToggleJump),
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
+            KeyCode::KeyG => return Some(Action::ToggleAnimBar),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit9 | KeyCode::Numpad9 => return Some(Action::PresetWindow),
@@ -872,6 +924,7 @@ impl State {
                 self.settings.seekbar_enabled = !self.settings.seekbar_enabled;
                 config::save(&self.settings);
             }
+            Action::ToggleAnimBar => self.playback.hidden = !self.playback.hidden,
             Action::ToggleFullscreen => {
                 let fs = match self.window.fullscreen() {
                     Some(_) => None,
@@ -1684,6 +1737,95 @@ impl State {
         pool.set_jobs(desired);
     }
 
+    /// The page index whose animation controls are active (the in-view anchor, if
+    /// it's an animated page and its texture is decoded).
+    fn anim_anchor(&self) -> Option<usize> {
+        if self.library_view {
+            return None;
+        }
+        let len = self.source.as_ref()?.len();
+        let anchor = if self.scroll_mode {
+            self.index
+        } else {
+            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+        };
+        (self.cache.get(anchor)?.frame_count() > 1).then_some(anchor)
+    }
+
+    /// Advance/refresh playback for the in-view animation and publish the panel's
+    /// display state to `self.ui`. Driven every frame by the continuous render
+    /// loop.
+    fn update_playback(&mut self) {
+        let Some(anchor) = self.anim_anchor() else {
+            self.playback.page = None;
+            self.ui.anim_show = false;
+            return;
+        };
+        let frames = self.cache.get(anchor).map_or(1, |t| t.frame_count());
+        // Rebind (and reset) when the viewed animation changes.
+        if self.playback.page != Some(anchor) {
+            self.playback.page = Some(anchor);
+            self.playback.frame = 0;
+            self.playback.playing = true;
+            self.playback.last = Instant::now();
+        }
+        if self.playback.playing {
+            let now = Instant::now();
+            // Advance through as many frames as real time has passed (respecting
+            // each frame's own delay), so playback tracks wall time even if we
+            // briefly lagged.
+            loop {
+                let d = self
+                    .cache
+                    .get(anchor)
+                    .map_or(100, |t| t.frame_delay_ms(self.playback.frame))
+                    .max(1) as u64;
+                if now.duration_since(self.playback.last) >= Duration::from_millis(d) {
+                    self.playback.last += Duration::from_millis(d);
+                    self.playback.frame = (self.playback.frame + 1) % frames;
+                } else {
+                    break;
+                }
+            }
+        }
+        self.playback.frame = self.playback.frame.min(frames - 1);
+        self.ui.anim_show = !self.playback.hidden;
+        self.ui.anim_playing = self.playback.playing;
+        self.ui.anim_frame = self.playback.frame;
+        self.ui.anim_total = frames;
+    }
+
+    fn playback_toggle(&mut self) {
+        self.playback.playing = !self.playback.playing;
+        if self.playback.playing {
+            self.playback.last = Instant::now(); // resume from now, no time-warp jump
+        }
+    }
+
+    fn playback_frame_count(&self) -> usize {
+        self.playback.page.and_then(|p| self.cache.get(p)).map_or(1, |t| t.frame_count())
+    }
+
+    /// Step the animation by `d` frames (pauses playback; wraps around).
+    fn playback_step(&mut self, d: i32) {
+        let frames = self.playback_frame_count();
+        if frames <= 1 {
+            return;
+        }
+        self.playback.playing = false;
+        self.playback.frame = (self.playback.frame as i32 + d).rem_euclid(frames as i32) as usize;
+    }
+
+    /// Jump the animation to a specific frame (pauses playback).
+    fn playback_seek(&mut self, frame: usize) {
+        let frames = self.playback_frame_count();
+        if frames <= 1 {
+            return;
+        }
+        self.playback.playing = false;
+        self.playback.frame = frame.min(frames - 1);
+    }
+
     #[allow(deprecated)]
     fn render(&mut self) {
         if let Some(p) = self.ui.pending_open.take() {
@@ -1736,6 +1878,8 @@ impl State {
             self.normalize();
         }
         self.prefetch();
+        // Advance the in-view animation's frame and refresh its control panel.
+        self.update_playback();
 
         // Decide what to draw this frame (library grid hides the page).
         let quads = if self.library_view {
@@ -1832,15 +1976,27 @@ impl State {
             self.ui.seek_show =
                 self.settings.seekbar_enabled && !self.library_view && len > 1 && near_bottom;
         }
+        let anim_t = self.anim_origin.elapsed();
+        let anim_page = self.playback.page;
+        let anim_frame = self.playback.frame;
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
                 self.cache.get(q.page_index).map(|t| {
+                    // The animation under user control shows its selected frame;
+                    // any other animated page free-runs on the wall clock; stills
+                    // return their sole view. Continuous redraw drives both.
+                    let view = if Some(q.page_index) == anim_page {
+                        t.frame_view(anim_frame)
+                    } else {
+                        t.view_at(anim_t)
+                    };
                     self.page_pipeline.prepare_quad(
                         &self.gpu.device,
                         &self.gpu.queue,
                         q.slot,
                         t,
+                        view,
                         q.scale,
                         q.offset,
                     )
@@ -1930,6 +2086,20 @@ impl State {
             if page != self.index {
                 self.goto(page);
             }
+        }
+        // Animation control-panel clicks (drained after the egui frame).
+        if std::mem::take(&mut self.ui.anim_req_toggle_play) {
+            self.playback_toggle();
+        }
+        let step = std::mem::take(&mut self.ui.anim_req_step);
+        if step != 0 {
+            self.playback_step(step);
+        }
+        if let Some(f) = self.ui.anim_req_seek.take() {
+            self.playback_seek(f);
+        }
+        if std::mem::take(&mut self.ui.anim_req_hide) {
+            self.playback.hidden = true;
         }
         if std::mem::take(&mut self.ui.req_update) && !self.updating {
             if let Some(u) = self.update.clone() {

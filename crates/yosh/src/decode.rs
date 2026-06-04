@@ -15,7 +15,9 @@
 
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
-use image::ImageDecoder;
+use image::codecs::gif::GifDecoder;
+use image::codecs::webp::WebPDecoder;
+use image::{AnimationDecoder, ImageDecoder};
 
 use crate::icc;
 use crate::tone;
@@ -139,6 +141,18 @@ fn decode_jxl(bytes: &[u8]) -> Result<Decoded, String> {
     }
 }
 
+/// Decode a Photoshop document to its flattened composite (the "merged image
+/// data" Photoshop stores), via the pure-Rust `psd` crate. Handles 8-bit RGB(A)
+/// documents only — CMYK / 16-bit / grayscale-mode / PSB files error out and the
+/// page shows as failed. yosh reads PSD when browsing a folder/archive but is not
+/// a registered `.psd` handler (that stays Photoshop's).
+fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
+    let psd = psd::Psd::from_bytes(bytes).map_err(|e| format!("psd: {e:?}"))?;
+    let (w, h) = (psd.width(), psd.height());
+    // rgba() is the pre-composited final image: [R,G,B,A, …], len = w*h*4.
+    Ok((w, h, false, psd.rgba(), None))
+}
+
 fn decode_other(bytes: &[u8]) -> Result<Decoded, String> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -188,6 +202,8 @@ fn decode_raw(bytes: &[u8]) -> Result<Decoded, String> {
         decode_jpeg(bytes)
     } else if is_jxl(bytes) {
         decode_jxl(bytes)
+    } else if bytes.starts_with(b"8BPS") {
+        decode_psd(bytes)
     } else {
         decode_other(bytes)
     }
@@ -338,5 +354,181 @@ pub fn decode_and_downscale(
         downscale_gray(&rgba_to_luma(&full), w, h, tw, target_h, resizer)
     } else {
         downscale_color(&full, w, h, tw, target_h, resizer)
+    }
+}
+
+/// A decoded page: either a single still image (the common case — every format
+/// except multi-frame GIF), or an animation as an ordered list of
+/// `(frame, delay_ms)`. A single-frame GIF comes back as `Still`, so the rest of
+/// the pipeline only pays the animation cost for GIFs that actually move.
+pub enum DecodedPage {
+    Still(DecodedImage),
+    Animated(Vec<(DecodedImage, u32)>),
+}
+
+/// Downscale one already-decoded, canvas-composited RGBA frame to `target_h` via
+/// the color (Lanczos3) path — the strategy for animated GIF frames (palette
+/// color, not manga screentone, so the gray linear-light path doesn't apply).
+fn downscale_rgba_frame(
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let target_h = target_h.min(h).max(1);
+    if target_h == h {
+        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels: rgba });
+    }
+    let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);
+    downscale_color(&rgba, w, h, tw, target_h, resizer)
+}
+
+/// Turn an animation's decoded frames into a `DecodedPage`: downscale each frame
+/// (color path) and keep its delay. The decoder (`GifDecoder` / `WebPDecoder`)
+/// hands back each frame **pre-composited to the full canvas** (disposal already
+/// applied), so each is a complete same-size RGBA image. A single frame collapses
+/// to `Still` so a non-animated file pays no animation overhead.
+fn frames_to_page(
+    frames: Vec<image::Frame>,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedPage, String> {
+    if frames.is_empty() {
+        return Err("animation: no frames".into());
+    }
+    let mut out: Vec<(DecodedImage, u32)> = Vec::with_capacity(frames.len());
+    for frame in frames {
+        // Delay as a ms ratio (numer/denom). Clamp tiny/zero delays to 100ms,
+        // matching browsers (which treat <20ms as 100ms) so a 0ms frame can't pin
+        // the loop.
+        let (num, den) = frame.delay().numer_denom_ms();
+        let ms = if den == 0 { 0 } else { num / den };
+        let delay = if ms < 20 { 100 } else { ms };
+        let buf = frame.into_buffer(); // RgbaImage, full canvas
+        let (w, h) = buf.dimensions();
+        out.push((downscale_rgba_frame(buf.into_raw(), w, h, target_h, resizer)?, delay));
+    }
+    if out.len() == 1 {
+        Ok(DecodedPage::Still(out.pop().unwrap().0))
+    } else {
+        Ok(DecodedPage::Animated(out))
+    }
+}
+
+/// Decode a page to a still image or (for animated GIF / WebP) an animation. This
+/// is the entry point the decode pool uses; stills go through the unchanged
+/// `decode_and_downscale` hot path.
+pub fn decode_page(
+    bytes: &[u8],
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedPage, String> {
+    // GIF is always frame-decoded (a 1-frame GIF collapses back to a still).
+    if bytes.starts_with(b"GIF8") {
+        let frames = GifDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(|e| format!("gif: {e}"))?
+            .into_frames()
+            .collect_frames()
+            .map_err(|e| format!("gif frames: {e}"))?;
+        return frames_to_page(frames, target_h, resizer);
+    }
+    // WebP: frame-decode only when it's actually animated; a static WebP takes the
+    // normal still path (with ICC color management) like any other image.
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        if let Ok(dec) = WebPDecoder::new(std::io::Cursor::new(bytes))
+            && dec.has_animation()
+        {
+            let frames = dec
+                .into_frames()
+                .collect_frames()
+                .map_err(|e| format!("webp frames: {e}"))?;
+            return frames_to_page(frames, target_h, resizer);
+        }
+    }
+    Ok(DecodedPage::Still(decode_and_downscale(bytes, target_h, resizer)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::codecs::gif::GifEncoder;
+    use image::{Delay, Frame, Rgba, RgbaImage};
+
+    fn encode_gif(frames: Vec<Frame>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut buf);
+            for f in frames {
+                enc.encode_frame(f).unwrap();
+            }
+        } // drop encoder → flush trailer
+        buf
+    }
+
+    fn frame(rgba: [u8; 4]) -> Frame {
+        let img = RgbaImage::from_pixel(4, 4, Rgba(rgba));
+        Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(100, 1))
+    }
+
+    #[test]
+    fn multiframe_gif_decodes_as_animation() {
+        let bytes = encode_gif(vec![frame([255, 0, 0, 255]), frame([0, 0, 255, 255])]);
+        let mut resizer = Resizer::new();
+        match decode_page(&bytes, 4, &mut resizer).unwrap() {
+            DecodedPage::Animated(fs) => {
+                assert_eq!(fs.len(), 2, "both frames preserved");
+                assert!(fs.iter().all(|(img, _)| img.w == 4 && img.h == 4 && !img.gray));
+                // 100ms round-trips through the centisecond GIF delay field.
+                assert!(fs.iter().all(|(_, d)| *d == 100), "delays = {:?}", fs.iter().map(|(_, d)| *d).collect::<Vec<_>>());
+            }
+            DecodedPage::Still(_) => panic!("expected an animation"),
+        }
+    }
+
+    #[test]
+    fn single_frame_gif_is_a_still() {
+        let bytes = encode_gif(vec![frame([0, 255, 0, 255])]);
+        let mut resizer = Resizer::new();
+        assert!(matches!(
+            decode_page(&bytes, 4, &mut resizer).unwrap(),
+            DecodedPage::Still(_)
+        ));
+    }
+
+    /// A minimal 4×4, 8-bit RGB PSD with raw (uncompressed) merged image data:
+    /// header → empty color-mode/resources/layer sections → planar R,G,B planes.
+    fn minimal_rgb_psd() -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(b"8BPS"); // signature
+        b.extend_from_slice(&1u16.to_be_bytes()); // version 1 = PSD
+        b.extend_from_slice(&[0u8; 6]); // reserved
+        b.extend_from_slice(&3u16.to_be_bytes()); // channels = RGB
+        b.extend_from_slice(&4u32.to_be_bytes()); // height
+        b.extend_from_slice(&4u32.to_be_bytes()); // width
+        b.extend_from_slice(&8u16.to_be_bytes()); // depth = 8
+        b.extend_from_slice(&3u16.to_be_bytes()); // color mode = RGB
+        b.extend_from_slice(&0u32.to_be_bytes()); // color mode data: none
+        b.extend_from_slice(&0u32.to_be_bytes()); // image resources: none
+        b.extend_from_slice(&0u32.to_be_bytes()); // layer & mask info: none
+        b.extend_from_slice(&0u16.to_be_bytes()); // compression = raw
+        b.extend(std::iter::repeat(255u8).take(16)); // R plane
+        b.extend(std::iter::repeat(0u8).take(16)); // G plane
+        b.extend(std::iter::repeat(0u8).take(16)); // B plane
+        b
+    }
+
+    #[test]
+    fn psd_decodes_flattened_composite() {
+        let bytes = minimal_rgb_psd();
+        let mut resizer = Resizer::new();
+        match decode_page(&bytes, 4, &mut resizer).unwrap() {
+            DecodedPage::Still(img) => {
+                assert_eq!((img.w, img.h), (4, 4));
+                assert!(!img.gray);
+                assert_eq!(&img.pixels[0..4], &[255, 0, 0, 255], "opaque red");
+            }
+            DecodedPage::Animated(_) => panic!("psd should be a still"),
+        }
     }
 }
