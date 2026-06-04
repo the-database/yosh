@@ -63,7 +63,13 @@ fn ga_to_gray(ga: &[u8]) -> Vec<u8> {
 type Decoded = (u32, u32, bool, Vec<u8>, Option<Vec<u8>>);
 
 fn decode_png(bytes: &[u8]) -> Result<Decoded, String> {
-    let mut reader = png::Decoder::new(std::io::Cursor::new(bytes))
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    // Normalize to 8-bit colour: down-convert 16-bit → 8-bit and expand
+    // palette / sub-8-bit grayscale / tRNS. Without this a 16-bit PNG reports 6
+    // (RGB16) or 8 (RGBA16) bytes-per-pixel below and fails to decode (and a
+    // paletted PNG would be misread as 1-channel gray). No-op for plain 8-bit.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder
         .read_info()
         .map_err(|e| format!("png read_info: {e}"))?;
     let size = reader.output_buffer_size().ok_or("png: no buffer size")?;
@@ -529,6 +535,29 @@ mod tests {
                 assert_eq!(&img.pixels[0..4], &[255, 0, 0, 255], "opaque red");
             }
             DecodedPage::Animated(_) => panic!("psd should be a still"),
+        }
+    }
+
+    #[test]
+    fn png_16bit_decodes() {
+        // A 16-bit RGBA PNG (e.g. from ImageMagick/Photoshop) — before the
+        // normalize-to-8-bit transform this failed to decode (reported 8 channels).
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Sixteen);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&[0xFFu8; 2 * 2 * 4 * 2]).unwrap(); // 2×2 RGBA16
+        }
+        let mut resizer = Resizer::new();
+        match decode_page(&bytes, 2, &mut resizer).unwrap() {
+            DecodedPage::Still(img) => {
+                assert_eq!((img.w, img.h), (2, 2));
+                assert!(!img.gray);
+                assert_eq!(img.pixels.len(), 2 * 2 * 4, "down-converted to RGBA8");
+            }
+            DecodedPage::Animated(_) => panic!("png is a still"),
         }
     }
 }

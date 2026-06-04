@@ -1981,17 +1981,28 @@ impl State {
             } else {
                 layout::view_pages(self.layout, self.index, len, self.spread_offset).0
             };
-            let loading = !self.cache.contains(anchor);
-            if !loading {
+            let in_cache = self.cache.contains(anchor);
+            // A page whose decode errored is in `failed`; treat it as not-loading
+            // so we show a failure notice instead of spinning forever.
+            let failed = !in_cache && self.failed.contains(&anchor);
+            let loading = !in_cache && !failed;
+            if in_cache {
                 self.last_drawn = Some(anchor);
             }
             self.ui.status = format!(
                 "{}/{}{}{}",
                 self.index + 1,
                 len,
-                if loading { "  …" } else { "" },
+                if failed {
+                    "  [failed]"
+                } else if loading {
+                    "  …"
+                } else {
+                    ""
+                },
                 if self.jump { "  [jump]" } else { "  [step]" }
             );
+            self.ui.failed = failed;
             // Show the centered spinner only after this page's decode has been
             // pending a beat, so fast flips don't flash it. The timer restarts
             // whenever the anchor changes, so a quick page reached at the end of
