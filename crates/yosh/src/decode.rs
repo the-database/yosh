@@ -1,7 +1,8 @@
 //! Decode + downscale a page's encoded bytes to a display-resolution buffer.
 //!
-//! Routes by magic bytes: PNG → `png`, JPEG → `jpeg-decoder`, else → `image`
-//! crate fallback (WebP/GIF/BMP/…). Normalizes to single-channel R8 (gray) or
+//! Routes by magic bytes: PNG → `png`, JPEG → `jpeg-decoder`, JPEG XL →
+//! `jxl-oxide` (pure Rust), else → `image` crate fallback (WebP/GIF/BMP/AVIF/…).
+//! Normalizes to single-channel R8 (gray) or
 //! RGBA8 (color), then downscales with a high-quality, content-aware filter
 //! (inspired by MangaJaNaiConverterGui's final-resize strategy):
 //!   - **color** → Lanczos3 in gamma space (no color conversion),
@@ -89,6 +90,50 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     }
 }
 
+/// Decode JPEG XL via the pure-Rust `jxl-oxide`. Renders the first frame (ignores
+/// animation) and normalizes to the same gray/RGBA8 + ICC contract as the others;
+/// jxl-oxide hands back samples in the image's own color space plus its embedded
+/// ICC, so the downstream qcms→sRGB step (in `decode_and_downscale`) color-manages
+/// it exactly like JPEG/PNG.
+fn decode_jxl(bytes: &[u8]) -> Result<Decoded, String> {
+    use jxl_oxide::{JxlImage, PixelFormat};
+    let image = JxlImage::builder()
+        .read(std::io::Cursor::new(bytes))
+        .map_err(|e| format!("jxl read: {e}"))?;
+    let (w, h) = (image.width(), image.height());
+    let icc = image.original_icc().map(<[u8]>::to_vec);
+    let fmt = image.pixel_format();
+    let render = image.render_frame(0).map_err(|e| format!("jxl render: {e}"))?;
+    let fb = render.image_all_channels(); // interleaved f32, len = w*h*channels
+    let buf = fb.buf();
+    let ch = fb.channels();
+    // jxl-oxide samples are f32 (≈[0,1] for SDR); clamp handles any HDR overshoot.
+    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+    match fmt {
+        // 1ch gray — map straight through.
+        PixelFormat::Gray => Ok((w, h, true, buf.iter().map(|&v| to_u8(v)).collect(), icc)),
+        // Gray+alpha — drop alpha to match the 1ch gray contract (like `ga_to_gray`).
+        PixelFormat::Graya => {
+            Ok((w, h, true, buf.chunks_exact(ch).map(|px| to_u8(px[0])).collect(), icc))
+        }
+        // RGB → RGBA8 (opaque).
+        PixelFormat::Rgb => {
+            let mut pixels = vec![0u8; (w as usize) * (h as usize) * 4];
+            for (px, out) in buf.chunks_exact(ch).zip(pixels.chunks_exact_mut(4)) {
+                out[0] = to_u8(px[0]);
+                out[1] = to_u8(px[1]);
+                out[2] = to_u8(px[2]);
+                out[3] = 255;
+            }
+            Ok((w, h, false, pixels, icc))
+        }
+        // Already interleaved RGBA — map straight through.
+        PixelFormat::Rgba => Ok((w, h, false, buf.iter().map(|&v| to_u8(v)).collect(), icc)),
+        // CMYK(A) would need a CMS we don't enable; effectively never occurs for manga.
+        other => Err(format!("jxl: unsupported pixel format {other:?}")),
+    }
+}
+
 fn decode_other(bytes: &[u8]) -> Result<Decoded, String> {
     let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
@@ -120,12 +165,22 @@ pub fn to_rgba_image(img: DecodedImage) -> DecodedImage {
     }
 }
 
+/// JPEG XL signature: either a bare codestream (`FF 0A`) or the ISOBMFF
+/// container's 12-byte JXL box (`\0\0\0\x0C JXL \r \n \x87 \n`).
+fn is_jxl(bytes: &[u8]) -> bool {
+    const JXL_BOX: [u8; 12] =
+        [0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20, 0x0D, 0x0A, 0x87, 0x0A];
+    bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&JXL_BOX)
+}
+
 /// Decode to full resolution (no resize), normalized to gray (1ch) or RGBA8.
 fn decode_raw(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.starts_with(&PNG_SIG) {
         decode_png(bytes)
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         decode_jpeg(bytes)
+    } else if is_jxl(bytes) {
+        decode_jxl(bytes)
     } else {
         decode_other(bytes)
     }

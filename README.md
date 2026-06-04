@@ -32,7 +32,7 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 
 ## Formats
 - Sources: image folders, CBZ/ZIP, CBR/RAR (UnRAR), 7z/CB7.
-- Images: PNG, JPEG, WebP, GIF, BMP. AVIF is **opt-in** (see below).
+- Images: PNG, JPEG, WebP, GIF, BMP, JPEG XL (.jxl). AVIF is **opt-in** (see below).
 
 ## Controls (press <kbd>F1</kbd> in-app for the full list)
 | | |
