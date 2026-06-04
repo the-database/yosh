@@ -50,9 +50,10 @@ jobs:
 
       # --- AVIF needs dav1d (C). Build it from source + statically link so the
       # shipped binaries are self-contained; local/default builds stay C-free and
-      # only CI passes --features avif. dav1d is pinned + cached, so it builds
-      # once per OS then restores in seconds. Recipe mirrors dav1d-rs's own CI,
-      # plus static + (Windows) /MT to match the +crt-static Rust build. ---
+      # only CI passes --features avif. Built fresh each release (~2 min; not
+      # cached — GitHub caches are ref-scoped, so a tag run can't reuse them).
+      # Recipe mirrors dav1d-rs's own CI, plus static + (Windows) /MT to match
+      # the +crt-static Rust build. ---
       - name: Set up MSVC env (Windows)
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -79,30 +80,15 @@ jobs:
           echo 'C:\build\bin' >> "$GITHUB_PATH"
           echo 'SYSTEM_DEPS_DAV1D_LINK=static' >> "$GITHUB_ENV"
 
-      - name: Cache dav1d (Linux)
-        if: runner.os == 'Linux'
-        id: dav1d_linux
-        uses: actions/cache@v4
-        with:
-          path: ~/dav1d_install
-          key: dav1d-linux-1.5.0-static
-      - name: Cache dav1d + pkg-config (Windows)
-        if: runner.os == 'Windows'
-        id: dav1d_windows
-        uses: actions/cache@v4
-        with:
-          path: C:\build
-          key: dav1d-windows-1.5.0-static-mt
-
       - name: Build dav1d static (Linux)
-        if: runner.os == 'Linux' && steps.dav1d_linux.outputs.cache-hit != 'true'
+        if: runner.os == 'Linux'
         run: |
           git clone --branch 1.5.0 --depth 1 https://code.videolan.org/videolan/dav1d.git
           cd dav1d
           meson setup build --prefix="$HOME/dav1d_install" -Ddefault_library=static -Denable_tools=false -Denable_examples=false --buildtype=release
           ninja -C build install
       - name: Build pkg-config + dav1d static (Windows)
-        if: runner.os == 'Windows' && steps.dav1d_windows.outputs.cache-hit != 'true'
+        if: runner.os == 'Windows'
         run: |
           git clone --branch meson-glib-subproject --depth 1 https://gitlab.freedesktop.org/tpm/pkg-config.git
           cd pkg-config
