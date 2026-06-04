@@ -7,11 +7,11 @@ ring buffer ahead of the read position, so page changes are just texture swaps.
 
 ## Install (Windows)
 Grab the latest [release](https://github.com/the-database/yosh-rust/releases):
-- **`yosh-setup-x64.exe`** — installer (per-user, **no admin**). Adds a Start Menu shortcut and
-  optional file associations: comic archives (`.cbz .cbr .cb7`) open in yosh, and yosh is added to
-  *Open with* for images (`.png .jpg .jpeg .webp .gif .bmp .avif`). To make yosh the *default* for an
-  image type, pick it once via right-click → *Open with* → *Choose another app* (or Settings → Apps →
-  Default apps) — Windows doesn't let installers change that silently.
+- **`yosh-setup-x64.exe`** — installer (per-user, **no admin**). Adds a Start Menu shortcut and lets
+  you tick which file types open in yosh — **comic archives** (`.cbz .cbr .cb7`), **images**
+  (`.png .jpg .jpeg .webp .gif .bmp .avif`), or both. For a type another app already owns (e.g. `.png`
+  → Photos), Windows keeps that default until you confirm yosh once via right-click → *Open with* →
+  *Choose another app* (or Settings → Apps → Default apps) — installers can't change it silently.
 - **`yosh-windows-x64-portable.zip`** — portable build. Unzip anywhere and run `yosh.exe`; settings
   live next to it (`yosh-state.json`), so it leaves nothing behind and travels on a USB stick. (The
   bundled `yosh-portable.txt` marker enables this; delete it to use the normal `%APPDATA%` location.)
