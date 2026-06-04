@@ -1,0 +1,8 @@
+This file marks yosh as running in PORTABLE mode.
+
+While yosh.exe finds this file next to it, it stores its settings in
+"yosh-state.json" in this same folder instead of %APPDATA%. Move or copy this
+folder anywhere (a USB stick, another PC) and your settings travel with it, and
+nothing is left behind on the machine.
+
+Delete this file to make yosh use the normal per-user location (%APPDATA%) again.
