@@ -62,6 +62,8 @@ const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(150);
 const EDGE_FRAC: f32 = 0.15;
 /// Max gap between two middle-zone clicks to count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
+/// How long a transient toast (boundary hit, zoom level) stays on screen.
+const TOAST_DURATION: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -144,6 +146,9 @@ struct State {
     /// the end of a slow-seek streak still gets its own grace period). None as
     /// soon as the anchor is ready.
     loading_pending: Option<(usize, Instant)>,
+    /// Transient on-screen message (boundary reached, zoom level) + when it was
+    /// raised; cleared after `TOAST_DURATION`.
+    toast: Option<(String, Instant)>,
 
     library: Library,
     library_view: bool,
@@ -272,6 +277,22 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
             }
             _ => return (0, 0, "WebP".to_string()),
         }
+    }
+    // JPEG XL: bare codestream (FF 0A) or ISOBMFF box (".../JXL ..."). Parse just
+    // the header via jxl-oxide for exact dimensions + color type (no pixel decode).
+    if (b.len() >= 2 && b[0] == 0xFF && b[1] == 0x0A) || (b.len() >= 12 && &b[4..8] == b"JXL ") {
+        if let Ok(img) = jxl_oxide::JxlImage::builder().read(std::io::Cursor::new(b)) {
+            let color = match img.pixel_format() {
+                jxl_oxide::PixelFormat::Gray => "grayscale",
+                jxl_oxide::PixelFormat::Graya => "grayscale+alpha",
+                jxl_oxide::PixelFormat::Rgb => "RGB",
+                jxl_oxide::PixelFormat::Rgba => "RGBA",
+                jxl_oxide::PixelFormat::Cmyk => "CMYK",
+                jxl_oxide::PixelFormat::Cmyka => "CMYK+alpha",
+            };
+            return (img.width(), img.height(), format!("JPEG XL · {color}"));
+        }
+        return (0, 0, "JPEG XL".to_string());
     }
     // AVIF / HEIF (ISO-BMFF): dimensions need a box walk; report the format only.
     if b.len() >= 12 && &b[4..8] == b"ftyp" {
@@ -531,6 +552,7 @@ impl ApplicationHandler for App {
             pending_target: 0,
             info_for: None,
             loading_pending: None,
+            toast: None,
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -707,10 +729,10 @@ impl State {
             }
             // In RTL, "left" advances the story; in LTR, "right" does. (Page-flip only.)
             Action::Right if !self.scroll_mode => {
-                self.step(if self.direction == Direction::Ltr { 1 } else { -1 })
+                self.step(if self.direction == Direction::Ltr { 1 } else { -1 });
             }
             Action::Left if !self.scroll_mode => {
-                self.step(if self.direction == Direction::Ltr { -1 } else { 1 })
+                self.step(if self.direction == Direction::Ltr { -1 } else { 1 });
             }
             Action::Right | Action::Left => {}
             Action::First => self.goto(0),
@@ -743,10 +765,12 @@ impl State {
             Action::ZoomIn => {
                 self.zoom = (self.zoom * 1.25).min(8.0);
                 self.clamp_pan();
+                self.toast(format!("Zoom {}%", (self.zoom * 100.0).round() as i32));
             }
             Action::ZoomOut => {
                 self.zoom = (self.zoom / 1.25).max(1.0);
                 self.clamp_pan();
+                self.toast(format!("Zoom {}%", (self.zoom * 100.0).round() as i32));
             }
             Action::PresetWindow => self.apply_view(FitMode::Window, false, None),
             Action::PresetWidth => self.apply_view(FitMode::Width, false, None),
@@ -822,11 +846,19 @@ impl State {
         }
     }
 
-    fn step(&mut self, dir: i64) {
-        let Some(src) = &self.source else { return };
+    /// Raise a transient on-screen toast (boundary reached, zoom level).
+    fn toast(&mut self, msg: impl Into<String>) {
+        self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Flip one view in `dir`. Returns `true` if the position actually changed.
+    /// At the first/last page it raises a toast and returns `false`; while the
+    /// current page is still decoding in step mode it just returns `false`.
+    fn step(&mut self, dir: i64) -> bool {
+        let Some(src) = &self.source else { return false };
         let len = src.len();
         if len == 0 {
-            return;
+            return false;
         }
         // "Step" seek (default; toggle "jump" with J): don't flip while the
         // current page is still decoding, so you see every page instead of
@@ -834,7 +866,7 @@ impl State {
         if !self.jump {
             let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
             if !self.cache.contains(cur) {
-                return;
+                return false;
             }
         }
         let next = if dir > 0 {
@@ -845,6 +877,11 @@ impl State {
         if next != self.index {
             self.nav_times.push_back(Instant::now());
             self.goto(next);
+            true
+        } else {
+            // Nowhere to go — let the reader know why seeking did nothing.
+            self.toast(if dir > 0 { "Last page" } else { "First page" });
+            false
         }
     }
 
@@ -874,11 +911,14 @@ impl State {
         let Some(idx) = sibs.iter().position(|p| p.file_name() == cur_name) else {
             return;
         };
-        let Ok(target) = usize::try_from(idx as i64 + delta) else {
-            return; // before the first
-        };
-        if let Some(path) = sibs.get(target).cloned() {
-            self.open(&path);
+        let target = idx as i64 + delta;
+        if target < 0 {
+            self.toast("First book");
+            return;
+        }
+        match sibs.get(target as usize).cloned() {
+            Some(path) => self.open(&path),
+            None => self.toast("Last book"),
         }
     }
 
@@ -957,16 +997,30 @@ impl State {
             self.step(if dy < 0.0 { 1 } else { -1 });
             return;
         }
-        // Vertical pan in px; flip pages at the top/bottom edges.
+        // Vertical pan in px. At the top/bottom edge, hard-stop first: a scroll
+        // that would overshoot the edge just parks at it; only a *further* scroll
+        // once already parked flips the page. So scrolling to the end of a zoomed
+        // page stops there instead of immediately jumping to the next page — you
+        // have to keep scrolling past the stop to advance. Only reset the pan when
+        // a flip actually happened (else the first/last page snaps to its edge).
         let sh = self.gpu.config.height.max(1) as f32;
         let maxp = ((self.current_display_h() - sh) / 2.0).max(0.0);
-        let next = self.pan_y.clamp(-maxp, maxp) + dy * 80.0;
+        let cur = self.pan_y.clamp(-maxp, maxp);
+        let next = cur + dy * 80.0;
         if next > maxp + 0.5 {
-            self.step(-1); // panned above the top -> previous page, land at its bottom
-            self.pan_y = -1.0e6;
+            if cur >= maxp - 0.5 {
+                // Already parked at the top; keep scrolling up -> previous page.
+                self.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
+            } else {
+                self.pan_y = maxp; // hard stop at the top edge
+            }
         } else if next < -maxp - 0.5 {
-            self.step(1); // panned below the bottom -> next page, land at its top
-            self.pan_y = 1.0e6;
+            if cur <= -maxp + 0.5 {
+                // Already parked at the bottom; keep scrolling down -> next page.
+                self.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
+            } else {
+                self.pan_y = -maxp; // hard stop at the bottom edge
+            }
         } else {
             self.pan_y = next;
         }
@@ -1192,14 +1246,23 @@ impl State {
     }
 
     fn scroll_by(&mut self, dy: f32) {
-        if self.source.is_none() {
-            return;
-        }
-        self.top_offset += dy;
+        let len = match &self.source {
+            Some(s) => s.len(),
+            None => return,
+        };
         let before = self.index;
+        let before_off = self.top_offset;
+        self.top_offset += dy;
         self.normalize();
         if self.index != before {
             self.nav_times.push_back(Instant::now());
+        } else if dy.abs() > 0.5 && (self.top_offset - before_off).abs() < 0.5 {
+            // The strip didn't move despite a scroll — clamped at an end.
+            if dy < 0.0 && self.index == 0 && self.top_offset <= 0.5 {
+                self.toast("First page");
+            } else if dy > 0.0 && self.index + 1 >= len {
+                self.toast("Last page");
+            }
         }
         self.prefetch();
     }
@@ -1597,6 +1660,16 @@ impl State {
             self.ui.info = self.build_page_info(self.index);
             self.info_for = Some(self.index);
         }
+        // Live view state for the overlays: current zoom % (shown in the info
+        // overlay, refreshed every frame so it tracks zooming without a rebuild)
+        // and the active toast (dropped once it expires).
+        self.ui.zoom_pct = (self.zoom * 100.0).round() as u32;
+        if let Some((_, t)) = &self.toast
+            && t.elapsed() >= TOAST_DURATION
+        {
+            self.toast = None;
+        }
+        self.ui.toast = self.toast.as_ref().map(|(m, _)| m.clone());
         // Hide the top bar in fullscreen, revealing it when the cursor is at the top edge.
         let fullscreen = self.window.fullscreen().is_some();
         let reveal = 48.0 * self.window.scale_factor() as f32;

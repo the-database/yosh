@@ -35,6 +35,11 @@ pub struct UiState {
     /// by the app for the current page).
     pub info_open: bool,
     pub info: Vec<(String, String)>,
+    /// Current zoom percent, appended live to the info overlay (refreshed every
+    /// frame so it tracks zooming without rebuilding the page info).
+    pub zoom_pct: u32,
+    /// Transient toast message (boundary reached, zoom level); None when idle.
+    pub toast: Option<String>,
     /// Whether to show the centered loading spinner (the current page's decode
     /// has been pending long enough to warrant feedback). Set by the app.
     pub loading: bool,
@@ -361,6 +366,16 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                                     );
                                     ui.end_row();
                                 }
+                                // Live view state (refreshed every frame, not cached with the page).
+                                ui.label(
+                                    egui::RichText::new("Zoom").color(egui::Color32::from_gray(150)),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!("{}%", st.zoom_pct))
+                                        .color(egui::Color32::WHITE)
+                                        .monospace(),
+                                );
+                                ui.end_row();
                             });
                     });
             });
@@ -388,6 +403,28 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                                     .size(15.0),
                             );
                         });
+                    });
+            });
+    }
+
+    // Transient toast (boundary reached, zoom level). Floats near the bottom,
+    // above the seekbar's reveal zone; auto-cleared by the app after a moment.
+    if let Some(msg) = &st.toast
+        && !library_view
+    {
+        egui::Area::new(egui::Id::new("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(205))
+                    .inner_margin(egui::Margin::symmetric(16, 9))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(msg).color(egui::Color32::WHITE).size(15.0),
+                        );
                     });
             });
     }
