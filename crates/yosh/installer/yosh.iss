@@ -38,8 +38,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
-Name: "assoc_comics"; Description: "Open comic archives (.cbz, .cbr, .cb7) with yosh"; GroupDescription: "File associations:"
-Name: "assoc_images"; Description: "Add yosh to ""Open with"" for images (.png, .jpg, .jpeg, .webp, .gif, .bmp, .avif)"; GroupDescription: "File associations:"; Flags: unchecked
+Name: "assoc_comics"; Description: "&Comic archives  (.cbz, .cbr, .cb7)"; GroupDescription: "Open these file types with yosh:"
+Name: "assoc_images"; Description: "&Images  (.png, .jpg, .jpeg, .webp, .gif, .bmp, .avif)"; GroupDescription: "Open these file types with yosh:"; Flags: unchecked
 
 [Files]
 Source: "..\..\..\target\release\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -70,13 +70,22 @@ Root: HKCU; Subkey: "Software\Classes\.cbr\OpenWithProgids"; ValueType: string; 
 Root: HKCU; Subkey: "Software\Classes\.cb7"; ValueType: string; ValueName: ""; ValueData: "yosh.comic"; Tasks: assoc_comics; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.cb7\OpenWithProgids"; ValueType: string; ValueName: "yosh.comic"; ValueData: ""; Tasks: assoc_comics; Flags: uninsdeletevalue
 
-; ---- Image extensions: add yosh to "Open with" (don't steal the existing default) ----
+; ---- Image extensions: make yosh the handler + add to "Open with" ----
+; (For an image type another app already owns, Windows keeps that default until
+;  the user confirms via "Open with > Always" or Settings > Default apps.)
+Root: HKCU; Subkey: "Software\Classes\.png"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.png\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.jpg"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.jpg\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.jpeg"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.jpeg\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.webp"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.webp\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.gif"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.gif\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.bmp"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.avif"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.avif\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
 
 ; ---- App registration so yosh shows in "Open with" and Settings > Default apps ----
