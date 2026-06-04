@@ -105,6 +105,9 @@ pub struct PageTexture {
     pub view: wgpu::TextureView,
     pub w: u32,
     pub h: u32,
+    /// Native source dimensions (pre-downscale), for reporting true zoom.
+    pub src_w: u32,
+    pub src_h: u32,
     pub gray: bool,
     /// Decode target height this page was produced for (the `target_h` the pool
     /// used). Lets the cache detect pages decoded at a stale resolution after a
@@ -119,6 +122,8 @@ impl PageTexture {
         texture: wgpu::Texture,
         w: u32,
         h: u32,
+        src_w: u32,
+        src_h: u32,
         gray: bool,
         target_h: u32,
     ) -> PageTexture {
@@ -128,6 +133,8 @@ impl PageTexture {
             view,
             w,
             h,
+            src_w,
+            src_h,
             gray,
             target_h,
         }
@@ -140,6 +147,8 @@ impl PageTexture {
             view,
             w,
             h,
+            src_w: _,
+            src_h: _,
             gray,
             target_h: _,
         } = self;
@@ -279,6 +288,8 @@ impl PagePipeline {
             view,
             w: img.w,
             h: img.h,
+            src_w: img.src_w,
+            src_h: img.src_h,
             gray: img.gray,
             target_h,
         }

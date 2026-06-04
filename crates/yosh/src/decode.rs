@@ -30,6 +30,11 @@ const GRAYSCALE_THRESHOLD: i32 = 12;
 pub struct DecodedImage {
     pub w: u32,
     pub h: u32,
+    /// Native (pre-downscale) source dimensions, kept so the UI can report the
+    /// zoom level relative to the original image (the texture is decoded to ~the
+    /// display size, so `w`/`h` alone can't reveal it).
+    pub src_w: u32,
+    pub src_h: u32,
     /// true => single-channel R8; false => RGBA8.
     pub gray: bool,
     pub pixels: Vec<u8>,
@@ -160,6 +165,8 @@ pub fn to_rgba_image(img: DecodedImage) -> DecodedImage {
     DecodedImage {
         w: img.w,
         h: img.h,
+        src_w: img.src_w,
+        src_h: img.src_h,
         gray: false,
         pixels,
     }
@@ -189,7 +196,7 @@ fn decode_raw(bytes: &[u8]) -> Result<Decoded, String> {
 /// Decode at full resolution (for the dormant GPU-downscale path; not color-managed).
 pub fn decode_full(bytes: &[u8]) -> Result<DecodedImage, String> {
     let (w, h, gray, pixels, _icc) = decode_raw(bytes)?;
-    Ok(DecodedImage { w, h, gray, pixels })
+    Ok(DecodedImage { w, h, src_w: w, src_h: h, gray, pixels })
 }
 
 /// Decide whether an RGBA buffer is *effectively* grayscale within `threshold`.
@@ -263,7 +270,7 @@ fn downscale_gray(
         .chunks_exact(2)
         .map(|c| enc[u16::from_ne_bytes([c[0], c[1]]) as usize])
         .collect();
-    Ok(DecodedImage { w: tw, h: target_h, gray: true, pixels })
+    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: true, pixels })
 }
 
 /// Color strategy (MangaJaNai `standard_resize`): Lanczos3 in gamma space, no
@@ -285,7 +292,7 @@ fn downscale_color(
             &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)),
         )
         .map_err(|e| format!("resize: {e}"))?;
-    Ok(DecodedImage { w: tw, h: target_h, gray: false, pixels: dst.into_vec() })
+    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, pixels: dst.into_vec() })
 }
 
 /// Decode page bytes (any supported format) and downscale to `target_h` on CPU,
@@ -315,7 +322,7 @@ pub fn decode_and_downscale(
     // No downscale needed (1:1 / "Actual" mode, or a source already <= target):
     // show the decoded pixels unaltered — no resampling, no tone remap.
     if target_h == h {
-        return Ok(DecodedImage { w, h, gray: gray_by_channels, pixels: full });
+        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, pixels: full });
     }
 
     let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);
