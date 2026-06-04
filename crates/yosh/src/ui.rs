@@ -248,7 +248,45 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     ui.visuals_mut().override_text_color = Some(egui::Color32::from_white_alpha(235));
                     ui.horizontal(|ui| {
-                        if ui.button(if st.anim_playing { "Pause" } else { "Play" }).clicked() {
+                        // Play/pause: a fixed-size button with a hand-painted icon
+                        // (play triangle / pause bars). Same width in both states —
+                        // no reflow on toggle — and independent of glyph fonts.
+                        let bh = ui.spacing().interact_size.y;
+                        let btn = ui.add_sized(egui::vec2(bh * 1.4, bh), egui::Button::new(""));
+                        {
+                            let c = btn.rect.center();
+                            let col = egui::Color32::from_white_alpha(235);
+                            let p = ui.painter();
+                            if st.anim_playing {
+                                // Pause — two equal vertical bars.
+                                let bw = (bh * 0.15).max(2.5);
+                                let bar = egui::vec2(bw, bh * 0.5);
+                                let off = bw * 0.5 + bh * 0.07;
+                                for s in [-1.0_f32, 1.0] {
+                                    p.rect_filled(
+                                        egui::Rect::from_center_size(
+                                            egui::pos2(c.x + s * off, c.y),
+                                            bar,
+                                        ),
+                                        egui::CornerRadius::same(1),
+                                        col,
+                                    );
+                                }
+                            } else {
+                                // Play — right-pointing triangle.
+                                let r = bh * 0.28;
+                                p.add(egui::Shape::convex_polygon(
+                                    vec![
+                                        egui::pos2(c.x - r * 0.7, c.y - r),
+                                        egui::pos2(c.x - r * 0.7, c.y + r),
+                                        egui::pos2(c.x + r, c.y),
+                                    ],
+                                    col,
+                                    egui::Stroke::NONE,
+                                ));
+                            }
+                        }
+                        if btn.on_hover_text(if st.anim_playing { "Pause" } else { "Play" }).clicked() {
                             st.anim_req_toggle_play = true;
                         }
                         if ui.button("<").on_hover_text("Previous frame").clicked() {
