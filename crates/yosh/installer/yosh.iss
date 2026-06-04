@@ -41,7 +41,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
 Name: "assoc_comics"; Description: "&Comic archives  (.cbz, .cbr, .cb7)"; GroupDescription: "Open these file types with yosh:"
-Name: "assoc_images"; Description: "&Images  (.png, .jpg, .jpeg, .webp, .gif, .bmp, .avif)"; GroupDescription: "Open these file types with yosh:"; Flags: unchecked
+Name: "assoc_images"; Description: "&Images  (.png, .jpg, .jpeg, .webp, .gif, .bmp, .avif, .jxl)"; GroupDescription: "Open these file types with yosh:"; Flags: unchecked
 Name: "context_menu"; Description: "Add ""View with yosh"" when right-clicking comics, archives, images, and folders"; GroupDescription: "Right-click menu:"
 
 [Files]
@@ -93,6 +93,8 @@ Root: HKCU; Subkey: "Software\Classes\.bmp"; ValueType: string; ValueName: ""; V
 Root: HKCU; Subkey: "Software\Classes\.bmp\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.avif"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.avif\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.jxl"; ValueType: string; ValueName: ""; ValueData: "yosh.image"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.jxl\OpenWithProgids"; ValueType: string; ValueName: "yosh.image"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
 
 ; ---- App registration so yosh shows in "Open with" and Settings > Default apps ----
 Root: HKCU; Subkey: "Software\Classes\Applications\{#AppExe}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"; Flags: uninsdeletekey
@@ -110,6 +112,7 @@ Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueTy
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".gif"; ValueData: "yosh.image"; Tasks: assoc_images
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".bmp"; ValueData: "yosh.image"; Tasks: assoc_images
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".avif"; ValueData: "yosh.image"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jxl"; ValueData: "yosh.image"; Tasks: assoc_images
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#AppName}"; ValueData: "Software\{#AppName}\Capabilities"; Flags: uninsdeletevalue
 
 ; ---- "View with yosh" right-click verb (Tasks: context_menu) ----
@@ -125,6 +128,9 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.zip\shell\yosh.vie
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.7z\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.7z\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.7z\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.rar\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.rar\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.rar\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.cbz\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.cbz\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.cbz\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
@@ -155,6 +161,9 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.bmp\shell\yosh.vie
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avif\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avif\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avif\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
 ; Folders (right-click a folder of images)
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu

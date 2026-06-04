@@ -221,7 +221,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                         "Comics & images",
                         &[
                             "cbz", "cbr", "zip", "rar", "7z", "cb7", "png", "jpg", "jpeg", "webp",
-                            "gif", "bmp", "avif",
+                            "gif", "bmp", "avif", "jxl",
                         ],
                     )
                     .pick_file()
