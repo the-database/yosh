@@ -64,6 +64,10 @@ const EDGE_FRAC: f32 = 0.15;
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 /// How long a transient toast (boundary hit, zoom level) stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
+/// Minimum time a zoomed-page scroll must dwell parked at the top/bottom edge
+/// before a further scroll flips the page — turns the edge into a perceptible
+/// hard stop instead of an instant jump to the next page.
+const EDGE_DWELL: Duration = Duration::from_millis(350);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
@@ -149,6 +153,9 @@ struct State {
     /// Transient on-screen message (boundary reached, zoom level) + when it was
     /// raised; cleared after `TOAST_DURATION`.
     toast: Option<(String, Instant)>,
+    /// When the zoomed-page wheel-pan first parked at the top/bottom edge (None
+    /// when not at an edge). Gates the hard-stop dwell before flipping pages.
+    pan_edge_at: Option<Instant>,
 
     library: Library,
     library_view: bool,
@@ -553,6 +560,7 @@ impl ApplicationHandler for App {
             info_for: None,
             loading_pending: None,
             toast: None,
+            pan_edge_at: None,
             library,
             library_view,
             thumb_resizer: Resizer::new(),
@@ -765,12 +773,12 @@ impl State {
             Action::ZoomIn => {
                 self.zoom = (self.zoom * 1.25).min(8.0);
                 self.clamp_pan();
-                self.toast(format!("Zoom {}%", (self.zoom * 100.0).round() as i32));
+                self.toast(format!("Zoom {}%", self.effective_zoom_pct()));
             }
             Action::ZoomOut => {
                 self.zoom = (self.zoom / 1.25).max(1.0);
                 self.clamp_pan();
-                self.toast(format!("Zoom {}%", (self.zoom * 100.0).round() as i32));
+                self.toast(format!("Zoom {}%", self.effective_zoom_pct()));
             }
             Action::PresetWindow => self.apply_view(FitMode::Window, false, None),
             Action::PresetWidth => self.apply_view(FitMode::Width, false, None),
@@ -1007,22 +1015,41 @@ impl State {
         let maxp = ((self.current_display_h() - sh) / 2.0).max(0.0);
         let cur = self.pan_y.clamp(-maxp, maxp);
         let next = cur + dy * 80.0;
+        let now = Instant::now();
+        // True once we've been parked at an edge long enough that a further
+        // scroll should flip (the hard stop the user has to keep scrolling past).
+        let dwelt = self.pan_edge_at.is_some_and(|t| now.duration_since(t) >= EDGE_DWELL);
         if next > maxp + 0.5 {
             if cur >= maxp - 0.5 {
-                // Already parked at the top; keep scrolling up -> previous page.
-                self.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
+                // Parked at the top: flip to the previous page only after dwelling.
+                if dwelt {
+                    self.pan_edge_at = None;
+                    self.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
+                } else {
+                    self.pan_y = maxp; // hold the stop
+                    self.pan_edge_at.get_or_insert(now);
+                }
             } else {
-                self.pan_y = maxp; // hard stop at the top edge
+                self.pan_y = maxp; // just reached the top edge -> park + start dwell
+                self.pan_edge_at = Some(now);
             }
         } else if next < -maxp - 0.5 {
             if cur <= -maxp + 0.5 {
-                // Already parked at the bottom; keep scrolling down -> next page.
-                self.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
+                // Parked at the bottom: flip to the next page only after dwelling.
+                if dwelt {
+                    self.pan_edge_at = None;
+                    self.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
+                } else {
+                    self.pan_y = -maxp; // hold the stop
+                    self.pan_edge_at.get_or_insert(now);
+                }
             } else {
-                self.pan_y = -maxp; // hard stop at the bottom edge
+                self.pan_y = -maxp; // just reached the bottom edge -> park + start dwell
+                self.pan_edge_at = Some(now);
             }
         } else {
             self.pan_y = next;
+            self.pan_edge_at = None; // panning within the page
         }
     }
 
@@ -1120,6 +1147,26 @@ impl State {
                 t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
             }
             None => sh,
+        }
+    }
+
+    /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
+    /// = 100%), for the toast + info overlay. Pages are decoded to ~the display
+    /// size, so the displayed-vs-native ratio uses the page's native source dims,
+    /// not the texture's. Falls back to the raw factor if the page isn't decoded.
+    fn effective_zoom_pct(&self) -> u32 {
+        let sw = self.gpu.config.width.max(1) as f32;
+        let sh = self.gpu.config.height.max(1) as f32;
+        if let Some(t) = self.cache.get(self.index) {
+            let (src_w, src_h) = (t.src_w.max(1) as f32, t.src_h.max(1) as f32);
+            let scale = if self.scroll_mode {
+                sw * self.zoom / src_w // strip pages are laid out at width = sw * zoom
+            } else {
+                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom / src_h
+            };
+            (scale * 100.0).round().max(0.0) as u32
+        } else {
+            (self.zoom * 100.0).round() as u32
         }
     }
 
@@ -1663,7 +1710,7 @@ impl State {
         // Live view state for the overlays: current zoom % (shown in the info
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
         // and the active toast (dropped once it expires).
-        self.ui.zoom_pct = (self.zoom * 100.0).round() as u32;
+        self.ui.zoom_pct = self.effective_zoom_pct();
         if let Some((_, t)) = &self.toast
             && t.elapsed() >= TOAST_DURATION
         {
