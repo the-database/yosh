@@ -26,6 +26,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The app's reported version comes from Cargo.toml (CARGO_PKG_VERSION); the
+      # release name/installer come from the tag. They must agree — guard against
+      # tagging without bumping (which ships a binary that misreports its version
+      # and re-offers the same self-update forever).
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          cargo_ver=$(grep -m1 '^version' crates/yosh/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          tag_ver="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml=$cargo_ver  tag=$tag_ver"
+          [ "$cargo_ver" = "$tag_ver" ] || { echo "::error::tag v$tag_ver does not match Cargo.toml version $cargo_ver — bump crates/yosh/Cargo.toml"; exit 1; }
+
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
