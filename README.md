@@ -6,7 +6,7 @@ worker threads decode pages full-res, downscale (CPU or GPU), upload to GPU text
 ring buffer ahead of the read position, so page changes are just texture swaps.
 
 ## Install (Windows)
-Grab the latest [release](https://github.com/the-database/yosh-rust/releases):
+Grab the latest [release](https://github.com/the-database/yosh/releases):
 - **`yosh-setup-x64.exe`** — installer (per-user, **no admin**). Adds a Start Menu shortcut and lets
   you tick which file types open in yosh — **comic archives** (`.cbz .cbr .cb7`), **images**
   (`.png .jpg .jpeg .webp .gif .bmp .avif`), or both. For a type another app already owns (e.g. `.png`
