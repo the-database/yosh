@@ -51,6 +51,15 @@ impl Default for Settings {
 }
 
 fn config_file() -> Option<PathBuf> {
+    // Portable mode: a `yosh-portable.txt` marker next to the exe keeps config
+    // beside the exe (travels with the app, leaves nothing in %APPDATA%). The
+    // portable zip ships the marker; the installer does not.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && dir.join("yosh-portable.txt").exists()
+    {
+        return Some(dir.join("yosh-state.json"));
+    }
     directories::ProjectDirs::from("", "the-database", "yosh")
         .map(|d| d.config_dir().join("state.json"))
 }

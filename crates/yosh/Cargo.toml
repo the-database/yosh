@@ -1,6 +1,6 @@
 [package]
 name = "yosh"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2024"
 
 [dependencies]
@@ -32,6 +32,11 @@ windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",
     "Win32_Security",
 ] }
+
+# Embed the application icon into the .exe (build.rs). Windows-only so a plain
+# `cargo build` on Linux pulls nothing extra.
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [features]
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so
