@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 
 use fast_image_resize::Resizer;
 
-use crate::decode::{decode_and_downscale, decode_full};
+use crate::decode::{decode_full, decode_page, DecodedPage};
 use crate::downscale::Downscaler;
 use crate::page::{PagePipeline, PageTexture};
 use crate::source::PageSource;
@@ -113,9 +113,15 @@ impl DecodePool {
                             tex_pool.put(src, img.gray, img.w, img.h);
                             PageTexture::from_pooled(dst, tw, th, img.src_w, img.src_h, img.gray, th)
                         }),
-                        Ok(bytes) => decode_and_downscale(&bytes, th, &mut resizer)
-                            .ok()
-                            .map(|img| PagePipeline::upload(&device, &queue, &img, &tex_pool, th)),
+                        Ok(bytes) => match decode_page(&bytes, th, &mut resizer) {
+                            Ok(DecodedPage::Still(img)) => {
+                                Some(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
+                            }
+                            Ok(DecodedPage::Animated(frames)) => Some(
+                                PagePipeline::upload_animated(&device, &queue, frames, &tex_pool, th),
+                            ),
+                            Err(_) => None,
+                        },
                         Err(_) => None,
                     };
 

@@ -61,7 +61,7 @@ pub fn is_image_ext(p: &Path) -> bool {
             .and_then(|e| e.to_str())
             .map(|s| s.to_ascii_lowercase())
             .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "jpe" | "webp" | "gif" | "bmp" | "avif" | "jxl")
+        Some("png" | "jpg" | "jpeg" | "jpe" | "webp" | "gif" | "bmp" | "avif" | "jxl" | "psd")
     )
 }
 

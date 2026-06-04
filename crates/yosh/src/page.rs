@@ -3,6 +3,8 @@
 //! placement. Supports up to 2 quads per frame (single page or two-page spread)
 //! via independent per-slot uniform buffers.
 
+use std::time::Duration;
+
 use crate::decode::DecodedImage;
 use crate::texpool::TexturePool;
 
@@ -99,6 +101,15 @@ struct Uniforms {
     _pad: [u32; 3],
 }
 
+/// One frame of an animated page (GIF/WebP), beyond frame 0. Frame 0 lives in the
+/// `PageTexture`'s own `texture`/`view`; these are frames 1..N.
+struct AnimFrame {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// How long this frame is shown, in milliseconds.
+    delay_ms: u32,
+}
+
 /// A decoded page resident on the GPU.
 pub struct PageTexture {
     texture: wgpu::Texture,
@@ -113,6 +124,13 @@ pub struct PageTexture {
     /// used). Lets the cache detect pages decoded at a stale resolution after a
     /// zoom/resize and re-decode them in place without blanking the display.
     pub target_h: u32,
+    /// Animation frames 1..N (frame 0 is `texture`/`view`). `None` for stills.
+    /// All frames share this page's `(gray=false, w, h)` texture-pool bucket.
+    anim: Option<Vec<AnimFrame>>,
+    /// Frame 0's display time, ms (only meaningful when `anim` is `Some`).
+    frame0_delay_ms: u32,
+    /// Sum of all frame delays, ms — the animation loop period (0 for stills).
+    anim_total_ms: u32,
 }
 
 impl PageTexture {
@@ -137,10 +155,63 @@ impl PageTexture {
             src_h,
             gray,
             target_h,
+            anim: None,
+            frame0_delay_ms: 0,
+            anim_total_ms: 0,
         }
     }
 
-    /// Return the GPU texture to the pool for reuse (drops the view first).
+    /// Number of frames (1 for a still page).
+    pub fn frame_count(&self) -> usize {
+        1 + self.anim.as_ref().map_or(0, |a| a.len())
+    }
+
+    /// The view for a specific frame index (clamped). Frame 0 is the base view.
+    pub fn frame_view(&self, i: usize) -> &wgpu::TextureView {
+        match &self.anim {
+            None => &self.view,
+            Some(frames) => match i.checked_sub(1) {
+                None => &self.view, // frame 0
+                Some(j) => frames.get(j).map_or(&self.view, |f| &f.view),
+            },
+        }
+    }
+
+    /// The display time (ms) of a specific frame index.
+    pub fn frame_delay_ms(&self, i: usize) -> u32 {
+        if i == 0 {
+            return self.frame0_delay_ms;
+        }
+        self.anim
+            .as_ref()
+            .and_then(|frames| frames.get(i - 1))
+            .map_or(self.frame0_delay_ms, |f| f.delay_ms)
+    }
+
+    /// The texture view to display at animation time `t` (since some fixed
+    /// origin). For a still page this is always frame 0; for an animation it
+    /// walks the cumulative per-frame delays modulo the loop period.
+    pub fn view_at(&self, t: Duration) -> &wgpu::TextureView {
+        let Some(frames) = &self.anim else {
+            return &self.view;
+        };
+        let mut acc = (t.as_millis() % self.anim_total_ms.max(1) as u128) as u32;
+        if acc < self.frame0_delay_ms {
+            return &self.view; // frame 0
+        }
+        acc -= self.frame0_delay_ms;
+        for f in frames {
+            if acc < f.delay_ms {
+                return &f.view;
+            }
+            acc -= f.delay_ms;
+        }
+        // Rounding slack at the loop boundary: fall back to the last frame.
+        frames.last().map_or(&self.view, |f| &f.view)
+    }
+
+    /// Return every GPU texture (frame 0 and any animation frames) to the pool
+    /// for reuse (drops the views first). All frames share the page's bucket.
     pub fn recycle(self, pool: &TexturePool) {
         let PageTexture {
             texture,
@@ -151,9 +222,18 @@ impl PageTexture {
             src_h: _,
             gray,
             target_h: _,
+            anim,
+            frame0_delay_ms: _,
+            anim_total_ms: _,
         } = self;
         drop(view);
         pool.put(texture, gray, w, h);
+        if let Some(frames) = anim {
+            for AnimFrame { texture, view, delay_ms: _ } in frames {
+                drop(view);
+                pool.put(texture, gray, w, h);
+            }
+        }
     }
 }
 
@@ -292,17 +372,51 @@ impl PagePipeline {
             src_h: img.src_h,
             gray: img.gray,
             target_h,
+            anim: None,
+            frame0_delay_ms: 0,
+            anim_total_ms: 0,
         }
     }
 
+    /// Upload an animation (GIF/WebP): frame 0 becomes the base `PageTexture`
+    /// (exactly as `upload`), each remaining frame gets its own pooled texture.
+    /// `frames` is the decode's `(frame, delay_ms)` list and must have ≥2 entries.
+    pub fn upload_animated(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frames: Vec<(DecodedImage, u32)>,
+        pool: &TexturePool,
+        target_h: u32,
+    ) -> PageTexture {
+        let total: u32 = frames.iter().map(|(_, d)| *d).sum();
+        let mut iter = frames.into_iter();
+        let (img0, d0) = iter.next().expect("upload_animated: empty frames");
+        let mut base = Self::upload(device, queue, &img0, pool, target_h);
+        let anim: Vec<AnimFrame> = iter
+            .map(|(img, delay_ms)| {
+                // Reuse `upload` to allocate+fill a pooled texture, then peel off
+                // its texture/view (PageTexture has no Drop, so the partial move
+                // is fine; the unused still-fields just drop).
+                let pt = Self::upload(device, queue, &img, pool, target_h);
+                AnimFrame { texture: pt.texture, view: pt.view, delay_ms }
+            })
+            .collect();
+        base.anim = Some(anim);
+        base.frame0_delay_ms = d0;
+        base.anim_total_ms = total.max(1);
+        base
+    }
+
     /// Write quad `slot`'s uniform (NDC scale + top-left offset) and return its
-    /// bind group, ready to bind and `draw(0..6)`.
+    /// bind group, ready to bind and `draw(0..6)`. `view` is the texture view to
+    /// sample — usually `page.view`, or `page.view_at(t)` for an animated page.
     pub fn prepare_quad(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         slot: usize,
         page: &PageTexture,
+        view: &wgpu::TextureView,
         scale: [f32; 2],
         offset: [f32; 2],
     ) -> wgpu::BindGroup {
@@ -323,7 +437,7 @@ impl PagePipeline {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&page.view),
+                    resource: wgpu::BindingResource::TextureView(view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,

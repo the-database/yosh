@@ -164,6 +164,11 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.avif\shell\yosh.vi
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+; PSD — "View with yosh" right-click only. Deliberately NOT a default association
+; (Photoshop keeps that); yosh just offers to open the flattened composite.
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.psd\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.psd\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.psd\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
 ; Folders (right-click a folder of images)
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\Directory\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu

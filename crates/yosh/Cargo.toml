@@ -19,6 +19,9 @@ image = "0.25"
 # the optional lcms2 (C) / image / rayon features — yosh color-manages via qcms
 # and parallelizes across pages in the DecodePool, so JXL decodes single-threaded.
 jxl-oxide = { version = "0.12", default-features = false }
+# Pure-Rust PSD parser. Used to render a PSD's flattened composite (8-bit RGB);
+# PSD is browsable inside folders/archives but is *not* a registered file type.
+psd = "0.3"
 fast_image_resize = "6"
 qcms = "0.3"
 natord = "1"
