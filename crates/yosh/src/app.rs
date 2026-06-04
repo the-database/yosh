@@ -282,6 +282,17 @@ fn install_cjk_font(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// The window / taskbar / title-bar icon, decoded from the embedded logo PNG.
+/// (The icon embedded in the .exe via the build script is used by Explorer and
+/// shortcuts, but winit needs the window icon set explicitly at runtime.)
+fn window_icon() -> Option<winit::window::Icon> {
+    let img = image::load_from_memory(include_bytes!("../assets/yosh.png"))
+        .ok()?
+        .to_rgba8();
+    let (w, h) = img.dimensions();
+    winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
+}
+
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
 struct Quad {
     slot: usize,
@@ -307,6 +318,7 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("yosh")
+            .with_window_icon(window_icon())
             .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1500.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let mut gpu = Gpu::new(window.clone());
