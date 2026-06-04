@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
@@ -122,6 +123,11 @@ struct State {
     est_aspect: f32,  // h/w estimate for undecoded pages in the strip
 
     settings: config::Settings,
+    /// Last observed window geometry (outer x/y, inner w/h, physical px) while in
+    /// the normal — not maximized, not fullscreen — state. Seeded from the saved
+    /// settings so a session spent entirely maximized still persists the prior
+    /// restored rect; updated on move/resize; written back on exit.
+    win_geom: Option<(i32, i32, u32, u32)>,
     volume_key: Option<String>,
     tex_pool: Arc<TexturePool>,
     downscaler: Arc<Downscaler>,
@@ -150,6 +156,21 @@ struct State {
     update_apply_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     updating: bool,
     update_error: Option<String>,
+}
+
+/// True if the saved window rect overlaps any currently-connected monitor, so
+/// we don't restore a window onto a display that's been unplugged (which would
+/// strand it off-screen and unreachable). On overlap failure we drop only the
+/// saved position; the size is still honored and the OS places the window.
+fn geometry_on_screen(event_loop: &ActiveEventLoop, w: &config::WindowState) -> bool {
+    let (wx0, wy0) = (w.x, w.y);
+    let (wx1, wy1) = (w.x + w.w as i32, w.y + w.h as i32);
+    event_loop.available_monitors().any(|m| {
+        let mp = m.position();
+        let ms = m.size();
+        let (mx1, my1) = (mp.x + ms.width as i32, mp.y + ms.height as i32);
+        wx0 < mx1 && wx1 > mp.x && wy0 < my1 && wy1 > mp.y
+    })
 }
 
 fn fit_from_u8(v: u8) -> FitMode {
@@ -375,10 +396,24 @@ impl ApplicationHandler for App {
         if self.state.is_some() {
             return;
         }
+        let mut settings = config::load();
         let attrs = Window::default_attributes()
             .with_title("yosh")
-            .with_window_icon(window_icon())
-            .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1500.0));
+            .with_window_icon(window_icon());
+        // Restore the last window geometry (size/position/maximized) if we saved
+        // one; otherwise fall back to the default launch size. The saved position
+        // is only reapplied when it still lands on a connected monitor, so a
+        // window saved on a now-disconnected display doesn't open off-screen.
+        let attrs = match settings.window {
+            Some(w) => {
+                let mut a = attrs.with_inner_size(PhysicalSize::new(w.w.max(1), w.h.max(1)));
+                if geometry_on_screen(event_loop, &w) {
+                    a = a.with_position(PhysicalPosition::new(w.x, w.y));
+                }
+                a.with_maximized(w.maximized)
+            }
+            None => attrs.with_inner_size(winit::dpi::LogicalSize::new(1100.0, 1500.0)),
+        };
         // `with_window_icon` sets only the small (title-bar) icon; the taskbar
         // reads ICON_BIG, which winit exposes separately on Windows.
         #[cfg(windows)]
@@ -409,7 +444,6 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
-        let mut settings = config::load();
         gpu.set_turbo(settings.turbo);
         let tex_pool = Arc::new(TexturePool::new());
         let downscaler = Arc::new(Downscaler::new(&gpu.device));
@@ -488,6 +522,7 @@ impl ApplicationHandler for App {
             scroll_mode: settings.scroll,
             top_offset: 0.0,
             est_aspect: DEFAULT_ASPECT,
+            win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             settings,
             volume_key: None,
             tex_pool,
@@ -519,7 +554,11 @@ impl ApplicationHandler for App {
                 state.persist();
                 event_loop.exit();
             }
-            WindowEvent::Resized(size) => state.gpu.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                state.gpu.resize(size.width, size.height);
+                state.record_window_geometry();
+            }
+            WindowEvent::Moved(_) => state.record_window_geometry(),
             WindowEvent::DroppedFile(path) => state.ui.pending_open = Some(path),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -842,9 +881,38 @@ impl State {
     }
 
     /// Persist the current position + settings (called on close).
+    /// Snapshot the window's restored (non-maximized, non-fullscreen) geometry.
+    /// Maximizing/fullscreen reports the filled-screen rect, which we don't want
+    /// as the restore target, so those states are skipped — `win_geom` keeps the
+    /// last normal rect, which is exactly what we persist.
+    fn record_window_geometry(&mut self) {
+        if self.window.is_maximized() || self.window.fullscreen().is_some() {
+            return;
+        }
+        let Ok(pos) = self.window.outer_position() else {
+            return;
+        };
+        let size = self.window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            self.win_geom = Some((pos.x, pos.y, size.width, size.height));
+        }
+    }
+
     fn persist(&mut self) {
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), self.index);
+        }
+        // Save geometry + the current maximized flag. `win_geom` already holds the
+        // restored rect (it's only updated while normal), so an un-maximize after
+        // restart returns to the right size/position.
+        if let Some((x, y, w, h)) = self.win_geom {
+            self.settings.window = Some(config::WindowState {
+                x,
+                y,
+                w,
+                h,
+                maximized: self.window.is_maximized(),
+            });
         }
         config::save(&self.settings);
     }

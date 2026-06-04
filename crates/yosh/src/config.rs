@@ -6,6 +6,19 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Persisted window geometry so size/position/maximized survive a restart.
+/// Coordinates are physical pixels: `x`/`y` are the window's outer top-left
+/// (incl. decorations), `w`/`h` are the inner (client-area) size. When
+/// `maximized`, the geometry is the *restored* rect to return to on un-maximize.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct WindowState {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub maximized: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -30,6 +43,8 @@ pub struct Settings {
     /// "Jump" seek mode (key J): skip ahead past not-yet-decoded pages for fast
     /// long-distance seeks. Default off = "step" (hold on each page; see them all).
     pub jump: bool,
+    /// Last window geometry (size/position/maximized). None until first saved.
+    pub window: Option<WindowState>,
 }
 
 impl Default for Settings {
@@ -46,6 +61,7 @@ impl Default for Settings {
             spread_offsets: HashMap::new(),
             help_seen: false,
             jump: false,
+            window: None,
         }
     }
 }
