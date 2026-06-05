@@ -35,9 +35,9 @@ pub struct UiState {
     /// by the app for the current page).
     pub info_open: bool,
     pub info: Vec<(String, String)>,
-    /// Current zoom percent, appended live to the info overlay (refreshed every
-    /// frame so it tracks zooming without rebuilding the page info).
-    pub zoom_pct: u32,
+    /// Current zoom percent (native-relative), appended live to the info overlay
+    /// (refreshed every frame so it tracks zooming without rebuilding page info).
+    pub zoom_pct: f32,
     /// Transient toast message (boundary reached, zoom level); None when idle.
     pub toast: Option<String>,
     /// Whether to show the centered loading spinner (the current page's decode
@@ -511,7 +511,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                                     egui::RichText::new("Zoom").color(egui::Color32::from_gray(150)),
                                 );
                                 ui.label(
-                                    egui::RichText::new(format!("{}%", st.zoom_pct))
+                                    egui::RichText::new(format!("{:.2}%", st.zoom_pct))
                                         .color(egui::Color32::WHITE)
                                         .monospace(),
                                 );
