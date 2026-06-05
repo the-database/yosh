@@ -56,18 +56,30 @@ cargo test  -p yosh spread                             # run a subset of tests b
     resampling in gamma/perceptual space does **not**. Don't "simplify" it back to a gamma-space resize.
   - **Color path**: Lanczos3, plus `qcms` ICC → sRGB color management (`icc.rs`), applied *before* resize.
   - Color decodes that are *visually* grayscale are detected (`rgba_is_grayscale`) and routed to the gray path.
-  - **Adaptive decode resolution = on-screen page height.** The pool reads a shared `target_h` atomic and
-    decodes each page to ≈ the display height (quantized, capped to source res), so the CPU resize is the
-    *only* downscale and the GPU samples ~1:1 — no second, aliasing downscale at draw time. `app.rs`
-    debounces `target_h` changes so page-flipping never re-decodes (only resize/zoom does).
+  - **Single-resize invariant (load-bearing for quality — do not regress).** A page displayed at ≤ its
+    native resolution must be resampled **exactly once**, by the HQ CPU resize above. The GPU then samples
+    that texture **1:1** at draw time; there must be no second (bilinear, no-mipmap) downscale at draw, which
+    would soften the image and re-introduce screentone moiré. The *only* permitted GPU resample is
+    **upscaling** when zoomed past native resolution (magnification — there's no source detail to do a CPU
+    resize, and `MAX_TARGET` caps the texture); that is not a quality regression.
+  - **How the invariant is enforced — exact per-page decode targets.** `app.rs::page_target_h(i)` computes
+    each page's *exact* on-screen displayed pixel height (from its source aspect + the active fit/zoom/layout,
+    pairing-aware for spreads, width-based for scroll), and `prefetch` passes it per page to the pool as
+    `(index, target_h)` jobs — so the CPU resize lands the texture at its drawn size and the GPU samples 1:1.
+    No quantization. `update_decode_view` debounces on `(surface_w, surface_h, zoom)` so a resize/zoom *drag*
+    re-decodes once it settles (not every frame), and page-flipping between same-size pages never changes a
+    target, so it never re-decodes. 1:1 (`FitMode::Actual`) keeps full source res (it draws the texture at
+    `zoom` directly); zooming out in 1:1 is the one case that GPU-downscales, by design. The `TexturePool`
+    is globally bounded (`max_total`) with eviction, since exact targets mint more distinct texture sizes.
   - A GPU-downscale path exists but is **disabled** (`GPU_DOWNSCALE_ENABLED = false` in `pool.rs`) because a
     single bilinear blit can't match the HQ CPU resize. Kept for a future HQ-GPU rewrite.
 
 ### Central state and the frame loop
 - **`app.rs` (~1.7k lines) — `State`** is the winit `ApplicationHandler` and owns everything: gpu, egui,
   the `PageSource`, the `DecodePool`, the `PageCache`, nav/layout/zoom/pan/scroll state, and persisted settings.
-  - **`render()`** is the per-frame heart: drain the pool, recompute+debounce `target_h`, build draw quads,
-    draw pages, then the egui chrome. Re-read this before touching frame behavior.
+  - **`render()`** is the per-frame heart: drain the pool, recompute+debounce the decode view
+    (`update_decode_view`), build draw quads, draw pages, then the egui chrome. Re-read this before touching
+    frame behavior.
   - Input: keyboard → `Action` enum via `action_from()` → `apply_action()`. The keymap is the source of truth
     for shortcuts (README/F1 help mirror it).
   - **Two reading modes** gated by `scroll_mode`: discrete page-flip (with `single`/two-page-spread `Layout`)
