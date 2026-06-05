@@ -926,13 +926,13 @@ impl State {
                 self.zoom *= 1.25;
                 self.clamp_zoom_native();
                 self.clamp_pan();
-                self.toast(format!("Zoom {}%", self.effective_zoom_pct()));
+                self.toast(format!("Zoom {:.2}%", self.effective_zoom_pct()));
             }
             Action::ZoomOut => {
                 self.zoom /= 1.25;
                 self.clamp_zoom_native();
                 self.clamp_pan();
-                self.toast(format!("Zoom {}%", self.effective_zoom_pct()));
+                self.toast(format!("Zoom {:.2}%", self.effective_zoom_pct()));
             }
             Action::PresetWindow => self.apply_view(FitMode::Window, false, None),
             Action::PresetWidth => self.apply_view(FitMode::Width, false, None),
@@ -1366,9 +1366,9 @@ impl State {
     /// = 100%), for the toast + info overlay. Derived from the same scale the
     /// renderer draws, so it tracks fit-to-window upscaling and facing pairs
     /// exactly. Falls back to the raw factor while the anchor isn't decoded.
-    fn effective_zoom_pct(&self) -> u32 {
+    fn effective_zoom_pct(&self) -> f32 {
         let scale = self.anchor_scale().unwrap_or(self.zoom);
-        (scale * 100.0).round().max(0.0) as u32
+        (scale * 100.0).max(0.0)
     }
 
     /// Clamp `self.zoom` (a fit-multiplier) so the *effective native* zoom stays
