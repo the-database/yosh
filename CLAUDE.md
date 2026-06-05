@@ -62,6 +62,12 @@ cargo test  -p yosh spread                             # run a subset of tests b
     would soften the image and re-introduce screentone moiré. The *only* permitted GPU resample is
     **upscaling** when zoomed past native resolution (magnification — there's no source detail to do a CPU
     resize, and `MAX_TARGET` caps the texture); that is not a quality regression.
+  - **1:1 needs whole-pixel placement, not just a size match.** The page sampler is bilinear, so even at the
+    exact 1:1 size it only reads texel centers (an identity, no resample) if the quad is positioned on whole
+    device pixels; a fractional offset (e.g. a 1537-px page centred on 3840 → x = 1151.5) makes it blend each
+    column 50/50 — a horizontal smear that beats against halftones. So `single_quad`/`build_quads` **round the
+    page's screen position and size to integers** in the page-flip path. (Scroll keeps sub-pixel placement so
+    motion stays smooth — its transient softness is acceptable.)
   - **How the invariant is enforced — exact per-page decode targets.** `app.rs::page_target_h(i)` computes
     each page's *exact* on-screen displayed pixel height (from its source aspect + the active fit/zoom/layout,
     pairing-aware for spreads, width-based for scroll), and `prefetch` passes it per page to the pool as
