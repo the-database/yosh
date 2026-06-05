@@ -46,6 +46,11 @@ const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
 const BACK: usize = 6;
 const FWD_MAX: usize = 40;
+/// Zoom limits, measured against the image's *native* resolution (1 image px :
+/// 1 screen px = 100%), matching BandiView. `self.zoom` is a fit-multiplier, so
+/// these are converted to multiplier bounds per page in `clamp_zoom_native`.
+const MIN_ZOOM_PCT: f32 = 0.05; // 5% of native
+const MAX_ZOOM_PCT: f32 = 200.0; // 20000% of native
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
 /// Height/width estimate for not-yet-decoded pages in the scroll strip.
@@ -918,12 +923,14 @@ impl State {
                 config::save(&self.settings);
             }
             Action::ZoomIn => {
-                self.zoom = (self.zoom * 1.25).min(8.0);
+                self.zoom *= 1.25;
+                self.clamp_zoom_native();
                 self.clamp_pan();
                 self.toast(format!("Zoom {}%", self.effective_zoom_pct()));
             }
             Action::ZoomOut => {
-                self.zoom = (self.zoom / 1.25).max(1.0);
+                self.zoom /= 1.25;
+                self.clamp_zoom_native();
                 self.clamp_pan();
                 self.toast(format!("Zoom {}%", self.effective_zoom_pct()));
             }
@@ -1300,23 +1307,87 @@ impl State {
         }
     }
 
-    /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
-    /// = 100%), for the toast + info overlay. Pages are decoded to ~the display
-    /// size, so the displayed-vs-native ratio uses the page's native source dims,
-    /// not the texture's. Falls back to the raw factor if the page isn't decoded.
-    fn effective_zoom_pct(&self) -> u32 {
+    /// On-screen scale (device-px per *native* source-px) for a page, mirroring
+    /// the draw scale in `build_quads`. `content` feeds `fit_scale` (a single
+    /// page: its own dims; a facing pair: the combined width and shared height);
+    /// `decoded_h` is the anchor's displayed decoded height; `src_h` its native.
+    fn anchor_native_scale(
+        fit: FitMode,
+        screen: (f32, f32),
+        content: (f32, f32),
+        decoded_h: f32,
+        src_h: f32,
+        zoom: f32,
+    ) -> f32 {
+        let ((sw, sh), (fit_w, fit_h)) = (screen, content);
+        fit_scale(fit, sw, sh, fit_w, fit_h) * zoom * decoded_h / src_h.max(1.0)
+    }
+
+    /// device-px-per-native-px of the in-view anchor page, matching exactly what
+    /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
+    /// isn't decoded yet.
+    fn anchor_scale(&self) -> Option<f32> {
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
-        if let Some(t) = self.cache.get(self.index) {
-            let (src_w, src_h) = (t.src_w.max(1) as f32, t.src_h.max(1) as f32);
-            let scale = if self.scroll_mode {
-                sw * self.zoom / src_w // strip pages are laid out at width = sw * zoom
-            } else {
-                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom / src_h
-            };
-            (scale * 100.0).round().max(0.0) as u32
-        } else {
-            (self.zoom * 100.0).round() as u32
+        if self.scroll_mode {
+            // Strip pages are laid out at width = sw * zoom (height follows aspect).
+            let t = self.cache.get(self.index)?;
+            return Some(sw * self.zoom / t.src_w.max(1) as f32);
+        }
+        let len = self.source.as_ref()?.len();
+        if len == 0 {
+            return None;
+        }
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let ta = self.cache.get(a)?;
+        // Wide (landscape) page is shown alone; otherwise pair with `b` if ready.
+        let force_single = ta.w > ta.h;
+        let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
+        let (fit_w, fit_h, dec_h) = match tb {
+            Some(tb) => {
+                let h_ref = ta.h.max(tb.h) as f32;
+                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
+                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
+                (wa + wb, h_ref, h_ref)
+            }
+            None => (ta.w as f32, ta.h as f32, ta.h as f32),
+        };
+        Some(Self::anchor_native_scale(
+            self.fit,
+            (sw, sh),
+            (fit_w, fit_h),
+            dec_h,
+            ta.src_h.max(1) as f32,
+            self.zoom,
+        ))
+    }
+
+    /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
+    /// = 100%), for the toast + info overlay. Derived from the same scale the
+    /// renderer draws, so it tracks fit-to-window upscaling and facing pairs
+    /// exactly. Falls back to the raw factor while the anchor isn't decoded.
+    fn effective_zoom_pct(&self) -> u32 {
+        let scale = self.anchor_scale().unwrap_or(self.zoom);
+        (scale * 100.0).round().max(0.0) as u32
+    }
+
+    /// Clamp `self.zoom` (a fit-multiplier) so the *effective native* zoom stays
+    /// within [`MIN_ZOOM_PCT`, `MAX_ZOOM_PCT`]. Converts via the page's native
+    /// scale at zoom = 1 (`base`). No-op while the anchor isn't decoded — the
+    /// next press clamps once it lands.
+    fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
+        let (lo, hi) = (MIN_ZOOM_PCT / base, MAX_ZOOM_PCT / base);
+        zoom.clamp(lo.min(hi), lo.max(hi))
+    }
+
+    fn clamp_zoom_native(&mut self) {
+        if self.zoom > 0.0
+            && let Some(s) = self.anchor_scale()
+        {
+            let base = s / self.zoom;
+            if base > 0.0 {
+                self.zoom = Self::clamp_zoom_multiplier(self.zoom, base);
+            }
         }
     }
 
@@ -1741,6 +1812,8 @@ impl State {
     fn desired_target_h(&self) -> u32 {
         // 1:1 mode wants full source resolution; a huge target makes the per-page
         // `target_h.min(source_h)` clamp decode each page at its native height.
+        // (1:1 draws the texture at zoom directly, so it must stay full-res even
+        // when zoomed out; the resulting GPU downscale is addressed in Phase 2.)
         if self.fit == FitMode::Actual && !self.scroll_mode {
             return u32::MAX;
         }
@@ -2314,5 +2387,47 @@ mod tests {
             assert_eq!((w, h), (7, 4), "probe dims for {fmt:?}");
             assert!(!label.is_empty() && label != "image", "probe label for {fmt:?}: {label}");
         }
+    }
+
+    // A 2048-tall portrait page on a 4K (2160-tall) screen, fit-to-window and
+    // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
+    #[test]
+    fn anchor_native_scale_fit_to_window_reports_upscale() {
+        let s = super::State::anchor_native_scale(
+            super::FitMode::Window,
+            (3840.0, 2160.0),
+            (1448.0, 2048.0),
+            2048.0,
+            2048.0,
+            1.0,
+        );
+        assert!((s - 2160.0 / 2048.0).abs() < 1e-4, "got {s}");
+    }
+
+    // 1:1 (Actual) at zoom 1 is exactly native: 100%.
+    #[test]
+    fn anchor_native_scale_actual_is_unity() {
+        let s = super::State::anchor_native_scale(
+            super::FitMode::Actual,
+            (3840.0, 2160.0),
+            (1448.0, 2048.0),
+            2048.0,
+            2048.0,
+            1.0,
+        );
+        assert!((s - 1.0).abs() < 1e-6, "got {s}");
+    }
+
+    // The fit-multiplier clamp maps to native bounds: far zoom-out hits the 5%
+    // floor, far zoom-in hits the 20000% ceiling, mid values pass through.
+    #[test]
+    fn zoom_multiplier_clamps_to_native_bounds() {
+        let base = 2160.0_f32 / 2048.0; // native scale at zoom = 1 (fit-to-window)
+        let lo = super::State::clamp_zoom_multiplier(1e-6, base);
+        assert!((lo * base - super::MIN_ZOOM_PCT).abs() < 1e-4, "lo eff {}", lo * base);
+        let hi = super::State::clamp_zoom_multiplier(1e9, base);
+        assert!((hi * base - super::MAX_ZOOM_PCT).abs() < 1e-2, "hi eff {}", hi * base);
+        let mid = super::State::clamp_zoom_multiplier(1.0, base);
+        assert!((mid - 1.0).abs() < 1e-6, "mid {mid}");
     }
 }
