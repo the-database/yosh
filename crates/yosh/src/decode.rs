@@ -58,6 +58,25 @@ fn ga_to_gray(ga: &[u8]) -> Vec<u8> {
     ga.iter().step_by(2).copied().collect()
 }
 
+/// True if every RGBA pixel is fully opaque (alpha 255).
+fn is_opaque(rgba: &[u8]) -> bool {
+    rgba.chunks_exact(4).all(|px| px[3] == 255)
+}
+
+/// Premultiply R,G,B by A in place (gamma space — consistent with the rest of the
+/// decode/resize path). Needed before downscaling and before the GPU's
+/// premultiplied-alpha blend: it zeroes the garbage RGB encoders leave in
+/// fully-transparent pixels and lets the bilinear sampler interpolate edges
+/// without colour fringing.
+fn premultiply_alpha(rgba: &mut [u8]) {
+    for px in rgba.chunks_exact_mut(4) {
+        let a = px[3] as u32;
+        px[0] = ((px[0] as u32 * a + 127) / 255) as u8;
+        px[1] = ((px[1] as u32 * a + 127) / 255) as u8;
+        px[2] = ((px[2] as u32 * a + 127) / 255) as u8;
+    }
+}
+
 /// Returns (w, h, gray, normalized pixels [1ch gray or 4ch rgba], icc profile).
 /// The ICC profile (if any) is read from the same decode — no second parse.
 type Decoded = (u32, u32, bool, Vec<u8>, Option<Vec<u8>>);
@@ -344,9 +363,16 @@ pub fn decode_and_downscale(
     // which can exceed a low-res source).
     let target_h = target_h.min(h).max(1);
 
+    // A color page may carry transparency; opaque pages (the manga norm) keep the
+    // unchanged fast path. Computed once and reused for the routing decisions.
+    let opaque = gray_by_channels || is_opaque(&full);
+
     // No downscale needed (1:1 / "Actual" mode, or a source already <= target):
     // show the decoded pixels unaltered — no resampling, no tone remap.
     if target_h == h {
+        if !opaque {
+            premultiply_alpha(&mut full);
+        }
         return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, pixels: full });
     }
 
@@ -355,10 +381,14 @@ pub fn decode_and_downscale(
     if gray_by_channels {
         // Already single-channel (1ch / GA PNG, L8 JPEG) — no scan needed.
         downscale_gray(&full, w, h, tw, target_h, resizer)
-    } else if rgba_is_grayscale(&full, GRAYSCALE_THRESHOLD) {
-        // Color-stored but visually gray → collapse to luma, gray strategy.
+    } else if opaque && rgba_is_grayscale(&full, GRAYSCALE_THRESHOLD) {
+        // Color-stored but visually gray (and opaque) → collapse to luma, gray
+        // strategy. Transparent images skip this so their alpha is preserved.
         downscale_gray(&rgba_to_luma(&full), w, h, tw, target_h, resizer)
     } else {
+        if !opaque {
+            premultiply_alpha(&mut full);
+        }
         downscale_color(&full, w, h, tw, target_h, resizer)
     }
 }
@@ -377,12 +407,16 @@ pub enum DecodedPage {
 /// the color (Lanczos3) path — the strategy for animated GIF frames (palette
 /// color, not manga screentone, so the gray linear-light path doesn't apply).
 fn downscale_rgba_frame(
-    rgba: Vec<u8>,
+    mut rgba: Vec<u8>,
     w: u32,
     h: u32,
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
+    // GIF/WebP frames can be transparent — premultiply before resize/return.
+    if !is_opaque(&rgba) {
+        premultiply_alpha(&mut rgba);
+    }
     let target_h = target_h.min(h).max(1);
     if target_h == h {
         return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels: rgba });
@@ -432,7 +466,13 @@ fn decode_ico(bytes: &[u8]) -> Result<Vec<DecodedImage>, String> {
     for entry in dir.entries() {
         let img = entry.decode().map_err(|e| format!("ico entry: {e}"))?;
         let (w, h) = (img.width(), img.height());
-        out.push(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels: img.rgba_data().to_vec() });
+        let mut pixels = img.rgba_data().to_vec();
+        // Icons are typically transparent — premultiply so the GPU blend composites
+        // them over the background instead of showing garbage in clear areas.
+        if !is_opaque(&pixels) {
+            premultiply_alpha(&mut pixels);
+        }
+        out.push(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels });
     }
     if out.is_empty() {
         return Err("ico: no entries".into());
@@ -608,6 +648,39 @@ mod tests {
                 assert_eq!((layers[1].w, layers[1].h), (16, 16));
             }
             _ => panic!("multi-entry ico should be Layered"),
+        }
+    }
+
+    #[test]
+    fn transparent_png_is_premultiplied() {
+        // 2x2 RGBA: opaque red, a fully-transparent pixel with garbage white RGB,
+        // opaque green, and a half-alpha pixel.
+        let data: [u8; 16] = [
+            255, 0, 0, 255, // opaque red
+            255, 255, 255, 0, // transparent — garbage RGB must premultiply to 0
+            0, 255, 0, 255, // opaque green
+            200, 100, 50, 128, // half alpha
+        ];
+        let mut bytes = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut bytes, 2, 2);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            let mut w = enc.write_header().unwrap();
+            w.write_image_data(&data).unwrap();
+        }
+        let mut resizer = Resizer::new();
+        match decode_page(&bytes, 2, &mut resizer).unwrap() {
+            DecodedPage::Still(img) => {
+                assert!(!img.gray, "transparent image keeps the color/alpha path");
+                assert_eq!(&img.pixels[4..8], &[0, 0, 0, 0], "transparent RGB zeroed");
+                assert_eq!(&img.pixels[0..4], &[255, 0, 0, 255], "opaque unchanged");
+                assert_eq!(&img.pixels[8..12], &[0, 255, 0, 255], "opaque unchanged");
+                let p = &img.pixels[12..16]; // ~ rgb * 128/255
+                assert_eq!(p[3], 128);
+                assert!((p[0] as i32 - 100).abs() <= 1 && (p[1] as i32 - 50).abs() <= 1);
+            }
+            _ => panic!("png is a still"),
         }
     }
 }

@@ -88,7 +88,10 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (u.gray != 0u) {
         return vec4<f32>(s.r, s.r, s.r, 1.0);
     }
-    return vec4<f32>(s.rgb, 1.0);
+    // Color pages are stored premultiplied (see decode.rs), so output them as-is
+    // for the pipeline's premultiplied-alpha blend — transparent areas let the
+    // cleared background show through.
+    return s;
 }
 "#;
 
@@ -314,7 +317,21 @@ impl PagePipeline {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: None,
+                    // Premultiplied-alpha "over": src + dst*(1-src.a). Opaque and
+                    // grayscale pages (alpha 1) are unaffected; transparent color
+                    // pages composite over the cleared background.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),

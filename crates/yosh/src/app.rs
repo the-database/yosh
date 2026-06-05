@@ -2102,10 +2102,13 @@ impl State {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
+                        // #202020. The surface is non-sRGB, so the stored byte is
+                        // value*255 (0x20 = 32). Transparent pages composite over
+                        // this via the page pipeline's premultiplied-alpha blend.
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.06,
+                            r: 32.0 / 255.0,
+                            g: 32.0 / 255.0,
+                            b: 32.0 / 255.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
