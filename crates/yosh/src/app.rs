@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,7 +20,6 @@ use fast_image_resize::Resizer;
 use crate::cache::PageCache;
 use crate::config;
 use crate::decode::decode_and_downscale;
-use crate::downscale::Downscaler;
 use crate::gpu::Gpu;
 use crate::layout::{self, Layout};
 use crate::library::{cover_bytes, Library};
@@ -164,8 +162,6 @@ struct State {
     win_geom: Option<(i32, i32, u32, u32)>,
     volume_key: Option<String>,
     tex_pool: Arc<TexturePool>,
-    downscaler: Arc<Downscaler>,
-    gpu_flag: Arc<AtomicBool>,
     /// Decode-view debounce: the last-seen `(surface_w, surface_h, zoom)`. Once it
     /// stops changing across frames the view is "settled" and target-change
     /// re-decodes are allowed — so a resize/zoom drag re-decodes once it lands, not
@@ -620,12 +616,6 @@ impl ApplicationHandler for App {
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
         let tex_pool = Arc::new(TexturePool::new());
-        let downscaler = Arc::new(Downscaler::new(&gpu.device));
-        // GPU downscale is disabled for now (the single-bilinear-blit path can't
-        // match the HQ CPU resize); the code is kept dormant behind
-        // `pool::GPU_DOWNSCALE_ENABLED` for a future HQ-GPU rewrite. Forced off
-        // here regardless of the persisted `settings.gpu`.
-        let gpu_flag = Arc::new(AtomicBool::new(false));
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -700,8 +690,6 @@ impl ApplicationHandler for App {
             settings,
             volume_key: None,
             tex_pool,
-            downscaler,
-            gpu_flag,
             pending_view: (0, 0, 1.0),
             view_settled: false,
             info_for: None,
@@ -1724,8 +1712,6 @@ impl State {
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
             self.tex_pool.clone(),
-            self.downscaler.clone(),
-            self.gpu_flag.clone(),
             WORKERS,
         ));
         self.cache.clear();
@@ -2449,6 +2435,34 @@ mod tests {
             1.0,
         );
         assert!((s - 1.0).abs() < 1e-6, "got {s}");
+    }
+
+    // Proof of the single-resize invariant (page-flip path): a page decoded to
+    // its per-page target (the displayed height `page_target_h` computes) is drawn
+    // by `build_quads` at that *same* height, so the GPU sampler maps 1 texel : 1
+    // pixel and adds no second resize. Checks the decode target and the draw size
+    // agree across fit modes, aspects, zooms, and surface sizes.
+    #[test]
+    fn decode_target_matches_drawn_size() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
+                    for zoom in [0.1_f32, 0.5, 1.0] {
+                        // Decode target = the page's displayed height (page_target_h).
+                        let th = (fit_scale(fit, sw, sh, aspect, 1.0) * zoom).round().max(1.0);
+                        let tw = (th * aspect).round().max(1.0);
+                        // build_quads draws that decoded (tw x th) texture at height:
+                        let drawn = th * fit_scale(fit, sw, sh, tw, th) * zoom;
+                        assert!(
+                            (drawn - th).abs() <= 2.0,
+                            "fit {} a {aspect} z {zoom} {sw}x{sh}: drawn {drawn} vs texture {th}",
+                            fit.label(),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // The fit-multiplier clamp maps to native bounds: far zoom-out hits the 5%

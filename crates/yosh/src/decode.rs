@@ -268,12 +268,6 @@ fn decode_raw(bytes: &[u8]) -> Result<Decoded, String> {
     }
 }
 
-/// Decode at full resolution (for the dormant GPU-downscale path; not color-managed).
-pub fn decode_full(bytes: &[u8]) -> Result<DecodedImage, String> {
-    let (w, h, gray, pixels, _icc) = decode_raw(bytes)?;
-    Ok(DecodedImage { w, h, src_w: w, src_h: h, gray, pixels })
-}
-
 /// Decide whether an RGBA buffer is *effectively* grayscale within `threshold`.
 /// Port of MangaJaNai's `cv_image_is_grayscale` (run_upscale.py): for every pixel
 /// that isn't pure black or pure white, sum the (saturating) channel-pair

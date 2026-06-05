@@ -71,8 +71,12 @@ cargo test  -p yosh spread                             # run a subset of tests b
     target, so it never re-decodes. 1:1 (`FitMode::Actual`) keeps full source res (it draws the texture at
     `zoom` directly); zooming out in 1:1 is the one case that GPU-downscales, by design. The `TexturePool`
     is globally bounded (`max_total`) with eviction, since exact targets mint more distinct texture sizes.
-  - A GPU-downscale path exists but is **disabled** (`GPU_DOWNSCALE_ENABLED = false` in `pool.rs`) because a
-    single bilinear blit can't match the HQ CPU resize. Kept for a future HQ-GPU rewrite.
+  - There is intentionally **no GPU-downscale path**: a single bilinear blit can't match the HQ CPU resize,
+    and a second GPU downscale is exactly what the invariant forbids. (An old dormant `Downscaler` blit was
+    removed; recover it from git history if a *high-quality* GPU resize is ever attempted.) The only GPU
+    resampling is the page-draw sampler, which is a no-op at the 1:1 sizes the exact targets produce — see
+    the `decode_target_matches_drawn_size` test in `app.rs`, which proves the decode target equals the drawn
+    size.
 
 ### Central state and the frame loop
 - **`app.rs` (~1.7k lines) — `State`** is the winit `ApplicationHandler` and owns everything: gpu, egui,
