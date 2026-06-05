@@ -43,8 +43,9 @@ pub struct UiState {
     /// Whether to show the centered loading spinner (the current page's decode
     /// has been pending long enough to warrant feedback). Set by the app.
     pub loading: bool,
-    /// Whether the current page's decode failed (show a notice, not the spinner).
-    pub failed: bool,
+    /// `Some((file name, error reason))` when the current page's decode failed
+    /// (show a notice instead of the spinner). Set by the app.
+    pub failed: Option<(String, String)>,
     /// Edge navigation arrows: set true while the cursor hovers the left/right
     /// page-flip strip (page-flip reader mode only). Set by the app.
     pub hover_left: bool,
@@ -548,21 +549,31 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
 
     // Centered failure notice: the current page's decode errored (unsupported or
     // corrupt). Replaces the spinner so a bad page doesn't appear to load forever.
-    if st.failed && !library_view {
+    // Names the file and shows the decoder's error so it's clear which page / why.
+    if let Some((name, reason)) = &st.failed
+        && !library_view
+    {
         egui::Area::new(egui::Id::new("failed_overlay"))
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
-                    .fill(egui::Color32::from_black_alpha(180))
+                    .fill(egui::Color32::from_black_alpha(190))
                     .inner_margin(egui::Margin::same(16))
                     .corner_radius(egui::CornerRadius::same(10))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Couldn't open this page")
-                                .color(egui::Color32::WHITE)
-                                .size(15.0),
-                        );
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("Couldn't open {name}"))
+                                    .color(egui::Color32::WHITE)
+                                    .size(15.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(reason)
+                                    .color(egui::Color32::from_gray(170))
+                                    .size(12.0),
+                            );
+                        });
                     });
             });
     }

@@ -28,7 +28,7 @@ const GPU_DOWNSCALE_ENABLED: bool = false;
 
 pub enum Msg {
     Done { index: usize, page: PageTexture },
-    Failed { index: usize },
+    Failed { index: usize, error: String },
 }
 
 struct JobState {
@@ -97,8 +97,8 @@ impl DecodePool {
 
                     let gpu = gpu_flag.load(Ordering::Relaxed);
                     let th = target_h.load(Ordering::Relaxed);
-                    let page: Option<PageTexture> = match source.read_page(index) {
-                        Ok(bytes) if gpu && GPU_DOWNSCALE_ENABLED => decode_full(&bytes).ok().map(|img| {
+                    let page: Result<PageTexture, String> = match source.read_page(index) {
+                        Ok(bytes) if gpu && GPU_DOWNSCALE_ENABLED => decode_full(&bytes).map(|img| {
                             // Upload full-res, downscale on the GPU into a display texture.
                             let src = tex_pool.get(&device, img.gray, img.w, img.h);
                             texpool::write_pixels(&queue, &src, &img.pixels, img.w, img.h, img.gray);
@@ -115,14 +115,14 @@ impl DecodePool {
                         }),
                         Ok(bytes) => match decode_page(&bytes, th, &mut resizer) {
                             Ok(DecodedPage::Still(img)) => {
-                                Some(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
+                                Ok(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
                             }
-                            Ok(DecodedPage::Animated(frames)) => Some(PagePipeline::upload_animated(
+                            Ok(DecodedPage::Animated(frames)) => Ok(PagePipeline::upload_animated(
                                 &device, &queue, frames, &tex_pool, th, true,
                             )),
                             // `.ico` layers: same multi-frame texture, but not an
                             // auto-playing animation (no delays, manual stepping).
-                            Ok(DecodedPage::Layered(layers)) => Some(PagePipeline::upload_animated(
+                            Ok(DecodedPage::Layered(layers)) => Ok(PagePipeline::upload_animated(
                                 &device,
                                 &queue,
                                 layers.into_iter().map(|i| (i, 0u32)).collect(),
@@ -130,9 +130,9 @@ impl DecodePool {
                                 th,
                                 false,
                             )),
-                            Err(_) => None,
+                            Err(e) => Err(e),
                         },
-                        Err(_) => None,
+                        Err(e) => Err(format!("read failed: {e}")),
                     };
 
                     {
@@ -141,8 +141,8 @@ impl DecodePool {
                     }
 
                     let msg = match page {
-                        Some(page) => Msg::Done { index, page },
-                        None => Msg::Failed { index },
+                        Ok(page) => Msg::Done { index, page },
+                        Err(error) => Msg::Failed { index, error },
                     };
                     if tx.send(msg).is_err() {
                         return; // receiver gone
