@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,14 +33,13 @@ use crate::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
 
-// Decode target height tracks the on-screen page size (see `desired_target_h`)
-// so the high-quality linear-light downscale does the *full* reduction in one
-// pass. Otherwise pages decode larger than shown and the GPU re-downscales them
-// with a plain bilinear (no mipmaps) → halftone aliasing/moiré.
-const TARGET_H_DEFAULT: u32 = 1440;
-const MIN_TARGET: u32 = 480;
+// Decode target height tracks each page's exact on-screen size (see
+// `page_target_h`) so the high-quality linear-light CPU resize does the *full*
+// reduction in one pass and the GPU samples 1:1 — the single-resize invariant.
+// Otherwise pages decode larger than shown and the GPU re-downscales them with a
+// plain bilinear (no mipmaps) → halftone aliasing/moiré.
+const MIN_TARGET: u32 = 32; // floor so extreme zoom-out still decodes ~exact
 const MAX_TARGET: u32 = 3840;
-const TARGET_QUANTUM: u32 = 128;
 const WORKERS: usize = 8;
 const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
@@ -167,11 +166,12 @@ struct State {
     tex_pool: Arc<TexturePool>,
     downscaler: Arc<Downscaler>,
     gpu_flag: Arc<AtomicBool>,
-    /// Decode resolution (page height in px), tracked to the display size so the
-    /// CPU linear-light resize is the only downscale. Read by pool workers.
-    target_h: Arc<AtomicU32>,
-    /// Last-computed desired target, for debouncing re-decode across resize/zoom.
-    pending_target: u32,
+    /// Decode-view debounce: the last-seen `(surface_w, surface_h, zoom)`. Once it
+    /// stops changing across frames the view is "settled" and target-change
+    /// re-decodes are allowed — so a resize/zoom drag re-decodes once it lands, not
+    /// every frame. Page-flipping doesn't change it, so it never re-decodes.
+    pending_view: (u32, u32, f32),
+    view_settled: bool,
     /// Page index the Tab info overlay text was built for (None = rebuild needed).
     info_for: Option<usize>,
     /// The anchor page currently waiting to decode and when that wait began,
@@ -702,8 +702,8 @@ impl ApplicationHandler for App {
             tex_pool,
             downscaler,
             gpu_flag,
-            target_h: Arc::new(AtomicU32::new(TARGET_H_DEFAULT)),
-            pending_target: 0,
+            pending_view: (0, 0, 1.0),
+            view_settled: false,
             info_for: None,
             loading_pending: None,
             toast: None,
@@ -1726,7 +1726,6 @@ impl State {
             self.tex_pool.clone(),
             self.downscaler.clone(),
             self.gpu_flag.clone(),
-            self.target_h.clone(),
             WORKERS,
         ));
         self.cache.clear();
@@ -1809,52 +1808,86 @@ impl State {
         ]
     }
 
-    fn desired_target_h(&self) -> u32 {
-        // 1:1 mode wants full source resolution; a huge target makes the per-page
-        // `target_h.min(source_h)` clamp decode each page at its native height.
-        // (1:1 draws the texture at zoom directly, so it must stay full-res even
-        // when zoomed out; the resulting GPU downscale is addressed in Phase 2.)
+    /// Source aspect (w / h) for page `index`: from its decoded texture if present,
+    /// else the in-view anchor's, else the running estimate. Used to size the decode
+    /// target before the page itself is decoded (exact for the usual uniform-size
+    /// volume; corrected in place once the page's own dimensions are known).
+    fn page_aspect(&self, index: usize) -> f32 {
+        if let Some(t) = self.cache.get(index) {
+            return t.src_w as f32 / t.src_h.max(1) as f32;
+        }
+        if let Some(t) = self.cache.get(self.index) {
+            return t.src_w as f32 / t.src_h.max(1) as f32;
+        }
+        1.0 / self.est_aspect.max(0.01) // est_aspect is h / w
+    }
+
+    /// The *exact* decode target (on-screen displayed pixel height) for page
+    /// `index` under the active fit/zoom/layout. Decoding each page to this height
+    /// makes the HQ CPU resize the only resample and the GPU sample 1:1 — the
+    /// single-resize invariant. `target_dims` later caps it at the source height
+    /// (so a display larger than native means full-res + GPU upscale, the one
+    /// allowed exception). 1:1 keeps full source res (it draws at `zoom` directly).
+    fn page_target_h(&self, index: usize) -> u32 {
         if self.fit == FitMode::Actual && !self.scroll_mode {
             return u32::MAX;
         }
-        let h = (self.gpu.config.height as f32 * self.zoom).round() as u32;
-        let q = ((h + TARGET_QUANTUM / 2) / TARGET_QUANTUM) * TARGET_QUANTUM;
-        q.clamp(MIN_TARGET, MAX_TARGET)
+        let sw = self.gpu.config.width.max(1) as f32;
+        let sh = self.gpu.config.height.max(1) as f32;
+        let aspect = self.page_aspect(index).max(0.001);
+        let dh = if self.scroll_mode {
+            // Continuous strip: width-fit at width sw*zoom, height follows aspect.
+            sw * self.zoom / aspect
+        } else {
+            // Pair two non-wide pages in spread layout (assume a same-size facing
+            // page — exact for uniform volumes; wide pages always show alone).
+            let content_aspect = if self.layout == Layout::Spread && aspect <= 1.0 {
+                aspect * 2.0
+            } else {
+                aspect
+            };
+            fit_scale(self.fit, sw, sh, content_aspect, 1.0) * self.zoom
+        };
+        (dh.round() as u32).clamp(MIN_TARGET, MAX_TARGET)
     }
 
-    /// Re-point the decode target at the current display size. Debounced: only
-    /// acts once the desired value settles (so a resize/zoom drag re-points once,
-    /// not every frame). Does NOT clear the cache: `prefetch` re-decodes pages
-    /// whose stamp is now stale while the old-resolution textures keep displaying,
-    /// so there's no black frame (the swap is in place). Normal page-flipping
-    /// never changes the target, so it never triggers a re-decode.
-    fn update_target_h(&mut self) {
-        let desired = self.desired_target_h();
-        if desired != self.pending_target {
-            self.pending_target = desired; // still settling
-            return;
-        }
-        self.target_h.store(desired, Ordering::Relaxed);
+    /// Debounce the decode view. While the surface size or zoom is changing (a
+    /// resize/zoom drag) the view is "unsettled" and `prefetch` won't re-decode
+    /// cached pages for a target change — it just keeps showing the old textures.
+    /// Once the value holds for a frame the view settles and stale pages re-decode
+    /// in place (no black frame). Page-flipping leaves the view settled, so it
+    /// never re-decodes.
+    fn update_decode_view(&mut self) {
+        let desired = (self.gpu.config.width, self.gpu.config.height, self.zoom);
+        self.view_settled = desired == self.pending_view;
+        self.pending_view = desired;
     }
 
-    /// Recompute the desired prefetch window and hand it to the pool. Queues a
-    /// page if it's missing OR cached at a stale decode target (after a
-    /// zoom/resize), so stale pages re-decode at the new resolution and overwrite
-    /// in place — the old texture keeps displaying until the new one lands.
+    /// Recompute the prefetch window and hand it to the pool with each page's exact
+    /// decode target. A page is queued if it's missing, or (once the view has
+    /// settled) if its decoded target no longer matches its current exact target —
+    /// then it re-decodes at the new resolution and overwrites in place.
     fn prefetch(&mut self) {
         let fwd = self.dynamic_fwd();
-        let cur = self.target_h.load(Ordering::Relaxed);
-        let (Some(src), Some(pool)) = (&self.source, &self.pool) else {
+        let settled = self.view_settled;
+        let Some(src) = &self.source else {
             return;
         };
-        let desired: Vec<usize> = desired_window(self.index, src.len(), fwd, BACK)
+        let len = src.len();
+        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, BACK)
             .into_iter()
-            .filter(|i| {
-                !self.failed.contains_key(i)
-                    && self.cache.get(*i).map_or(true, |p| p.target_h != cur)
+            .filter(|i| !self.failed.contains_key(i))
+            .filter_map(|i| {
+                let want = self.page_target_h(i);
+                match self.cache.get(i) {
+                    None => Some((i, want)),
+                    Some(p) => (settled && p.target_h != want).then_some((i, want)),
+                }
             })
             .collect();
-        pool.set_jobs(desired);
+        if let Some(pool) = &self.pool {
+            pool.set_jobs(jobs);
+        }
     }
 
     /// The page index whose animation controls are active (the in-view anchor, if
@@ -2036,8 +2069,8 @@ impl State {
         self.ui.update_version = self.update.as_ref().map(|u| u.version.clone());
         self.ui.updating = self.updating;
         self.ui.update_failed = self.update_error.is_some();
-        // Track the decode resolution to the display size (debounced re-decode).
-        self.update_target_h();
+        // Debounce the decode view, so resize/zoom drags re-decode once on settle.
+        self.update_decode_view();
         // Keep the scroll anchor valid as page heights resolve, then refresh work.
         if self.scroll_mode {
             self.normalize();

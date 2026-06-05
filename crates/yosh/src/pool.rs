@@ -7,7 +7,7 @@
 //! workers always pick the highest-priority page relative to the latest position.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -32,7 +32,9 @@ pub enum Msg {
 }
 
 struct JobState {
-    jobs: Vec<usize>,
+    /// Pending decodes as `(page index, exact target height)` — the target is the
+    /// page's on-screen displayed height, computed per page by the scheduler.
+    jobs: Vec<(usize, u32)>,
     inflight: HashSet<usize>,
     running: bool,
 }
@@ -51,7 +53,6 @@ impl DecodePool {
         tex_pool: Arc<TexturePool>,
         downscaler: Arc<Downscaler>,
         gpu_flag: Arc<AtomicBool>,
-        target_h: Arc<AtomicU32>,
         workers: usize,
     ) -> Self {
         let shared = Arc::new((
@@ -73,13 +74,13 @@ impl DecodePool {
             let tex_pool = tex_pool.clone();
             let downscaler = downscaler.clone();
             let gpu_flag = gpu_flag.clone();
-            let target_h = target_h.clone();
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
                 loop {
-                    // Wait for and claim the highest-priority job.
-                    let index: usize = {
+                    // Wait for and claim the highest-priority job (index + its
+                    // exact, per-page decode target height).
+                    let (index, th): (usize, u32) = {
                         let (m, cv) = &*shared;
                         let mut st = m.lock().unwrap();
                         loop {
@@ -87,16 +88,15 @@ impl DecodePool {
                                 return;
                             }
                             if !st.jobs.is_empty() {
-                                let i = st.jobs.remove(0);
-                                st.inflight.insert(i);
-                                break i;
+                                let job = st.jobs.remove(0);
+                                st.inflight.insert(job.0);
+                                break job;
                             }
                             st = cv.wait(st).unwrap();
                         }
                     };
 
                     let gpu = gpu_flag.load(Ordering::Relaxed);
-                    let th = target_h.load(Ordering::Relaxed);
                     let page: Result<PageTexture, String> = match source.read_page(index) {
                         Ok(bytes) if gpu && GPU_DOWNSCALE_ENABLED => decode_full(&bytes).map(|img| {
                             // Upload full-res, downscale on the GPU into a display texture.
@@ -158,14 +158,14 @@ impl DecodePool {
         }
     }
 
-    /// Replace the work list with `desired` (nearest-first), skipping pages
-    /// already in flight. Wakes idle workers.
-    pub fn set_jobs(&self, desired: Vec<usize>) {
+    /// Replace the work list with `desired` (`(index, target_h)`, nearest-first),
+    /// skipping pages already in flight. Wakes idle workers.
+    pub fn set_jobs(&self, desired: Vec<(usize, u32)>) {
         let (m, cv) = &*self.shared;
         let mut st = m.lock().unwrap();
-        let filtered: Vec<usize> = desired
+        let filtered: Vec<(usize, u32)> = desired
             .into_iter()
-            .filter(|i| !st.inflight.contains(i))
+            .filter(|(i, _)| !st.inflight.contains(i))
             .collect();
         st.jobs = filtered;
         drop(st);
