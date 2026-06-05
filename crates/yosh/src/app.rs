@@ -352,6 +352,20 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
         };
         return (w, h, format!("PSD · {}-bit {}", be16(22), mode));
     }
+    // ICO: report the largest entry's size + how many layers it holds.
+    if b.len() >= 6 && b[0..4] == [0x00, 0x00, 0x01, 0x00] {
+        let count = le16(4) as usize;
+        let dim = |v: u8| if v == 0 { 256 } else { v as u32 };
+        let (mut mw, mut mh) = (0u32, 0u32);
+        for i in 0..count {
+            let off = 6 + i * 16;
+            if off + 1 < b.len() {
+                mw = mw.max(dim(b[off]));
+                mh = mh.max(dim(b[off + 1]));
+            }
+        }
+        return (mw, mh, format!("ICO · {count} layer{}", if count == 1 { "" } else { "s" }));
+    }
     // BMP
     if b.len() >= 26 && &b[0..2] == b"BM" {
         let w = i32::from_le_bytes([b[18], b[19], b[20], b[21]]).unsigned_abs();
@@ -1766,11 +1780,13 @@ impl State {
             return;
         };
         let frames = self.cache.get(anchor).map_or(1, |t| t.frame_count());
-        // Rebind (and reset) when the viewed animation changes.
+        // GIF/WebP auto-play; `.ico` layers are stepped manually (no play/pause).
+        let is_anim = self.cache.get(anchor).is_some_and(|t| t.is_animation());
+        // Rebind (and reset) when the viewed page changes.
         if self.playback.page != Some(anchor) {
             self.playback.page = Some(anchor);
             self.playback.frame = 0;
-            self.playback.playing = true;
+            self.playback.playing = is_anim;
             self.playback.last = Instant::now();
         }
         if self.playback.playing {
@@ -1794,6 +1810,7 @@ impl State {
         }
         self.playback.frame = self.playback.frame.min(frames - 1);
         self.ui.anim_show = !self.playback.hidden;
+        self.ui.anim_is_animation = is_anim;
         self.ui.anim_playing = self.playback.playing;
         self.ui.anim_frame = self.playback.frame;
         self.ui.anim_total = frames;

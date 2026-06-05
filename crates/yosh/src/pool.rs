@@ -117,9 +117,19 @@ impl DecodePool {
                             Ok(DecodedPage::Still(img)) => {
                                 Some(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
                             }
-                            Ok(DecodedPage::Animated(frames)) => Some(
-                                PagePipeline::upload_animated(&device, &queue, frames, &tex_pool, th),
-                            ),
+                            Ok(DecodedPage::Animated(frames)) => Some(PagePipeline::upload_animated(
+                                &device, &queue, frames, &tex_pool, th, true,
+                            )),
+                            // `.ico` layers: same multi-frame texture, but not an
+                            // auto-playing animation (no delays, manual stepping).
+                            Ok(DecodedPage::Layered(layers)) => Some(PagePipeline::upload_animated(
+                                &device,
+                                &queue,
+                                layers.into_iter().map(|i| (i, 0u32)).collect(),
+                                &tex_pool,
+                                th,
+                                false,
+                            )),
                             Err(_) => None,
                         },
                         Err(_) => None,

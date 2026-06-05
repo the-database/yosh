@@ -124,13 +124,17 @@ pub struct PageTexture {
     /// used). Lets the cache detect pages decoded at a stale resolution after a
     /// zoom/resize and re-decode them in place without blanking the display.
     pub target_h: u32,
-    /// Animation frames 1..N (frame 0 is `texture`/`view`). `None` for stills.
-    /// All frames share this page's `(gray=false, w, h)` texture-pool bucket.
+    /// Extra frames/layers 1..N (frame 0 is `texture`/`view`). `None` for stills.
+    /// Animation (GIF/WebP) frames share this page's size; `.ico` layers may each
+    /// be a different size, so recycling keys off each texture's own dimensions.
     anim: Option<Vec<AnimFrame>>,
     /// Frame 0's display time, ms (only meaningful when `anim` is `Some`).
     frame0_delay_ms: u32,
     /// Sum of all frame delays, ms — the animation loop period (0 for stills).
     anim_total_ms: u32,
+    /// True for an auto-playing animation (GIF/WebP); false for a still or for
+    /// `.ico` layers (stepped manually, no play/pause). Gates the panel controls.
+    animated: bool,
 }
 
 impl PageTexture {
@@ -158,10 +162,16 @@ impl PageTexture {
             anim: None,
             frame0_delay_ms: 0,
             anim_total_ms: 0,
+            animated: false,
         }
     }
 
-    /// Number of frames (1 for a still page).
+    /// Whether this page auto-plays (GIF/WebP). False for stills and `.ico` layers.
+    pub fn is_animation(&self) -> bool {
+        self.animated
+    }
+
+    /// Number of frames/layers (1 for a still page).
     pub fn frame_count(&self) -> usize {
         1 + self.anim.as_ref().map_or(0, |a| a.len())
     }
@@ -225,13 +235,16 @@ impl PageTexture {
             anim,
             frame0_delay_ms: _,
             anim_total_ms: _,
+            animated: _,
         } = self;
         drop(view);
         pool.put(texture, gray, w, h);
         if let Some(frames) = anim {
             for AnimFrame { texture, view, delay_ms: _ } in frames {
                 drop(view);
-                pool.put(texture, gray, w, h);
+                // `.ico` layers differ in size, so key by each texture's own dims.
+                let (fw, fh) = (texture.width(), texture.height());
+                pool.put(texture, gray, fw, fh);
             }
         }
     }
@@ -375,18 +388,22 @@ impl PagePipeline {
             anim: None,
             frame0_delay_ms: 0,
             anim_total_ms: 0,
+            animated: false,
         }
     }
 
-    /// Upload an animation (GIF/WebP): frame 0 becomes the base `PageTexture`
-    /// (exactly as `upload`), each remaining frame gets its own pooled texture.
-    /// `frames` is the decode's `(frame, delay_ms)` list and must have ≥2 entries.
+    /// Upload a multi-frame page — an animation (GIF/WebP) or `.ico` layers. Frame
+    /// 0 becomes the base `PageTexture` (exactly as `upload`); each remaining frame
+    /// gets its own pooled texture (sizes may differ for `.ico`). `frames` is the
+    /// decode's `(frame, delay_ms)` list (≥2 entries); `animated` is true for a
+    /// GIF/WebP (auto-play) and false for `.ico` layers (manual stepping only).
     pub fn upload_animated(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         frames: Vec<(DecodedImage, u32)>,
         pool: &TexturePool,
         target_h: u32,
+        animated: bool,
     ) -> PageTexture {
         let total: u32 = frames.iter().map(|(_, d)| *d).sum();
         let mut iter = frames.into_iter();
@@ -404,6 +421,7 @@ impl PagePipeline {
         base.anim = Some(anim);
         base.frame0_delay_ms = d0;
         base.anim_total_ms = total.max(1);
+        base.animated = animated;
         base
     }
 
