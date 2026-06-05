@@ -13,6 +13,8 @@
 //! Color decodes that are *visually* grayscale (within a threshold) are detected
 //! and routed through the grayscale path, matching MangaJaNai's behavior.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use fast_image_resize::images::{Image, ImageRef};
 use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
 use image::codecs::gif::GifDecoder;
@@ -27,6 +29,31 @@ const PNG_SIG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
 /// MangaJaNai's default `GrayscaleDetectionThreshold` (its slider spans 0..24).
 /// Higher = more tolerant of slight color casts when deciding "is this gray?".
 const GRAYSCALE_THRESHOLD: i32 = 12;
+
+/// GPU `max_texture_dimension_2d`, published by `gpu.rs` at startup. A decoded page
+/// can't exceed this in either dimension (it's one texture), so pages that would
+/// go over are rejected with a clear error rather than downscaled. wgpu's default
+/// (8192) until set; modern GPUs report 16384.
+pub static MAX_TEX_DIM: AtomicU32 = AtomicU32::new(8192);
+
+/// Decoded size for a source of `(w, h)` at a desired `target_h`: scale to
+/// `target_h` (never upscaling past the source), preserving aspect.
+fn target_dims(w: u32, h: u32, target_h: u32) -> (u32, u32) {
+    let th = target_h.min(h).max(1);
+    let tw = (((w as f64) * (th as f64) / (h as f64)).round() as u32).max(1);
+    (tw, th)
+}
+
+/// Reject a page whose decoded size won't fit in a single GPU texture (full
+/// resolution is preserved up to the limit; we never silently downscale past it).
+fn check_fits(tw: u32, th: u32) -> Result<(), String> {
+    let max = MAX_TEX_DIM.load(Ordering::Relaxed);
+    if tw > max || th > max {
+        Err(format!("image too large for the GPU ({tw}x{th}; max {max} px per side)"))
+    } else {
+        Ok(())
+    }
+}
 
 /// A decoded, downscaled page ready for GPU upload.
 pub struct DecodedImage {
@@ -366,37 +393,37 @@ pub fn decode_and_downscale(
             }
         }
     }
-    // Never upscale a page beyond its own resolution (target tracks display size,
-    // which can exceed a low-res source).
-    let target_h = target_h.min(h).max(1);
+    // Decoded size = scale to the display height (never upscaling past the source).
+    // A page bigger than one GPU texture is rejected (full res is preserved up to
+    // the limit; we don't silently downscale a 16k-px image to a blurry one).
+    let (tw, th) = target_dims(w, h, target_h);
+    check_fits(tw, th)?;
 
     // A color page may carry transparency; opaque pages (the manga norm) keep the
     // unchanged fast path. Computed once and reused for the routing decisions.
     let opaque = gray_by_channels || is_opaque(&full);
 
-    // No downscale needed (1:1 / "Actual" mode, or a source already <= target):
+    // No downscale needed (source already fits the target and the GPU limit):
     // show the decoded pixels unaltered — no resampling, no tone remap.
-    if target_h == h {
+    if tw == w && th == h {
         if !opaque {
             premultiply_alpha(&mut full);
         }
         return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, pixels: full });
     }
 
-    let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);
-
     if gray_by_channels {
         // Already single-channel (1ch / GA PNG, L8 JPEG) — no scan needed.
-        downscale_gray(&full, w, h, tw, target_h, resizer)
+        downscale_gray(&full, w, h, tw, th, resizer)
     } else if opaque && rgba_is_grayscale(&full, GRAYSCALE_THRESHOLD) {
         // Color-stored but visually gray (and opaque) → collapse to luma, gray
         // strategy. Transparent images skip this so their alpha is preserved.
-        downscale_gray(&rgba_to_luma(&full), w, h, tw, target_h, resizer)
+        downscale_gray(&rgba_to_luma(&full), w, h, tw, th, resizer)
     } else {
         if !opaque {
             premultiply_alpha(&mut full);
         }
-        downscale_color(&full, w, h, tw, target_h, resizer)
+        downscale_color(&full, w, h, tw, th, resizer)
     }
 }
 
@@ -424,12 +451,12 @@ fn downscale_rgba_frame(
     if !is_opaque(&rgba) {
         premultiply_alpha(&mut rgba);
     }
-    let target_h = target_h.min(h).max(1);
-    if target_h == h {
+    let (tw, th) = target_dims(w, h, target_h);
+    check_fits(tw, th)?;
+    if tw == w && th == h {
         return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels: rgba });
     }
-    let tw = (((w as f64) * (target_h as f64) / (h as f64)).round() as u32).max(1);
-    downscale_color(&rgba, w, h, tw, target_h, resizer)
+    downscale_color(&rgba, w, h, tw, th, resizer)
 }
 
 /// Turn an animation's decoded frames into a `DecodedPage`: downscale each frame
