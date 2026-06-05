@@ -179,9 +179,16 @@ fn decode_psd(bytes: &[u8]) -> Result<Decoded, String> {
 }
 
 fn decode_other(bytes: &[u8]) -> Result<Decoded, String> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+    let guessed = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("image: {e}"))?;
+    // TGA has no magic bytes, so content-guessing yields no format. Since the file
+    // already passed the image-extension allowlist, fall back to decoding it as TGA.
+    let reader = if guessed.format().is_some() {
+        guessed
+    } else {
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Tga)
+    };
     let mut decoder = reader.into_decoder().map_err(|e| format!("image: {e}"))?;
     let icc = decoder.icc_profile().ok().flatten();
     let img = image::DynamicImage::from_decoder(decoder).map_err(|e| format!("image: {e}"))?;
@@ -681,6 +688,24 @@ mod tests {
                 assert!((p[0] as i32 - 100).abs() <= 1 && (p[1] as i32 - 50).abs() <= 1);
             }
             _ => panic!("png is a still"),
+        }
+    }
+
+    #[test]
+    fn tiff_and_qoi_decode_via_image_crate() {
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        // These formats have no dedicated decoder in yosh — they round-trip through
+        // the `image`-crate fallback (decode_other), proving the easy-batch support.
+        let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(5, 3, Rgba([10, 20, 30, 255])));
+        for fmt in [ImageFormat::Tiff, ImageFormat::Qoi, ImageFormat::Tga] {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, fmt).unwrap();
+            let bytes = buf.into_inner();
+            let mut resizer = Resizer::new();
+            match decode_page(&bytes, 3, &mut resizer).unwrap() {
+                DecodedPage::Still(d) => assert_eq!((d.w, d.h), (5, 3), "{fmt:?} dims"),
+                _ => panic!("{fmt:?} should be a still"),
+            }
         }
     }
 }

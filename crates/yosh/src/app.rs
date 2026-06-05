@@ -420,6 +420,32 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
         let label = if matches!(&b[8..12], b"avif" | b"avis") { "AVIF" } else { "HEIF" };
         return (w, h, label.to_string());
     }
+    // Generic fallback: let the `image` crate identify the format and read just the
+    // dimensions (no full decode). Covers TIFF/TGA/DDS/EXR/HDR/QOI/PNM and anything
+    // else the crate guesses by content. TGA has no magic bytes, so fall back to it
+    // when content-guessing finds nothing (mirrors decode_other).
+    if let Ok(guessed) = image::ImageReader::new(std::io::Cursor::new(b)).with_guessed_format() {
+        let reader = if guessed.format().is_some() {
+            guessed
+        } else {
+            image::ImageReader::with_format(std::io::Cursor::new(b), image::ImageFormat::Tga)
+        };
+        let label = match reader.format() {
+            Some(image::ImageFormat::Tiff) => "TIFF".to_string(),
+            Some(image::ImageFormat::Tga) => "TGA".to_string(),
+            Some(image::ImageFormat::Dds) => "DDS".to_string(),
+            Some(image::ImageFormat::OpenExr) => "OpenEXR".to_string(),
+            Some(image::ImageFormat::Hdr) => "Radiance HDR".to_string(),
+            Some(image::ImageFormat::Qoi) => "QOI".to_string(),
+            Some(image::ImageFormat::Pnm) => "PNM".to_string(),
+            Some(f) => format!("{f:?}"),
+            None => "image".to_string(),
+        };
+        if let Ok((w, h)) = reader.into_dimensions() {
+            return (w, h, label);
+        }
+        return (0, 0, label);
+    }
     (0, 0, "image".to_string())
 }
 
@@ -2257,5 +2283,23 @@ impl State {
             .queue
             .submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn probe_reads_image_crate_dimensions() {
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        // TIFF/QOI have no magic-byte branch in probe(); the generic fallback must
+        // still report their resolution (the "probe data for resolution" rule).
+        let img = DynamicImage::ImageRgba8(RgbaImage::from_pixel(7, 4, Rgba([1, 2, 3, 255])));
+        for fmt in [ImageFormat::Tiff, ImageFormat::Qoi, ImageFormat::Tga] {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut buf, fmt).unwrap();
+            let (w, h, label) = super::probe(&buf.into_inner());
+            assert_eq!((w, h), (7, 4), "probe dims for {fmt:?}");
+            assert!(!label.is_empty() && label != "image", "probe label for {fmt:?}: {label}");
+        }
     }
 }
