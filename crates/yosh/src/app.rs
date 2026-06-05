@@ -3,7 +3,7 @@
 //! navigation. The current page is drawn from the cache; if a target isn't ready
 //! yet the last-drawn page is held (no flicker).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -125,7 +125,8 @@ struct State {
     source: Option<Arc<dyn PageSource>>,
     pool: Option<DecodePool>,
     cache: PageCache,
-    failed: HashSet<usize>,
+    /// Pages whose decode errored, mapped to the error message (shown to the user).
+    failed: HashMap<usize, String>,
     index: usize,
     start_index: usize,
     last_drawn: Option<usize>,
@@ -660,7 +661,7 @@ impl ApplicationHandler for App {
             source: None,
             pool: None,
             cache: PageCache::new(CACHE_CAP, tex_pool.clone()),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
             index: 0,
             start_index: self.start_index,
             last_drawn: None,
@@ -1774,7 +1775,7 @@ impl State {
         let desired: Vec<usize> = desired_window(self.index, src.len(), fwd, BACK)
             .into_iter()
             .filter(|i| {
-                !self.failed.contains(i)
+                !self.failed.contains_key(i)
                     && self.cache.get(*i).map_or(true, |p| p.target_h != cur)
             })
             .collect();
@@ -1921,8 +1922,8 @@ impl State {
                         self.est_aspect = page.h as f32 / page.w as f32;
                         self.cache.insert(index, page, self.index);
                     }
-                    Msg::Failed { index } => {
-                        self.failed.insert(index);
+                    Msg::Failed { index, error } => {
+                        self.failed.insert(index, error);
                     }
                 }
             }
@@ -2025,9 +2026,11 @@ impl State {
                 layout::view_pages(self.layout, self.index, len, self.spread_offset).0
             };
             let in_cache = self.cache.contains(anchor);
-            // A page whose decode errored is in `failed`; treat it as not-loading
-            // so we show a failure notice instead of spinning forever.
-            let failed = !in_cache && self.failed.contains(&anchor);
+            // A page whose decode errored is in `failed`; treat it as not-loading so
+            // we show a failure notice (file name + reason) instead of spinning.
+            let fail_err: Option<String> =
+                if in_cache { None } else { self.failed.get(&anchor).cloned() };
+            let failed = fail_err.is_some();
             let loading = !in_cache && !failed;
             if in_cache {
                 self.last_drawn = Some(anchor);
@@ -2045,7 +2048,7 @@ impl State {
                 },
                 if self.jump { "  [jump]" } else { "  [step]" }
             );
-            self.ui.failed = failed;
+            self.ui.failed = fail_err.map(|reason| (src.name(anchor).to_string(), reason));
             // Show the centered spinner only after this page's decode has been
             // pending a beat, so fast flips don't flash it. The timer restarts
             // whenever the anchor changes, so a quick page reached at the end of
