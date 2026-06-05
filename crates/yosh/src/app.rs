@@ -1876,8 +1876,9 @@ impl State {
         self.playback.frame = frame.min(frames - 1);
     }
 
-    /// The dynamic window title: `{book} > {file} [ pg / total ] - yosh` in the
-    /// reader, `Library - yosh` in the grid, plain `yosh` when nothing is open.
+    /// The dynamic window title: `{book} > {file} (W × H) [ pg / total ] - yosh`
+    /// in the reader (resolution Firefox-tab style, shown once the page decodes),
+    /// `Library - yosh` in the grid, plain `yosh` when nothing is open.
     fn title(&self) -> String {
         if self.library_view {
             return "Library - yosh".to_string();
@@ -1903,10 +1904,17 @@ impl State {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(name);
+        // Native resolution of the shown page, Firefox-tab style. Pulled from the
+        // decoded texture (`src_w`/`src_h` are pre-downscale source dims), so it
+        // appears once the page lands and is empty while it's still decoding.
+        let res = match self.cache.get(anchor) {
+            Some(t) if t.src_w > 0 && t.src_h > 0 => format!(" ({} × {})", t.src_w, t.src_h),
+            _ => String::new(),
+        };
         let pos = format!("[ {} / {} ] - yosh", anchor + 1, len);
         match self.ui.opened.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-            Some(book) => format!("{book} > {file} {pos}"),
-            None => format!("{file} {pos}"),
+            Some(book) => format!("{book} > {file}{res} {pos}"),
+            None => format!("{file}{res} {pos}"),
         }
     }
 
