@@ -41,7 +41,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
 Name: "assoc_comics"; Description: "&Comic archives  (.cbz, .cbr, .cb7)"; GroupDescription: "Open these file types with yosh:"
-Name: "assoc_images"; Description: "&Images  (.png, .jpg, .jpeg, .webp, .gif, .bmp, .avif, .jxl)"; GroupDescription: "Open these file types with yosh:"; Flags: unchecked
+Name: "assoc_images"; Description: "&Images  (.png, .jpg, .webp, .gif, .bmp, .avif, .jxl, .tif, .tga, .dds, .exr, .qoi, .hdr)"; GroupDescription: "Open these file types with yosh:"; Flags: unchecked
 Name: "context_menu"; Description: "Add ""View with yosh"" when right-clicking comics, archives, images, and folders"; GroupDescription: "Right-click menu:"
 
 [Files]
@@ -101,6 +101,24 @@ Root: HKCU; Subkey: "Software\Classes\yosh.jxl\shell\open\command"; ValueType: s
 Root: HKCU; Subkey: "Software\Classes\yosh.psd"; ValueType: string; ValueName: ""; ValueData: "PSD image"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\yosh.psd\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\psd.ico"
 Root: HKCU; Subkey: "Software\Classes\yosh.psd\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\yosh.tif"; ValueType: string; ValueName: ""; ValueData: "TIFF image"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\yosh.tif\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\tif.ico"
+Root: HKCU; Subkey: "Software\Classes\yosh.tif\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\yosh.tga"; ValueType: string; ValueName: ""; ValueData: "TGA image"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\yosh.tga\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\tga.ico"
+Root: HKCU; Subkey: "Software\Classes\yosh.tga\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\yosh.dds"; ValueType: string; ValueName: ""; ValueData: "DDS texture"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\yosh.dds\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\dds.ico"
+Root: HKCU; Subkey: "Software\Classes\yosh.dds\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\yosh.exr"; ValueType: string; ValueName: ""; ValueData: "OpenEXR image"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\yosh.exr\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\exr.ico"
+Root: HKCU; Subkey: "Software\Classes\yosh.exr\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\yosh.qoi"; ValueType: string; ValueName: ""; ValueData: "QOI image"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\yosh.qoi\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\qoi.ico"
+Root: HKCU; Subkey: "Software\Classes\yosh.qoi\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\yosh.hdr"; ValueType: string; ValueName: ""; ValueData: "Radiance HDR image"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\yosh.hdr\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icons\hdr.ico"
+Root: HKCU; Subkey: "Software\Classes\yosh.hdr\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""
 
 ; ---- Comic extensions: make yosh the handler (these are normally unassociated) ----
 Root: HKCU; Subkey: "Software\Classes\.cbz"; ValueType: string; ValueName: ""; ValueData: "yosh.cbz"; Tasks: assoc_comics; Flags: uninsdeletevalue
@@ -129,6 +147,20 @@ Root: HKCU; Subkey: "Software\Classes\.avif"; ValueType: string; ValueName: ""; 
 Root: HKCU; Subkey: "Software\Classes\.avif\OpenWithProgids"; ValueType: string; ValueName: "yosh.avif"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.jxl"; ValueType: string; ValueName: ""; ValueData: "yosh.jxl"; Tasks: assoc_images; Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\Classes\.jxl\OpenWithProgids"; ValueType: string; ValueName: "yosh.jxl"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.tif"; ValueType: string; ValueName: ""; ValueData: "yosh.tif"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.tif\OpenWithProgids"; ValueType: string; ValueName: "yosh.tif"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.tiff"; ValueType: string; ValueName: ""; ValueData: "yosh.tif"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.tiff\OpenWithProgids"; ValueType: string; ValueName: "yosh.tif"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.tga"; ValueType: string; ValueName: ""; ValueData: "yosh.tga"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.tga\OpenWithProgids"; ValueType: string; ValueName: "yosh.tga"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.dds"; ValueType: string; ValueName: ""; ValueData: "yosh.dds"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.dds\OpenWithProgids"; ValueType: string; ValueName: "yosh.dds"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.exr"; ValueType: string; ValueName: ""; ValueData: "yosh.exr"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.exr\OpenWithProgids"; ValueType: string; ValueName: "yosh.exr"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.qoi"; ValueType: string; ValueName: ""; ValueData: "yosh.qoi"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.qoi\OpenWithProgids"; ValueType: string; ValueName: "yosh.qoi"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.hdr"; ValueType: string; ValueName: ""; ValueData: "yosh.hdr"; Tasks: assoc_images; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.hdr\OpenWithProgids"; ValueType: string; ValueName: "yosh.hdr"; ValueData: ""; Tasks: assoc_images; Flags: uninsdeletevalue
 ; PSD — additive only (adds yosh to "Open with", never the default). Photoshop
 ; keeps the default; the yosh.psd icon only appears if the user opts yosh in.
 Root: HKCU; Subkey: "Software\Classes\.psd\OpenWithProgids"; ValueType: string; ValueName: "yosh.psd"; ValueData: ""; Flags: uninsdeletevalue
@@ -150,6 +182,13 @@ Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueTy
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".bmp"; ValueData: "yosh.bmp"; Tasks: assoc_images
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".avif"; ValueData: "yosh.avif"; Tasks: assoc_images
 Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".jxl"; ValueData: "yosh.jxl"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tif"; ValueData: "yosh.tif"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tiff"; ValueData: "yosh.tif"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".tga"; ValueData: "yosh.tga"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".dds"; ValueData: "yosh.dds"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".exr"; ValueData: "yosh.exr"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".qoi"; ValueData: "yosh.qoi"; Tasks: assoc_images
+Root: HKCU; Subkey: "Software\{#AppName}\Capabilities\FileAssociations"; ValueType: string; ValueName: ".hdr"; ValueData: "yosh.hdr"; Tasks: assoc_images
 Root: HKCU; Subkey: "Software\RegisteredApplications"; ValueType: string; ValueName: "{#AppName}"; ValueData: "Software\{#AppName}\Capabilities"; Flags: uninsdeletevalue
 
 ; ---- "View with yosh" right-click verb (Tasks: context_menu) ----
@@ -204,6 +243,27 @@ Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.jxl\shell\yosh.vie
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ico\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ico\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.ico\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tif\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tif\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tif\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tiff\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tiff\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tiff\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tga\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tga\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.tga\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.dds\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.dds\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.dds\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.exr\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.exr\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.exr\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.qoi\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.qoi\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.qoi\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.hdr\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.hdr\shell\yosh.view"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\{#AppExe},0"; Tasks: context_menu
+Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.hdr\shell\yosh.view\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: context_menu
 ; PSD — "View with yosh" right-click only. Deliberately NOT a default association
 ; (Photoshop keeps that); yosh just offers to open the flattened composite.
 Root: HKCU; Subkey: "Software\Classes\SystemFileAssociations\.psd\shell\yosh.view"; ValueType: string; ValueName: ""; ValueData: "View with yosh"; Tasks: context_menu; Flags: uninsdeletekey
