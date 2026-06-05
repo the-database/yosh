@@ -32,8 +32,10 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 
 ## Formats
 - Sources: image folders, CBZ/ZIP, CBR/RAR (UnRAR), 7z/CB7.
-- Images: PNG, JPEG, WebP, GIF, BMP, JPEG XL (.jxl), PSD. AVIF is **opt-in** (see below).
+- Images: PNG, JPEG, WebP, GIF, BMP, JPEG XL (.jxl), PSD, ICO, TIFF, TGA, DDS, OpenEXR, Radiance
+  HDR, QOI, PNM. AVIF is **opt-in** (see below).
   - Animated GIF and animated WebP play back, with a mini panel for play/pause and frame stepping.
+  - ICO files step through their contained resolutions ("layers") in that same panel.
   - PSD shows the flattened composite (8-bit RGB); it's browsable in folders/archives but is **not**
     registered as a default `.psd` handler (a "View with yosh" right-click entry is offered instead).
 
