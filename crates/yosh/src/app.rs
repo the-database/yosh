@@ -1018,10 +1018,12 @@ impl State {
         }
         // "Step" seek (default; toggle "jump" with J): don't flip while the
         // current page is still decoding, so you see every page instead of
-        // skipping past it. "Jump" skips ahead for fast long-distance seeks.
+        // skipping past it. "Jump" skips ahead for fast long-distance seeks. A
+        // *failed* page never lands in the cache, so allow stepping past it —
+        // otherwise next/prev gets stuck on an unopenable page.
         if !self.jump {
             let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
-            if !self.cache.contains(cur) {
+            if !self.cache.contains(cur) && !self.failed.contains_key(&cur) {
                 return false;
             }
         }
