@@ -363,13 +363,14 @@ pub fn decode_and_downscale(
     }
 }
 
-/// A decoded page: either a single still image (the common case — every format
-/// except multi-frame GIF), or an animation as an ordered list of
-/// `(frame, delay_ms)`. A single-frame GIF comes back as `Still`, so the rest of
-/// the pipeline only pays the animation cost for GIFs that actually move.
+/// A decoded page: a single still image (the common case), an animation as an
+/// ordered list of `(frame, delay_ms)` (GIF/WebP — auto-plays), or a set of
+/// static layers (an `.ico`'s multiple resolutions — stepped manually, no
+/// playback). Single-frame/-layer inputs collapse to `Still`.
 pub enum DecodedPage {
     Still(DecodedImage),
     Animated(Vec<(DecodedImage, u32)>),
+    Layered(Vec<DecodedImage>),
 }
 
 /// Downscale one already-decoded, canvas-composited RGBA frame to `target_h` via
@@ -422,14 +423,42 @@ fn frames_to_page(
     }
 }
 
-/// Decode a page to a still image or (for animated GIF / WebP) an animation. This
-/// is the entry point the decode pool uses; stills go through the unchanged
+/// Decode every image inside an `.ico` (its multiple resolutions / "layers"),
+/// largest first. Each entry decodes to RGBA8 at its own native size; they are
+/// kept native (icons are tiny) and shown scaled to the page box.
+fn decode_ico(bytes: &[u8]) -> Result<Vec<DecodedImage>, String> {
+    let dir = ico::IconDir::read(std::io::Cursor::new(bytes)).map_err(|e| format!("ico: {e}"))?;
+    let mut out: Vec<DecodedImage> = Vec::with_capacity(dir.entries().len());
+    for entry in dir.entries() {
+        let img = entry.decode().map_err(|e| format!("ico entry: {e}"))?;
+        let (w, h) = (img.width(), img.height());
+        out.push(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels: img.rgba_data().to_vec() });
+    }
+    if out.is_empty() {
+        return Err("ico: no entries".into());
+    }
+    // Largest first, so the default-shown layer is the highest resolution.
+    out.sort_by_key(|i| std::cmp::Reverse((i.w as u64) * (i.h as u64)));
+    Ok(out)
+}
+
+/// Decode a page to a still image, an animation (GIF/WebP), or layered (`.ico`).
+/// This is the entry point the decode pool uses; stills go through the unchanged
 /// `decode_and_downscale` hot path.
 pub fn decode_page(
     bytes: &[u8],
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedPage, String> {
+    // ICO: expose every contained image as a steppable layer (1 entry → still).
+    if bytes.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
+        let mut layers = decode_ico(bytes)?;
+        return Ok(if layers.len() == 1 {
+            DecodedPage::Still(layers.pop().unwrap())
+        } else {
+            DecodedPage::Layered(layers)
+        });
+    }
     // GIF is always frame-decoded (a 1-frame GIF collapses back to a still).
     if bytes.starts_with(b"GIF8") {
         let frames = GifDecoder::new(std::io::Cursor::new(bytes))
@@ -488,7 +517,7 @@ mod tests {
                 // 100ms round-trips through the centisecond GIF delay field.
                 assert!(fs.iter().all(|(_, d)| *d == 100), "delays = {:?}", fs.iter().map(|(_, d)| *d).collect::<Vec<_>>());
             }
-            DecodedPage::Still(_) => panic!("expected an animation"),
+            _ => panic!("expected an animation"),
         }
     }
 
@@ -534,7 +563,7 @@ mod tests {
                 assert!(!img.gray);
                 assert_eq!(&img.pixels[0..4], &[255, 0, 0, 255], "opaque red");
             }
-            DecodedPage::Animated(_) => panic!("psd should be a still"),
+            _ => panic!("psd should be a still"),
         }
     }
 
@@ -557,7 +586,28 @@ mod tests {
                 assert!(!img.gray);
                 assert_eq!(img.pixels.len(), 2 * 2 * 4, "down-converted to RGBA8");
             }
-            DecodedPage::Animated(_) => panic!("png is a still"),
+            _ => panic!("png is a still"),
+        }
+    }
+
+    #[test]
+    fn ico_decodes_as_layers() {
+        use ico::{IconDir, IconDirEntry, IconImage, ResourceType};
+        let mut dir = IconDir::new(ResourceType::Icon);
+        for sz in [16u32, 32u32] {
+            let img = IconImage::from_rgba_data(sz, sz, vec![0xFFu8; (sz * sz * 4) as usize]);
+            dir.add_entry(IconDirEntry::encode(&img).unwrap());
+        }
+        let mut bytes = Vec::new();
+        dir.write(&mut bytes).unwrap();
+        let mut resizer = Resizer::new();
+        match decode_page(&bytes, 64, &mut resizer).unwrap() {
+            DecodedPage::Layered(layers) => {
+                assert_eq!(layers.len(), 2);
+                assert_eq!((layers[0].w, layers[0].h), (32, 32), "largest layer first");
+                assert_eq!((layers[1].w, layers[1].h), (16, 16));
+            }
+            _ => panic!("multi-entry ico should be Layered"),
         }
     }
 }
