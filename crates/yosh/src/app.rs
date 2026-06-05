@@ -1420,13 +1420,17 @@ impl State {
     fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
         let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom;
         let (dw, dh) = (t.w as f32 * s, t.h as f32 * s);
+        // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
+        // fractional offset would make the bilinear sampler blend every column
+        // 50/50 with its neighbour — a horizontal smear that also beats against
+        // halftone screentones. Whole-pixel placement samples texel centers 1:1.
         Self::quad_from_px(
             0,
             idx,
-            self.horizontal_left(dw, sw),
-            self.vertical_top(dh, sh),
-            dw,
-            dh,
+            self.horizontal_left(dw, sw).round(),
+            self.vertical_top(dh, sh).round(),
+            dw.round(),
+            dh.round(),
             sw,
             sh,
         )
@@ -1475,9 +1479,15 @@ impl State {
                     Direction::Rtl => (bi, wb, a, wa),
                 };
                 let (dwl, dwr) = (wl * s, wr * s);
+                // Snap to the pixel grid (see single_quad). The right page starts
+                // at the left's snapped right edge, so there's no sub-pixel seam.
+                let yt = self.vertical_top(dh, sh).round();
+                let dhr = dh.round();
+                let xl = x0.round();
+                let dwl_r = dwl.round();
                 vec![
-                    Self::quad_from_px(0, l_idx, x0, self.vertical_top(dh, sh), dwl, dh, sw, sh),
-                    Self::quad_from_px(1, r_idx, x0 + dwl, self.vertical_top(dh, sh), dwr, dh, sw, sh),
+                    Self::quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh),
+                    Self::quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh),
                 ]
             }
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
