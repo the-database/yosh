@@ -35,9 +35,22 @@ impl Gpu {
         }))
         .expect("request adapter");
         let adapter_info = adapter.get_info();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-                .expect("request device");
+        // Request the adapter's full max texture dimension (wgpu's default is only
+        // 8192) so very wide/tall images — e.g. a 16k-px panorama — fit in one GPU
+        // texture. Decoded pages are clamped to this limit in decode.rs.
+        let required_limits = wgpu::Limits {
+            max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
+            ..wgpu::Limits::default()
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_limits,
+            ..Default::default()
+        }))
+        .expect("request device");
+        crate::decode::MAX_TEX_DIM.store(
+            device.limits().max_texture_dimension_2d,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
