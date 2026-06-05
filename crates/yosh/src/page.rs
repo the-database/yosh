@@ -141,34 +141,6 @@ pub struct PageTexture {
 }
 
 impl PageTexture {
-    /// Wrap a texture that already holds page pixels (e.g. a GPU-downscale
-    /// target) as a `PageTexture`.
-    pub fn from_pooled(
-        texture: wgpu::Texture,
-        w: u32,
-        h: u32,
-        src_w: u32,
-        src_h: u32,
-        gray: bool,
-        target_h: u32,
-    ) -> PageTexture {
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        PageTexture {
-            texture,
-            view,
-            w,
-            h,
-            src_w,
-            src_h,
-            gray,
-            target_h,
-            anim: None,
-            frame0_delay_ms: 0,
-            anim_total_ms: 0,
-            animated: false,
-        }
-    }
-
     /// Whether this page auto-plays (GIF/WebP). False for stills and `.ico` layers.
     pub fn is_animation(&self) -> bool {
         self.animated

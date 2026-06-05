@@ -7,24 +7,16 @@
 //! workers always pick the highest-priority page relative to the latest position.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use fast_image_resize::Resizer;
 
-use crate::decode::{decode_full, decode_page, DecodedPage};
-use crate::downscale::Downscaler;
+use crate::decode::{decode_page, DecodedPage};
 use crate::page::{PagePipeline, PageTexture};
 use crate::source::PageSource;
-use crate::texpool::{self, TexturePool};
-
-/// GPU-side downscale is disabled: a single bilinear blit can't match the HQ
-/// CPU resize (Lanczos / Catmull-Rom + dot-gain). The path below is kept intact
-/// behind this flag for a future high-quality GPU rewrite. While `false`, every
-/// page goes through the HQ CPU path.
-const GPU_DOWNSCALE_ENABLED: bool = false;
+use crate::texpool::TexturePool;
 
 pub enum Msg {
     Done { index: usize, page: PageTexture },
@@ -51,8 +43,6 @@ impl DecodePool {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         tex_pool: Arc<TexturePool>,
-        downscaler: Arc<Downscaler>,
-        gpu_flag: Arc<AtomicBool>,
         workers: usize,
     ) -> Self {
         let shared = Arc::new((
@@ -72,8 +62,6 @@ impl DecodePool {
             let device = device.clone();
             let queue = queue.clone();
             let tex_pool = tex_pool.clone();
-            let downscaler = downscaler.clone();
-            let gpu_flag = gpu_flag.clone();
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
@@ -96,23 +84,7 @@ impl DecodePool {
                         }
                     };
 
-                    let gpu = gpu_flag.load(Ordering::Relaxed);
                     let page: Result<PageTexture, String> = match source.read_page(index) {
-                        Ok(bytes) if gpu && GPU_DOWNSCALE_ENABLED => decode_full(&bytes).map(|img| {
-                            // Upload full-res, downscale on the GPU into a display texture.
-                            let src = tex_pool.get(&device, img.gray, img.w, img.h);
-                            texpool::write_pixels(&queue, &src, &img.pixels, img.w, img.h, img.gray);
-                            let src_view = src.create_view(&wgpu::TextureViewDescriptor::default());
-                            let tw = (((img.w as f64) * (th as f64) / (img.h as f64)).round()
-                                as u32)
-                                .max(1);
-                            let dst = tex_pool.get(&device, img.gray, tw, th);
-                            let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
-                            downscaler.blit(&device, &queue, &src_view, &dst_view, img.gray);
-                            drop(src_view);
-                            tex_pool.put(src, img.gray, img.w, img.h);
-                            PageTexture::from_pooled(dst, tw, th, img.src_w, img.src_h, img.gray, th)
-                        }),
                         Ok(bytes) => match decode_page(&bytes, th, &mut resizer) {
                             Ok(DecodedPage::Still(img)) => {
                                 Ok(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
