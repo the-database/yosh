@@ -6,7 +6,16 @@
 //! input, and storage. It is filled in across Phase 2; for now it carries the
 //! [`Viewport`], the one piece the shell hands in every frame.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::cache::PageCache;
+use crate::layout::Layout;
 use crate::page::{fit_scale, FitMode};
+use crate::pool::DecodePool;
+use crate::source::PageSource;
+use crate::texpool::TexturePool;
 
 /// The drawable surface size in physical pixels, as the reading math sees it.
 ///
@@ -148,5 +157,108 @@ pub fn quad_from_px(
         scale: [2.0 * dw / sw, 2.0 * dh / sh],
         offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
         rot,
+    }
+}
+
+/// Default h/w aspect estimate for not-yet-decoded pages in the scroll strip.
+pub const DEFAULT_ASPECT: f32 = 1.5;
+
+/// The platform-agnostic reading-state machine: navigation, zoom/pan, fit/layout,
+/// the continuous-scroll anchor, the decode-view debounce, and the engine
+/// resources (page source, decode pool, cache, texture pool) it drives. A shell
+/// owns a `Reader`, feeds it a [`Viewport`] and input each frame, and renders the
+/// draw list it produces. Fields are `pub` while Phase 2 migrates logic in; they
+/// tighten as the reading methods land on `impl Reader`.
+pub struct Reader {
+    // --- Engine resources ---
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
+    pub tex_pool: Arc<TexturePool>,
+    pub source: Option<Arc<dyn PageSource>>,
+    pub pool: Option<DecodePool>,
+    pub cache: PageCache,
+    /// Worker count for the decode pool, kept so `set_source` can rebuild it.
+    pub workers: usize,
+    /// Pages whose decode errored, mapped to the error message (shown to the user).
+    pub failed: HashMap<usize, String>,
+
+    // --- Reading model ---
+    pub index: usize,
+    pub start_index: usize,
+    pub last_drawn: Option<usize>,
+    pub fit: FitMode,
+    pub layout: Layout,
+    pub spread_offset: usize, // spread pairing parity (0 or 1), per-volume
+    pub rotation: u8,         // 90° CW steps (0..=3); single-page draws only
+    pub zoom: f32,            // page-flip zoom factor (1.0 = fit)
+    pub pan_x: f32,           // page-flip pan offset in screen px (from centered)
+    pub pan_y: f32,
+    pub direction: Direction,
+    pub jump: bool, // seek mode (key J): true = skip ahead, false = step every page
+    pub nav_times: VecDeque<Instant>,
+    pub scroll_mode: bool,
+    pub top_offset: f32, // px the anchor page is scrolled above the viewport top
+    pub est_aspect: f32, // h/w estimate for undecoded pages in the strip
+
+    // --- Surface + decode-view debounce ---
+    pub viewport: Viewport,
+    /// Last-seen `(surface_w, surface_h, zoom)`; once it holds across a frame the
+    /// view is "settled" and target-change re-decodes are allowed.
+    pub pending_view: (u32, u32, f32),
+    pub view_settled: bool,
+    /// True while a "settled view is GPU-downscaling" warning has already fired for
+    /// the current episode, so the tripwire logs once, not per frame.
+    pub gpu_downscale_warned: bool,
+    /// When the zoomed-page wheel-pan first parked at the top/bottom edge (gates
+    /// the hard-stop dwell before flipping).
+    pub pan_edge_at: Option<Instant>,
+}
+
+impl Reader {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        tex_pool: Arc<TexturePool>,
+        cache_cap: usize,
+        workers: usize,
+        fit: FitMode,
+        layout: Layout,
+        scroll_mode: bool,
+        jump: bool,
+        direction: Direction,
+        start_index: usize,
+    ) -> Self {
+        Self {
+            cache: PageCache::new(cache_cap, tex_pool.clone()),
+            device,
+            queue,
+            tex_pool,
+            source: None,
+            pool: None,
+            workers,
+            failed: HashMap::new(),
+            index: 0,
+            start_index,
+            last_drawn: None,
+            fit,
+            layout,
+            spread_offset: 0,
+            rotation: 0,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            direction,
+            jump,
+            nav_times: VecDeque::new(),
+            scroll_mode,
+            top_offset: 0.0,
+            est_aspect: DEFAULT_ASPECT,
+            viewport: Viewport::default(),
+            pending_view: (0, 0, 1.0),
+            view_settled: false,
+            gpu_downscale_warned: false,
+            pan_edge_at: None,
+        }
     }
 }
