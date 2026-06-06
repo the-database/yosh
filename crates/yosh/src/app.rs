@@ -48,6 +48,50 @@ const FWD_MAX: usize = 40;
 /// these are converted to multiplier bounds per page in `clamp_zoom_native`.
 const MIN_ZOOM_PCT: f32 = 0.05; // 5% of native
 const MAX_ZOOM_PCT: f32 = 200.0; // 20000% of native
+
+/// Fixed zoom ladder in native percent (BandiView): 5, then 10..300 by 10,
+/// 320..500 by 20, 550..20000 by 50. The endpoints equal the clamp range
+/// (`MIN_ZOOM_PCT*100` .. `MAX_ZOOM_PCT*100`), so snapping never fights the clamp.
+fn zoom_presets() -> Vec<f32> {
+    let mut v = vec![5.0];
+    let mut p = 10;
+    while p <= 300 {
+        v.push(p as f32);
+        p += 10;
+    }
+    p = 320;
+    while p <= 500 {
+        v.push(p as f32);
+        p += 20;
+    }
+    p = 550;
+    while p <= 20000 {
+        v.push(p as f32);
+        p += 50;
+    }
+    v
+}
+
+/// The next stop above (`zoom_in`) or below `current_pct` in `ladder` (which must
+/// be sorted ascending: the fixed presets plus any spliced fit stops). A 0.1%
+/// relative guard — tighter than the smallest step (~0.25% at the top) — keeps
+/// float noise from sticking on or skipping a level. Clamps at the ends.
+fn next_zoom_preset(ladder: &[f32], current_pct: f32, zoom_in: bool) -> f32 {
+    if zoom_in {
+        ladder
+            .iter()
+            .copied()
+            .find(|&p| p > current_pct * 1.001)
+            .unwrap_or_else(|| *ladder.last().unwrap())
+    } else {
+        ladder
+            .iter()
+            .copied()
+            .rev()
+            .find(|&p| p < current_pct * 0.999)
+            .unwrap_or(ladder[0])
+    }
+}
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
 /// Height/width estimate for not-yet-decoded pages in the scroll strip.
@@ -202,6 +246,69 @@ struct State {
     update_apply_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     updating: bool,
     update_error: Option<String>,
+
+    // Async open: source construction (the I/O-bound part of opening a volume)
+    // runs on a background thread so a slow network-share open never freezes the
+    // UI. Each `open` bumps `open_gen`; `render` applies only the newest result,
+    // so rapid `[`/`]` supersede in-flight opens. `opening_key` tracks the
+    // most-recently-targeted volume so successive `[`/`]` advance from the pending
+    // target rather than repeating the same neighbor.
+    open_gen: u64,
+    opening: bool,
+    opening_key: Option<PathBuf>,
+    open_tx: std::sync::mpsc::Sender<(u64, Built)>,
+    open_rx: std::sync::mpsc::Receiver<(u64, Built)>,
+    /// Cached parent-dir scan for `[`/`]` — (parent dir, want_folder, natural-sort
+    /// paths). Warmed in the background on open so the first jump doesn't pay it.
+    sib_cache: Option<(PathBuf, bool, Vec<PathBuf>)>,
+    sib_tx: std::sync::mpsc::Sender<(PathBuf, bool, Vec<PathBuf>)>,
+    sib_rx: std::sync::mpsc::Receiver<(PathBuf, bool, Vec<PathBuf>)>,
+}
+
+/// Result of constructing a page source: `(source, volume-key path, explicit
+/// start index)`, or an error message. Built off-thread by `build_source`.
+type Built = Result<(Arc<dyn PageSource>, PathBuf, Option<usize>), String>;
+
+/// Construct a page source for `path` (folder / archive / single image). Pure
+/// I/O, touches no app state, so it runs on a background thread — a slow
+/// (e.g. network-share) open never blocks the UI. The result is handed back to
+/// the main thread and applied via `set_source`.
+fn build_source(path: &Path) -> Built {
+    if path.is_dir() {
+        return FolderSource::new(path)
+            .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
+            .map_err(|e| e.to_string());
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("cbz") | Some("zip") => ZipSource::new(path)
+            .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
+            .map_err(|e| e.to_string()),
+        Some("cbr") | Some("rar") => RarSource::new(path)
+            .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
+            .map_err(|e| e.to_string()),
+        Some("7z") | Some("cb7") => SevenzSource::new(path)
+            .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
+            .map_err(|e| e.to_string()),
+        // A single image opens its containing folder, positioned at that image,
+        // so you can seek forward/back within the folder.
+        _ if is_image_ext(path) => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            FolderSource::new(parent)
+                .map(|s| {
+                    let start = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .and_then(|n| s.index_of_name(n));
+                    (Arc::new(s) as Arc<dyn PageSource>, parent.to_path_buf(), start)
+                })
+                .map_err(|e| e.to_string())
+        }
+        _ => Err("unsupported file type (open a folder, image, CBZ, CBR, or 7z)".to_string()),
+    }
 }
 
 /// True if the saved window rect overlaps any currently-connected monitor, so
@@ -645,6 +752,9 @@ impl ApplicationHandler for App {
                 let _ = update_tx.send(u);
             }
         });
+        // Channels for background archive opens and sibling-volume prescans.
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        let (sib_tx, sib_rx) = std::sync::mpsc::channel();
         self.state = Some(State {
             window,
             gpu,
@@ -707,6 +817,14 @@ impl ApplicationHandler for App {
             update_apply_rx: None,
             updating: false,
             update_error: None,
+            open_gen: 0,
+            opening: false,
+            opening_key: None,
+            open_tx,
+            open_rx,
+            sib_cache: None,
+            sib_tx,
+            sib_rx,
         });
     }
 
@@ -910,18 +1028,8 @@ impl State {
                 self.settings.fit = fit_to_u8(self.fit);
                 config::save(&self.settings);
             }
-            Action::ZoomIn => {
-                self.zoom *= 1.25;
-                self.clamp_zoom_native();
-                self.clamp_pan();
-                self.toast(format!("Zoom {:.2}%", self.effective_zoom_pct()));
-            }
-            Action::ZoomOut => {
-                self.zoom /= 1.25;
-                self.clamp_zoom_native();
-                self.clamp_pan();
-                self.toast(format!("Zoom {:.2}%", self.effective_zoom_pct()));
-            }
+            Action::ZoomIn => self.zoom_to_preset(true),
+            Action::ZoomOut => self.zoom_to_preset(false),
             Action::PresetWindow => self.apply_view(FitMode::Window, false, None),
             Action::PresetWidth => self.apply_view(FitMode::Width, false, None),
             Action::PresetActual => self.apply_view(FitMode::Actual, false, None),
@@ -1055,11 +1163,28 @@ impl State {
     /// reading mode/position of the current volume is persisted by `open`; the
     /// new one resumes its own saved page. No-op at the ends or with nothing open.
     fn jump_volume(&mut self, delta: i64) {
-        let Some(key) = self.volume_key.clone() else {
+        // Base "current" on the pending target if an open is in flight, so a
+        // second `[`/`]` advances from the not-yet-loaded neighbor instead of
+        // repeating it.
+        let cur = match self.opening_key.clone() {
+            Some(p) => p,
+            None => match &self.volume_key {
+                Some(k) => PathBuf::from(k),
+                None => return,
+            },
+        };
+        let Some(parent) = cur.parent().map(|p| p.to_path_buf()) else {
             return;
         };
-        let cur = PathBuf::from(&key);
-        let sibs = crate::library::sibling_volumes(&cur);
+        let want_folder = cur.is_dir();
+        // Use the background-warmed cache when it matches this folder; otherwise
+        // scan synchronously this once (cold cache, e.g. a very first `[`/`]`).
+        let hit = matches!(&self.sib_cache, Some((p, wf, _)) if *p == parent && *wf == want_folder);
+        if !hit {
+            let vols = crate::library::sibling_volumes(&cur);
+            self.sib_cache = Some((parent, want_folder, vols));
+        }
+        let sibs = &self.sib_cache.as_ref().unwrap().2;
         let cur_name = cur.file_name();
         let Some(idx) = sibs.iter().position(|p| p.file_name() == cur_name) else {
             return;
@@ -1069,7 +1194,8 @@ impl State {
             self.toast("First book");
             return;
         }
-        match sibs.get(target as usize).cloned() {
+        let next = sibs.get(target as usize).cloned();
+        match next {
             Some(path) => self.open(&path),
             None => self.toast("Last book"),
         }
@@ -1311,17 +1437,16 @@ impl State {
         fit_scale(fit, sw, sh, fit_w, fit_h) * zoom * decoded_h / src_h.max(1.0)
     }
 
-    /// device-px-per-native-px of the in-view anchor page, matching exactly what
-    /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
-    /// isn't decoded yet.
-    fn anchor_scale(&self) -> Option<f32> {
+    /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h)` — the inputs
+    /// `anchor_native_scale` needs, computed once and shared by `anchor_scale`
+    /// (current fit/zoom) and `fit_native_pct` (an arbitrary fit at zoom 1). `None`
+    /// in scroll mode (no facing-pair layout) or before the anchor is decoded.
+    fn anchor_metrics(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
+        if self.scroll_mode {
+            return None;
+        }
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
-        if self.scroll_mode {
-            // Strip pages are laid out at width = sw * zoom (height follows aspect).
-            let t = self.cache.get(self.index)?;
-            return Some(sw * self.zoom / t.src_w.max(1) as f32);
-        }
         let len = self.source.as_ref()?.len();
         if len == 0 {
             return None;
@@ -1340,14 +1465,36 @@ impl State {
             }
             None => (ta.w as f32, ta.h as f32, ta.h as f32),
         };
+        Some((sw, sh, fit_w, fit_h, dec_h, ta.src_h.max(1) as f32))
+    }
+
+    /// device-px-per-native-px of the in-view anchor page, matching exactly what
+    /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
+    /// isn't decoded yet.
+    fn anchor_scale(&self) -> Option<f32> {
+        if self.scroll_mode {
+            // Strip pages are laid out at width = sw * zoom (height follows aspect).
+            let sw = self.gpu.config.width.max(1) as f32;
+            let t = self.cache.get(self.index)?;
+            return Some(sw * self.zoom / t.src_w.max(1) as f32);
+        }
+        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
         Some(Self::anchor_native_scale(
             self.fit,
             (sw, sh),
             (fit_w, fit_h),
             dec_h,
-            ta.src_h.max(1) as f32,
+            src_h,
             self.zoom,
         ))
+    }
+
+    /// The native zoom % the current anchor would display at under `fit` at zoom 1
+    /// — used to splice fit-to-window / fit-to-width stops into the zoom ladder.
+    /// `None` in scroll mode (handled inline in `zoom_ladder`) or before decode.
+    fn fit_native_pct(&self, fit: FitMode) -> Option<f32> {
+        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
+        Some(Self::anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, 1.0) * 100.0)
     }
 
     /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
@@ -1357,6 +1504,73 @@ impl State {
     fn effective_zoom_pct(&self) -> f32 {
         let scale = self.anchor_scale().unwrap_or(self.zoom);
         (scale * 100.0).max(0.0)
+    }
+
+    /// The active zoom ladder: the fixed presets plus the current page's
+    /// fit-to-window and fit-to-width stops (which depend on its resolution),
+    /// in-range, sorted, and de-duplicated. In scroll mode the two fit stops are
+    /// the page's width-fit (the zoom-1 strip) and height-fit native percents.
+    fn zoom_ladder(&self) -> Vec<f32> {
+        let mut ladder = zoom_presets();
+        let (lo, hi) = (MIN_ZOOM_PCT * 100.0, MAX_ZOOM_PCT * 100.0);
+        let mut stops: Vec<f32> = Vec::new();
+        if self.scroll_mode {
+            if let Some(t) = self.cache.get(self.index) {
+                let sw = self.gpu.config.width.max(1) as f32;
+                let sh = self.gpu.config.height.max(1) as f32;
+                stops.push(sw / t.src_w.max(1) as f32 * 100.0); // fit width (strip @ zoom 1)
+                stops.push(sh / t.src_h.max(1) as f32 * 100.0); // fit window (height fills)
+            }
+        } else {
+            for f in [FitMode::Window, FitMode::Width] {
+                if let Some(p) = self.fit_native_pct(f) {
+                    stops.push(p);
+                }
+            }
+        }
+        for p in stops {
+            if (lo..=hi).contains(&p) {
+                ladder.push(p);
+            }
+        }
+        ladder.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ladder.dedup_by(|a, b| (*a - *b).abs() <= *b * 1e-3); // merge a fit stop on a preset
+        ladder
+    }
+
+    /// Snap zoom to the next ladder stop above/below the current native %. The
+    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
+    /// step can land exactly on fit-to-window / fit-to-width. Works in both
+    /// page-flip and scroll modes (both derive from `effective_zoom_pct`).
+    fn zoom_to_preset(&mut self, zoom_in: bool) {
+        let cur = self.effective_zoom_pct();
+        let mut label: Option<&'static str> = None;
+        if self.anchor_scale().is_some() && cur > 0.0 {
+            let ladder = self.zoom_ladder();
+            let target = next_zoom_preset(&ladder, cur, zoom_in);
+            // Tag the stop if it is this page's fit-to-window / fit-to-width level.
+            if !self.scroll_mode {
+                let near = |p: Option<f32>| p.is_some_and(|p| (p - target).abs() <= target * 1e-3);
+                if near(self.fit_native_pct(FitMode::Window)) {
+                    label = Some("Fit window");
+                } else if near(self.fit_native_pct(FitMode::Width)) {
+                    label = Some("Fit width");
+                }
+            }
+            self.zoom *= target / cur; // rescale the fit-multiplier to hit target %
+        } else {
+            // Anchor not decoded yet: coarse step; the next press snaps once it lands.
+            self.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
+        }
+        self.clamp_zoom_native();
+        self.clamp_pan();
+        let pct = self.effective_zoom_pct();
+        match label {
+            // Fit label on its own line so the "Zoom %" line stays centered
+            // (the toast is center-aligned), aligned across zoom levels.
+            Some(l) => self.toast(format!("Zoom {pct:.2}%\n({l})")),
+            None => self.toast(format!("Zoom {pct:.2}%")),
+        }
     }
 
     /// Clamp `self.zoom` (a fit-multiplier) so the *effective native* zoom stays
@@ -1647,52 +1861,21 @@ impl State {
         (FWD + self.nav_times.len() * 4).min(FWD_MAX)
     }
 
+    /// Begin opening `path`. The source is built on a background thread (see
+    /// `build_source`) so a slow network-share open never freezes the UI — the
+    /// current page stays on screen under the spinner until the new source lands
+    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
+    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
     fn open(&mut self, path: &Path) {
-        // (source, volume-key path, explicit start index)
-        type Built = Result<(Arc<dyn PageSource>, PathBuf, Option<usize>), String>;
-        let built: Built = if path.is_dir() {
-            FolderSource::new(path)
-                .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
-                .map_err(|e| e.to_string())
-        } else {
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|s| s.to_ascii_lowercase());
-            match ext.as_deref() {
-                Some("cbz") | Some("zip") => ZipSource::new(path)
-                    .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
-                    .map_err(|e| e.to_string()),
-                Some("cbr") | Some("rar") => RarSource::new(path)
-                    .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
-                    .map_err(|e| e.to_string()),
-                Some("7z") | Some("cb7") => SevenzSource::new(path)
-                    .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
-                    .map_err(|e| e.to_string()),
-                // A single image opens its containing folder, positioned at that
-                // image, so you can seek forward/back within the folder.
-                _ if is_image_ext(path) => {
-                    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-                    FolderSource::new(parent)
-                        .map(|s| {
-                            let start = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .and_then(|n| s.index_of_name(n));
-                            (Arc::new(s) as Arc<dyn PageSource>, parent.to_path_buf(), start)
-                        })
-                        .map_err(|e| e.to_string())
-                }
-                _ => Err(
-                    "unsupported file type (open a folder, image, CBZ, CBR, or 7z)".to_string(),
-                ),
-            }
-        };
-        match built {
-            Ok((source, key, start)) if source.len() > 0 => self.set_source(source, &key, start),
-            Ok(_) => self.ui.status = "no images found".into(),
-            Err(e) => self.ui.status = format!("open failed: {e}"),
-        }
+        self.open_gen = self.open_gen.wrapping_add(1);
+        let generation = self.open_gen;
+        let tx = self.open_tx.clone();
+        let path = path.to_path_buf();
+        self.opening = true;
+        self.opening_key = Some(path.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((generation, build_source(&path)));
+        });
     }
 
     fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path, start: Option<usize>) {
@@ -1735,6 +1918,25 @@ impl State {
         self.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
         self.prefetch();
+        // Warm the sibling-volume list for this folder in the background, so the
+        // first `[`/`]` press doesn't pay the parent-dir scan on the main thread.
+        self.warm_sib_cache(path);
+    }
+
+    /// Scan the current volume's folder for sibling volumes on a background
+    /// thread and hand the result back for `sib_cache` (consumed in `render`).
+    /// Keeps the parent-dir `read_dir` + per-entry stat off the UI thread so
+    /// `[`/`]` stays responsive even on a network share.
+    fn warm_sib_cache(&self, vol: &Path) {
+        let tx = self.sib_tx.clone();
+        let of = vol.to_path_buf();
+        std::thread::spawn(move || {
+            let Some(parent) = of.parent().map(|p| p.to_path_buf()) else {
+                return;
+            };
+            let want_folder = of.is_dir();
+            let _ = tx.send((parent, want_folder, crate::library::sibling_volumes(&of)));
+        });
     }
 
     /// Desired decode height: the page's on-screen height (window height × zoom),
@@ -2040,6 +2242,26 @@ impl State {
                 }
             }
         }
+        // Apply finished background opens, newest generation only — a later
+        // `[`/`]` bumps `open_gen`, so a stale in-flight result is discarded.
+        while let Ok((generation, built)) = self.open_rx.try_recv() {
+            if generation != self.open_gen {
+                continue; // superseded by a newer open()
+            }
+            self.opening = false;
+            self.opening_key = None;
+            match built {
+                Ok((source, key, start)) if source.len() > 0 => {
+                    self.set_source(source, &key, start)
+                }
+                Ok(_) => self.ui.status = "no images found".into(),
+                Err(e) => self.ui.status = format!("open failed: {e}"),
+            }
+        }
+        // Pick up background sibling-volume scans into the `[`/`]` cache.
+        while let Ok(entry) = self.sib_rx.try_recv() {
+            self.sib_cache = Some(entry);
+        }
         // Auto-update: pick up the background check result and any apply result.
         if let Some(rx) = self.update_rx.take() {
             match rx.try_recv() {
@@ -2188,6 +2410,11 @@ impl State {
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
             self.ui.seek_show =
                 self.settings.seekbar_enabled && !self.library_view && len > 1 && near_bottom;
+        }
+        // A background open is in flight: show the spinner over the current page
+        // (or the dark fill on a first open) until the new source lands.
+        if self.opening {
+            self.ui.loading = true;
         }
         let anim_t = self.anim_origin.elapsed();
         let anim_page = self.playback.page;
@@ -2486,5 +2713,46 @@ mod tests {
         assert!((hi * base - super::MAX_ZOOM_PCT).abs() < 1e-2, "hi eff {}", hi * base);
         let mid = super::State::clamp_zoom_multiplier(1.0, base);
         assert!((mid - 1.0).abs() < 1e-6, "mid {mid}");
+    }
+
+    // The BandiView ladder: 5, 10..300 by 10, 320..500 by 20, 550..20000 by 50.
+    #[test]
+    fn zoom_ladder_shape() {
+        let p = super::zoom_presets();
+        assert_eq!(p.first().copied(), Some(5.0));
+        assert_eq!(p.last().copied(), Some(20000.0));
+        assert!(p.windows(2).all(|w| w[1] > w[0]), "strictly increasing");
+        for v in [10.0, 100.0, 300.0, 320.0, 500.0, 550.0, 20000.0] {
+            assert!(p.contains(&v), "ladder missing {v}");
+        }
+        let idx = |v: f32| p.iter().position(|&x| x == v).unwrap();
+        assert_eq!(p[idx(300.0) + 1], 320.0, "300 -> 320 (step 20)");
+        assert_eq!(p[idx(500.0) + 1], 550.0, "500 -> 550 (step 50)");
+    }
+
+    // +/- step to the neighbouring fixed stop, clamping at the ends.
+    #[test]
+    fn zoom_stepping_fixed() {
+        let p = super::zoom_presets();
+        let up = |c: f32| super::next_zoom_preset(&p, c, true);
+        let dn = |c: f32| super::next_zoom_preset(&p, c, false);
+        assert_eq!(up(71.0), 80.0);
+        assert_eq!(up(80.0), 90.0);
+        assert_eq!(up(300.0), 320.0);
+        assert_eq!(up(500.0), 550.0);
+        assert_eq!(up(20000.0), 20000.0, "clamps at the top");
+        assert_eq!(dn(5.0), 5.0, "clamps at the bottom");
+        assert_eq!(dn(95.0), 90.0);
+        assert_eq!(dn(320.0), 300.0);
+        assert_eq!(dn(550.0), 500.0);
+    }
+
+    // A spliced fit-% (e.g. 71.34) becomes a reachable stop between fixed presets.
+    #[test]
+    fn zoom_stepping_dynamic_stop() {
+        let ladder = vec![70.0, 71.34, 80.0, 90.0];
+        assert_eq!(super::next_zoom_preset(&ladder, 70.0, true), 71.34);
+        assert_eq!(super::next_zoom_preset(&ladder, 71.34, true), 80.0);
+        assert_eq!(super::next_zoom_preset(&ladder, 71.34, false), 70.0);
     }
 }
