@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::decode::DecodedImage;
+use crate::decode::{DecodedImage, ResizePath};
 use crate::texpool::TexturePool;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -135,6 +135,8 @@ pub struct PageTexture {
     pub src_w: u32,
     pub src_h: u32,
     pub gray: bool,
+    /// Which CPU resize path produced this page (for the info overlay readout).
+    pub path: ResizePath,
     /// Decode target height this page was produced for (the `target_h` the pool
     /// used). Lets the cache detect pages decoded at a stale resolution after a
     /// zoom/resize and re-decode them in place without blanking the display.
@@ -218,6 +220,7 @@ impl PageTexture {
             src_w: _,
             src_h: _,
             gray,
+            path: _,
             target_h: _,
             anim,
             frame0_delay_ms: _,
@@ -385,6 +388,7 @@ impl PagePipeline {
             src_w: img.src_w,
             src_h: img.src_h,
             gray: img.gray,
+            path: img.path,
             target_h,
             anim: None,
             frame0_delay_ms: 0,
