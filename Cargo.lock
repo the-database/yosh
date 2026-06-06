@@ -5209,10 +5209,14 @@ dependencies = [
  "image",
  "jpeg-decoder",
  "jxl-oxide",
+ "natord",
  "png 0.18.1",
  "psd",
  "qcms",
+ "sevenz-rust2",
+ "unrar",
  "wgpu",
+ "zip",
 ]
 
 [[package]]

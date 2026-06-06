@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use fast_image_resize::Resizer;
 
 use yosh_engine::decode::{decode_page, DecodedPage};
-use crate::source::PageSource;
+use yosh_engine::source::PageSource;
 use yosh_engine::page::{PagePipeline, PageTexture};
 use yosh_engine::texpool::TexturePool;
 
