@@ -60,4 +60,5 @@ winresource = "0.1"
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so
 # the standard `cargo build` needs no C toolchain. Enabling it requires nasm +
 # dav1d (or a vendored build): `cargo build --release -p yosh --features avif`.
-avif = ["image/avif-native"]
+# Forwarded to the engine, which owns the decode path (image/avif-native).
+avif = ["yosh-engine/avif"]

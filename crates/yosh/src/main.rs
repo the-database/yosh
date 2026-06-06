@@ -9,15 +9,12 @@
 mod app;
 mod cache;
 mod config;
-mod decode;
 mod gpu;
-mod icc;
 mod library;
 mod page;
 mod pool;
 mod source;
 mod texpool;
-mod tone;
 mod ui;
 mod update;
 
