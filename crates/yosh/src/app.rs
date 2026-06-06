@@ -1126,6 +1126,13 @@ impl State {
             Action::ToggleSeekbar => {
                 self.settings.seekbar_enabled = !self.settings.seekbar_enabled;
                 config::save(&self.settings);
+                // Announce the change like the other toggles — a silent flip left
+                // the seekbar disabled with no clue it had been turned off.
+                self.toast(if self.settings.seekbar_enabled {
+                    "Seekbar: on"
+                } else {
+                    "Seekbar: off"
+                });
             }
             Action::ToggleAnimBar => self.playback.hidden = !self.playback.hidden,
             Action::ToggleFullscreen => {
