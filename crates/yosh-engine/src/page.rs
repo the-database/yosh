@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use yosh_engine::decode::{DecodedImage, ResizePath};
+use crate::decode::{DecodedImage, ResizePath};
 use crate::texpool::TexturePool;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

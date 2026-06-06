@@ -13,6 +13,8 @@ name = "yosh_engine"
 avif = ["image/avif-native"]
 
 [dependencies]
+wgpu = "29.0.3"
+bytemuck = { version = "1", features = ["derive"] }
 image = "0.25"
 png = "0.18"
 jpeg-decoder = "0.3"
