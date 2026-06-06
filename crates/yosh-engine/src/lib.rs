@@ -8,3 +8,6 @@
 //!
 //! Modules are moved here in stages from `crates/yosh`; this file grows its
 //! `pub mod`/re-export surface as each lands.
+
+pub mod layout;
+pub mod prefetch;
