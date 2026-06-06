@@ -3,7 +3,6 @@
 //! navigation. The current page is drawn from the cache; if a target isn't ready
 //! yet the last-drawn page is held (no flicker).
 
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,84 +16,23 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use fast_image_resize::Resizer;
 
-use yosh_engine::cache::PageCache;
 use crate::config;
 use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library};
-use yosh_engine::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
+use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
-use yosh_engine::prefetch::desired_window;
+use yosh_engine::reader::{next_zoom_preset, Direction, Reader, Viewport};
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
 
-// Decode target height tracks each page's exact on-screen size (see
-// `page_target_h`) so the high-quality linear-light CPU resize does the *full*
-// reduction in one pass and the GPU samples 1:1 — the single-resize invariant.
-// Otherwise pages decode larger than shown and the GPU re-downscales them with a
-// plain bilinear (no mipmaps) → halftone aliasing/moiré.
-const MIN_TARGET: u32 = 32; // floor so extreme zoom-out still decodes ~exact
 const WORKERS: usize = 8;
 const CACHE_CAP: usize = 48;
-const FWD: usize = 16;
-const BACK: usize = 6;
-const FWD_MAX: usize = 40;
-/// Zoom limits, measured against the image's *native* resolution (1 image px :
-/// 1 screen px = 100%), matching BandiView. `self.zoom` is a fit-multiplier, so
-/// these are converted to multiplier bounds per page in `clamp_zoom_native`.
-const MIN_ZOOM_PCT: f32 = 0.05; // 5% of native
-const MAX_ZOOM_PCT: f32 = 200.0; // 20000% of native
-
-/// Fixed zoom ladder in native percent (BandiView): 5, then 10..300 by 10,
-/// 320..500 by 20, 550..20000 by 50. The endpoints equal the clamp range
-/// (`MIN_ZOOM_PCT*100` .. `MAX_ZOOM_PCT*100`), so snapping never fights the clamp.
-fn zoom_presets() -> Vec<f32> {
-    let mut v = vec![5.0];
-    let mut p = 10;
-    while p <= 300 {
-        v.push(p as f32);
-        p += 10;
-    }
-    p = 320;
-    while p <= 500 {
-        v.push(p as f32);
-        p += 20;
-    }
-    p = 550;
-    while p <= 20000 {
-        v.push(p as f32);
-        p += 50;
-    }
-    v
-}
-
-/// The next stop above (`zoom_in`) or below `current_pct` in `ladder` (which must
-/// be sorted ascending: the fixed presets plus any spliced fit stops). A 0.1%
-/// relative guard — tighter than the smallest step (~0.25% at the top) — keeps
-/// float noise from sticking on or skipping a level. Clamps at the ends.
-fn next_zoom_preset(ladder: &[f32], current_pct: f32, zoom_in: bool) -> f32 {
-    if zoom_in {
-        ladder
-            .iter()
-            .copied()
-            .find(|&p| p > current_pct * 1.001)
-            .unwrap_or_else(|| *ladder.last().unwrap())
-    } else {
-        ladder
-            .iter()
-            .copied()
-            .rev()
-            .find(|&p| p < current_pct * 0.999)
-            .unwrap_or(ladder[0])
-    }
-}
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
-/// Height/width estimate for not-yet-decoded pages in the scroll strip.
-const DEFAULT_ASPECT: f32 = 1.5;
 /// Library cover thumbnail height, and how many to decode per frame.
 const THUMB_H: u32 = 360;
 const THUMB_BUDGET: usize = 2;
@@ -113,21 +51,6 @@ const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// before a further scroll flips the page — turns the edge into a perceptible
 /// hard stop instead of an instant jump to the next page.
 const EDGE_DWELL: Duration = Duration::from_millis(350);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Ltr,
-    Rtl,
-}
-
-impl Direction {
-    fn label(self) -> &'static str {
-        match self {
-            Direction::Ltr => "LTR",
-            Direction::Rtl => "RTL",
-        }
-    }
-}
 
 pub struct App {
     initial_path: Option<PathBuf>,
@@ -161,44 +84,22 @@ impl Default for Playback {
 struct State {
     window: Arc<Window>,
     gpu: Gpu,
+    /// The reading-state machine + the engine resources it drives (page source,
+    /// decode pool, cache, texture pool, wgpu device/queue). The shell mirrors the
+    /// surface into `reader.viewport` and feeds it input each frame.
+    reader: Reader,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     ui: UiState,
 
     page_pipeline: PagePipeline,
-    source: Option<Arc<dyn PageSource>>,
-    pool: Option<DecodePool>,
-    cache: PageCache,
-    /// Pages whose decode errored, mapped to the error message (shown to the user).
-    failed: HashMap<usize, String>,
-    index: usize,
-    start_index: usize,
-    last_drawn: Option<usize>,
-
-    fit: FitMode,
-    layout: Layout,
-    spread_offset: usize, // spread pairing parity (0 or 1), per-volume
-    /// Page rotation in 90° CW steps (0..=3). Session-global, applied to
-    /// single-page draws only; reset to 0 when a new volume opens.
-    rotation: u8,
-    zoom: f32,       // page-flip zoom factor (1.0 = fit)
-    pan_x: f32,      // page-flip pan offset in screen px (from centered)
-    pan_y: f32,
-    direction: Direction,
     cursor_x: f64,
     cursor_y: f64,
     mouse_down: bool,
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     cursor_in_window: bool, // gates the edge-hover navigation arrows
     last_mid_click: Option<Instant>, // middle-zone double-click → fullscreen
-    jump: bool, // seek mode (key J): true = "jump" (skip ahead), false = "step" (see every page, default)
-    nav_times: VecDeque<Instant>,
-
-    // Continuous-scroll mode (M2.1).
-    scroll_mode: bool,
-    top_offset: f32,  // pixels the anchor page (self.index) is scrolled above the viewport top
-    est_aspect: f32,  // h/w estimate for undecoded pages in the strip
 
     settings: config::Settings,
     /// Last observed window geometry (outer x/y, inner w/h, physical px) while in
@@ -207,17 +108,6 @@ struct State {
     /// restored rect; updated on move/resize; written back on exit.
     win_geom: Option<(i32, i32, u32, u32)>,
     volume_key: Option<String>,
-    tex_pool: Arc<TexturePool>,
-    /// Decode-view debounce: the last-seen `(surface_w, surface_h, zoom)`. Once it
-    /// stops changing across frames the view is "settled" and target-change
-    /// re-decodes are allowed — so a resize/zoom drag re-decodes once it lands, not
-    /// every frame. Page-flipping doesn't change it, so it never re-decodes.
-    pending_view: (u32, u32, f32),
-    view_settled: bool,
-    /// True while we've already logged a "settled view is GPU-downscaling" warning
-    /// for the current occurrence, so the tripwire fires once per episode, not per
-    /// frame. Cleared as soon as the view returns to 1:1/upscale.
-    gpu_downscale_warned: bool,
     /// Page index the Tab info overlay text was built for (None = rebuild needed).
     info_for: Option<usize>,
     /// The anchor page currently waiting to decode and when that wait began,
@@ -228,9 +118,6 @@ struct State {
     /// Transient on-screen message (boundary reached, zoom level) + when it was
     /// raised; cleared after `TOAST_DURATION`.
     toast: Option<(String, Instant)>,
-    /// When the zoomed-page wheel-pan first parked at the top/bottom edge (None
-    /// when not at an edge). Gates the hard-stop dwell before flipping pages.
-    pan_edge_at: Option<Instant>,
     /// Fixed origin for animation timing. A single shared clock is correct —
     /// every animated page derives its current frame from the same wall time, so
     /// all animations loop in step and the render loop stays stateless per page.
@@ -692,15 +579,6 @@ fn reveal_in_explorer(path: &std::path::Path) {
     }
 }
 
-/// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
-struct Quad {
-    slot: usize,
-    page_index: usize,
-    scale: [f32; 2],
-    offset: [f32; 2],
-    rot: u32, // 0/1/2/3 = 0/90/180/270° CW (single-page draws only; 0 for spreads)
-}
-
 impl App {
     pub fn new(initial_path: Option<PathBuf>, start_index: usize) -> Self {
         Self {
@@ -797,59 +675,48 @@ impl ApplicationHandler for App {
         // Channels for background archive opens and sibling-volume prescans.
         let (open_tx, open_rx) = std::sync::mpsc::channel();
         let (sib_tx, sib_rx) = std::sync::mpsc::channel();
+        let reader = Reader::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            tex_pool,
+            CACHE_CAP,
+            WORKERS,
+            fit_from_u8(settings.fit),
+            if settings.layout_spread {
+                Layout::Spread
+            } else {
+                Layout::Single
+            },
+            settings.scroll,
+            settings.jump,
+            if settings.direction_rtl {
+                Direction::Rtl
+            } else {
+                Direction::Ltr
+            },
+            self.start_index,
+        );
         self.state = Some(State {
             window,
             gpu,
+            reader,
             egui_ctx,
             egui_state,
             egui_renderer,
             ui,
             page_pipeline,
-            source: None,
-            pool: None,
-            cache: PageCache::new(CACHE_CAP, tex_pool.clone()),
-            failed: HashMap::new(),
-            index: 0,
-            start_index: self.start_index,
-            last_drawn: None,
-            fit: fit_from_u8(settings.fit),
-            layout: if settings.layout_spread {
-                Layout::Spread
-            } else {
-                Layout::Single
-            },
-            spread_offset: 0,
-            rotation: 0,
-            zoom: 1.0,
-            pan_x: 0.0,
-            pan_y: 0.0,
+            cursor_x: 0.0,
             cursor_y: 0.0,
             mouse_down: false,
             drag_dist: 0.0,
             cursor_in_window: false,
             last_mid_click: None,
-            jump: settings.jump,
-            direction: if settings.direction_rtl {
-                Direction::Rtl
-            } else {
-                Direction::Ltr
-            },
-            cursor_x: 0.0,
-            nav_times: VecDeque::new(),
-            scroll_mode: settings.scroll,
-            top_offset: 0.0,
-            est_aspect: DEFAULT_ASPECT,
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             settings,
             volume_key: None,
-            tex_pool,
-            pending_view: (0, 0, 1.0),
-            view_settled: false,
-            gpu_downscale_warned: false,
             info_for: None,
             loading_pending: None,
             toast: None,
-            pan_edge_at: None,
             anim_origin: Instant::now(),
             playback: Playback::default(),
             last_title: String::new(),
@@ -885,6 +752,13 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size.width, size.height);
+                // Keep the reading viewport in lock-step with the surface so an
+                // input event between renders sees the new size (as it did when
+                // these reads came straight from `gpu.config`).
+                state.reader.viewport = Viewport {
+                    w: state.gpu.config.width,
+                    h: state.gpu.config.height,
+                };
                 state.record_window_geometry();
             }
             WindowEvent::Moved(_) => state.record_window_geometry(),
@@ -1026,54 +900,54 @@ impl State {
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::Forward => {
-                if self.scroll_mode {
-                    let vh = self.gpu.config.height as f32;
+                if self.reader.scroll_mode {
+                    let vh = self.reader.viewport.h as f32;
                     self.scroll_by(vh * 0.9);
                 } else {
                     self.step(1);
                 }
             }
             Action::Backward => {
-                if self.scroll_mode {
-                    let vh = self.gpu.config.height as f32;
+                if self.reader.scroll_mode {
+                    let vh = self.reader.viewport.h as f32;
                     self.scroll_by(-vh * 0.9);
                 } else {
                     self.step(-1);
                 }
             }
             // In RTL, "left" advances the story; in LTR, "right" does. (Page-flip only.)
-            Action::Right if !self.scroll_mode => {
-                self.step(if self.direction == Direction::Ltr { 1 } else { -1 });
+            Action::Right if !self.reader.scroll_mode => {
+                self.step(if self.reader.direction == Direction::Ltr { 1 } else { -1 });
             }
-            Action::Left if !self.scroll_mode => {
-                self.step(if self.direction == Direction::Ltr { -1 } else { 1 });
+            Action::Left if !self.reader.scroll_mode => {
+                self.step(if self.reader.direction == Direction::Ltr { -1 } else { 1 });
             }
             Action::Right | Action::Left => {}
             Action::First => self.goto(0),
             Action::Last => {
-                if let Some(s) = &self.source {
+                if let Some(s) = &self.reader.source {
                     self.goto(s.len().saturating_sub(1));
                 }
             }
-            Action::CycleFit if self.scroll_mode => {
+            Action::CycleFit if self.reader.scroll_mode => {
                 // In scroll: toggle width-fit (zoom 1) vs height-fit (a typical
                 // page ~fills the viewport height).
-                self.pan_x = 0.0;
-                if (self.zoom - 1.0).abs() < 0.01 {
-                    let sw = self.gpu.config.width.max(1) as f32;
-                    let sh = self.gpu.config.height.max(1) as f32;
-                    let cw = sh / self.est_aspect.max(0.1);
-                    self.zoom = (cw / sw).clamp(0.2, 8.0);
+                self.reader.pan_x = 0.0;
+                if (self.reader.zoom - 1.0).abs() < 0.01 {
+                    let sw = self.reader.viewport.w.max(1) as f32;
+                    let sh = self.reader.viewport.h.max(1) as f32;
+                    let cw = sh / self.reader.est_aspect.max(0.1);
+                    self.reader.zoom = (cw / sw).clamp(0.2, 8.0);
                 } else {
-                    self.zoom = 1.0;
+                    self.reader.zoom = 1.0;
                 }
             }
             Action::CycleFit => {
-                self.fit = self.fit.cycle();
-                self.zoom = 1.0;
-                self.pan_x = 0.0;
-                self.pan_y = 0.0;
-                self.settings.fit = fit_to_u8(self.fit);
+                self.reader.fit = self.reader.fit.cycle();
+                self.reader.zoom = 1.0;
+                self.reader.pan_x = 0.0;
+                self.reader.pan_y = 0.0;
+                self.settings.fit = fit_to_u8(self.reader.fit);
                 config::save(&self.settings);
             }
             Action::ZoomIn => self.zoom_to_preset(true),
@@ -1088,31 +962,31 @@ impl State {
                 self.apply_view(FitMode::Window, true, Some(Direction::Rtl))
             }
             Action::ToggleDir => {
-                self.direction = match self.direction {
+                self.reader.direction = match self.reader.direction {
                     Direction::Ltr => Direction::Rtl,
                     Direction::Rtl => Direction::Ltr,
                 };
-                self.settings.direction_rtl = self.direction == Direction::Rtl;
+                self.settings.direction_rtl = self.reader.direction == Direction::Rtl;
                 config::save(&self.settings);
-                self.toast(format!("Direction: {}", self.direction.label()));
+                self.toast(format!("Direction: {}", self.reader.direction.label()));
             }
             Action::ToggleLayout => {
-                self.layout = self.layout.toggled();
+                self.reader.layout = self.reader.layout.toggled();
                 // Snap to the current view's anchor so pairing is consistent.
-                self.index = layout::view_start(self.layout, self.index, self.spread_offset);
-                self.pan_y = 0.0;
-                self.settings.layout_spread = self.layout == Layout::Spread;
+                self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+                self.reader.pan_y = 0.0;
+                self.settings.layout_spread = self.reader.layout == Layout::Spread;
                 config::save(&self.settings);
-                self.prefetch();
-                self.toast(format!("Layout: {}", self.layout.label()));
+                self.reader.prefetch();
+                self.toast(format!("Layout: {}", self.reader.layout.label()));
             }
             Action::ToggleScroll => {
-                self.scroll_mode = !self.scroll_mode;
-                self.top_offset = 0.0;
-                self.settings.scroll = self.scroll_mode;
+                self.reader.scroll_mode = !self.reader.scroll_mode;
+                self.reader.top_offset = 0.0;
+                self.settings.scroll = self.reader.scroll_mode;
                 config::save(&self.settings);
-                self.prefetch();
-                self.toast(if self.scroll_mode {
+                self.reader.prefetch();
+                self.toast(if self.reader.scroll_mode {
                     "Scroll mode"
                 } else {
                     "Page-flip mode"
@@ -1143,34 +1017,34 @@ impl State {
                 self.window.set_fullscreen(fs);
             }
             Action::ToggleSpreadOffset => {
-                self.spread_offset ^= 1;
+                self.reader.spread_offset ^= 1;
                 if let Some(k) = &self.volume_key {
                     self.settings
                         .spread_offsets
-                        .insert(k.clone(), self.spread_offset as u8);
+                        .insert(k.clone(), self.reader.spread_offset as u8);
                     config::save(&self.settings);
                 }
                 // Re-anchor so the current view re-pairs with the new parity.
-                self.index = layout::view_start(self.layout, self.index, self.spread_offset);
-                self.prefetch();
-                self.toast(format!("Spread offset: {}", self.spread_offset));
+                self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+                self.reader.prefetch();
+                self.toast(format!("Spread offset: {}", self.reader.spread_offset));
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
             Action::ToggleJump => {
-                self.jump = !self.jump;
-                self.settings.jump = self.jump;
+                self.reader.jump = !self.reader.jump;
+                self.settings.jump = self.reader.jump;
                 config::save(&self.settings);
-                self.toast(if self.jump { "Jump mode" } else { "Step mode" });
+                self.toast(if self.reader.jump { "Jump mode" } else { "Step mode" });
             }
             Action::Rotate => {
-                self.rotation = (self.rotation + 1) % 4;
+                self.reader.rotation = (self.reader.rotation + 1) % 4;
                 // Recenter: the rotated box has different bounds, so any prior pan
                 // would now be out of range.
-                self.pan_x = 0.0;
-                self.pan_y = 0.0;
-                self.prefetch(); // re-decode at the rotation-aware target (1:1)
-                self.toast(format!("Rotation: {}\u{00b0}", self.rotation as u32 * 90));
+                self.reader.pan_x = 0.0;
+                self.reader.pan_y = 0.0;
+                self.reader.prefetch(); // re-decode at the rotation-aware target (1:1)
+                self.toast(format!("Rotation: {}\u{00b0}", self.reader.rotation as u32 * 90));
             }
             Action::ShowInExplorer => self.reveal_current(),
             // Esc → quit is intercepted in `window_event` (needs the event loop),
@@ -1196,8 +1070,8 @@ impl State {
         let target = if base.is_dir() {
             // Folder (incl. single-image opens, which open the parent folder):
             // select the current page's file. `name(index)` is a flat file name.
-            match self.source.as_ref() {
-                Some(s) if s.len() > 0 => base.join(s.name(self.index)),
+            match self.reader.source.as_ref() {
+                Some(s) if s.len() > 0 => base.join(s.name(self.reader.index)),
                 _ => base,
             }
         } else {
@@ -1211,7 +1085,7 @@ impl State {
     /// At the first/last page it raises a toast and returns `false`; while the
     /// current page is still decoding in step mode it just returns `false`.
     fn step(&mut self, dir: i64) -> bool {
-        let Some(src) = &self.source else { return false };
+        let Some(src) = &self.reader.source else { return false };
         let len = src.len();
         if len == 0 {
             return false;
@@ -1221,19 +1095,19 @@ impl State {
         // skipping past it. "Jump" skips ahead for fast long-distance seeks. A
         // *failed* page never lands in the cache, so allow stepping past it —
         // otherwise next/prev gets stuck on an unopenable page.
-        if !self.jump {
-            let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
-            if !self.cache.contains(cur) && !self.failed.contains_key(&cur) {
+        if !self.reader.jump {
+            let cur = layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
+            if !self.reader.cache.contains(cur) && !self.reader.failed.contains_key(&cur) {
                 return false;
             }
         }
         let next = if dir > 0 {
-            layout::next_view(self.layout, self.index, len, self.spread_offset)
+            layout::next_view(self.reader.layout, self.reader.index, len, self.reader.spread_offset)
         } else {
-            layout::prev_view(self.layout, self.index, len, self.spread_offset)
+            layout::prev_view(self.reader.layout, self.reader.index, len, self.reader.spread_offset)
         };
-        if next != self.index {
-            self.nav_times.push_back(Instant::now());
+        if next != self.reader.index {
+            self.reader.nav_times.push_back(Instant::now());
             self.goto(next);
             true
         } else {
@@ -1244,14 +1118,14 @@ impl State {
     }
 
     fn goto(&mut self, index: usize) {
-        self.index = index;
-        self.pan_x = 0.0;
-        self.pan_y = 0.0; // start new page centered
-        self.top_offset = 0.0;
+        self.reader.index = index;
+        self.reader.pan_x = 0.0;
+        self.reader.pan_y = 0.0; // start new page centered
+        self.reader.top_offset = 0.0;
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), index);
         }
-        self.prefetch();
+        self.reader.prefetch();
     }
 
     /// Open the previous (`delta < 0`) or next (`delta > 0`) sibling volume of
@@ -1318,7 +1192,7 @@ impl State {
 
     fn persist(&mut self) {
         if let Some(k) = &self.volume_key {
-            self.settings.last_pages.insert(k.clone(), self.index);
+            self.settings.last_pages.insert(k.clone(), self.reader.index);
         }
         // Save geometry + the current maximized flag. `win_geom` already holds the
         // restored rect (it's only updated while normal), so an un-maximize after
@@ -1352,7 +1226,7 @@ impl State {
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
     /// the page already fits.
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             let dy_px = match delta {
                 MouseScrollDelta::LineDelta(_, y) => y * SCROLL_WHEEL_PX,
                 MouseScrollDelta::PixelDelta(p) => p.y as f32,
@@ -1367,7 +1241,7 @@ impl State {
         if dy == 0.0 {
             return;
         }
-        let overflow = self.current_overflows();
+        let overflow = self.reader.current_overflows();
         if !overflow {
             // Page fits: wheel flips (down = forward).
             self.step(if dy < 0.0 { 1 } else { -1 });
@@ -1379,52 +1253,52 @@ impl State {
         // page stops there instead of immediately jumping to the next page — you
         // have to keep scrolling past the stop to advance. Only reset the pan when
         // a flip actually happened (else the first/last page snaps to its edge).
-        let sh = self.gpu.config.height.max(1) as f32;
-        let maxp = ((self.current_display_h() - sh) / 2.0).max(0.0);
-        let cur = self.pan_y.clamp(-maxp, maxp);
+        let sh = self.reader.viewport.h.max(1) as f32;
+        let maxp = ((self.reader.current_display_h() - sh) / 2.0).max(0.0);
+        let cur = self.reader.pan_y.clamp(-maxp, maxp);
         let next = cur + dy * 80.0;
         let now = Instant::now();
         // True once we've been parked at an edge long enough that a further
         // scroll should flip (the hard stop the user has to keep scrolling past).
-        let dwelt = self.pan_edge_at.is_some_and(|t| now.duration_since(t) >= EDGE_DWELL);
+        let dwelt = self.reader.pan_edge_at.is_some_and(|t| now.duration_since(t) >= EDGE_DWELL);
         if next > maxp + 0.5 {
             if cur >= maxp - 0.5 {
                 // Parked at the top: flip to the previous page only after dwelling.
                 if dwelt {
-                    self.pan_edge_at = None;
-                    self.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
+                    self.reader.pan_edge_at = None;
+                    self.reader.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
                 } else {
-                    self.pan_y = maxp; // hold the stop
-                    self.pan_edge_at.get_or_insert(now);
+                    self.reader.pan_y = maxp; // hold the stop
+                    self.reader.pan_edge_at.get_or_insert(now);
                 }
             } else {
-                self.pan_y = maxp; // just reached the top edge -> park + start dwell
-                self.pan_edge_at = Some(now);
+                self.reader.pan_y = maxp; // just reached the top edge -> park + start dwell
+                self.reader.pan_edge_at = Some(now);
             }
         } else if next < -maxp - 0.5 {
             if cur <= -maxp + 0.5 {
                 // Parked at the bottom: flip to the next page only after dwelling.
                 if dwelt {
-                    self.pan_edge_at = None;
-                    self.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
+                    self.reader.pan_edge_at = None;
+                    self.reader.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
                 } else {
-                    self.pan_y = -maxp; // hold the stop
-                    self.pan_edge_at.get_or_insert(now);
+                    self.reader.pan_y = -maxp; // hold the stop
+                    self.reader.pan_edge_at.get_or_insert(now);
                 }
             } else {
-                self.pan_y = -maxp; // just reached the bottom edge -> park + start dwell
-                self.pan_edge_at = Some(now);
+                self.reader.pan_y = -maxp; // just reached the bottom edge -> park + start dwell
+                self.reader.pan_edge_at = Some(now);
             }
         } else {
-            self.pan_y = next;
-            self.pan_edge_at = None; // panning within the page
+            self.reader.pan_y = next;
+            self.reader.pan_edge_at = None; // panning within the page
         }
     }
 
     /// A clean click: the left/right edge strips flip pages; the wide middle
     /// does nothing on a single click but toggles fullscreen on a double-click.
     fn on_click(&mut self) {
-        let w = self.gpu.config.width.max(1) as f64;
+        let w = self.reader.viewport.w.max(1) as f64;
         let edge = (w * EDGE_FRAC as f64).max(1.0);
         if self.cursor_x < edge {
             self.last_mid_click = None;
@@ -1456,16 +1330,16 @@ impl State {
             return;
         }
         self.drag_dist += dx.abs() + dy.abs();
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             // Grab the strip: pan horizontally, scroll vertically.
-            self.pan_x += dx;
-            self.top_offset -= dy;
-            self.clamp_pan();
-            self.normalize();
+            self.reader.pan_x += dx;
+            self.reader.top_offset -= dy;
+            self.reader.clamp_pan();
+            self.reader.normalize();
         } else {
-            self.pan_x += dx;
-            self.pan_y += dy;
-            self.clamp_pan();
+            self.reader.pan_x += dx;
+            self.reader.pan_y += dy;
+            self.reader.clamp_pan();
         }
     }
 
@@ -1484,276 +1358,29 @@ impl State {
     }
 
     /// Does the current page overflow the window vertically under the active fit?
-    fn current_overflows(&self) -> bool {
-        let Some(pt) = self.cache.get(self.index) else {
-            return false;
-        };
-        let (sw, sh) = (self.gpu.config.width.max(1) as f32, self.gpu.config.height.max(1) as f32);
-        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32) * self.zoom;
-        pt.h as f32 * s > sh + 0.5
-    }
-
-    /// Top edge (screen px): centered, then panned by `pan_y`, clamped so the
-    /// page can't pull away from the viewport edge when larger than it.
-    fn vertical_top(&self, dh: f32, sh: f32) -> f32 {
-        let maxp = ((dh - sh) / 2.0).max(0.0);
-        (sh - dh) / 2.0 + self.pan_y.clamp(-maxp, maxp)
-    }
-
-    /// Left edge (screen px): centered, then panned by `pan_x`, clamped.
-    fn horizontal_left(&self, dw: f32, sw: f32) -> f32 {
-        let maxp = ((dw - sw) / 2.0).max(0.0);
-        (sw - dw) / 2.0 + self.pan_x.clamp(-maxp, maxp)
-    }
-
-    /// Displayed height of the current page under the active fit + zoom.
-    fn current_display_h(&self) -> f32 {
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
-        match self.cache.get(self.index) {
-            Some(t) => {
-                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
-            }
-            None => sh,
-        }
-    }
-
-    /// On-screen scale (device-px per *native* source-px) for a page, mirroring
-    /// the draw scale in `build_quads`. `content` feeds `fit_scale` (a single
-    /// page: its own dims; a facing pair: the combined width and shared height);
-    /// `decoded_h` is the anchor's displayed decoded height; `src_h` its native.
-    fn anchor_native_scale(
-        fit: FitMode,
-        screen: (f32, f32),
-        content: (f32, f32),
-        decoded_h: f32,
-        src_h: f32,
-        zoom: f32,
-    ) -> f32 {
-        // 1:1 now draws at native × zoom regardless of the decoded texture size
-        // (see single_quad), so its native scale is exactly `zoom` — the
-        // decoded_h/src_h correction below applies only to the fit-scaled modes.
-        if fit == FitMode::Actual {
-            return zoom;
-        }
-        let ((sw, sh), (fit_w, fit_h)) = (screen, content);
-        fit_scale(fit, sw, sh, fit_w, fit_h) * zoom * decoded_h / src_h.max(1.0)
-    }
-
-    /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h)` — the inputs
-    /// `anchor_native_scale` needs, computed once and shared by `anchor_scale`
-    /// (current fit/zoom) and `fit_native_pct` (an arbitrary fit at zoom 1). `None`
-    /// in scroll mode (no facing-pair layout) or before the anchor is decoded.
-    fn anchor_metrics(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
-        if self.scroll_mode {
-            return None;
-        }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
-        let len = self.source.as_ref()?.len();
-        if len == 0 {
-            return None;
-        }
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ta = self.cache.get(a)?;
-        // Wide (landscape) page is shown alone; otherwise pair with `b` if ready.
-        let force_single = ta.w > ta.h;
-        let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
-        let (fit_w, fit_h, dec_h) = match tb {
-            Some(tb) => {
-                let h_ref = ta.h.max(tb.h) as f32;
-                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
-                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
-                (wa + wb, h_ref, h_ref)
-            }
-            None => (ta.w as f32, ta.h as f32, ta.h as f32),
-        };
-        Some((sw, sh, fit_w, fit_h, dec_h, ta.src_h.max(1) as f32))
-    }
-
-    /// device-px-per-native-px of the in-view anchor page, matching exactly what
-    /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
-    /// isn't decoded yet.
-    fn anchor_scale(&self) -> Option<f32> {
-        if self.scroll_mode {
-            // Strip pages are laid out at width = sw * zoom (height follows aspect).
-            let sw = self.gpu.config.width.max(1) as f32;
-            let t = self.cache.get(self.index)?;
-            return Some(sw * self.zoom / t.src_w.max(1) as f32);
-        }
-        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        Some(Self::anchor_native_scale(
-            self.fit,
-            (sw, sh),
-            (fit_w, fit_h),
-            dec_h,
-            src_h,
-            self.zoom,
-        ))
-    }
-
-    /// The native zoom % the current anchor would display at under `fit` at zoom 1
-    /// — used to splice fit-to-window / fit-to-width stops into the zoom ladder.
-    /// `None` in scroll mode (handled inline in `zoom_ladder`) or before decode.
-    fn fit_native_pct(&self, fit: FitMode) -> Option<f32> {
-        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        Some(Self::anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, 1.0) * 100.0)
-    }
-
-    /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
-    /// = 100%), for the toast + info overlay. Derived from the same scale the
-    /// renderer draws, so it tracks fit-to-window upscaling and facing pairs
-    /// exactly. Falls back to the raw factor while the anchor isn't decoded.
-    fn effective_zoom_pct(&self) -> f32 {
-        let scale = self.anchor_scale().unwrap_or(self.zoom);
-        (scale * 100.0).max(0.0)
-    }
-
-    /// Device-px per *decoded texel* for the in-view anchor — i.e. exactly how the
-    /// GPU sampler scales the texture at draw time. `1.0` = sampling 1:1 (the HQ CPU
-    /// resize did all the work); `>1` = GPU upscale (zoom-past-native magnification,
-    /// the one allowed GPU resample); `<1` = GPU downscale (the soft/moiré path —
-    /// only ever valid as a transient while a re-decode is in flight). `None` before
-    /// the anchor is decoded.
-    fn gpu_sample_scale(&self) -> Option<f32> {
-        if self.scroll_mode {
-            let t = self.cache.get(self.index)?;
-            let sw = self.gpu.config.width.max(1) as f32;
-            return Some(sw * self.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
-        }
-        // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
-        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        let native = Self::anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
-        Some(native * src_h / dec_h.max(1.0))
-    }
-
-    /// The in-view anchor's full resize pipeline for the info overlay:
-    /// `"<CPU resize path>  →  <GPU sampling state>"`. Empty until decoded.
-    /// `(CPU resize-path label, GPU sample scale, re-decode-pending)` for the
-    /// in-view anchor — `None` until it's decoded. `pending` means the texture's
-    /// decode target no longer matches the *current* desired target, so a re-decode
-    /// is due: any GPU downscale right now is transient and will converge. So
-    /// `!pending && scale < 1` is the only genuine single-resize-invariant violation
-    /// (decoded at the intended target, yet the GPU still has to shrink it).
-    fn anchor_resize_state(&self) -> Option<(&'static str, f32, bool)> {
-        let src = self.source.as_ref()?;
-        let len = src.len();
-        if len == 0 {
-            return None;
-        }
-        let anchor = if self.scroll_mode {
-            self.index
-        } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
-        };
-        let t = self.cache.get(anchor)?;
-        let s = self.gpu_sample_scale()?;
-        let pending = t.target_h != self.page_target_h(anchor);
-        Some((t.path.label(), s, pending))
-    }
-
-    /// The in-view anchor's full resize pipeline for the info overlay:
-    /// `"<CPU resize path>  →  <GPU sampling state>"`. Empty until decoded.
-    fn resize_path_label(&self) -> String {
-        let Some((cpu, s, pending)) = self.anchor_resize_state() else {
-            return String::new();
-        };
-        let gpu = if (s - 1.0).abs() <= 0.01 {
-            "GPU 1:1".to_string()
-        } else if s > 1.0 {
-            format!("GPU \u{2191}{s:.2}\u{d7} (magnify)")
-        } else if pending {
-            format!("GPU \u{2193}{s:.2}\u{d7} (re-decoding\u{2026})")
-        } else {
-            format!("GPU \u{2193}{s:.2}\u{d7} (LQ \u{2014} STUCK)")
-        };
-        format!("{cpu}  \u{2192}  {gpu}")
-    }
-
-    /// Refresh the live resize readout (`ui.resize_path`) and fire a one-shot debug
-    /// warning only on a *genuine* violation: the anchor is decoded at its intended
-    /// target (no re-decode pending) yet the GPU is still downscaling it. Re-decode
-    /// transients (a fresh page still at its prefetch-guessed size, a zoom/resize not
-    /// yet settled) are expected and are not warned.
-    fn update_resize_readout(&mut self) {
-        let stuck = !self.scroll_mode
-            && matches!(self.anchor_resize_state(), Some((_, s, pending)) if !pending && s < 0.99);
-        if stuck && !self.gpu_downscale_warned {
-            eprintln!(
-                "yosh: WARNING — view at its decode target is still GPU-downscaling (single-resize invariant violated): {}",
-                self.resize_path_label()
-            );
-            self.gpu_downscale_warned = true;
-        } else if !stuck {
-            self.gpu_downscale_warned = false;
-        }
-        self.ui.resize_path = self.resize_path_label();
-    }
-
-    /// The active zoom ladder: the fixed presets plus the current page's
-    /// fit-to-window and fit-to-width stops (which depend on its resolution),
-    /// in-range, sorted, and de-duplicated. In scroll mode the two fit stops are
-    /// the page's width-fit (the zoom-1 strip) and height-fit native percents.
-    fn zoom_ladder(&self) -> Vec<f32> {
-        let mut ladder = zoom_presets();
-        let (lo, hi) = (MIN_ZOOM_PCT * 100.0, MAX_ZOOM_PCT * 100.0);
-        let mut stops: Vec<f32> = Vec::new();
-        if self.scroll_mode {
-            if let Some(t) = self.cache.get(self.index) {
-                let sw = self.gpu.config.width.max(1) as f32;
-                let sh = self.gpu.config.height.max(1) as f32;
-                stops.push(sw / t.src_w.max(1) as f32 * 100.0); // fit width (strip @ zoom 1)
-                stops.push(sh / t.src_h.max(1) as f32 * 100.0); // fit window (height fills)
-            }
-        } else {
-            for f in [FitMode::Window, FitMode::Width] {
-                if let Some(p) = self.fit_native_pct(f) {
-                    stops.push(p);
-                }
-            }
-        }
-        for p in stops {
-            // Splice a fit stop only if it isn't essentially on a value already in
-            // the ladder. Otherwise a fit level a hair off a round preset (e.g. a
-            // fit-window of 69.99% next to the 70% preset) shadows the preset, and
-            // zoom snaps to 69.99% / 70.01% instead of a clean 70%. Keeping the
-            // round preset still gets the "(Fit window/width)" toast label via the
-            // `near()` check in `zoom_to_preset`.
-            if (lo..=hi).contains(&p) && !ladder.iter().any(|&q| (q - p).abs() <= q * 1e-3) {
-                ladder.push(p);
-            }
-        }
-        ladder.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        ladder
-    }
-
-    /// Snap zoom to the next ladder stop above/below the current native %. The
-    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
-    /// step can land exactly on fit-to-window / fit-to-width. Works in both
-    /// page-flip and scroll modes (both derive from `effective_zoom_pct`).
     fn zoom_to_preset(&mut self, zoom_in: bool) {
-        let cur = self.effective_zoom_pct();
+        let cur = self.reader.effective_zoom_pct();
         let mut label: Option<&'static str> = None;
-        if self.anchor_scale().is_some() && cur > 0.0 {
-            let ladder = self.zoom_ladder();
+        if self.reader.anchor_scale().is_some() && cur > 0.0 {
+            let ladder = self.reader.zoom_ladder();
             let target = next_zoom_preset(&ladder, cur, zoom_in);
             // Tag the stop if it is this page's fit-to-window / fit-to-width level.
-            if !self.scroll_mode {
+            if !self.reader.scroll_mode {
                 let near = |p: Option<f32>| p.is_some_and(|p| (p - target).abs() <= target * 1e-3);
-                if near(self.fit_native_pct(FitMode::Window)) {
+                if near(self.reader.fit_native_pct(FitMode::Window)) {
                     label = Some("Fit window");
-                } else if near(self.fit_native_pct(FitMode::Width)) {
+                } else if near(self.reader.fit_native_pct(FitMode::Width)) {
                     label = Some("Fit width");
                 }
             }
-            self.zoom *= target / cur; // rescale the fit-multiplier to hit target %
+            self.reader.zoom *= target / cur; // rescale the fit-multiplier to hit target %
         } else {
             // Anchor not decoded yet: coarse step; the next press snaps once it lands.
-            self.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
+            self.reader.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
         }
-        self.clamp_zoom_native();
-        self.clamp_pan();
-        let pct = self.effective_zoom_pct();
+        self.reader.clamp_zoom_native();
+        self.reader.clamp_pan();
+        let pct = self.reader.effective_zoom_pct();
         match label {
             // Fit label on its own line so the "Zoom %" line stays centered
             // (the toast is center-aligned), aligned across zoom levels.
@@ -1762,282 +1389,30 @@ impl State {
         }
     }
 
-    /// Clamp `self.zoom` (a fit-multiplier) so the *effective native* zoom stays
-    /// within [`MIN_ZOOM_PCT`, `MAX_ZOOM_PCT`]. Converts via the page's native
-    /// scale at zoom = 1 (`base`). No-op while the anchor isn't decoded — the
-    /// next press clamps once it lands.
-    fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
-        let (lo, hi) = (MIN_ZOOM_PCT / base, MAX_ZOOM_PCT / base);
-        zoom.clamp(lo.min(hi), lo.max(hi))
-    }
-
-    fn clamp_zoom_native(&mut self) {
-        if self.zoom > 0.0
-            && let Some(s) = self.anchor_scale()
-        {
-            let base = s / self.zoom;
-            if base > 0.0 {
-                self.zoom = Self::clamp_zoom_multiplier(self.zoom, base);
-            }
-        }
-    }
-
-    /// Clamp stored pan to the current page's overflow so dragging/zooming can't
-    /// strand the view in an empty region.
-    fn clamp_pan(&mut self) {
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
-        if self.scroll_mode {
-            let cw = sw * self.zoom;
-            let mx = ((cw - sw) / 2.0).max(0.0);
-            self.pan_x = self.pan_x.clamp(-mx, mx);
-            return;
-        }
-        if let Some(t) = self.cache.get(self.index) {
-            // Match single_quad's rotated bounding box so pan clamps to the
-            // displayed (possibly turned) page, not the source orientation.
-            let single = self.layout == Layout::Single || t.w > t.h;
-            let (ew, eh) = if single && self.rotation % 2 == 1 {
-                (t.h as f32, t.w as f32)
-            } else {
-                (t.w as f32, t.h as f32)
-            };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
-            let mx = ((ew * s - sw) / 2.0).max(0.0);
-            let my = ((eh * s - sh) / 2.0).max(0.0);
-            self.pan_x = self.pan_x.clamp(-mx, mx);
-            self.pan_y = self.pan_y.clamp(-my, my);
-        }
-    }
-
-    fn quad_from_px(
-        slot: usize,
-        page_index: usize,
-        x_px: f32,
-        y_px: f32,
-        dw: f32,
-        dh: f32,
-        sw: f32,
-        sh: f32,
-        rot: u32,
-    ) -> Quad {
-        Quad {
-            slot,
-            page_index,
-            scale: [2.0 * dw / sw, 2.0 * dh / sh],
-            offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
-            rot,
-        }
-    }
-
-    fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
-        // A 90°/270° turn swaps the page's effective width/height for fitting; the
-        // shader then turns the texture inside this (rotated) bounding box. The box
-        // dimensions stay whole texels at the fit scale, so 1:1 sampling holds (the
-        // decode target in `page_target_h` is rotation-aware to match).
-        let (dw, dh) = if self.fit == FitMode::Actual {
-            // 1:1: size from the *source* dims × zoom, not the decoded dims, so the
-            // displayed box is the same native size whether the texture is full res
-            // (zoom ≥ 1) or re-decoded smaller for zoom-out — the latter then samples
-            // 1:1 instead of the GPU bilinear-downscaling a full-res texture.
-            let (nw, nh) = if self.rotation % 2 == 1 {
-                (t.src_h as f32, t.src_w as f32)
-            } else {
-                (t.src_w as f32, t.src_h as f32)
-            };
-            (nw * self.zoom, nh * self.zoom)
-        } else {
-            let (ew, eh) = if self.rotation % 2 == 1 {
-                (t.h as f32, t.w as f32)
-            } else {
-                (t.w as f32, t.h as f32)
-            };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
-            (ew * s, eh * s)
-        };
-        // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
-        // fractional offset would make the bilinear sampler blend every column
-        // 50/50 with its neighbour — a horizontal smear that also beats against
-        // halftone screentones. Whole-pixel placement samples texel centers 1:1.
-        Self::quad_from_px(
-            0,
-            idx,
-            self.horizontal_left(dw, sw).round(),
-            self.vertical_top(dh, sh).round(),
-            dw.round(),
-            dh.round(),
-            sw,
-            sh,
-            self.rotation as u32,
-        )
-    }
-
-    /// Compute the quads to draw this frame (1 for single/last-held, 2 for a
-    /// ready spread). Only includes pages present in the cache.
-    fn build_quads(&self) -> Vec<Quad> {
-        let Some(src) = &self.source else {
-            return Vec::new();
-        };
-        let len = src.len();
-        if len == 0 {
-            return Vec::new();
-        }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
-
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ta = self.cache.get(a);
-        // Wide (landscape) page is a double-spread image → show it alone.
-        let force_single = ta.map_or(false, |t| t.w > t.h);
-        let b = if force_single { None } else { b };
-        let tb = b.and_then(|bi| self.cache.get(bi).map(|t| (bi, t)));
-
-        match (ta, tb) {
-            (Some(ta), Some((bi, tb))) => {
-                // Facing pages share a display height. Size each to a common
-                // reference height (its width following its own aspect ratio)
-                // before fitting the pair to the window. Aspect ratios are
-                // stable across decode resolutions, so if the two pages are
-                // momentarily decoded at different heights — e.g. mid re-decode
-                // after a fullscreen toggle / resize, where one updates a frame
-                // before the other — neither page jumps size. (Identical to
-                // per-pixel sizing when both heights already match.)
-                let h_ref = ta.h.max(tb.h) as f32;
-                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
-                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
-                let combined_w = wa + wb;
-                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref) * self.zoom;
-                let x0 = self.horizontal_left(combined_w * s, sw);
-                let dh = h_ref * s;
-                // Screen order: LTR puts the lower index on the left; RTL reverses.
-                let (l_idx, wl, r_idx, wr) = match self.direction {
-                    Direction::Ltr => (a, wa, bi, wb),
-                    Direction::Rtl => (bi, wb, a, wa),
-                };
-                let (dwl, dwr) = (wl * s, wr * s);
-                // Snap to the pixel grid (see single_quad). The right page starts
-                // at the left's snapped right edge, so there's no sub-pixel seam.
-                let yt = self.vertical_top(dh, sh).round();
-                let dhr = dh.round();
-                let xl = x0.round();
-                let dwl_r = dwl.round();
-                vec![
-                    Self::quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
-                    Self::quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
-                ]
-            }
-            (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
-            _ => {
-                // Anchor not decoded yet: hold the last-drawn page if still cached.
-                if let Some(li) = self.last_drawn
-                    && let Some(t) = self.cache.get(li)
-                {
-                    return vec![self.single_quad(li, t, sw, sh)];
-                }
-                Vec::new()
-            }
-        }
-    }
-
-    fn page_display_h(&self, i: usize, sw: f32) -> f32 {
-        let cw = sw * self.zoom; // strip content width (zoomable)
-        match self.cache.get(i) {
-            Some(t) => cw * (t.h as f32 / t.w as f32),
-            None => cw * self.est_aspect,
-        }
-    }
-
     fn scroll_by(&mut self, dy: f32) {
-        let len = match &self.source {
+        let len = match &self.reader.source {
             Some(s) => s.len(),
             None => return,
         };
-        let before = self.index;
-        let before_off = self.top_offset;
-        self.top_offset += dy;
-        self.normalize();
-        if self.index != before {
-            self.nav_times.push_back(Instant::now());
-        } else if dy.abs() > 0.5 && (self.top_offset - before_off).abs() < 0.5 {
+        let before = self.reader.index;
+        let before_off = self.reader.top_offset;
+        self.reader.top_offset += dy;
+        self.reader.normalize();
+        if self.reader.index != before {
+            self.reader.nav_times.push_back(Instant::now());
+        } else if dy.abs() > 0.5 && (self.reader.top_offset - before_off).abs() < 0.5 {
             // The strip didn't move despite a scroll — clamped at an end.
-            if dy < 0.0 && self.index == 0 && self.top_offset <= 0.5 {
+            if dy < 0.0 && self.reader.index == 0 && self.reader.top_offset <= 0.5 {
                 self.toast("First page");
-            } else if dy > 0.0 && self.index + 1 >= len {
+            } else if dy > 0.0 && self.reader.index + 1 >= len {
                 self.toast("Last page");
             }
         }
-        self.prefetch();
+        self.reader.prefetch();
     }
 
     /// Keep (index, top_offset) in range using best-known page heights, so the
     /// anchor stays valid as nearby pages decode (and their real heights land).
-    fn normalize(&mut self) {
-        let len = match &self.source {
-            Some(s) => s.len(),
-            None => return,
-        };
-        if len == 0 {
-            return;
-        }
-        let sw = self.gpu.config.width.max(1) as f32;
-        while self.index + 1 < len {
-            let h = self.page_display_h(self.index, sw);
-            if self.top_offset >= h {
-                self.top_offset -= h;
-                self.index += 1;
-            } else {
-                break;
-            }
-        }
-        while self.top_offset < 0.0 && self.index > 0 {
-            self.index -= 1;
-            self.top_offset += self.page_display_h(self.index, sw);
-        }
-        if self.index == 0 && self.top_offset < 0.0 {
-            self.top_offset = 0.0;
-        }
-        if self.index + 1 >= len {
-            let vh = self.gpu.config.height as f32;
-            let max_off = (self.page_display_h(len - 1, sw) - vh).max(0.0);
-            if self.top_offset > max_off {
-                self.top_offset = max_off;
-            }
-        }
-    }
-
-    /// Build the visible vertical-strip quads (width-fit, stacked top to bottom).
-    fn build_scroll_quads(&self) -> Vec<Quad> {
-        let Some(src) = &self.source else {
-            return Vec::new();
-        };
-        let len = src.len();
-        if len == 0 {
-            return Vec::new();
-        }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
-        let mut quads = Vec::new();
-        let cw = sw * self.zoom; // strip width (zoom); centered with horizontal pan
-        let x = self.horizontal_left(cw, sw);
-        let mut y = -self.top_offset;
-        let mut i = self.index;
-        let mut slot = 0;
-        while i < len && y < sh && slot < MAX_QUADS {
-            let dh = self.page_display_h(i, sw);
-            if y + dh > 0.0 {
-                if self.cache.get(i).is_some() {
-                    quads.push(Self::quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
-                    slot += 1;
-                }
-            }
-            y += dh;
-            i += 1;
-        }
-        quads
-    }
-
-    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
-    /// and register them with egui.
     fn decode_thumbnails(&mut self, budget: usize) {
         let mut done = 0;
         for i in 0..self.library.volumes.len() {
@@ -2059,7 +1434,7 @@ impl State {
             // Library thumbnail (registered with egui, not stored in the page
             // cache) — its decode-target stamp is unused, so pass 0.
             let pt =
-                PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.tex_pool, 0);
+                PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.reader.tex_pool, 0);
             let id = self.egui_renderer.register_native_texture(
                 &self.gpu.device,
                 &pt.view,
@@ -2071,23 +1446,6 @@ impl State {
     }
 
     /// Forward look-ahead distance, widened when flipping quickly.
-    fn dynamic_fwd(&mut self) -> usize {
-        let now = Instant::now();
-        while let Some(&t) = self.nav_times.front() {
-            if now.duration_since(t) > Duration::from_millis(800) {
-                self.nav_times.pop_front();
-            } else {
-                break;
-            }
-        }
-        (FWD + self.nav_times.len() * 4).min(FWD_MAX)
-    }
-
-    /// Begin opening `path`. The source is built on a background thread (see
-    /// `build_source`) so a slow network-share open never freezes the UI — the
-    /// current page stays on screen under the spinner until the new source lands
-    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
-    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
     fn open(&mut self, path: &Path) {
         self.open_gen = self.open_gen.wrapping_add(1);
         let generation = self.open_gen;
@@ -2103,44 +1461,44 @@ impl State {
     fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path, start: Option<usize>) {
         // Persist the previous volume's position before switching.
         if let Some(k) = self.volume_key.take() {
-            self.settings.last_pages.insert(k, self.index);
+            self.settings.last_pages.insert(k, self.reader.index);
         }
         let key = path.to_string_lossy().into_owned();
-        self.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
+        self.reader.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
         // Explicit start (e.g. a specific dropped image) wins; else CLI start
         // index; else the saved position.
         let idx = match start {
             Some(i) => i,
             None => {
                 let resume = self.settings.last_pages.get(&key).copied().unwrap_or(0);
-                if self.start_index > 0 {
-                    self.start_index
+                if self.reader.start_index > 0 {
+                    self.reader.start_index
                 } else {
                     resume
                 }
             }
         };
-        self.start_index = 0;
+        self.reader.start_index = 0;
 
-        self.pool = Some(DecodePool::new(
+        self.reader.pool = Some(DecodePool::new(
             source.clone(),
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
-            self.tex_pool.clone(),
+            self.reader.tex_pool.clone(),
             WORKERS,
         ));
-        self.cache.clear();
-        self.failed.clear();
-        self.last_drawn = None;
+        self.reader.cache.clear();
+        self.reader.failed.clear();
+        self.reader.last_drawn = None;
         self.info_for = None;
-        self.nav_times.clear();
-        self.rotation = 0; // each volume opens upright
-        self.index = idx.min(source.len() - 1);
+        self.reader.nav_times.clear();
+        self.reader.rotation = 0; // each volume opens upright
+        self.reader.index = idx.min(source.len() - 1);
         self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
-        self.source = Some(source);
+        self.reader.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
-        self.prefetch();
+        self.reader.prefetch();
         // Warm the sibling-volume list for this folder in the background, so the
         // first `[`/`]` press doesn't pay the parent-dir scan on the main thread.
         self.warm_sib_cache(path);
@@ -2169,26 +1527,26 @@ impl State {
     /// direction) at once, leave scroll, reset zoom/pan, re-anchor the spread
     /// pairing, persist, and refresh the prefetch window.
     fn apply_view(&mut self, fit: FitMode, spread: bool, dir: Option<Direction>) {
-        self.scroll_mode = false;
-        self.fit = fit;
-        self.layout = if spread { Layout::Spread } else { Layout::Single };
+        self.reader.scroll_mode = false;
+        self.reader.fit = fit;
+        self.reader.layout = if spread { Layout::Spread } else { Layout::Single };
         if let Some(d) = dir {
-            self.direction = d;
+            self.reader.direction = d;
         }
-        self.index = layout::view_start(self.layout, self.index, self.spread_offset);
-        self.zoom = 1.0;
-        self.pan_x = 0.0;
-        self.pan_y = 0.0;
-        self.settings.fit = fit_to_u8(self.fit);
-        self.settings.layout_spread = self.layout == Layout::Spread;
-        self.settings.direction_rtl = self.direction == Direction::Rtl;
+        self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+        self.reader.zoom = 1.0;
+        self.reader.pan_x = 0.0;
+        self.reader.pan_y = 0.0;
+        self.settings.fit = fit_to_u8(self.reader.fit);
+        self.settings.layout_spread = self.reader.layout == Layout::Spread;
+        self.settings.direction_rtl = self.reader.direction == Direction::Rtl;
         self.settings.scroll = false;
         config::save(&self.settings);
-        self.prefetch();
+        self.reader.prefetch();
         // Tell the user what the preset just switched to (presets change fit +
         // layout + maybe direction at once, so summarize the resulting view).
         let view_label = if spread {
-            format!("Spread, {}", self.direction.label())
+            format!("Spread, {}", self.reader.direction.label())
         } else {
             let f = match fit {
                 FitMode::Window => "Fit window",
@@ -2205,7 +1563,7 @@ impl State {
     /// once and probes the header for resolution + format. Only called on a page
     /// change while the overlay is open, so the extra read is cheap.
     fn build_page_info(&self, index: usize) -> Vec<(String, String)> {
-        let Some(src) = &self.source else {
+        let Some(src) = &self.reader.source else {
             return Vec::new();
         };
         let name = src.name(index).to_string();
@@ -2247,129 +1605,17 @@ impl State {
     /// else the in-view anchor's, else the running estimate. Used to size the decode
     /// target before the page itself is decoded (exact for the usual uniform-size
     /// volume; corrected in place once the page's own dimensions are known).
-    fn page_aspect(&self, index: usize) -> f32 {
-        if let Some(t) = self.cache.get(index) {
-            return t.src_w as f32 / t.src_h.max(1) as f32;
-        }
-        if let Some(t) = self.cache.get(self.index) {
-            return t.src_w as f32 / t.src_h.max(1) as f32;
-        }
-        1.0 / self.est_aspect.max(0.01) // est_aspect is h / w
-    }
-
-    /// The *exact* decode target (on-screen displayed pixel height) for page
-    /// `index` under the active fit/zoom/layout. Decoding each page to this height
-    /// makes the HQ CPU resize the only resample and the GPU sample 1:1 — the
-    /// single-resize invariant. `target_dims` later caps it at the source height
-    /// (so a display larger than native means full-res + GPU upscale, the one
-    /// allowed exception). 1:1 keeps full source res (it draws at `zoom` directly).
-    fn page_target_h(&self, index: usize) -> u32 {
-        let aspect = self.page_aspect(index).max(0.001);
-        // Cap the decode target so neither the texture height nor its aspect-derived
-        // width exceeds the GPU's real max texture size. This replaces a former fixed
-        // 3840 cap, which forced the GPU to *upscale* (and thus moiré) any page taller
-        // than 3840 px viewed near native — the texture couldn't be decoded to the
-        // shown size, so the GPU resampled it. Now the HQ CPU resize hits the display
-        // size and the GPU stays 1:1 below native, all the way up to what the GPU can
-        // hold. (`target_dims` still caps at the source height, so it never upscales.)
-        let max_dim = yosh_engine::decode::MAX_TEX_DIM.load(std::sync::atomic::Ordering::Relaxed);
-        let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(MIN_TARGET);
-        if self.fit == FitMode::Actual && !self.scroll_mode {
-            // 1:1 displays at native × zoom. Target that height so the page decodes
-            // to its *shown* size: `target_dims` caps at the source height, so
-            // zoom ≥ 1 keeps full res (magnification GPU-upscales, the one allowed
-            // GPU resample) while zoom < 1 decodes smaller → the HQ CPU resize does
-            // the reduction and the GPU samples 1:1 (no bilinear-downscale moiré).
-            // (Rotation-independent: a 90° turn swaps which screen edge the texture
-            // height maps to, but the target works out to src_h × zoom either way.)
-            return match self.cache.get(index) {
-                Some(t) => {
-                    ((t.src_h as f32 * self.zoom).round() as u32).clamp(MIN_TARGET, max_h)
-                }
-                None => u32::MAX, // native size unknown yet: decode full, re-decode once cached
-            };
-        }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
-        let target = if self.scroll_mode {
-            // Continuous strip: width-fit at width sw*zoom, height follows aspect.
-            sw * self.zoom / aspect
-        } else {
-            // A page is drawn alone when layout is Single or it's a wide
-            // (landscape) page that force-shows alone — only then does rotation
-            // apply. `content_aspect` is the on-screen box's width/height.
-            let single = self.layout == Layout::Single || aspect > 1.0;
-            let rotated = single && self.rotation % 2 == 1;
-            let content_aspect = if rotated {
-                1.0 / aspect // rotated single page: box is the inverse of the source
-            } else if self.layout == Layout::Spread && aspect <= 1.0 {
-                // Pair two non-wide pages (assume a same-size facing page — exact
-                // for uniform volumes; wide pages always show alone).
-                aspect * 2.0
-            } else {
-                aspect
-            };
-            let box_h = fit_scale(self.fit, sw, sh, content_aspect, 1.0) * self.zoom;
-            // Decode target = the texture height that draws 1:1. For a rotated
-            // single page the texture's height lands along the screen *width*, so
-            // the target is the box width (box_h * content_aspect); else box height.
-            if rotated { box_h * content_aspect } else { box_h }
-        };
-        (target.round() as u32).clamp(MIN_TARGET, max_h)
-    }
-
-    /// Debounce the decode view. While the surface size or zoom is changing (a
-    /// resize/zoom drag) the view is "unsettled" and `prefetch` won't re-decode
-    /// cached pages for a target change — it just keeps showing the old textures.
-    /// Once the value holds for a frame the view settles and stale pages re-decode
-    /// in place (no black frame). Page-flipping leaves the view settled, so it
-    /// never re-decodes.
-    fn update_decode_view(&mut self) {
-        let desired = (self.gpu.config.width, self.gpu.config.height, self.zoom);
-        self.view_settled = desired == self.pending_view;
-        self.pending_view = desired;
-    }
-
-    /// Recompute the prefetch window and hand it to the pool with each page's exact
-    /// decode target. A page is queued if it's missing, or (once the view has
-    /// settled) if its decoded target no longer matches its current exact target —
-    /// then it re-decodes at the new resolution and overwrites in place.
-    fn prefetch(&mut self) {
-        let fwd = self.dynamic_fwd();
-        let settled = self.view_settled;
-        let Some(src) = &self.source else {
-            return;
-        };
-        let len = src.len();
-        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, BACK)
-            .into_iter()
-            .filter(|i| !self.failed.contains_key(i))
-            .filter_map(|i| {
-                let want = self.page_target_h(i);
-                match self.cache.get(i) {
-                    None => Some((i, want)),
-                    Some(p) => (settled && p.target_h != want).then_some((i, want)),
-                }
-            })
-            .collect();
-        if let Some(pool) = &self.pool {
-            pool.set_jobs(jobs);
-        }
-    }
-
-    /// The page index whose animation controls are active (the in-view anchor, if
-    /// it's an animated page and its texture is decoded).
     fn anim_anchor(&self) -> Option<usize> {
         if self.library_view {
             return None;
         }
-        let len = self.source.as_ref()?.len();
-        let anchor = if self.scroll_mode {
-            self.index
+        let len = self.reader.source.as_ref()?.len();
+        let anchor = if self.reader.scroll_mode {
+            self.reader.index
         } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
         };
-        (self.cache.get(anchor)?.frame_count() > 1).then_some(anchor)
+        (self.reader.cache.get(anchor)?.frame_count() > 1).then_some(anchor)
     }
 
     /// Advance/refresh playback for the in-view animation and publish the panel's
@@ -2381,9 +1627,9 @@ impl State {
             self.ui.anim_show = false;
             return;
         };
-        let frames = self.cache.get(anchor).map_or(1, |t| t.frame_count());
+        let frames = self.reader.cache.get(anchor).map_or(1, |t| t.frame_count());
         // GIF/WebP auto-play; `.ico` layers are stepped manually (no play/pause).
-        let is_anim = self.cache.get(anchor).is_some_and(|t| t.is_animation());
+        let is_anim = self.reader.cache.get(anchor).is_some_and(|t| t.is_animation());
         // Rebind (and reset) when the viewed page changes.
         if self.playback.page != Some(anchor) {
             self.playback.page = Some(anchor);
@@ -2398,6 +1644,7 @@ impl State {
             // briefly lagged.
             loop {
                 let d = self
+                    .reader
                     .cache
                     .get(anchor)
                     .map_or(100, |t| t.frame_delay_ms(self.playback.frame))
@@ -2426,7 +1673,7 @@ impl State {
     }
 
     fn playback_frame_count(&self) -> usize {
-        self.playback.page.and_then(|p| self.cache.get(p)).map_or(1, |t| t.frame_count())
+        self.playback.page.and_then(|p| self.reader.cache.get(p)).map_or(1, |t| t.frame_count())
     }
 
     /// Step the animation by `d` frames (pauses playback; wraps around).
@@ -2456,7 +1703,7 @@ impl State {
         if self.library_view {
             return "Library - yosh".to_string();
         }
-        let Some(src) = &self.source else {
+        let Some(src) = &self.reader.source else {
             return "yosh".to_string();
         };
         let len = src.len();
@@ -2465,10 +1712,10 @@ impl State {
         }
         // The page actually shown (anchor): `index` in single/scroll, the first
         // page of the pair in a two-page spread.
-        let anchor = if self.scroll_mode {
-            self.index
+        let anchor = if self.reader.scroll_mode {
+            self.reader.index
         } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
         }
         .min(len - 1);
         let name = src.name(anchor);
@@ -2480,7 +1727,7 @@ impl State {
         // Native resolution of the shown page, Firefox-tab style. Pulled from the
         // decoded texture (`src_w`/`src_h` are pre-downscale source dims), so it
         // appears once the page lands and is empty while it's still decoding.
-        let res = match self.cache.get(anchor) {
+        let res = match self.reader.cache.get(anchor) {
             Some(t) if t.src_w > 0 && t.src_h > 0 => format!(" ({} × {})", t.src_w, t.src_h),
             _ => String::new(),
         };
@@ -2493,20 +1740,27 @@ impl State {
 
     #[allow(deprecated)]
     fn render(&mut self) {
+        // Mirror the live surface size into the reading viewport (the value the
+        // reading math reads instead of `gpu.config`). Equal to `gpu.config` by
+        // construction, so this is a no-op for behavior.
+        self.reader.viewport = Viewport {
+            w: self.gpu.config.width,
+            h: self.gpu.config.height,
+        };
         if let Some(p) = self.ui.pending_open.take() {
             self.open(&p);
         }
 
         // Drain finished decodes into the cache.
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = &self.reader.pool {
             for msg in pool.poll() {
                 match msg {
                     Msg::Done { index, page } => {
-                        self.est_aspect = page.h as f32 / page.w as f32;
-                        self.cache.insert(index, page, self.index);
+                        self.reader.est_aspect = page.h as f32 / page.w as f32;
+                        self.reader.cache.insert(index, page, self.reader.index);
                     }
                     Msg::Failed { index, error } => {
-                        self.failed.insert(index, error);
+                        self.reader.failed.insert(index, error);
                     }
                 }
             }
@@ -2557,12 +1811,12 @@ impl State {
         self.ui.updating = self.updating;
         self.ui.update_failed = self.update_error.is_some();
         // Debounce the decode view, so resize/zoom drags re-decode once on settle.
-        self.update_decode_view();
+        self.reader.update_decode_view();
         // Keep the scroll anchor valid as page heights resolve, then refresh work.
-        if self.scroll_mode {
-            self.normalize();
+        if self.reader.scroll_mode {
+            self.reader.normalize();
         }
-        self.prefetch();
+        self.reader.prefetch();
         // Advance the in-view animation's frame and refresh its control panel.
         self.update_playback();
         // Keep the OS titlebar in sync with the open book + page (change-only).
@@ -2575,28 +1829,29 @@ impl State {
         // Decide what to draw this frame (library grid hides the page).
         let quads = if self.library_view {
             Vec::new()
-        } else if self.scroll_mode {
-            self.build_scroll_quads()
+        } else if self.reader.scroll_mode {
+            self.reader.build_scroll_quads()
         } else {
-            self.build_quads()
+            self.reader.build_quads()
         };
-        self.ui.dir_label = self.direction.label();
-        self.ui.fit_label = self.fit.label();
-        self.ui.layout_label = if self.scroll_mode {
+        self.ui.dir_label = self.reader.direction.label();
+        self.ui.fit_label = self.reader.fit.label();
+        self.ui.layout_label = if self.reader.scroll_mode {
             "scroll"
         } else {
-            self.layout.label()
+            self.reader.layout.label()
         };
         // Build the Tab info overlay text, reading the source once per page change.
-        if self.ui.info_open && !self.library_view && self.info_for != Some(self.index) {
-            self.ui.info = self.build_page_info(self.index);
-            self.info_for = Some(self.index);
+        if self.ui.info_open && !self.library_view && self.info_for != Some(self.reader.index) {
+            self.ui.info = self.build_page_info(self.reader.index);
+            self.info_for = Some(self.reader.index);
         }
         // Live view state for the overlays: current zoom % (shown in the info
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
         // and the active toast (dropped once it expires).
-        self.ui.zoom_pct = self.effective_zoom_pct();
-        self.update_resize_readout();
+        self.ui.zoom_pct = self.reader.effective_zoom_pct();
+        self.reader.update_resize_readout();
+        self.ui.resize_path = self.reader.resize_path_label();
         if let Some((_, t)) = &self.toast
             && t.elapsed() >= TOAST_DURATION
         {
@@ -2609,9 +1864,9 @@ impl State {
         self.ui.show_bar = !fullscreen || (self.cursor_y as f32) < reveal;
         // Edge hover arrows: only in page-flip reader mode, below the top bar,
         // while the cursor is inside the window.
-        let win_w = self.gpu.config.width.max(1) as f32;
+        let win_w = self.reader.viewport.w.max(1) as f32;
         let edge = win_w * EDGE_FRAC;
-        let in_reader = self.source.is_some() && !self.library_view && !self.scroll_mode;
+        let in_reader = self.reader.source.is_some() && !self.library_view && !self.reader.scroll_mode;
         let below_bar = (self.cursor_y as f32) >= reveal;
         let cx = self.cursor_x as f32;
         self.ui.hover_left = in_reader && self.cursor_in_window && below_bar && cx < edge;
@@ -2622,26 +1877,26 @@ impl State {
         // the reveal zone). Cleared here so it vanishes when no volume is open.
         self.ui.seek_show = false;
         self.ui.seek_hovered = false;
-        if let Some(src) = &self.source {
+        if let Some(src) = &self.reader.source {
             let len = src.len();
-            let anchor = if self.scroll_mode {
-                self.index
+            let anchor = if self.reader.scroll_mode {
+                self.reader.index
             } else {
-                layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+                layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
             };
-            let in_cache = self.cache.contains(anchor);
+            let in_cache = self.reader.cache.contains(anchor);
             // A page whose decode errored is in `failed`; treat it as not-loading so
             // we show a failure notice (file name + reason) instead of spinning.
             let fail_err: Option<String> =
-                if in_cache { None } else { self.failed.get(&anchor).cloned() };
+                if in_cache { None } else { self.reader.failed.get(&anchor).cloned() };
             let failed = fail_err.is_some();
             let loading = !in_cache && !failed;
             if in_cache {
-                self.last_drawn = Some(anchor);
+                self.reader.last_drawn = Some(anchor);
             }
             self.ui.status = format!(
                 "{}/{}{}{}",
-                self.index + 1,
+                self.reader.index + 1,
                 len,
                 if failed {
                     "  [failed]"
@@ -2650,7 +1905,7 @@ impl State {
                 } else {
                     ""
                 },
-                if self.jump { "  [jump]" } else { "  [step]" }
+                if self.reader.jump { "  [jump]" } else { "  [step]" }
             );
             self.ui.failed = fail_err.map(|reason| (src.name(anchor).to_string(), reason));
             // Show the centered spinner only after this page's decode has been
@@ -2671,11 +1926,11 @@ impl State {
                 self.loading_pending = None;
                 self.ui.loading = false;
             }
-            self.ui.seek_index = self.index;
+            self.ui.seek_index = self.reader.index;
             self.ui.seek_total = len;
-            self.ui.seek_rtl = self.direction == Direction::Rtl;
+            self.ui.seek_rtl = self.reader.direction == Direction::Rtl;
             self.ui.seek_style = ui::SeekbarStyle::Bar;
-            let win_h = self.gpu.config.height.max(1) as f32;
+            let win_h = self.reader.viewport.h.max(1) as f32;
             let near_bottom =
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
             self.ui.seek_show =
@@ -2692,7 +1947,7 @@ impl State {
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
-                self.cache.get(q.page_index).map(|t| {
+                self.reader.cache.get(q.page_index).map(|t| {
                     // The animation under user control shows its selected frame;
                     // any other animated page free-runs on the wall clock; stills
                     // return their sole view. Continuous redraw drives both.
@@ -2794,10 +2049,10 @@ impl State {
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
         if let Some(page) = self.ui.seek_request.take()
-            && let Some(src) = &self.source
+            && let Some(src) = &self.reader.source
         {
             let page = page.min(src.len().saturating_sub(1));
-            if page != self.index {
+            if page != self.reader.index {
                 self.goto(page);
             }
         }
@@ -2916,198 +2171,4 @@ mod tests {
         }
     }
 
-    // A 2048-tall portrait page on a 4K (2160-tall) screen, fit-to-window and
-    // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
-    #[test]
-    fn anchor_native_scale_fit_to_window_reports_upscale() {
-        let s = super::State::anchor_native_scale(
-            super::FitMode::Window,
-            (3840.0, 2160.0),
-            (1448.0, 2048.0),
-            2048.0,
-            2048.0,
-            1.0,
-        );
-        assert!((s - 2160.0 / 2048.0).abs() < 1e-4, "got {s}");
-    }
-
-    // 1:1 (Actual) at zoom 1 is exactly native: 100%.
-    #[test]
-    fn anchor_native_scale_actual_is_unity() {
-        let s = super::State::anchor_native_scale(
-            super::FitMode::Actual,
-            (3840.0, 2160.0),
-            (1448.0, 2048.0),
-            2048.0,
-            2048.0,
-            1.0,
-        );
-        assert!((s - 1.0).abs() < 1e-6, "got {s}");
-    }
-
-    // Proof of the single-resize invariant (page-flip path): a page decoded to
-    // its per-page target (the displayed height `page_target_h` computes) is drawn
-    // by `build_quads` at that *same* height, so the GPU sampler maps 1 texel : 1
-    // pixel and adds no second resize. Checks the decode target and the draw size
-    // agree across fit modes, aspects, zooms, and surface sizes.
-    #[test]
-    fn decode_target_matches_drawn_size() {
-        use yosh_engine::page::{fit_scale, FitMode};
-        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
-            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
-                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
-                    for zoom in [0.1_f32, 0.5, 1.0] {
-                        // Decode target = the page's displayed height (page_target_h).
-                        let th = (fit_scale(fit, sw, sh, aspect, 1.0) * zoom).round().max(1.0);
-                        let tw = (th * aspect).round().max(1.0);
-                        // build_quads draws that decoded (tw x th) texture at height:
-                        let drawn = th * fit_scale(fit, sw, sh, tw, th) * zoom;
-                        assert!(
-                            (drawn - th).abs() <= 2.0,
-                            "fit {} a {aspect} z {zoom} {sw}x{sh}: drawn {drawn} vs texture {th}",
-                            fit.label(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Single-resize invariant under a 90°/270° turn: `page_target_h` swaps the
-    // aspect and returns the on-screen box *width* as the decode target (texture
-    // height), then `single_quad` turns the texture inside the rotated box. The
-    // turned texture's height must still map 1 texel : 1 pixel along the screen
-    // width — i.e. the rotated-draw fit scale stays ~1, so no second GPU resize.
-    #[test]
-    fn decode_target_matches_drawn_size_rotated() {
-        use yosh_engine::page::{fit_scale, FitMode};
-        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
-            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
-                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
-                    for zoom in [0.1_f32, 0.5, 1.0] {
-                        // page_target_h (rotated): content_aspect = 1/aspect, the
-                        // target is the box width = box_h * content_aspect.
-                        let box_h = fit_scale(fit, sw, sh, 1.0 / aspect, 1.0) * zoom;
-                        let th = (box_h / aspect).round().max(1.0); // texture height (target)
-                        let tw = (th * aspect).round().max(1.0); // texture width (source aspect)
-                        // single_quad swaps (w,h) for the odd rotation: ew = th, eh = tw.
-                        let s = fit_scale(fit, sw, sh, th, tw) * zoom;
-                        let drawn_w = th * s; // screen width the turned texture's height fills
-                        assert!(
-                            (drawn_w - th).abs() <= 2.0,
-                            "rot fit {} a {aspect} z {zoom} {sw}x{sh}: drawn_w {drawn_w} vs texture-h {th}",
-                            fit.label(),
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // Single-resize invariant in 1:1 (Actual) fit when zoomed *out* (the fixed
-    // path): the page targets its displayed native×zoom height, decodes to that,
-    // and is drawn at the same size — so the GPU samples 1:1 and never bilinear-
-    // downscales a full-res texture. (Surface size is irrelevant in 1:1.)
-    #[test]
-    fn decode_target_matches_drawn_size_actual_zoomed_out() {
-        for (src_w, src_h) in [(1500.0_f32, 5200.0), (5200.0, 1500.0), (2048.0, 2048.0)] {
-            let _ = src_w; // 1:1 sizes off src_h × zoom; width follows the same scale
-            for zoom in [0.1_f32, 0.27, 0.5, 0.99] {
-                // page_target_h (Actual): displayed height = src_h × zoom; target_dims
-                // caps at the source height (no cap here since zoom < 1).
-                let target = (src_h * zoom).round().max(1.0);
-                let th = target.min(src_h); // decoded texture height
-                let drawn = src_h * zoom; // single_quad draws the box at src_h × zoom
-                let gpu_scale = drawn / th; // displayed ÷ decoded — must be ~1 (no resize)
-                assert!(
-                    (gpu_scale - 1.0).abs() <= 0.01,
-                    "actual {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (drawn {drawn}, texture {th})",
-                );
-            }
-        }
-    }
-
-    // A source taller than the *former* fixed 3840 cap, viewed below native, must
-    // decode to its displayed height — capped only by the GPU's real max texture
-    // size, aspect-aware so the width fits too — so the GPU samples 1:1. The old
-    // 3840 cap forced a GPU upscale (e.g. a 5207px page at 80–90% → ↑1.08–1.22×),
-    // which beats against the screentone → moiré. This models `page_target_h`'s cap.
-    #[test]
-    fn large_page_decodes_to_display_not_a_fixed_cap() {
-        let max_dim = 8192u32; // default MAX_TEX_DIM (the GPU's real limit)
-        for (src_w, src_h) in [(3600.0_f32, 5207.0), (5207.0, 3600.0), (4000.0, 6000.0)] {
-            let aspect = src_w / src_h;
-            let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(super::MIN_TARGET);
-            for zoom in [0.5_f32, 0.74, 0.8, 0.9, 1.0] {
-                // page_target_h (Actual): displayed height = src_h × zoom, clamped to max_h.
-                let target = ((src_h * zoom).round() as u32).clamp(super::MIN_TARGET, max_h);
-                let th = (target as f32).min(src_h); // target_dims caps at source
-                let tw = (th * aspect).round() as u32; // width follows source aspect
-                let display = src_h * zoom; // single_quad (Actual) draws at src_h × zoom
-                let gpu_scale = display / th;
-                assert!(
-                    (gpu_scale - 1.0).abs() <= 0.01,
-                    "src {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (display {display}, tex {th})"
-                );
-                assert!(
-                    th as u32 <= max_dim && tw <= max_dim,
-                    "src {src_w}x{src_h} z {zoom}: texture {tw}x{th} exceeds GPU max {max_dim}"
-                );
-            }
-        }
-    }
-
-    // The fit-multiplier clamp maps to native bounds: far zoom-out hits the 5%
-    // floor, far zoom-in hits the 20000% ceiling, mid values pass through.
-    #[test]
-    fn zoom_multiplier_clamps_to_native_bounds() {
-        let base = 2160.0_f32 / 2048.0; // native scale at zoom = 1 (fit-to-window)
-        let lo = super::State::clamp_zoom_multiplier(1e-6, base);
-        assert!((lo * base - super::MIN_ZOOM_PCT).abs() < 1e-4, "lo eff {}", lo * base);
-        let hi = super::State::clamp_zoom_multiplier(1e9, base);
-        assert!((hi * base - super::MAX_ZOOM_PCT).abs() < 1e-2, "hi eff {}", hi * base);
-        let mid = super::State::clamp_zoom_multiplier(1.0, base);
-        assert!((mid - 1.0).abs() < 1e-6, "mid {mid}");
-    }
-
-    // The BandiView ladder: 5, 10..300 by 10, 320..500 by 20, 550..20000 by 50.
-    #[test]
-    fn zoom_ladder_shape() {
-        let p = super::zoom_presets();
-        assert_eq!(p.first().copied(), Some(5.0));
-        assert_eq!(p.last().copied(), Some(20000.0));
-        assert!(p.windows(2).all(|w| w[1] > w[0]), "strictly increasing");
-        for v in [10.0, 100.0, 300.0, 320.0, 500.0, 550.0, 20000.0] {
-            assert!(p.contains(&v), "ladder missing {v}");
-        }
-        let idx = |v: f32| p.iter().position(|&x| x == v).unwrap();
-        assert_eq!(p[idx(300.0) + 1], 320.0, "300 -> 320 (step 20)");
-        assert_eq!(p[idx(500.0) + 1], 550.0, "500 -> 550 (step 50)");
-    }
-
-    // +/- step to the neighbouring fixed stop, clamping at the ends.
-    #[test]
-    fn zoom_stepping_fixed() {
-        let p = super::zoom_presets();
-        let up = |c: f32| super::next_zoom_preset(&p, c, true);
-        let dn = |c: f32| super::next_zoom_preset(&p, c, false);
-        assert_eq!(up(71.0), 80.0);
-        assert_eq!(up(80.0), 90.0);
-        assert_eq!(up(300.0), 320.0);
-        assert_eq!(up(500.0), 550.0);
-        assert_eq!(up(20000.0), 20000.0, "clamps at the top");
-        assert_eq!(dn(5.0), 5.0, "clamps at the bottom");
-        assert_eq!(dn(95.0), 90.0);
-        assert_eq!(dn(320.0), 300.0);
-        assert_eq!(dn(550.0), 500.0);
-    }
-
-    // A spliced fit-% (e.g. 71.34) becomes a reachable stop between fixed presets.
-    #[test]
-    fn zoom_stepping_dynamic_stop() {
-        let ladder = vec![70.0, 71.34, 80.0, 90.0];
-        assert_eq!(super::next_zoom_preset(&ladder, 70.0, true), 71.34);
-        assert_eq!(super::next_zoom_preset(&ladder, 71.34, true), 80.0);
-        assert_eq!(super::next_zoom_preset(&ladder, 71.34, false), 70.0);
-    }
 }
