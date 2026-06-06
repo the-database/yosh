@@ -583,8 +583,14 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
     if let Some(msg) = &st.toast
         && !library_view
     {
+        // Bottom-anchored, so extra lines (the "(Fit window)" suffix) grow upward
+        // and would shove the first "Zoom %" line higher than a one-line toast.
+        // Nudge the bubble down by one row per extra line so the first line stays
+        // at a fixed height as you step through zoom levels.
+        let extra = msg.matches('\n').count() as f32;
+        let row_h = ctx.fonts_mut(|f| f.row_height(&egui::FontId::proportional(15.0)));
         egui::Area::new(egui::Id::new("toast"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -96.0 + extra * row_h))
             .order(egui::Order::Foreground)
             .interactable(false)
             .show(ctx, |ui| {
@@ -593,8 +599,16 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                     .inner_margin(egui::Margin::symmetric(16, 9))
                     .corner_radius(egui::CornerRadius::same(8))
                     .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(msg).color(egui::Color32::WHITE).size(15.0),
+                        // Extend = never auto-wrap (only explicit '\n' breaks lines,
+                        // e.g. the "(Fit window)" suffix), so egui can't newline the
+                        // toast inconsistently. Center-align so the "Zoom %" line
+                        // stays put across zoom levels.
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(msg).color(egui::Color32::WHITE).size(15.0),
+                            )
+                            .wrap_mode(egui::TextWrapMode::Extend)
+                            .halign(egui::Align::Center),
                         );
                     });
             });
