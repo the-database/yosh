@@ -27,7 +27,10 @@ use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::prefetch::desired_window;
-use yosh_engine::reader::Viewport;
+use yosh_engine::reader::{
+    anchor_native_scale, clamp_zoom_multiplier, next_zoom_preset, zoom_presets, Direction, Viewport,
+    MAX_ZOOM_PCT, MIN_ZOOM_PCT,
+};
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
@@ -43,55 +46,6 @@ const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
 const BACK: usize = 6;
 const FWD_MAX: usize = 40;
-/// Zoom limits, measured against the image's *native* resolution (1 image px :
-/// 1 screen px = 100%), matching BandiView. `self.zoom` is a fit-multiplier, so
-/// these are converted to multiplier bounds per page in `clamp_zoom_native`.
-const MIN_ZOOM_PCT: f32 = 0.05; // 5% of native
-const MAX_ZOOM_PCT: f32 = 200.0; // 20000% of native
-
-/// Fixed zoom ladder in native percent (BandiView): 5, then 10..300 by 10,
-/// 320..500 by 20, 550..20000 by 50. The endpoints equal the clamp range
-/// (`MIN_ZOOM_PCT*100` .. `MAX_ZOOM_PCT*100`), so snapping never fights the clamp.
-fn zoom_presets() -> Vec<f32> {
-    let mut v = vec![5.0];
-    let mut p = 10;
-    while p <= 300 {
-        v.push(p as f32);
-        p += 10;
-    }
-    p = 320;
-    while p <= 500 {
-        v.push(p as f32);
-        p += 20;
-    }
-    p = 550;
-    while p <= 20000 {
-        v.push(p as f32);
-        p += 50;
-    }
-    v
-}
-
-/// The next stop above (`zoom_in`) or below `current_pct` in `ladder` (which must
-/// be sorted ascending: the fixed presets plus any spliced fit stops). A 0.1%
-/// relative guard — tighter than the smallest step (~0.25% at the top) — keeps
-/// float noise from sticking on or skipping a level. Clamps at the ends.
-fn next_zoom_preset(ladder: &[f32], current_pct: f32, zoom_in: bool) -> f32 {
-    if zoom_in {
-        ladder
-            .iter()
-            .copied()
-            .find(|&p| p > current_pct * 1.001)
-            .unwrap_or_else(|| *ladder.last().unwrap())
-    } else {
-        ladder
-            .iter()
-            .copied()
-            .rev()
-            .find(|&p| p < current_pct * 0.999)
-            .unwrap_or(ladder[0])
-    }
-}
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
 /// Height/width estimate for not-yet-decoded pages in the scroll strip.
@@ -114,21 +68,6 @@ const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// before a further scroll flips the page — turns the edge into a perceptible
 /// hard stop instead of an instant jump to the next page.
 const EDGE_DWELL: Duration = Duration::from_millis(350);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Ltr,
-    Rtl,
-}
-
-impl Direction {
-    fn label(self) -> &'static str {
-        match self {
-            Direction::Ltr => "LTR",
-            Direction::Rtl => "RTL",
-        }
-    }
-}
 
 pub struct App {
     initial_path: Option<PathBuf>,
@@ -1525,28 +1464,6 @@ impl State {
         }
     }
 
-    /// On-screen scale (device-px per *native* source-px) for a page, mirroring
-    /// the draw scale in `build_quads`. `content` feeds `fit_scale` (a single
-    /// page: its own dims; a facing pair: the combined width and shared height);
-    /// `decoded_h` is the anchor's displayed decoded height; `src_h` its native.
-    fn anchor_native_scale(
-        fit: FitMode,
-        screen: (f32, f32),
-        content: (f32, f32),
-        decoded_h: f32,
-        src_h: f32,
-        zoom: f32,
-    ) -> f32 {
-        // 1:1 now draws at native × zoom regardless of the decoded texture size
-        // (see single_quad), so its native scale is exactly `zoom` — the
-        // decoded_h/src_h correction below applies only to the fit-scaled modes.
-        if fit == FitMode::Actual {
-            return zoom;
-        }
-        let ((sw, sh), (fit_w, fit_h)) = (screen, content);
-        fit_scale(fit, sw, sh, fit_w, fit_h) * zoom * decoded_h / src_h.max(1.0)
-    }
-
     /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h)` — the inputs
     /// `anchor_native_scale` needs, computed once and shared by `anchor_scale`
     /// (current fit/zoom) and `fit_native_pct` (an arbitrary fit at zoom 1). `None`
@@ -1589,7 +1506,7 @@ impl State {
             return Some(sw * self.zoom / t.src_w.max(1) as f32);
         }
         let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        Some(Self::anchor_native_scale(
+        Some(anchor_native_scale(
             self.fit,
             (sw, sh),
             (fit_w, fit_h),
@@ -1604,7 +1521,7 @@ impl State {
     /// `None` in scroll mode (handled inline in `zoom_ladder`) or before decode.
     fn fit_native_pct(&self, fit: FitMode) -> Option<f32> {
         let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        Some(Self::anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, 1.0) * 100.0)
+        Some(anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, 1.0) * 100.0)
     }
 
     /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
@@ -1630,7 +1547,7 @@ impl State {
         }
         // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
         let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        let native = Self::anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
+        let native = anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
         Some(native * src_h / dec_h.max(1.0))
     }
 
@@ -1769,22 +1686,13 @@ impl State {
         }
     }
 
-    /// Clamp `self.zoom` (a fit-multiplier) so the *effective native* zoom stays
-    /// within [`MIN_ZOOM_PCT`, `MAX_ZOOM_PCT`]. Converts via the page's native
-    /// scale at zoom = 1 (`base`). No-op while the anchor isn't decoded — the
-    /// next press clamps once it lands.
-    fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
-        let (lo, hi) = (MIN_ZOOM_PCT / base, MAX_ZOOM_PCT / base);
-        zoom.clamp(lo.min(hi), lo.max(hi))
-    }
-
     fn clamp_zoom_native(&mut self) {
         if self.zoom > 0.0
             && let Some(s) = self.anchor_scale()
         {
             let base = s / self.zoom;
             if base > 0.0 {
-                self.zoom = Self::clamp_zoom_multiplier(self.zoom, base);
+                self.zoom = clamp_zoom_multiplier(self.zoom, base);
             }
         }
     }
@@ -2934,7 +2842,7 @@ mod tests {
     // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
     #[test]
     fn anchor_native_scale_fit_to_window_reports_upscale() {
-        let s = super::State::anchor_native_scale(
+        let s = super::anchor_native_scale(
             super::FitMode::Window,
             (3840.0, 2160.0),
             (1448.0, 2048.0),
@@ -2948,7 +2856,7 @@ mod tests {
     // 1:1 (Actual) at zoom 1 is exactly native: 100%.
     #[test]
     fn anchor_native_scale_actual_is_unity() {
-        let s = super::State::anchor_native_scale(
+        let s = super::anchor_native_scale(
             super::FitMode::Actual,
             (3840.0, 2160.0),
             (1448.0, 2048.0),
@@ -3076,11 +2984,11 @@ mod tests {
     #[test]
     fn zoom_multiplier_clamps_to_native_bounds() {
         let base = 2160.0_f32 / 2048.0; // native scale at zoom = 1 (fit-to-window)
-        let lo = super::State::clamp_zoom_multiplier(1e-6, base);
+        let lo = super::clamp_zoom_multiplier(1e-6, base);
         assert!((lo * base - super::MIN_ZOOM_PCT).abs() < 1e-4, "lo eff {}", lo * base);
-        let hi = super::State::clamp_zoom_multiplier(1e9, base);
+        let hi = super::clamp_zoom_multiplier(1e9, base);
         assert!((hi * base - super::MAX_ZOOM_PCT).abs() < 1e-2, "hi eff {}", hi * base);
-        let mid = super::State::clamp_zoom_multiplier(1.0, base);
+        let mid = super::clamp_zoom_multiplier(1.0, base);
         assert!((mid - 1.0).abs() < 1e-6, "mid {mid}");
     }
 
