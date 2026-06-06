@@ -28,3 +28,9 @@ fast_image_resize = "6"
 qcms = "0.3"
 # ICO container parsing (multi-image .ico → layered pages) and re-encoding.
 ico = "0.5"
+natord = "1"
+# Archive page sources: zip/cbz (parallel reads), rar/cbr + 7z/cb7 (sequential —
+# a reader thread decompresses into an in-memory map served to readers).
+zip = "8"
+unrar = "0.5"
+sevenz-rust2 = "0.21"

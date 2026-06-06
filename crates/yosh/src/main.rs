@@ -11,7 +11,6 @@ mod config;
 mod gpu;
 mod library;
 mod pool;
-mod source;
 mod ui;
 mod update;
 

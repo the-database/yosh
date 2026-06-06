@@ -15,5 +15,6 @@ pub mod icc;
 pub mod layout;
 pub mod page;
 pub mod prefetch;
+pub mod source;
 pub mod texpool;
 pub mod tone;
