@@ -281,6 +281,7 @@ impl Reader {
 }
 
 impl Reader {
+    /// Does the current page overflow the window vertically under the active fit?
     pub fn current_overflows(&self) -> bool {
         let Some(pt) = self.cache.get(self.index) else {
             return false;
@@ -501,10 +502,8 @@ impl Reader {
         ladder
     }
 
-    /// Snap zoom to the next ladder stop above/below the current native %. The
-    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
-    /// step can land exactly on fit-to-window / fit-to-width. Works in both
-    /// page-flip and scroll modes (both derive from `effective_zoom_pct`).
+    /// Clamp the page-flip zoom so the page's *effective native* zoom stays within
+    /// [`MIN_ZOOM_PCT`, `MAX_ZOOM_PCT`]. No-op until the anchor page is decoded.
     pub fn clamp_zoom_native(&mut self) {
         if self.zoom > 0.0
             && let Some(s) = self.anchor_scale()
@@ -661,6 +660,8 @@ impl Reader {
         }
     }
 
+    /// Keep `(index, top_offset)` in range using best-known page heights, so the
+    /// scroll anchor stays valid as nearby pages decode (and their real heights land).
     pub fn normalize(&mut self) {
         let len = match &self.source {
             Some(s) => s.len(),
@@ -726,8 +727,9 @@ impl Reader {
         quads
     }
 
-    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
-    /// and register them with egui.
+    /// Forward prefetch-window width: base `FWD`, widened by recent flip velocity
+    /// (flips in the last ~0.8 s) up to `FWD_MAX`, so fast seeking buffers further
+    /// ahead.
     pub fn dynamic_fwd(&mut self) -> usize {
         let now = Instant::now();
         while let Some(&t) = self.nav_times.front() {
@@ -740,11 +742,10 @@ impl Reader {
         (FWD + self.nav_times.len() * 4).min(FWD_MAX)
     }
 
-    /// Begin opening `path`. The source is built on a background thread (see
-    /// `build_source`) so a slow network-share open never freezes the UI — the
-    /// current page stays on screen under the spinner until the new source lands
-    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
-    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
+    /// Source aspect (w / h) for page `index`: from its decoded texture if present,
+    /// else the in-view anchor's, else the running estimate. Used to size the decode
+    /// target before the page itself is decoded (exact for the usual uniform-size
+    /// volume; corrected in place once the page's own dimensions are known).
     pub fn page_aspect(&self, index: usize) -> f32 {
         if let Some(t) = self.cache.get(index) {
             return t.src_w as f32 / t.src_h.max(1) as f32;
@@ -1056,6 +1057,9 @@ mod tests {
 }
 
 impl Reader {
+    /// Flip one view in `dir`. Returns `true` if the position actually changed. At
+    /// the first/last page it queues a toast and returns `false`; in step mode while
+    /// the current page is still decoding it just returns `false`.
     pub fn step(&mut self, dir: i64) -> bool {
         let Some(src) = &self.source else { return false };
         let len = src.len();
@@ -1097,6 +1101,9 @@ impl Reader {
         // The shell persists the read position (it owns the volume key + settings).
         self.prefetch();
     }
+    /// Snap zoom to the next ladder stop above/below the current native %. The
+    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
+    /// step can land exactly on fit-to-window / fit-to-width.
     pub fn zoom_to_preset(&mut self, zoom_in: bool) {
         let cur = self.effective_zoom_pct();
         let mut label: Option<&'static str> = None;
