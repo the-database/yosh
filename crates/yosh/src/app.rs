@@ -27,6 +27,7 @@ use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::prefetch::desired_window;
+use yosh_engine::reader::Viewport;
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
@@ -161,6 +162,11 @@ impl Default for Playback {
 struct State {
     window: Arc<Window>,
     gpu: Gpu,
+    /// Surface size mirrored from `gpu.config` for the reading math — refreshed at
+    /// the top of `render()` and on resize, so it is always value-equal to the
+    /// live surface. The seam that lets the reading methods stop reading `gpu`
+    /// directly, ahead of their move into `yosh_engine::reader`.
+    viewport: Viewport,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
@@ -843,6 +849,7 @@ impl ApplicationHandler for App {
             settings,
             volume_key: None,
             tex_pool,
+            viewport: Viewport::default(),
             pending_view: (0, 0, 1.0),
             view_settled: false,
             gpu_downscale_warned: false,
@@ -885,6 +892,13 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size.width, size.height);
+                // Keep the reading viewport in lock-step with the surface so an
+                // input event between renders sees the new size (as it did when
+                // these reads came straight from `gpu.config`).
+                state.viewport = Viewport {
+                    w: state.gpu.config.width,
+                    h: state.gpu.config.height,
+                };
                 state.record_window_geometry();
             }
             WindowEvent::Moved(_) => state.record_window_geometry(),
@@ -1027,7 +1041,7 @@ impl State {
         match action {
             Action::Forward => {
                 if self.scroll_mode {
-                    let vh = self.gpu.config.height as f32;
+                    let vh = self.viewport.h as f32;
                     self.scroll_by(vh * 0.9);
                 } else {
                     self.step(1);
@@ -1035,7 +1049,7 @@ impl State {
             }
             Action::Backward => {
                 if self.scroll_mode {
-                    let vh = self.gpu.config.height as f32;
+                    let vh = self.viewport.h as f32;
                     self.scroll_by(-vh * 0.9);
                 } else {
                     self.step(-1);
@@ -1060,8 +1074,8 @@ impl State {
                 // page ~fills the viewport height).
                 self.pan_x = 0.0;
                 if (self.zoom - 1.0).abs() < 0.01 {
-                    let sw = self.gpu.config.width.max(1) as f32;
-                    let sh = self.gpu.config.height.max(1) as f32;
+                    let sw = self.viewport.w.max(1) as f32;
+                    let sh = self.viewport.h.max(1) as f32;
                     let cw = sh / self.est_aspect.max(0.1);
                     self.zoom = (cw / sw).clamp(0.2, 8.0);
                 } else {
@@ -1372,7 +1386,7 @@ impl State {
         // page stops there instead of immediately jumping to the next page — you
         // have to keep scrolling past the stop to advance. Only reset the pan when
         // a flip actually happened (else the first/last page snaps to its edge).
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
         let maxp = ((self.current_display_h() - sh) / 2.0).max(0.0);
         let cur = self.pan_y.clamp(-maxp, maxp);
         let next = cur + dy * 80.0;
@@ -1417,7 +1431,7 @@ impl State {
     /// A clean click: the left/right edge strips flip pages; the wide middle
     /// does nothing on a single click but toggles fullscreen on a double-click.
     fn on_click(&mut self) {
-        let w = self.gpu.config.width.max(1) as f64;
+        let w = self.viewport.w.max(1) as f64;
         let edge = (w * EDGE_FRAC as f64).max(1.0);
         if self.cursor_x < edge {
             self.last_mid_click = None;
@@ -1481,7 +1495,7 @@ impl State {
         let Some(pt) = self.cache.get(self.index) else {
             return false;
         };
-        let (sw, sh) = (self.gpu.config.width.max(1) as f32, self.gpu.config.height.max(1) as f32);
+        let (sw, sh) = (self.viewport.w.max(1) as f32, self.viewport.h.max(1) as f32);
         let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32) * self.zoom;
         pt.h as f32 * s > sh + 0.5
     }
@@ -1501,8 +1515,8 @@ impl State {
 
     /// Displayed height of the current page under the active fit + zoom.
     fn current_display_h(&self) -> f32 {
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
         match self.cache.get(self.index) {
             Some(t) => {
                 t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
@@ -1541,8 +1555,8 @@ impl State {
         if self.scroll_mode {
             return None;
         }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
         let len = self.source.as_ref()?.len();
         if len == 0 {
             return None;
@@ -1570,7 +1584,7 @@ impl State {
     fn anchor_scale(&self) -> Option<f32> {
         if self.scroll_mode {
             // Strip pages are laid out at width = sw * zoom (height follows aspect).
-            let sw = self.gpu.config.width.max(1) as f32;
+            let sw = self.viewport.w.max(1) as f32;
             let t = self.cache.get(self.index)?;
             return Some(sw * self.zoom / t.src_w.max(1) as f32);
         }
@@ -1611,7 +1625,7 @@ impl State {
     fn gpu_sample_scale(&self) -> Option<f32> {
         if self.scroll_mode {
             let t = self.cache.get(self.index)?;
-            let sw = self.gpu.config.width.max(1) as f32;
+            let sw = self.viewport.w.max(1) as f32;
             return Some(sw * self.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
         }
         // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
@@ -1693,8 +1707,8 @@ impl State {
         let mut stops: Vec<f32> = Vec::new();
         if self.scroll_mode {
             if let Some(t) = self.cache.get(self.index) {
-                let sw = self.gpu.config.width.max(1) as f32;
-                let sh = self.gpu.config.height.max(1) as f32;
+                let sw = self.viewport.w.max(1) as f32;
+                let sh = self.viewport.h.max(1) as f32;
                 stops.push(sw / t.src_w.max(1) as f32 * 100.0); // fit width (strip @ zoom 1)
                 stops.push(sh / t.src_h.max(1) as f32 * 100.0); // fit window (height fills)
             }
@@ -1778,8 +1792,8 @@ impl State {
     /// Clamp stored pan to the current page's overflow so dragging/zooming can't
     /// strand the view in an empty region.
     fn clamp_pan(&mut self) {
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
         if self.scroll_mode {
             let cw = sw * self.zoom;
             let mx = ((cw - sw) / 2.0).max(0.0);
@@ -1875,8 +1889,8 @@ impl State {
         if len == 0 {
             return Vec::new();
         }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
 
         let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
         let ta = self.cache.get(a);
@@ -1972,7 +1986,7 @@ impl State {
         if len == 0 {
             return;
         }
-        let sw = self.gpu.config.width.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
         while self.index + 1 < len {
             let h = self.page_display_h(self.index, sw);
             if self.top_offset >= h {
@@ -1990,7 +2004,7 @@ impl State {
             self.top_offset = 0.0;
         }
         if self.index + 1 >= len {
-            let vh = self.gpu.config.height as f32;
+            let vh = self.viewport.h as f32;
             let max_off = (self.page_display_h(len - 1, sw) - vh).max(0.0);
             if self.top_offset > max_off {
                 self.top_offset = max_off;
@@ -2007,8 +2021,8 @@ impl State {
         if len == 0 {
             return Vec::new();
         }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
         let mut quads = Vec::new();
         let cw = sw * self.zoom; // strip width (zoom); centered with horizontal pan
         let x = self.horizontal_left(cw, sw);
@@ -2282,8 +2296,8 @@ impl State {
                 None => u32::MAX, // native size unknown yet: decode full, re-decode once cached
             };
         }
-        let sw = self.gpu.config.width.max(1) as f32;
-        let sh = self.gpu.config.height.max(1) as f32;
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
         let target = if self.scroll_mode {
             // Continuous strip: width-fit at width sw*zoom, height follows aspect.
             sw * self.zoom / aspect
@@ -2318,7 +2332,7 @@ impl State {
     /// in place (no black frame). Page-flipping leaves the view settled, so it
     /// never re-decodes.
     fn update_decode_view(&mut self) {
-        let desired = (self.gpu.config.width, self.gpu.config.height, self.zoom);
+        let desired = (self.viewport.w, self.viewport.h, self.zoom);
         self.view_settled = desired == self.pending_view;
         self.pending_view = desired;
     }
@@ -2486,6 +2500,13 @@ impl State {
 
     #[allow(deprecated)]
     fn render(&mut self) {
+        // Mirror the live surface size into the reading viewport (the value the
+        // reading math reads instead of `gpu.config`). Equal to `gpu.config` by
+        // construction, so this is a no-op for behavior.
+        self.viewport = Viewport {
+            w: self.gpu.config.width,
+            h: self.gpu.config.height,
+        };
         if let Some(p) = self.ui.pending_open.take() {
             self.open(&p);
         }
@@ -2602,7 +2623,7 @@ impl State {
         self.ui.show_bar = !fullscreen || (self.cursor_y as f32) < reveal;
         // Edge hover arrows: only in page-flip reader mode, below the top bar,
         // while the cursor is inside the window.
-        let win_w = self.gpu.config.width.max(1) as f32;
+        let win_w = self.viewport.w.max(1) as f32;
         let edge = win_w * EDGE_FRAC;
         let in_reader = self.source.is_some() && !self.library_view && !self.scroll_mode;
         let below_bar = (self.cursor_y as f32) >= reveal;
@@ -2668,7 +2689,7 @@ impl State {
             self.ui.seek_total = len;
             self.ui.seek_rtl = self.direction == Direction::Rtl;
             self.ui.seek_style = ui::SeekbarStyle::Bar;
-            let win_h = self.gpu.config.height.max(1) as f32;
+            let win_h = self.viewport.h.max(1) as f32;
             let near_bottom =
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
             self.ui.seek_show =
