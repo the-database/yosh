@@ -10,7 +10,6 @@ mod app;
 mod config;
 mod gpu;
 mod library;
-mod pool;
 mod ui;
 mod update;
 

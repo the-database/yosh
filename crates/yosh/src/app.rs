@@ -23,7 +23,7 @@ use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library};
 use yosh_engine::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
-use crate::pool::{DecodePool, Msg};
+use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::prefetch::desired_window;
