@@ -3,7 +3,6 @@
 //! navigation. The current page is drawn from the cache; if a target isn't ready
 //! yet the last-drawn page is held (no flicker).
 
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,7 +16,6 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use fast_image_resize::Resizer;
 
-use yosh_engine::cache::PageCache;
 use crate::config;
 use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
@@ -29,7 +27,7 @@ use yosh_engine::layout::{self, Layout};
 use yosh_engine::prefetch::desired_window;
 use yosh_engine::reader::{
     anchor_native_scale, clamp_zoom_multiplier, next_zoom_preset, quad_from_px, zoom_presets,
-    Direction, Quad, Viewport, MAX_ZOOM_PCT, MIN_TARGET, MIN_ZOOM_PCT,
+    Direction, Quad, Reader, Viewport, MAX_ZOOM_PCT, MIN_TARGET, MIN_ZOOM_PCT,
 };
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
@@ -42,8 +40,6 @@ const BACK: usize = 6;
 const FWD_MAX: usize = 40;
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
-/// Height/width estimate for not-yet-decoded pages in the scroll strip.
-const DEFAULT_ASPECT: f32 = 1.5;
 /// Library cover thumbnail height, and how many to decode per frame.
 const THUMB_H: u32 = 360;
 const THUMB_BUDGET: usize = 2;
@@ -95,49 +91,22 @@ impl Default for Playback {
 struct State {
     window: Arc<Window>,
     gpu: Gpu,
-    /// Surface size mirrored from `gpu.config` for the reading math — refreshed at
-    /// the top of `render()` and on resize, so it is always value-equal to the
-    /// live surface. The seam that lets the reading methods stop reading `gpu`
-    /// directly, ahead of their move into `yosh_engine::reader`.
-    viewport: Viewport,
+    /// The reading-state machine + the engine resources it drives (page source,
+    /// decode pool, cache, texture pool, wgpu device/queue). The shell mirrors the
+    /// surface into `reader.viewport` and feeds it input each frame.
+    reader: Reader,
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
     ui: UiState,
 
     page_pipeline: PagePipeline,
-    source: Option<Arc<dyn PageSource>>,
-    pool: Option<DecodePool>,
-    cache: PageCache,
-    /// Pages whose decode errored, mapped to the error message (shown to the user).
-    failed: HashMap<usize, String>,
-    index: usize,
-    start_index: usize,
-    last_drawn: Option<usize>,
-
-    fit: FitMode,
-    layout: Layout,
-    spread_offset: usize, // spread pairing parity (0 or 1), per-volume
-    /// Page rotation in 90° CW steps (0..=3). Session-global, applied to
-    /// single-page draws only; reset to 0 when a new volume opens.
-    rotation: u8,
-    zoom: f32,       // page-flip zoom factor (1.0 = fit)
-    pan_x: f32,      // page-flip pan offset in screen px (from centered)
-    pan_y: f32,
-    direction: Direction,
     cursor_x: f64,
     cursor_y: f64,
     mouse_down: bool,
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     cursor_in_window: bool, // gates the edge-hover navigation arrows
     last_mid_click: Option<Instant>, // middle-zone double-click → fullscreen
-    jump: bool, // seek mode (key J): true = "jump" (skip ahead), false = "step" (see every page, default)
-    nav_times: VecDeque<Instant>,
-
-    // Continuous-scroll mode (M2.1).
-    scroll_mode: bool,
-    top_offset: f32,  // pixels the anchor page (self.index) is scrolled above the viewport top
-    est_aspect: f32,  // h/w estimate for undecoded pages in the strip
 
     settings: config::Settings,
     /// Last observed window geometry (outer x/y, inner w/h, physical px) while in
@@ -146,17 +115,6 @@ struct State {
     /// restored rect; updated on move/resize; written back on exit.
     win_geom: Option<(i32, i32, u32, u32)>,
     volume_key: Option<String>,
-    tex_pool: Arc<TexturePool>,
-    /// Decode-view debounce: the last-seen `(surface_w, surface_h, zoom)`. Once it
-    /// stops changing across frames the view is "settled" and target-change
-    /// re-decodes are allowed — so a resize/zoom drag re-decodes once it lands, not
-    /// every frame. Page-flipping doesn't change it, so it never re-decodes.
-    pending_view: (u32, u32, f32),
-    view_settled: bool,
-    /// True while we've already logged a "settled view is GPU-downscaling" warning
-    /// for the current occurrence, so the tripwire fires once per episode, not per
-    /// frame. Cleared as soon as the view returns to 1:1/upscale.
-    gpu_downscale_warned: bool,
     /// Page index the Tab info overlay text was built for (None = rebuild needed).
     info_for: Option<usize>,
     /// The anchor page currently waiting to decode and when that wait began,
@@ -167,9 +125,6 @@ struct State {
     /// Transient on-screen message (boundary reached, zoom level) + when it was
     /// raised; cleared after `TOAST_DURATION`.
     toast: Option<(String, Instant)>,
-    /// When the zoomed-page wheel-pan first parked at the top/bottom edge (None
-    /// when not at an edge). Gates the hard-stop dwell before flipping pages.
-    pan_edge_at: Option<Instant>,
     /// Fixed origin for animation timing. A single shared clock is correct —
     /// every animated page derives its current frame from the same wall time, so
     /// all animations loop in step and the render loop stays stateless per page.
@@ -727,60 +682,48 @@ impl ApplicationHandler for App {
         // Channels for background archive opens and sibling-volume prescans.
         let (open_tx, open_rx) = std::sync::mpsc::channel();
         let (sib_tx, sib_rx) = std::sync::mpsc::channel();
+        let reader = Reader::new(
+            gpu.device.clone(),
+            gpu.queue.clone(),
+            tex_pool,
+            CACHE_CAP,
+            WORKERS,
+            fit_from_u8(settings.fit),
+            if settings.layout_spread {
+                Layout::Spread
+            } else {
+                Layout::Single
+            },
+            settings.scroll,
+            settings.jump,
+            if settings.direction_rtl {
+                Direction::Rtl
+            } else {
+                Direction::Ltr
+            },
+            self.start_index,
+        );
         self.state = Some(State {
             window,
             gpu,
+            reader,
             egui_ctx,
             egui_state,
             egui_renderer,
             ui,
             page_pipeline,
-            source: None,
-            pool: None,
-            cache: PageCache::new(CACHE_CAP, tex_pool.clone()),
-            failed: HashMap::new(),
-            index: 0,
-            start_index: self.start_index,
-            last_drawn: None,
-            fit: fit_from_u8(settings.fit),
-            layout: if settings.layout_spread {
-                Layout::Spread
-            } else {
-                Layout::Single
-            },
-            spread_offset: 0,
-            rotation: 0,
-            zoom: 1.0,
-            pan_x: 0.0,
-            pan_y: 0.0,
+            cursor_x: 0.0,
             cursor_y: 0.0,
             mouse_down: false,
             drag_dist: 0.0,
             cursor_in_window: false,
             last_mid_click: None,
-            jump: settings.jump,
-            direction: if settings.direction_rtl {
-                Direction::Rtl
-            } else {
-                Direction::Ltr
-            },
-            cursor_x: 0.0,
-            nav_times: VecDeque::new(),
-            scroll_mode: settings.scroll,
-            top_offset: 0.0,
-            est_aspect: DEFAULT_ASPECT,
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             settings,
             volume_key: None,
-            tex_pool,
-            viewport: Viewport::default(),
-            pending_view: (0, 0, 1.0),
-            view_settled: false,
-            gpu_downscale_warned: false,
             info_for: None,
             loading_pending: None,
             toast: None,
-            pan_edge_at: None,
             anim_origin: Instant::now(),
             playback: Playback::default(),
             last_title: String::new(),
@@ -819,7 +762,7 @@ impl ApplicationHandler for App {
                 // Keep the reading viewport in lock-step with the surface so an
                 // input event between renders sees the new size (as it did when
                 // these reads came straight from `gpu.config`).
-                state.viewport = Viewport {
+                state.reader.viewport = Viewport {
                     w: state.gpu.config.width,
                     h: state.gpu.config.height,
                 };
@@ -964,54 +907,54 @@ impl State {
     fn apply_action(&mut self, action: Action) {
         match action {
             Action::Forward => {
-                if self.scroll_mode {
-                    let vh = self.viewport.h as f32;
+                if self.reader.scroll_mode {
+                    let vh = self.reader.viewport.h as f32;
                     self.scroll_by(vh * 0.9);
                 } else {
                     self.step(1);
                 }
             }
             Action::Backward => {
-                if self.scroll_mode {
-                    let vh = self.viewport.h as f32;
+                if self.reader.scroll_mode {
+                    let vh = self.reader.viewport.h as f32;
                     self.scroll_by(-vh * 0.9);
                 } else {
                     self.step(-1);
                 }
             }
             // In RTL, "left" advances the story; in LTR, "right" does. (Page-flip only.)
-            Action::Right if !self.scroll_mode => {
-                self.step(if self.direction == Direction::Ltr { 1 } else { -1 });
+            Action::Right if !self.reader.scroll_mode => {
+                self.step(if self.reader.direction == Direction::Ltr { 1 } else { -1 });
             }
-            Action::Left if !self.scroll_mode => {
-                self.step(if self.direction == Direction::Ltr { -1 } else { 1 });
+            Action::Left if !self.reader.scroll_mode => {
+                self.step(if self.reader.direction == Direction::Ltr { -1 } else { 1 });
             }
             Action::Right | Action::Left => {}
             Action::First => self.goto(0),
             Action::Last => {
-                if let Some(s) = &self.source {
+                if let Some(s) = &self.reader.source {
                     self.goto(s.len().saturating_sub(1));
                 }
             }
-            Action::CycleFit if self.scroll_mode => {
+            Action::CycleFit if self.reader.scroll_mode => {
                 // In scroll: toggle width-fit (zoom 1) vs height-fit (a typical
                 // page ~fills the viewport height).
-                self.pan_x = 0.0;
-                if (self.zoom - 1.0).abs() < 0.01 {
-                    let sw = self.viewport.w.max(1) as f32;
-                    let sh = self.viewport.h.max(1) as f32;
-                    let cw = sh / self.est_aspect.max(0.1);
-                    self.zoom = (cw / sw).clamp(0.2, 8.0);
+                self.reader.pan_x = 0.0;
+                if (self.reader.zoom - 1.0).abs() < 0.01 {
+                    let sw = self.reader.viewport.w.max(1) as f32;
+                    let sh = self.reader.viewport.h.max(1) as f32;
+                    let cw = sh / self.reader.est_aspect.max(0.1);
+                    self.reader.zoom = (cw / sw).clamp(0.2, 8.0);
                 } else {
-                    self.zoom = 1.0;
+                    self.reader.zoom = 1.0;
                 }
             }
             Action::CycleFit => {
-                self.fit = self.fit.cycle();
-                self.zoom = 1.0;
-                self.pan_x = 0.0;
-                self.pan_y = 0.0;
-                self.settings.fit = fit_to_u8(self.fit);
+                self.reader.fit = self.reader.fit.cycle();
+                self.reader.zoom = 1.0;
+                self.reader.pan_x = 0.0;
+                self.reader.pan_y = 0.0;
+                self.settings.fit = fit_to_u8(self.reader.fit);
                 config::save(&self.settings);
             }
             Action::ZoomIn => self.zoom_to_preset(true),
@@ -1026,31 +969,31 @@ impl State {
                 self.apply_view(FitMode::Window, true, Some(Direction::Rtl))
             }
             Action::ToggleDir => {
-                self.direction = match self.direction {
+                self.reader.direction = match self.reader.direction {
                     Direction::Ltr => Direction::Rtl,
                     Direction::Rtl => Direction::Ltr,
                 };
-                self.settings.direction_rtl = self.direction == Direction::Rtl;
+                self.settings.direction_rtl = self.reader.direction == Direction::Rtl;
                 config::save(&self.settings);
-                self.toast(format!("Direction: {}", self.direction.label()));
+                self.toast(format!("Direction: {}", self.reader.direction.label()));
             }
             Action::ToggleLayout => {
-                self.layout = self.layout.toggled();
+                self.reader.layout = self.reader.layout.toggled();
                 // Snap to the current view's anchor so pairing is consistent.
-                self.index = layout::view_start(self.layout, self.index, self.spread_offset);
-                self.pan_y = 0.0;
-                self.settings.layout_spread = self.layout == Layout::Spread;
+                self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+                self.reader.pan_y = 0.0;
+                self.settings.layout_spread = self.reader.layout == Layout::Spread;
                 config::save(&self.settings);
                 self.prefetch();
-                self.toast(format!("Layout: {}", self.layout.label()));
+                self.toast(format!("Layout: {}", self.reader.layout.label()));
             }
             Action::ToggleScroll => {
-                self.scroll_mode = !self.scroll_mode;
-                self.top_offset = 0.0;
-                self.settings.scroll = self.scroll_mode;
+                self.reader.scroll_mode = !self.reader.scroll_mode;
+                self.reader.top_offset = 0.0;
+                self.settings.scroll = self.reader.scroll_mode;
                 config::save(&self.settings);
                 self.prefetch();
-                self.toast(if self.scroll_mode {
+                self.toast(if self.reader.scroll_mode {
                     "Scroll mode"
                 } else {
                     "Page-flip mode"
@@ -1074,34 +1017,34 @@ impl State {
                 self.window.set_fullscreen(fs);
             }
             Action::ToggleSpreadOffset => {
-                self.spread_offset ^= 1;
+                self.reader.spread_offset ^= 1;
                 if let Some(k) = &self.volume_key {
                     self.settings
                         .spread_offsets
-                        .insert(k.clone(), self.spread_offset as u8);
+                        .insert(k.clone(), self.reader.spread_offset as u8);
                     config::save(&self.settings);
                 }
                 // Re-anchor so the current view re-pairs with the new parity.
-                self.index = layout::view_start(self.layout, self.index, self.spread_offset);
+                self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
                 self.prefetch();
-                self.toast(format!("Spread offset: {}", self.spread_offset));
+                self.toast(format!("Spread offset: {}", self.reader.spread_offset));
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
             Action::ToggleJump => {
-                self.jump = !self.jump;
-                self.settings.jump = self.jump;
+                self.reader.jump = !self.reader.jump;
+                self.settings.jump = self.reader.jump;
                 config::save(&self.settings);
-                self.toast(if self.jump { "Jump mode" } else { "Step mode" });
+                self.toast(if self.reader.jump { "Jump mode" } else { "Step mode" });
             }
             Action::Rotate => {
-                self.rotation = (self.rotation + 1) % 4;
+                self.reader.rotation = (self.reader.rotation + 1) % 4;
                 // Recenter: the rotated box has different bounds, so any prior pan
                 // would now be out of range.
-                self.pan_x = 0.0;
-                self.pan_y = 0.0;
+                self.reader.pan_x = 0.0;
+                self.reader.pan_y = 0.0;
                 self.prefetch(); // re-decode at the rotation-aware target (1:1)
-                self.toast(format!("Rotation: {}\u{00b0}", self.rotation as u32 * 90));
+                self.toast(format!("Rotation: {}\u{00b0}", self.reader.rotation as u32 * 90));
             }
             Action::ShowInExplorer => self.reveal_current(),
             // Esc → quit is intercepted in `window_event` (needs the event loop),
@@ -1127,8 +1070,8 @@ impl State {
         let target = if base.is_dir() {
             // Folder (incl. single-image opens, which open the parent folder):
             // select the current page's file. `name(index)` is a flat file name.
-            match self.source.as_ref() {
-                Some(s) if s.len() > 0 => base.join(s.name(self.index)),
+            match self.reader.source.as_ref() {
+                Some(s) if s.len() > 0 => base.join(s.name(self.reader.index)),
                 _ => base,
             }
         } else {
@@ -1142,7 +1085,7 @@ impl State {
     /// At the first/last page it raises a toast and returns `false`; while the
     /// current page is still decoding in step mode it just returns `false`.
     fn step(&mut self, dir: i64) -> bool {
-        let Some(src) = &self.source else { return false };
+        let Some(src) = &self.reader.source else { return false };
         let len = src.len();
         if len == 0 {
             return false;
@@ -1152,19 +1095,19 @@ impl State {
         // skipping past it. "Jump" skips ahead for fast long-distance seeks. A
         // *failed* page never lands in the cache, so allow stepping past it —
         // otherwise next/prev gets stuck on an unopenable page.
-        if !self.jump {
-            let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
-            if !self.cache.contains(cur) && !self.failed.contains_key(&cur) {
+        if !self.reader.jump {
+            let cur = layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
+            if !self.reader.cache.contains(cur) && !self.reader.failed.contains_key(&cur) {
                 return false;
             }
         }
         let next = if dir > 0 {
-            layout::next_view(self.layout, self.index, len, self.spread_offset)
+            layout::next_view(self.reader.layout, self.reader.index, len, self.reader.spread_offset)
         } else {
-            layout::prev_view(self.layout, self.index, len, self.spread_offset)
+            layout::prev_view(self.reader.layout, self.reader.index, len, self.reader.spread_offset)
         };
-        if next != self.index {
-            self.nav_times.push_back(Instant::now());
+        if next != self.reader.index {
+            self.reader.nav_times.push_back(Instant::now());
             self.goto(next);
             true
         } else {
@@ -1175,10 +1118,10 @@ impl State {
     }
 
     fn goto(&mut self, index: usize) {
-        self.index = index;
-        self.pan_x = 0.0;
-        self.pan_y = 0.0; // start new page centered
-        self.top_offset = 0.0;
+        self.reader.index = index;
+        self.reader.pan_x = 0.0;
+        self.reader.pan_y = 0.0; // start new page centered
+        self.reader.top_offset = 0.0;
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), index);
         }
@@ -1249,7 +1192,7 @@ impl State {
 
     fn persist(&mut self) {
         if let Some(k) = &self.volume_key {
-            self.settings.last_pages.insert(k.clone(), self.index);
+            self.settings.last_pages.insert(k.clone(), self.reader.index);
         }
         // Save geometry + the current maximized flag. `win_geom` already holds the
         // restored rect (it's only updated while normal), so an un-maximize after
@@ -1283,7 +1226,7 @@ impl State {
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
     /// the page already fits.
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             let dy_px = match delta {
                 MouseScrollDelta::LineDelta(_, y) => y * SCROLL_WHEEL_PX,
                 MouseScrollDelta::PixelDelta(p) => p.y as f32,
@@ -1310,52 +1253,52 @@ impl State {
         // page stops there instead of immediately jumping to the next page — you
         // have to keep scrolling past the stop to advance. Only reset the pan when
         // a flip actually happened (else the first/last page snaps to its edge).
-        let sh = self.viewport.h.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
         let maxp = ((self.current_display_h() - sh) / 2.0).max(0.0);
-        let cur = self.pan_y.clamp(-maxp, maxp);
+        let cur = self.reader.pan_y.clamp(-maxp, maxp);
         let next = cur + dy * 80.0;
         let now = Instant::now();
         // True once we've been parked at an edge long enough that a further
         // scroll should flip (the hard stop the user has to keep scrolling past).
-        let dwelt = self.pan_edge_at.is_some_and(|t| now.duration_since(t) >= EDGE_DWELL);
+        let dwelt = self.reader.pan_edge_at.is_some_and(|t| now.duration_since(t) >= EDGE_DWELL);
         if next > maxp + 0.5 {
             if cur >= maxp - 0.5 {
                 // Parked at the top: flip to the previous page only after dwelling.
                 if dwelt {
-                    self.pan_edge_at = None;
-                    self.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
+                    self.reader.pan_edge_at = None;
+                    self.reader.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
                 } else {
-                    self.pan_y = maxp; // hold the stop
-                    self.pan_edge_at.get_or_insert(now);
+                    self.reader.pan_y = maxp; // hold the stop
+                    self.reader.pan_edge_at.get_or_insert(now);
                 }
             } else {
-                self.pan_y = maxp; // just reached the top edge -> park + start dwell
-                self.pan_edge_at = Some(now);
+                self.reader.pan_y = maxp; // just reached the top edge -> park + start dwell
+                self.reader.pan_edge_at = Some(now);
             }
         } else if next < -maxp - 0.5 {
             if cur <= -maxp + 0.5 {
                 // Parked at the bottom: flip to the next page only after dwelling.
                 if dwelt {
-                    self.pan_edge_at = None;
-                    self.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
+                    self.reader.pan_edge_at = None;
+                    self.reader.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
                 } else {
-                    self.pan_y = -maxp; // hold the stop
-                    self.pan_edge_at.get_or_insert(now);
+                    self.reader.pan_y = -maxp; // hold the stop
+                    self.reader.pan_edge_at.get_or_insert(now);
                 }
             } else {
-                self.pan_y = -maxp; // just reached the bottom edge -> park + start dwell
-                self.pan_edge_at = Some(now);
+                self.reader.pan_y = -maxp; // just reached the bottom edge -> park + start dwell
+                self.reader.pan_edge_at = Some(now);
             }
         } else {
-            self.pan_y = next;
-            self.pan_edge_at = None; // panning within the page
+            self.reader.pan_y = next;
+            self.reader.pan_edge_at = None; // panning within the page
         }
     }
 
     /// A clean click: the left/right edge strips flip pages; the wide middle
     /// does nothing on a single click but toggles fullscreen on a double-click.
     fn on_click(&mut self) {
-        let w = self.viewport.w.max(1) as f64;
+        let w = self.reader.viewport.w.max(1) as f64;
         let edge = (w * EDGE_FRAC as f64).max(1.0);
         if self.cursor_x < edge {
             self.last_mid_click = None;
@@ -1387,15 +1330,15 @@ impl State {
             return;
         }
         self.drag_dist += dx.abs() + dy.abs();
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             // Grab the strip: pan horizontally, scroll vertically.
-            self.pan_x += dx;
-            self.top_offset -= dy;
+            self.reader.pan_x += dx;
+            self.reader.top_offset -= dy;
             self.clamp_pan();
             self.normalize();
         } else {
-            self.pan_x += dx;
-            self.pan_y += dy;
+            self.reader.pan_x += dx;
+            self.reader.pan_y += dy;
             self.clamp_pan();
         }
     }
@@ -1416,11 +1359,11 @@ impl State {
 
     /// Does the current page overflow the window vertically under the active fit?
     fn current_overflows(&self) -> bool {
-        let Some(pt) = self.cache.get(self.index) else {
+        let Some(pt) = self.reader.cache.get(self.reader.index) else {
             return false;
         };
-        let (sw, sh) = (self.viewport.w.max(1) as f32, self.viewport.h.max(1) as f32);
-        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32) * self.zoom;
+        let (sw, sh) = (self.reader.viewport.w.max(1) as f32, self.reader.viewport.h.max(1) as f32);
+        let s = fit_scale(self.reader.fit, sw, sh, pt.w as f32, pt.h as f32) * self.reader.zoom;
         pt.h as f32 * s > sh + 0.5
     }
 
@@ -1428,22 +1371,22 @@ impl State {
     /// page can't pull away from the viewport edge when larger than it.
     fn vertical_top(&self, dh: f32, sh: f32) -> f32 {
         let maxp = ((dh - sh) / 2.0).max(0.0);
-        (sh - dh) / 2.0 + self.pan_y.clamp(-maxp, maxp)
+        (sh - dh) / 2.0 + self.reader.pan_y.clamp(-maxp, maxp)
     }
 
     /// Left edge (screen px): centered, then panned by `pan_x`, clamped.
     fn horizontal_left(&self, dw: f32, sw: f32) -> f32 {
         let maxp = ((dw - sw) / 2.0).max(0.0);
-        (sw - dw) / 2.0 + self.pan_x.clamp(-maxp, maxp)
+        (sw - dw) / 2.0 + self.reader.pan_x.clamp(-maxp, maxp)
     }
 
     /// Displayed height of the current page under the active fit + zoom.
     fn current_display_h(&self) -> f32 {
-        let sw = self.viewport.w.max(1) as f32;
-        let sh = self.viewport.h.max(1) as f32;
-        match self.cache.get(self.index) {
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
+        match self.reader.cache.get(self.reader.index) {
             Some(t) => {
-                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
+                t.h as f32 * fit_scale(self.reader.fit, sw, sh, t.w as f32, t.h as f32) * self.reader.zoom
             }
             None => sh,
         }
@@ -1454,20 +1397,20 @@ impl State {
     /// (current fit/zoom) and `fit_native_pct` (an arbitrary fit at zoom 1). `None`
     /// in scroll mode (no facing-pair layout) or before the anchor is decoded.
     fn anchor_metrics(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             return None;
         }
-        let sw = self.viewport.w.max(1) as f32;
-        let sh = self.viewport.h.max(1) as f32;
-        let len = self.source.as_ref()?.len();
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
+        let len = self.reader.source.as_ref()?.len();
         if len == 0 {
             return None;
         }
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ta = self.cache.get(a)?;
+        let (a, b) = layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset);
+        let ta = self.reader.cache.get(a)?;
         // Wide (landscape) page is shown alone; otherwise pair with `b` if ready.
         let force_single = ta.w > ta.h;
-        let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
+        let tb = if force_single { None } else { b.and_then(|bi| self.reader.cache.get(bi)) };
         let (fit_w, fit_h, dec_h) = match tb {
             Some(tb) => {
                 let h_ref = ta.h.max(tb.h) as f32;
@@ -1484,20 +1427,20 @@ impl State {
     /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
     /// isn't decoded yet.
     fn anchor_scale(&self) -> Option<f32> {
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             // Strip pages are laid out at width = sw * zoom (height follows aspect).
-            let sw = self.viewport.w.max(1) as f32;
-            let t = self.cache.get(self.index)?;
-            return Some(sw * self.zoom / t.src_w.max(1) as f32);
+            let sw = self.reader.viewport.w.max(1) as f32;
+            let t = self.reader.cache.get(self.reader.index)?;
+            return Some(sw * self.reader.zoom / t.src_w.max(1) as f32);
         }
         let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
         Some(anchor_native_scale(
-            self.fit,
+            self.reader.fit,
             (sw, sh),
             (fit_w, fit_h),
             dec_h,
             src_h,
-            self.zoom,
+            self.reader.zoom,
         ))
     }
 
@@ -1514,7 +1457,7 @@ impl State {
     /// renderer draws, so it tracks fit-to-window upscaling and facing pairs
     /// exactly. Falls back to the raw factor while the anchor isn't decoded.
     fn effective_zoom_pct(&self) -> f32 {
-        let scale = self.anchor_scale().unwrap_or(self.zoom);
+        let scale = self.anchor_scale().unwrap_or(self.reader.zoom);
         (scale * 100.0).max(0.0)
     }
 
@@ -1525,14 +1468,14 @@ impl State {
     /// only ever valid as a transient while a re-decode is in flight). `None` before
     /// the anchor is decoded.
     fn gpu_sample_scale(&self) -> Option<f32> {
-        if self.scroll_mode {
-            let t = self.cache.get(self.index)?;
-            let sw = self.viewport.w.max(1) as f32;
-            return Some(sw * self.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
+        if self.reader.scroll_mode {
+            let t = self.reader.cache.get(self.reader.index)?;
+            let sw = self.reader.viewport.w.max(1) as f32;
+            return Some(sw * self.reader.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
         }
         // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
         let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        let native = anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
+        let native = anchor_native_scale(self.reader.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.reader.zoom);
         Some(native * src_h / dec_h.max(1.0))
     }
 
@@ -1545,17 +1488,17 @@ impl State {
     /// `!pending && scale < 1` is the only genuine single-resize-invariant violation
     /// (decoded at the intended target, yet the GPU still has to shrink it).
     fn anchor_resize_state(&self) -> Option<(&'static str, f32, bool)> {
-        let src = self.source.as_ref()?;
+        let src = self.reader.source.as_ref()?;
         let len = src.len();
         if len == 0 {
             return None;
         }
-        let anchor = if self.scroll_mode {
-            self.index
+        let anchor = if self.reader.scroll_mode {
+            self.reader.index
         } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
         };
-        let t = self.cache.get(anchor)?;
+        let t = self.reader.cache.get(anchor)?;
         let s = self.gpu_sample_scale()?;
         let pending = t.target_h != self.page_target_h(anchor);
         Some((t.path.label(), s, pending))
@@ -1585,16 +1528,16 @@ impl State {
     /// transients (a fresh page still at its prefetch-guessed size, a zoom/resize not
     /// yet settled) are expected and are not warned.
     fn update_resize_readout(&mut self) {
-        let stuck = !self.scroll_mode
+        let stuck = !self.reader.scroll_mode
             && matches!(self.anchor_resize_state(), Some((_, s, pending)) if !pending && s < 0.99);
-        if stuck && !self.gpu_downscale_warned {
+        if stuck && !self.reader.gpu_downscale_warned {
             eprintln!(
                 "yosh: WARNING — view at its decode target is still GPU-downscaling (single-resize invariant violated): {}",
                 self.resize_path_label()
             );
-            self.gpu_downscale_warned = true;
+            self.reader.gpu_downscale_warned = true;
         } else if !stuck {
-            self.gpu_downscale_warned = false;
+            self.reader.gpu_downscale_warned = false;
         }
         self.ui.resize_path = self.resize_path_label();
     }
@@ -1607,10 +1550,10 @@ impl State {
         let mut ladder = zoom_presets();
         let (lo, hi) = (MIN_ZOOM_PCT * 100.0, MAX_ZOOM_PCT * 100.0);
         let mut stops: Vec<f32> = Vec::new();
-        if self.scroll_mode {
-            if let Some(t) = self.cache.get(self.index) {
-                let sw = self.viewport.w.max(1) as f32;
-                let sh = self.viewport.h.max(1) as f32;
+        if self.reader.scroll_mode {
+            if let Some(t) = self.reader.cache.get(self.reader.index) {
+                let sw = self.reader.viewport.w.max(1) as f32;
+                let sh = self.reader.viewport.h.max(1) as f32;
                 stops.push(sw / t.src_w.max(1) as f32 * 100.0); // fit width (strip @ zoom 1)
                 stops.push(sh / t.src_h.max(1) as f32 * 100.0); // fit window (height fills)
             }
@@ -1647,7 +1590,7 @@ impl State {
             let ladder = self.zoom_ladder();
             let target = next_zoom_preset(&ladder, cur, zoom_in);
             // Tag the stop if it is this page's fit-to-window / fit-to-width level.
-            if !self.scroll_mode {
+            if !self.reader.scroll_mode {
                 let near = |p: Option<f32>| p.is_some_and(|p| (p - target).abs() <= target * 1e-3);
                 if near(self.fit_native_pct(FitMode::Window)) {
                     label = Some("Fit window");
@@ -1655,10 +1598,10 @@ impl State {
                     label = Some("Fit width");
                 }
             }
-            self.zoom *= target / cur; // rescale the fit-multiplier to hit target %
+            self.reader.zoom *= target / cur; // rescale the fit-multiplier to hit target %
         } else {
             // Anchor not decoded yet: coarse step; the next press snaps once it lands.
-            self.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
+            self.reader.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
         }
         self.clamp_zoom_native();
         self.clamp_pan();
@@ -1672,12 +1615,12 @@ impl State {
     }
 
     fn clamp_zoom_native(&mut self) {
-        if self.zoom > 0.0
+        if self.reader.zoom > 0.0
             && let Some(s) = self.anchor_scale()
         {
-            let base = s / self.zoom;
+            let base = s / self.reader.zoom;
             if base > 0.0 {
-                self.zoom = clamp_zoom_multiplier(self.zoom, base);
+                self.reader.zoom = clamp_zoom_multiplier(self.reader.zoom, base);
             }
         }
     }
@@ -1685,28 +1628,28 @@ impl State {
     /// Clamp stored pan to the current page's overflow so dragging/zooming can't
     /// strand the view in an empty region.
     fn clamp_pan(&mut self) {
-        let sw = self.viewport.w.max(1) as f32;
-        let sh = self.viewport.h.max(1) as f32;
-        if self.scroll_mode {
-            let cw = sw * self.zoom;
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
+        if self.reader.scroll_mode {
+            let cw = sw * self.reader.zoom;
             let mx = ((cw - sw) / 2.0).max(0.0);
-            self.pan_x = self.pan_x.clamp(-mx, mx);
+            self.reader.pan_x = self.reader.pan_x.clamp(-mx, mx);
             return;
         }
-        if let Some(t) = self.cache.get(self.index) {
+        if let Some(t) = self.reader.cache.get(self.reader.index) {
             // Match single_quad's rotated bounding box so pan clamps to the
             // displayed (possibly turned) page, not the source orientation.
-            let single = self.layout == Layout::Single || t.w > t.h;
-            let (ew, eh) = if single && self.rotation % 2 == 1 {
+            let single = self.reader.layout == Layout::Single || t.w > t.h;
+            let (ew, eh) = if single && self.reader.rotation % 2 == 1 {
                 (t.h as f32, t.w as f32)
             } else {
                 (t.w as f32, t.h as f32)
             };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            let s = fit_scale(self.reader.fit, sw, sh, ew, eh) * self.reader.zoom;
             let mx = ((ew * s - sw) / 2.0).max(0.0);
             let my = ((eh * s - sh) / 2.0).max(0.0);
-            self.pan_x = self.pan_x.clamp(-mx, mx);
-            self.pan_y = self.pan_y.clamp(-my, my);
+            self.reader.pan_x = self.reader.pan_x.clamp(-mx, mx);
+            self.reader.pan_y = self.reader.pan_y.clamp(-my, my);
         }
     }
 
@@ -1715,24 +1658,24 @@ impl State {
         // shader then turns the texture inside this (rotated) bounding box. The box
         // dimensions stay whole texels at the fit scale, so 1:1 sampling holds (the
         // decode target in `page_target_h` is rotation-aware to match).
-        let (dw, dh) = if self.fit == FitMode::Actual {
+        let (dw, dh) = if self.reader.fit == FitMode::Actual {
             // 1:1: size from the *source* dims × zoom, not the decoded dims, so the
             // displayed box is the same native size whether the texture is full res
             // (zoom ≥ 1) or re-decoded smaller for zoom-out — the latter then samples
             // 1:1 instead of the GPU bilinear-downscaling a full-res texture.
-            let (nw, nh) = if self.rotation % 2 == 1 {
+            let (nw, nh) = if self.reader.rotation % 2 == 1 {
                 (t.src_h as f32, t.src_w as f32)
             } else {
                 (t.src_w as f32, t.src_h as f32)
             };
-            (nw * self.zoom, nh * self.zoom)
+            (nw * self.reader.zoom, nh * self.reader.zoom)
         } else {
-            let (ew, eh) = if self.rotation % 2 == 1 {
+            let (ew, eh) = if self.reader.rotation % 2 == 1 {
                 (t.h as f32, t.w as f32)
             } else {
                 (t.w as f32, t.h as f32)
             };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            let s = fit_scale(self.reader.fit, sw, sh, ew, eh) * self.reader.zoom;
             (ew * s, eh * s)
         };
         // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
@@ -1748,29 +1691,29 @@ impl State {
             dh.round(),
             sw,
             sh,
-            self.rotation as u32,
+            self.reader.rotation as u32,
         )
     }
 
     /// Compute the quads to draw this frame (1 for single/last-held, 2 for a
     /// ready spread). Only includes pages present in the cache.
     fn build_quads(&self) -> Vec<Quad> {
-        let Some(src) = &self.source else {
+        let Some(src) = &self.reader.source else {
             return Vec::new();
         };
         let len = src.len();
         if len == 0 {
             return Vec::new();
         }
-        let sw = self.viewport.w.max(1) as f32;
-        let sh = self.viewport.h.max(1) as f32;
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
 
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ta = self.cache.get(a);
+        let (a, b) = layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset);
+        let ta = self.reader.cache.get(a);
         // Wide (landscape) page is a double-spread image → show it alone.
         let force_single = ta.map_or(false, |t| t.w > t.h);
         let b = if force_single { None } else { b };
-        let tb = b.and_then(|bi| self.cache.get(bi).map(|t| (bi, t)));
+        let tb = b.and_then(|bi| self.reader.cache.get(bi).map(|t| (bi, t)));
 
         match (ta, tb) {
             (Some(ta), Some((bi, tb))) => {
@@ -1786,11 +1729,11 @@ impl State {
                 let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
                 let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
                 let combined_w = wa + wb;
-                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref) * self.zoom;
+                let s = fit_scale(self.reader.fit, sw, sh, combined_w, h_ref) * self.reader.zoom;
                 let x0 = self.horizontal_left(combined_w * s, sw);
                 let dh = h_ref * s;
                 // Screen order: LTR puts the lower index on the left; RTL reverses.
-                let (l_idx, wl, r_idx, wr) = match self.direction {
+                let (l_idx, wl, r_idx, wr) = match self.reader.direction {
                     Direction::Ltr => (a, wa, bi, wb),
                     Direction::Rtl => (bi, wb, a, wa),
                 };
@@ -1809,8 +1752,8 @@ impl State {
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
             _ => {
                 // Anchor not decoded yet: hold the last-drawn page if still cached.
-                if let Some(li) = self.last_drawn
-                    && let Some(t) = self.cache.get(li)
+                if let Some(li) = self.reader.last_drawn
+                    && let Some(t) = self.reader.cache.get(li)
                 {
                     return vec![self.single_quad(li, t, sw, sh)];
                 }
@@ -1820,29 +1763,29 @@ impl State {
     }
 
     fn page_display_h(&self, i: usize, sw: f32) -> f32 {
-        let cw = sw * self.zoom; // strip content width (zoomable)
-        match self.cache.get(i) {
+        let cw = sw * self.reader.zoom; // strip content width (zoomable)
+        match self.reader.cache.get(i) {
             Some(t) => cw * (t.h as f32 / t.w as f32),
-            None => cw * self.est_aspect,
+            None => cw * self.reader.est_aspect,
         }
     }
 
     fn scroll_by(&mut self, dy: f32) {
-        let len = match &self.source {
+        let len = match &self.reader.source {
             Some(s) => s.len(),
             None => return,
         };
-        let before = self.index;
-        let before_off = self.top_offset;
-        self.top_offset += dy;
+        let before = self.reader.index;
+        let before_off = self.reader.top_offset;
+        self.reader.top_offset += dy;
         self.normalize();
-        if self.index != before {
-            self.nav_times.push_back(Instant::now());
-        } else if dy.abs() > 0.5 && (self.top_offset - before_off).abs() < 0.5 {
+        if self.reader.index != before {
+            self.reader.nav_times.push_back(Instant::now());
+        } else if dy.abs() > 0.5 && (self.reader.top_offset - before_off).abs() < 0.5 {
             // The strip didn't move despite a scroll — clamped at an end.
-            if dy < 0.0 && self.index == 0 && self.top_offset <= 0.5 {
+            if dy < 0.0 && self.reader.index == 0 && self.reader.top_offset <= 0.5 {
                 self.toast("First page");
-            } else if dy > 0.0 && self.index + 1 >= len {
+            } else if dy > 0.0 && self.reader.index + 1 >= len {
                 self.toast("Last page");
             }
         }
@@ -1852,60 +1795,60 @@ impl State {
     /// Keep (index, top_offset) in range using best-known page heights, so the
     /// anchor stays valid as nearby pages decode (and their real heights land).
     fn normalize(&mut self) {
-        let len = match &self.source {
+        let len = match &self.reader.source {
             Some(s) => s.len(),
             None => return,
         };
         if len == 0 {
             return;
         }
-        let sw = self.viewport.w.max(1) as f32;
-        while self.index + 1 < len {
-            let h = self.page_display_h(self.index, sw);
-            if self.top_offset >= h {
-                self.top_offset -= h;
-                self.index += 1;
+        let sw = self.reader.viewport.w.max(1) as f32;
+        while self.reader.index + 1 < len {
+            let h = self.page_display_h(self.reader.index, sw);
+            if self.reader.top_offset >= h {
+                self.reader.top_offset -= h;
+                self.reader.index += 1;
             } else {
                 break;
             }
         }
-        while self.top_offset < 0.0 && self.index > 0 {
-            self.index -= 1;
-            self.top_offset += self.page_display_h(self.index, sw);
+        while self.reader.top_offset < 0.0 && self.reader.index > 0 {
+            self.reader.index -= 1;
+            self.reader.top_offset += self.page_display_h(self.reader.index, sw);
         }
-        if self.index == 0 && self.top_offset < 0.0 {
-            self.top_offset = 0.0;
+        if self.reader.index == 0 && self.reader.top_offset < 0.0 {
+            self.reader.top_offset = 0.0;
         }
-        if self.index + 1 >= len {
-            let vh = self.viewport.h as f32;
+        if self.reader.index + 1 >= len {
+            let vh = self.reader.viewport.h as f32;
             let max_off = (self.page_display_h(len - 1, sw) - vh).max(0.0);
-            if self.top_offset > max_off {
-                self.top_offset = max_off;
+            if self.reader.top_offset > max_off {
+                self.reader.top_offset = max_off;
             }
         }
     }
 
     /// Build the visible vertical-strip quads (width-fit, stacked top to bottom).
     fn build_scroll_quads(&self) -> Vec<Quad> {
-        let Some(src) = &self.source else {
+        let Some(src) = &self.reader.source else {
             return Vec::new();
         };
         let len = src.len();
         if len == 0 {
             return Vec::new();
         }
-        let sw = self.viewport.w.max(1) as f32;
-        let sh = self.viewport.h.max(1) as f32;
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
         let mut quads = Vec::new();
-        let cw = sw * self.zoom; // strip width (zoom); centered with horizontal pan
+        let cw = sw * self.reader.zoom; // strip width (zoom); centered with horizontal pan
         let x = self.horizontal_left(cw, sw);
-        let mut y = -self.top_offset;
-        let mut i = self.index;
+        let mut y = -self.reader.top_offset;
+        let mut i = self.reader.index;
         let mut slot = 0;
         while i < len && y < sh && slot < MAX_QUADS {
             let dh = self.page_display_h(i, sw);
             if y + dh > 0.0 {
-                if self.cache.get(i).is_some() {
+                if self.reader.cache.get(i).is_some() {
                     quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
                     slot += 1;
                 }
@@ -1939,7 +1882,7 @@ impl State {
             // Library thumbnail (registered with egui, not stored in the page
             // cache) — its decode-target stamp is unused, so pass 0.
             let pt =
-                PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.tex_pool, 0);
+                PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.reader.tex_pool, 0);
             let id = self.egui_renderer.register_native_texture(
                 &self.gpu.device,
                 &pt.view,
@@ -1953,14 +1896,14 @@ impl State {
     /// Forward look-ahead distance, widened when flipping quickly.
     fn dynamic_fwd(&mut self) -> usize {
         let now = Instant::now();
-        while let Some(&t) = self.nav_times.front() {
+        while let Some(&t) = self.reader.nav_times.front() {
             if now.duration_since(t) > Duration::from_millis(800) {
-                self.nav_times.pop_front();
+                self.reader.nav_times.pop_front();
             } else {
                 break;
             }
         }
-        (FWD + self.nav_times.len() * 4).min(FWD_MAX)
+        (FWD + self.reader.nav_times.len() * 4).min(FWD_MAX)
     }
 
     /// Begin opening `path`. The source is built on a background thread (see
@@ -1983,42 +1926,42 @@ impl State {
     fn set_source(&mut self, source: Arc<dyn PageSource>, path: &Path, start: Option<usize>) {
         // Persist the previous volume's position before switching.
         if let Some(k) = self.volume_key.take() {
-            self.settings.last_pages.insert(k, self.index);
+            self.settings.last_pages.insert(k, self.reader.index);
         }
         let key = path.to_string_lossy().into_owned();
-        self.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
+        self.reader.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
         // Explicit start (e.g. a specific dropped image) wins; else CLI start
         // index; else the saved position.
         let idx = match start {
             Some(i) => i,
             None => {
                 let resume = self.settings.last_pages.get(&key).copied().unwrap_or(0);
-                if self.start_index > 0 {
-                    self.start_index
+                if self.reader.start_index > 0 {
+                    self.reader.start_index
                 } else {
                     resume
                 }
             }
         };
-        self.start_index = 0;
+        self.reader.start_index = 0;
 
-        self.pool = Some(DecodePool::new(
+        self.reader.pool = Some(DecodePool::new(
             source.clone(),
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
-            self.tex_pool.clone(),
+            self.reader.tex_pool.clone(),
             WORKERS,
         ));
-        self.cache.clear();
-        self.failed.clear();
-        self.last_drawn = None;
+        self.reader.cache.clear();
+        self.reader.failed.clear();
+        self.reader.last_drawn = None;
         self.info_for = None;
-        self.nav_times.clear();
-        self.rotation = 0; // each volume opens upright
-        self.index = idx.min(source.len() - 1);
+        self.reader.nav_times.clear();
+        self.reader.rotation = 0; // each volume opens upright
+        self.reader.index = idx.min(source.len() - 1);
         self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
-        self.source = Some(source);
+        self.reader.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
         self.prefetch();
         // Warm the sibling-volume list for this folder in the background, so the
@@ -2049,26 +1992,26 @@ impl State {
     /// direction) at once, leave scroll, reset zoom/pan, re-anchor the spread
     /// pairing, persist, and refresh the prefetch window.
     fn apply_view(&mut self, fit: FitMode, spread: bool, dir: Option<Direction>) {
-        self.scroll_mode = false;
-        self.fit = fit;
-        self.layout = if spread { Layout::Spread } else { Layout::Single };
+        self.reader.scroll_mode = false;
+        self.reader.fit = fit;
+        self.reader.layout = if spread { Layout::Spread } else { Layout::Single };
         if let Some(d) = dir {
-            self.direction = d;
+            self.reader.direction = d;
         }
-        self.index = layout::view_start(self.layout, self.index, self.spread_offset);
-        self.zoom = 1.0;
-        self.pan_x = 0.0;
-        self.pan_y = 0.0;
-        self.settings.fit = fit_to_u8(self.fit);
-        self.settings.layout_spread = self.layout == Layout::Spread;
-        self.settings.direction_rtl = self.direction == Direction::Rtl;
+        self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+        self.reader.zoom = 1.0;
+        self.reader.pan_x = 0.0;
+        self.reader.pan_y = 0.0;
+        self.settings.fit = fit_to_u8(self.reader.fit);
+        self.settings.layout_spread = self.reader.layout == Layout::Spread;
+        self.settings.direction_rtl = self.reader.direction == Direction::Rtl;
         self.settings.scroll = false;
         config::save(&self.settings);
         self.prefetch();
         // Tell the user what the preset just switched to (presets change fit +
         // layout + maybe direction at once, so summarize the resulting view).
         let view_label = if spread {
-            format!("Spread, {}", self.direction.label())
+            format!("Spread, {}", self.reader.direction.label())
         } else {
             let f = match fit {
                 FitMode::Window => "Fit window",
@@ -2085,7 +2028,7 @@ impl State {
     /// once and probes the header for resolution + format. Only called on a page
     /// change while the overlay is open, so the extra read is cheap.
     fn build_page_info(&self, index: usize) -> Vec<(String, String)> {
-        let Some(src) = &self.source else {
+        let Some(src) = &self.reader.source else {
             return Vec::new();
         };
         let name = src.name(index).to_string();
@@ -2128,13 +2071,13 @@ impl State {
     /// target before the page itself is decoded (exact for the usual uniform-size
     /// volume; corrected in place once the page's own dimensions are known).
     fn page_aspect(&self, index: usize) -> f32 {
-        if let Some(t) = self.cache.get(index) {
+        if let Some(t) = self.reader.cache.get(index) {
             return t.src_w as f32 / t.src_h.max(1) as f32;
         }
-        if let Some(t) = self.cache.get(self.index) {
+        if let Some(t) = self.reader.cache.get(self.reader.index) {
             return t.src_w as f32 / t.src_h.max(1) as f32;
         }
-        1.0 / self.est_aspect.max(0.01) // est_aspect is h / w
+        1.0 / self.reader.est_aspect.max(0.01) // est_aspect is h / w
     }
 
     /// The *exact* decode target (on-screen displayed pixel height) for page
@@ -2154,7 +2097,7 @@ impl State {
         // hold. (`target_dims` still caps at the source height, so it never upscales.)
         let max_dim = yosh_engine::decode::MAX_TEX_DIM.load(std::sync::atomic::Ordering::Relaxed);
         let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(MIN_TARGET);
-        if self.fit == FitMode::Actual && !self.scroll_mode {
+        if self.reader.fit == FitMode::Actual && !self.reader.scroll_mode {
             // 1:1 displays at native × zoom. Target that height so the page decodes
             // to its *shown* size: `target_dims` caps at the source height, so
             // zoom ≥ 1 keeps full res (magnification GPU-upscales, the one allowed
@@ -2162,34 +2105,34 @@ impl State {
             // the reduction and the GPU samples 1:1 (no bilinear-downscale moiré).
             // (Rotation-independent: a 90° turn swaps which screen edge the texture
             // height maps to, but the target works out to src_h × zoom either way.)
-            return match self.cache.get(index) {
+            return match self.reader.cache.get(index) {
                 Some(t) => {
-                    ((t.src_h as f32 * self.zoom).round() as u32).clamp(MIN_TARGET, max_h)
+                    ((t.src_h as f32 * self.reader.zoom).round() as u32).clamp(MIN_TARGET, max_h)
                 }
                 None => u32::MAX, // native size unknown yet: decode full, re-decode once cached
             };
         }
-        let sw = self.viewport.w.max(1) as f32;
-        let sh = self.viewport.h.max(1) as f32;
-        let target = if self.scroll_mode {
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
+        let target = if self.reader.scroll_mode {
             // Continuous strip: width-fit at width sw*zoom, height follows aspect.
-            sw * self.zoom / aspect
+            sw * self.reader.zoom / aspect
         } else {
             // A page is drawn alone when layout is Single or it's a wide
             // (landscape) page that force-shows alone — only then does rotation
             // apply. `content_aspect` is the on-screen box's width/height.
-            let single = self.layout == Layout::Single || aspect > 1.0;
-            let rotated = single && self.rotation % 2 == 1;
+            let single = self.reader.layout == Layout::Single || aspect > 1.0;
+            let rotated = single && self.reader.rotation % 2 == 1;
             let content_aspect = if rotated {
                 1.0 / aspect // rotated single page: box is the inverse of the source
-            } else if self.layout == Layout::Spread && aspect <= 1.0 {
+            } else if self.reader.layout == Layout::Spread && aspect <= 1.0 {
                 // Pair two non-wide pages (assume a same-size facing page — exact
                 // for uniform volumes; wide pages always show alone).
                 aspect * 2.0
             } else {
                 aspect
             };
-            let box_h = fit_scale(self.fit, sw, sh, content_aspect, 1.0) * self.zoom;
+            let box_h = fit_scale(self.reader.fit, sw, sh, content_aspect, 1.0) * self.reader.zoom;
             // Decode target = the texture height that draws 1:1. For a rotated
             // single page the texture's height lands along the screen *width*, so
             // the target is the box width (box_h * content_aspect); else box height.
@@ -2205,9 +2148,9 @@ impl State {
     /// in place (no black frame). Page-flipping leaves the view settled, so it
     /// never re-decodes.
     fn update_decode_view(&mut self) {
-        let desired = (self.viewport.w, self.viewport.h, self.zoom);
-        self.view_settled = desired == self.pending_view;
-        self.pending_view = desired;
+        let desired = (self.reader.viewport.w, self.reader.viewport.h, self.reader.zoom);
+        self.reader.view_settled = desired == self.reader.pending_view;
+        self.reader.pending_view = desired;
     }
 
     /// Recompute the prefetch window and hand it to the pool with each page's exact
@@ -2216,23 +2159,23 @@ impl State {
     /// then it re-decodes at the new resolution and overwrites in place.
     fn prefetch(&mut self) {
         let fwd = self.dynamic_fwd();
-        let settled = self.view_settled;
-        let Some(src) = &self.source else {
+        let settled = self.reader.view_settled;
+        let Some(src) = &self.reader.source else {
             return;
         };
         let len = src.len();
-        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, BACK)
+        let jobs: Vec<(usize, u32)> = desired_window(self.reader.index, len, fwd, BACK)
             .into_iter()
-            .filter(|i| !self.failed.contains_key(i))
+            .filter(|i| !self.reader.failed.contains_key(i))
             .filter_map(|i| {
                 let want = self.page_target_h(i);
-                match self.cache.get(i) {
+                match self.reader.cache.get(i) {
                     None => Some((i, want)),
                     Some(p) => (settled && p.target_h != want).then_some((i, want)),
                 }
             })
             .collect();
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = &self.reader.pool {
             pool.set_jobs(jobs);
         }
     }
@@ -2243,13 +2186,13 @@ impl State {
         if self.library_view {
             return None;
         }
-        let len = self.source.as_ref()?.len();
-        let anchor = if self.scroll_mode {
-            self.index
+        let len = self.reader.source.as_ref()?.len();
+        let anchor = if self.reader.scroll_mode {
+            self.reader.index
         } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
         };
-        (self.cache.get(anchor)?.frame_count() > 1).then_some(anchor)
+        (self.reader.cache.get(anchor)?.frame_count() > 1).then_some(anchor)
     }
 
     /// Advance/refresh playback for the in-view animation and publish the panel's
@@ -2261,9 +2204,9 @@ impl State {
             self.ui.anim_show = false;
             return;
         };
-        let frames = self.cache.get(anchor).map_or(1, |t| t.frame_count());
+        let frames = self.reader.cache.get(anchor).map_or(1, |t| t.frame_count());
         // GIF/WebP auto-play; `.ico` layers are stepped manually (no play/pause).
-        let is_anim = self.cache.get(anchor).is_some_and(|t| t.is_animation());
+        let is_anim = self.reader.cache.get(anchor).is_some_and(|t| t.is_animation());
         // Rebind (and reset) when the viewed page changes.
         if self.playback.page != Some(anchor) {
             self.playback.page = Some(anchor);
@@ -2278,6 +2221,7 @@ impl State {
             // briefly lagged.
             loop {
                 let d = self
+                    .reader
                     .cache
                     .get(anchor)
                     .map_or(100, |t| t.frame_delay_ms(self.playback.frame))
@@ -2306,7 +2250,7 @@ impl State {
     }
 
     fn playback_frame_count(&self) -> usize {
-        self.playback.page.and_then(|p| self.cache.get(p)).map_or(1, |t| t.frame_count())
+        self.playback.page.and_then(|p| self.reader.cache.get(p)).map_or(1, |t| t.frame_count())
     }
 
     /// Step the animation by `d` frames (pauses playback; wraps around).
@@ -2336,7 +2280,7 @@ impl State {
         if self.library_view {
             return "Library - yosh".to_string();
         }
-        let Some(src) = &self.source else {
+        let Some(src) = &self.reader.source else {
             return "yosh".to_string();
         };
         let len = src.len();
@@ -2345,10 +2289,10 @@ impl State {
         }
         // The page actually shown (anchor): `index` in single/scroll, the first
         // page of the pair in a two-page spread.
-        let anchor = if self.scroll_mode {
-            self.index
+        let anchor = if self.reader.scroll_mode {
+            self.reader.index
         } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
         }
         .min(len - 1);
         let name = src.name(anchor);
@@ -2360,7 +2304,7 @@ impl State {
         // Native resolution of the shown page, Firefox-tab style. Pulled from the
         // decoded texture (`src_w`/`src_h` are pre-downscale source dims), so it
         // appears once the page lands and is empty while it's still decoding.
-        let res = match self.cache.get(anchor) {
+        let res = match self.reader.cache.get(anchor) {
             Some(t) if t.src_w > 0 && t.src_h > 0 => format!(" ({} × {})", t.src_w, t.src_h),
             _ => String::new(),
         };
@@ -2376,7 +2320,7 @@ impl State {
         // Mirror the live surface size into the reading viewport (the value the
         // reading math reads instead of `gpu.config`). Equal to `gpu.config` by
         // construction, so this is a no-op for behavior.
-        self.viewport = Viewport {
+        self.reader.viewport = Viewport {
             w: self.gpu.config.width,
             h: self.gpu.config.height,
         };
@@ -2385,15 +2329,15 @@ impl State {
         }
 
         // Drain finished decodes into the cache.
-        if let Some(pool) = &self.pool {
+        if let Some(pool) = &self.reader.pool {
             for msg in pool.poll() {
                 match msg {
                     Msg::Done { index, page } => {
-                        self.est_aspect = page.h as f32 / page.w as f32;
-                        self.cache.insert(index, page, self.index);
+                        self.reader.est_aspect = page.h as f32 / page.w as f32;
+                        self.reader.cache.insert(index, page, self.reader.index);
                     }
                     Msg::Failed { index, error } => {
-                        self.failed.insert(index, error);
+                        self.reader.failed.insert(index, error);
                     }
                 }
             }
@@ -2446,7 +2390,7 @@ impl State {
         // Debounce the decode view, so resize/zoom drags re-decode once on settle.
         self.update_decode_view();
         // Keep the scroll anchor valid as page heights resolve, then refresh work.
-        if self.scroll_mode {
+        if self.reader.scroll_mode {
             self.normalize();
         }
         self.prefetch();
@@ -2462,22 +2406,22 @@ impl State {
         // Decide what to draw this frame (library grid hides the page).
         let quads = if self.library_view {
             Vec::new()
-        } else if self.scroll_mode {
+        } else if self.reader.scroll_mode {
             self.build_scroll_quads()
         } else {
             self.build_quads()
         };
-        self.ui.dir_label = self.direction.label();
-        self.ui.fit_label = self.fit.label();
-        self.ui.layout_label = if self.scroll_mode {
+        self.ui.dir_label = self.reader.direction.label();
+        self.ui.fit_label = self.reader.fit.label();
+        self.ui.layout_label = if self.reader.scroll_mode {
             "scroll"
         } else {
-            self.layout.label()
+            self.reader.layout.label()
         };
         // Build the Tab info overlay text, reading the source once per page change.
-        if self.ui.info_open && !self.library_view && self.info_for != Some(self.index) {
-            self.ui.info = self.build_page_info(self.index);
-            self.info_for = Some(self.index);
+        if self.ui.info_open && !self.library_view && self.info_for != Some(self.reader.index) {
+            self.ui.info = self.build_page_info(self.reader.index);
+            self.info_for = Some(self.reader.index);
         }
         // Live view state for the overlays: current zoom % (shown in the info
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
@@ -2496,9 +2440,9 @@ impl State {
         self.ui.show_bar = !fullscreen || (self.cursor_y as f32) < reveal;
         // Edge hover arrows: only in page-flip reader mode, below the top bar,
         // while the cursor is inside the window.
-        let win_w = self.viewport.w.max(1) as f32;
+        let win_w = self.reader.viewport.w.max(1) as f32;
         let edge = win_w * EDGE_FRAC;
-        let in_reader = self.source.is_some() && !self.library_view && !self.scroll_mode;
+        let in_reader = self.reader.source.is_some() && !self.library_view && !self.reader.scroll_mode;
         let below_bar = (self.cursor_y as f32) >= reveal;
         let cx = self.cursor_x as f32;
         self.ui.hover_left = in_reader && self.cursor_in_window && below_bar && cx < edge;
@@ -2509,26 +2453,26 @@ impl State {
         // the reveal zone). Cleared here so it vanishes when no volume is open.
         self.ui.seek_show = false;
         self.ui.seek_hovered = false;
-        if let Some(src) = &self.source {
+        if let Some(src) = &self.reader.source {
             let len = src.len();
-            let anchor = if self.scroll_mode {
-                self.index
+            let anchor = if self.reader.scroll_mode {
+                self.reader.index
             } else {
-                layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+                layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
             };
-            let in_cache = self.cache.contains(anchor);
+            let in_cache = self.reader.cache.contains(anchor);
             // A page whose decode errored is in `failed`; treat it as not-loading so
             // we show a failure notice (file name + reason) instead of spinning.
             let fail_err: Option<String> =
-                if in_cache { None } else { self.failed.get(&anchor).cloned() };
+                if in_cache { None } else { self.reader.failed.get(&anchor).cloned() };
             let failed = fail_err.is_some();
             let loading = !in_cache && !failed;
             if in_cache {
-                self.last_drawn = Some(anchor);
+                self.reader.last_drawn = Some(anchor);
             }
             self.ui.status = format!(
                 "{}/{}{}{}",
-                self.index + 1,
+                self.reader.index + 1,
                 len,
                 if failed {
                     "  [failed]"
@@ -2537,7 +2481,7 @@ impl State {
                 } else {
                     ""
                 },
-                if self.jump { "  [jump]" } else { "  [step]" }
+                if self.reader.jump { "  [jump]" } else { "  [step]" }
             );
             self.ui.failed = fail_err.map(|reason| (src.name(anchor).to_string(), reason));
             // Show the centered spinner only after this page's decode has been
@@ -2558,11 +2502,11 @@ impl State {
                 self.loading_pending = None;
                 self.ui.loading = false;
             }
-            self.ui.seek_index = self.index;
+            self.ui.seek_index = self.reader.index;
             self.ui.seek_total = len;
-            self.ui.seek_rtl = self.direction == Direction::Rtl;
+            self.ui.seek_rtl = self.reader.direction == Direction::Rtl;
             self.ui.seek_style = ui::SeekbarStyle::Bar;
-            let win_h = self.viewport.h.max(1) as f32;
+            let win_h = self.reader.viewport.h.max(1) as f32;
             let near_bottom =
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
             self.ui.seek_show =
@@ -2579,7 +2523,7 @@ impl State {
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
-                self.cache.get(q.page_index).map(|t| {
+                self.reader.cache.get(q.page_index).map(|t| {
                     // The animation under user control shows its selected frame;
                     // any other animated page free-runs on the wall clock; stills
                     // return their sole view. Continuous redraw drives both.
@@ -2681,10 +2625,10 @@ impl State {
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
         if let Some(page) = self.ui.seek_request.take()
-            && let Some(src) = &self.source
+            && let Some(src) = &self.reader.source
         {
             let page = page.min(src.len().saturating_sub(1));
-            if page != self.index {
+            if page != self.reader.index {
                 self.goto(page);
             }
         }
