@@ -180,6 +180,9 @@ struct State {
     fit: FitMode,
     layout: Layout,
     spread_offset: usize, // spread pairing parity (0 or 1), per-volume
+    /// Page rotation in 90° CW steps (0..=3). Session-global, applied to
+    /// single-page draws only; reset to 0 when a new volume opens.
+    rotation: u8,
     zoom: f32,       // page-flip zoom factor (1.0 = fit)
     pan_x: f32,      // page-flip pan offset in screen px (from centered)
     pan_y: f32,
@@ -651,12 +654,48 @@ fn bind_exe_icon(window: &Window) {
     }
 }
 
+/// Open the OS file browser at `path`'s containing folder and select `path`.
+/// On Windows this uses `SHOpenFolderAndSelectItems`, which reuses an existing
+/// Explorer window showing that folder instead of spawning a new one each time
+/// (unlike `explorer.exe /select,`). Runs on a short-lived thread because it
+/// initializes COM and may launch/raise Explorer — neither belongs on the UI thread.
+#[cfg(windows)]
+fn reveal_in_explorer(path: &std::path::Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+    };
+    use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
+        let pidl = ILCreateFromPathW(wide.as_ptr());
+        if !pidl.is_null() {
+            // cidl = 0 + apidl = null → open the item's parent and select the item.
+            let _ = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+            ILFree(pidl);
+        }
+        CoUninitialize();
+    });
+}
+
+/// Non-Windows fallback: best-effort open the containing folder (no selection),
+/// so the Linux build stays functional and green.
+#[cfg(not(windows))]
+fn reveal_in_explorer(path: &std::path::Path) {
+    if let Some(dir) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
 struct Quad {
     slot: usize,
     page_index: usize,
     scale: [f32; 2],
     offset: [f32; 2],
+    rot: u32, // 0/1/2/3 = 0/90/180/270° CW (single-page draws only; 0 for spreads)
 }
 
 impl App {
@@ -777,6 +816,7 @@ impl ApplicationHandler for App {
                 Layout::Single
             },
             spread_offset: 0,
+            rotation: 0,
             zoom: 1.0,
             pan_x: 0.0,
             pan_y: 0.0,
@@ -920,6 +960,8 @@ enum Action {
     PrevVolume,
     NextVolume,
     ToggleJump,
+    Rotate,
+    ShowInExplorer,
     Quit,
 }
 
@@ -942,6 +984,8 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyJ => return Some(Action::ToggleJump),
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
             KeyCode::KeyG => return Some(Action::ToggleAnimBar),
+            KeyCode::KeyE => return Some(Action::ShowInExplorer),
+            KeyCode::KeyR => return Some(Action::Rotate),
             KeyCode::Equal | KeyCode::NumpadAdd => return Some(Action::ZoomIn),
             KeyCode::Minus | KeyCode::NumpadSubtract => return Some(Action::ZoomOut),
             KeyCode::Digit9 | KeyCode::Numpad9 => return Some(Action::PresetWindow),
@@ -1046,6 +1090,7 @@ impl State {
                 };
                 self.settings.direction_rtl = self.direction == Direction::Rtl;
                 config::save(&self.settings);
+                self.toast(format!("Direction: {}", self.direction.label()));
             }
             Action::ToggleLayout => {
                 self.layout = self.layout.toggled();
@@ -1055,6 +1100,7 @@ impl State {
                 self.settings.layout_spread = self.layout == Layout::Spread;
                 config::save(&self.settings);
                 self.prefetch();
+                self.toast(format!("Layout: {}", self.layout.label()));
             }
             Action::ToggleScroll => {
                 self.scroll_mode = !self.scroll_mode;
@@ -1062,6 +1108,11 @@ impl State {
                 self.settings.scroll = self.scroll_mode;
                 config::save(&self.settings);
                 self.prefetch();
+                self.toast(if self.scroll_mode {
+                    "Scroll mode"
+                } else {
+                    "Page-flip mode"
+                });
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
             Action::ToggleInfo => {
@@ -1091,6 +1142,7 @@ impl State {
                 // Re-anchor so the current view re-pairs with the new parity.
                 self.index = layout::view_start(self.layout, self.index, self.spread_offset);
                 self.prefetch();
+                self.toast(format!("Spread offset: {}", self.spread_offset));
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
@@ -1098,7 +1150,18 @@ impl State {
                 self.jump = !self.jump;
                 self.settings.jump = self.jump;
                 config::save(&self.settings);
+                self.toast(if self.jump { "Jump mode" } else { "Step mode" });
             }
+            Action::Rotate => {
+                self.rotation = (self.rotation + 1) % 4;
+                // Recenter: the rotated box has different bounds, so any prior pan
+                // would now be out of range.
+                self.pan_x = 0.0;
+                self.pan_y = 0.0;
+                self.prefetch(); // re-decode at the rotation-aware target (1:1)
+                self.toast(format!("Rotation: {}\u{00b0}", self.rotation as u32 * 90));
+            }
+            Action::ShowInExplorer => self.reveal_current(),
             // Esc → quit is intercepted in `window_event` (needs the event loop),
             // so it never reaches here.
             Action::Quit => {}
@@ -1108,6 +1171,29 @@ impl State {
     /// Raise a transient on-screen toast (boundary reached, zoom level).
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// "Show in Explorer" (key `E`): open the containing folder of the current
+    /// item and select it. For a folder/single-image volume that's the current
+    /// page's image file; for an archive it's the archive file itself.
+    fn reveal_current(&mut self) {
+        let Some(key) = self.volume_key.clone() else {
+            self.toast("Nothing open");
+            return;
+        };
+        let base = PathBuf::from(&key);
+        let target = if base.is_dir() {
+            // Folder (incl. single-image opens, which open the parent folder):
+            // select the current page's file. `name(index)` is a flat file name.
+            match self.source.as_ref() {
+                Some(s) if s.len() > 0 => base.join(s.name(self.index)),
+                _ => base,
+            }
+        } else {
+            base // archive (or single file): select it in its folder
+        };
+        reveal_in_explorer(&target);
+        self.toast("Shown in Explorer");
     }
 
     /// Flip one view in `dir`. Returns `true` if the position actually changed.
@@ -1605,9 +1691,17 @@ impl State {
             return;
         }
         if let Some(t) = self.cache.get(self.index) {
-            let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom;
-            let mx = ((t.w as f32 * s - sw) / 2.0).max(0.0);
-            let my = ((t.h as f32 * s - sh) / 2.0).max(0.0);
+            // Match single_quad's rotated bounding box so pan clamps to the
+            // displayed (possibly turned) page, not the source orientation.
+            let single = self.layout == Layout::Single || t.w > t.h;
+            let (ew, eh) = if single && self.rotation % 2 == 1 {
+                (t.h as f32, t.w as f32)
+            } else {
+                (t.w as f32, t.h as f32)
+            };
+            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            let mx = ((ew * s - sw) / 2.0).max(0.0);
+            let my = ((eh * s - sh) / 2.0).max(0.0);
             self.pan_x = self.pan_x.clamp(-mx, mx);
             self.pan_y = self.pan_y.clamp(-my, my);
         }
@@ -1622,18 +1716,29 @@ impl State {
         dh: f32,
         sw: f32,
         sh: f32,
+        rot: u32,
     ) -> Quad {
         Quad {
             slot,
             page_index,
             scale: [2.0 * dw / sw, 2.0 * dh / sh],
             offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
+            rot,
         }
     }
 
     fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
-        let s = fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom;
-        let (dw, dh) = (t.w as f32 * s, t.h as f32 * s);
+        // A 90°/270° turn swaps the page's effective width/height for fitting; the
+        // shader then turns the texture inside this (rotated) bounding box. The box
+        // dimensions stay whole texels at the fit scale, so 1:1 sampling holds (the
+        // decode target in `page_target_h` is rotation-aware to match).
+        let (ew, eh) = if self.rotation % 2 == 1 {
+            (t.h as f32, t.w as f32)
+        } else {
+            (t.w as f32, t.h as f32)
+        };
+        let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+        let (dw, dh) = (ew * s, eh * s);
         // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
         // fractional offset would make the bilinear sampler blend every column
         // 50/50 with its neighbour — a horizontal smear that also beats against
@@ -1647,6 +1752,7 @@ impl State {
             dh.round(),
             sw,
             sh,
+            self.rotation as u32,
         )
     }
 
@@ -1700,8 +1806,8 @@ impl State {
                 let xl = x0.round();
                 let dwl_r = dwl.round();
                 vec![
-                    Self::quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh),
-                    Self::quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh),
+                    Self::quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
+                    Self::quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
                 ]
             }
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
@@ -1804,7 +1910,7 @@ impl State {
             let dh = self.page_display_h(i, sw);
             if y + dh > 0.0 {
                 if self.cache.get(i).is_some() {
-                    quads.push(Self::quad_from_px(slot, i, x, y, cw, dh, sw, sh));
+                    quads.push(Self::quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
                     slot += 1;
                 }
             }
@@ -1912,6 +2018,7 @@ impl State {
         self.last_drawn = None;
         self.info_for = None;
         self.nav_times.clear();
+        self.rotation = 0; // each volume opens upright
         self.index = idx.min(source.len() - 1);
         self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
@@ -1962,6 +2069,20 @@ impl State {
         self.settings.scroll = false;
         config::save(&self.settings);
         self.prefetch();
+        // Tell the user what the preset just switched to (presets change fit +
+        // layout + maybe direction at once, so summarize the resulting view).
+        let view_label = if spread {
+            format!("Spread, {}", self.direction.label())
+        } else {
+            let f = match fit {
+                FitMode::Window => "Fit window",
+                FitMode::Width => "Fit width",
+                FitMode::Height => "Fit height",
+                FitMode::Actual => "1:1",
+            };
+            format!("{f} (single)")
+        };
+        self.toast(view_label);
     }
 
     /// Gather display info for page `index` (Tab overlay): reads the page bytes
@@ -2033,20 +2154,31 @@ impl State {
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
         let aspect = self.page_aspect(index).max(0.001);
-        let dh = if self.scroll_mode {
+        let target = if self.scroll_mode {
             // Continuous strip: width-fit at width sw*zoom, height follows aspect.
             sw * self.zoom / aspect
         } else {
-            // Pair two non-wide pages in spread layout (assume a same-size facing
-            // page — exact for uniform volumes; wide pages always show alone).
-            let content_aspect = if self.layout == Layout::Spread && aspect <= 1.0 {
+            // A page is drawn alone when layout is Single or it's a wide
+            // (landscape) page that force-shows alone — only then does rotation
+            // apply. `content_aspect` is the on-screen box's width/height.
+            let single = self.layout == Layout::Single || aspect > 1.0;
+            let rotated = single && self.rotation % 2 == 1;
+            let content_aspect = if rotated {
+                1.0 / aspect // rotated single page: box is the inverse of the source
+            } else if self.layout == Layout::Spread && aspect <= 1.0 {
+                // Pair two non-wide pages (assume a same-size facing page — exact
+                // for uniform volumes; wide pages always show alone).
                 aspect * 2.0
             } else {
                 aspect
             };
-            fit_scale(self.fit, sw, sh, content_aspect, 1.0) * self.zoom
+            let box_h = fit_scale(self.fit, sw, sh, content_aspect, 1.0) * self.zoom;
+            // Decode target = the texture height that draws 1:1. For a rotated
+            // single page the texture's height lands along the screen *width*, so
+            // the target is the box width (box_h * content_aspect); else box height.
+            if rotated { box_h * content_aspect } else { box_h }
         };
-        (dh.round() as u32).clamp(MIN_TARGET, MAX_TARGET)
+        (target.round() as u32).clamp(MIN_TARGET, MAX_TARGET)
     }
 
     /// Debounce the decode view. While the surface size or zoom is changing (a
@@ -2439,6 +2571,7 @@ impl State {
                         view,
                         q.scale,
                         q.offset,
+                        q.rot,
                     )
                 })
             })
@@ -2694,6 +2827,37 @@ mod tests {
                         assert!(
                             (drawn - th).abs() <= 2.0,
                             "fit {} a {aspect} z {zoom} {sw}x{sh}: drawn {drawn} vs texture {th}",
+                            fit.label(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Single-resize invariant under a 90°/270° turn: `page_target_h` swaps the
+    // aspect and returns the on-screen box *width* as the decode target (texture
+    // height), then `single_quad` turns the texture inside the rotated box. The
+    // turned texture's height must still map 1 texel : 1 pixel along the screen
+    // width — i.e. the rotated-draw fit scale stays ~1, so no second GPU resize.
+    #[test]
+    fn decode_target_matches_drawn_size_rotated() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
+                    for zoom in [0.1_f32, 0.5, 1.0] {
+                        // page_target_h (rotated): content_aspect = 1/aspect, the
+                        // target is the box width = box_h * content_aspect.
+                        let box_h = fit_scale(fit, sw, sh, 1.0 / aspect, 1.0) * zoom;
+                        let th = (box_h / aspect).round().max(1.0); // texture height (target)
+                        let tw = (th * aspect).round().max(1.0); // texture width (source aspect)
+                        // single_quad swaps (w,h) for the odd rotation: ew = th, eh = tw.
+                        let s = fit_scale(fit, sw, sh, th, tw) * zoom;
+                        let drawn_w = th * s; // screen width the turned texture's height fills
+                        assert!(
+                            (drawn_w - th).abs() <= 2.0,
+                            "rot fit {} a {aspect} z {zoom} {sw}x{sh}: drawn_w {drawn_w} vs texture-h {th}",
                             fit.label(),
                         );
                     }

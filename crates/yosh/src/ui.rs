@@ -469,12 +469,14 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.separator();
                 ui.heading("View");
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
+                ui.label("R   rotate 90° (clockwise)");
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");
                 ui.label("G   show/hide the animation panel (animated GIF / WebP)");
                 ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();
                 ui.heading("Files");
+                ui.label("E   show in Explorer (open the folder & select the file)");
                 ui.label("Open folder / Open file / Library;  Grid ↔ Reader");
                 ui.label("drag a folder, archive, or image onto the window");
                 ui.label("F1   toggle this help");
