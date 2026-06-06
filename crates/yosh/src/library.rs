@@ -100,8 +100,14 @@ pub fn sibling_volumes(of: &Path) -> Vec<PathBuf> {
 fn dir_has_image(dir: &Path) -> bool {
     std::fs::read_dir(dir).map_or(false, |rd| {
         rd.flatten().any(|e| {
-            let p = e.path();
-            p.is_file() && is_image_ext(&p)
+            // Use the entry's cached type to avoid a stat per file (a network
+            // round-trip on a share); only follow a symlink with a real check.
+            let is_file = match e.file_type() {
+                Ok(ft) if ft.is_symlink() => e.path().is_file(),
+                Ok(ft) => ft.is_file(),
+                Err(_) => false,
+            };
+            is_file && is_image_ext(&e.path())
         })
     })
 }
