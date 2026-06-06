@@ -48,7 +48,9 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | Views | `9` fit window · `8` fit width · `0` 100% (1:1) · `7` two-page L→R · `6` two-page R→L |
 | `S` / `D` / `C` / `O` | spread ↔ single · direction RTL↔LTR · continuous scroll · shift spread pairing |
 | `J` | seek mode: **step** (see every page) ↔ **jump** (skip ahead) |
+| `R` | rotate 90° clockwise (single-page view; resets on opening a new book) |
 | `+` `-` | zoom; drag to pan |
+| `E` | show in Explorer (opens the folder and selects the file/archive) |
 | `I` | image info overlay |
 | `B` | bottom seekbar (reveals near the bottom edge; click/drag to jump) |
 | `G` | show/hide the animation panel (animated GIF / WebP) |

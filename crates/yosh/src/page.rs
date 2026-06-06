@@ -56,6 +56,7 @@ struct Uniforms {
     scale: vec2<f32>,
     offset: vec2<f32>,
     gray: u32,
+    rotation: u32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -76,9 +77,19 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     let c = corners[vi];
     var out: VsOut;
     // offset = top-left corner in NDC (+x right, +y up); uv.y=0 is the page top.
+    // The on-screen rectangle (offset/scale) is the rotated bounding box computed
+    // by the app; here we only turn the sampled UVs so the texture fills it rotated.
     let ndc = vec2<f32>(u.offset.x + c.x * u.scale.x, u.offset.y - c.y * u.scale.y);
     out.pos = vec4<f32>(ndc, 0.0, 1.0);
-    out.uv = c;
+    // 90° steps clockwise about the quad center (u.rotation = 0/1/2/3).
+    var p = c - vec2<f32>(0.5, 0.5);
+    switch (u.rotation) {
+        case 1u: { p = vec2<f32>( p.y, -p.x); } // 90° CW
+        case 2u: { p = vec2<f32>(-p.x, -p.y); } // 180°
+        case 3u: { p = vec2<f32>(-p.y,  p.x); } // 270° CW
+        default: {}
+    }
+    out.uv = p + vec2<f32>(0.5, 0.5);
     return out;
 }
 
@@ -101,7 +112,8 @@ struct Uniforms {
     scale: [f32; 2],
     offset: [f32; 2],
     gray: u32,
-    _pad: [u32; 3],
+    rotation: u32, // 0/1/2/3 = 0/90/180/270° CW (UV turn in the vertex shader)
+    _pad: [u32; 2],
 }
 
 /// One frame of an animated page (GIF/WebP), beyond frame 0. Frame 0 lives in the
@@ -426,12 +438,14 @@ impl PagePipeline {
         view: &wgpu::TextureView,
         scale: [f32; 2],
         offset: [f32; 2],
+        rotation: u32,
     ) -> wgpu::BindGroup {
         let u = Uniforms {
             scale,
             offset,
             gray: page.gray as u32,
-            _pad: [0; 3],
+            rotation,
+            _pad: [0; 2],
         };
         queue.write_buffer(&self.ubos[slot], 0, bytemuck::bytes_of(&u));
         device.create_bind_group(&wgpu::BindGroupDescriptor {
