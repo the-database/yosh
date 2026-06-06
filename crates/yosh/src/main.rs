@@ -7,14 +7,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod cache;
 mod config;
 mod gpu;
 mod library;
-mod page;
 mod pool;
 mod source;
-mod texpool;
 mod ui;
 mod update;
 

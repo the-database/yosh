@@ -3,8 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::page::PageTexture;
 use crate::source::{is_image_ext, FolderSource, PageSource, ZipSource};
+use yosh_engine::page::PageTexture;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum VolKind {

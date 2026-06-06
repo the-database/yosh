@@ -17,17 +17,17 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use fast_image_resize::Resizer;
 
-use crate::cache::PageCache;
+use yosh_engine::cache::PageCache;
 use crate::config;
 use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library};
-use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
+use yosh_engine::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg};
 use crate::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::prefetch::desired_window;
-use crate::texpool::TexturePool;
+use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
 
@@ -2945,7 +2945,7 @@ mod tests {
     // agree across fit modes, aspects, zooms, and surface sizes.
     #[test]
     fn decode_target_matches_drawn_size() {
-        use crate::page::{fit_scale, FitMode};
+        use yosh_engine::page::{fit_scale, FitMode};
         for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
             for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
                 for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
@@ -2973,7 +2973,7 @@ mod tests {
     // width — i.e. the rotated-draw fit scale stays ~1, so no second GPU resize.
     #[test]
     fn decode_target_matches_drawn_size_rotated() {
-        use crate::page::{fit_scale, FitMode};
+        use yosh_engine::page::{fit_scale, FitMode};
         for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
             for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
                 for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
