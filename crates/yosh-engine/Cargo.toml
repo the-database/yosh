@@ -14,6 +14,7 @@ avif = ["image/avif-native"]
 
 [dependencies]
 wgpu = "29.0.3"
+pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 image = "0.25"
 png = "0.18"

@@ -5211,6 +5211,7 @@ dependencies = [
  "jxl-oxide",
  "natord",
  "png 0.18.1",
+ "pollster",
  "psd",
  "qcms",
  "sevenz-rust2",
