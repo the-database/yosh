@@ -14,8 +14,8 @@ use std::thread::JoinHandle;
 use fast_image_resize::Resizer;
 
 use crate::decode::{decode_page, DecodedPage};
-use crate::page::{PagePipeline, PageTexture};
 use crate::source::PageSource;
+use crate::page::{PagePipeline, PageTexture};
 use crate::texpool::TexturePool;
 
 pub enum Msg {

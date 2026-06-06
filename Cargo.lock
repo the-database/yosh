@@ -5169,11 +5169,31 @@ dependencies = [
 name = "yosh"
 version = "0.1.36"
 dependencies = [
- "bytemuck",
  "directories",
  "egui",
  "egui-wgpu",
  "egui-winit",
+ "fast_image_resize",
+ "image",
+ "jxl-oxide",
+ "natord",
+ "rfd",
+ "self-replace",
+ "serde",
+ "serde_json",
+ "ureq",
+ "wgpu",
+ "windows-sys 0.59.0",
+ "winit",
+ "winresource",
+ "yosh-engine",
+]
+
+[[package]]
+name = "yosh-engine"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
  "fast_image_resize",
  "ico",
  "image",
@@ -5184,17 +5204,9 @@ dependencies = [
  "pollster",
  "psd",
  "qcms",
- "rfd",
- "self-replace",
- "serde",
- "serde_json",
  "sevenz-rust2",
  "unrar",
- "ureq",
  "wgpu",
- "windows-sys 0.59.0",
- "winit",
- "winresource",
  "zip",
 ]
 
