@@ -61,7 +61,15 @@ cargo test  -p yosh spread                             # run a subset of tests b
     that texture **1:1** at draw time; there must be no second (bilinear, no-mipmap) downscale at draw, which
     would soften the image and re-introduce screentone moiré. The *only* permitted GPU resample is
     **upscaling** when zoomed past native resolution (magnification — there's no source detail to do a CPU
-    resize, and `MAX_TARGET` caps the texture); that is not a quality regression.
+    resize, and the texture is capped at the source size). The per-page decode target is bounded only by the
+    GPU's real `max_texture_dimension_2d` (`decode::MAX_TEX_DIM`, aspect-aware so the width fits too) — **not**
+    a smaller fixed cap. A former fixed 3840-px cap silently forced a GPU *upscale* (→ moiré) on any page
+    taller than 3840 viewed near native, because the texture couldn't be decoded to the shown size; decoding to
+    the display size (up to the GPU limit) keeps the GPU at 1:1 below native. A *transient* GPU resample
+    is tolerated only while a re-decode is still in flight (a zoom/resize hasn't `settled` yet) — it keeps
+    transitions fast and **must converge back to 1:1**. To keep this verifiable, the info overlay's **Resize**
+    line shows the live pipeline (CPU path → `GPU 1:1` / `↑upscale` / `↓downscale`), and a debug warning fires
+    if a *settled* page-flip view is ever still GPU-downscaling (the invariant violated).
   - **1:1 needs whole-pixel placement, not just a size match.** The page sampler is bilinear, so even at the
     exact 1:1 size it only reads texel centers (an identity, no resample) if the quad is positioned on whole
     device pixels; a fractional offset (e.g. a 1537-px page centred on 3840 → x = 1151.5) makes it blend each
@@ -74,15 +82,18 @@ cargo test  -p yosh spread                             # run a subset of tests b
     `(index, target_h)` jobs — so the CPU resize lands the texture at its drawn size and the GPU samples 1:1.
     No quantization. `update_decode_view` debounces on `(surface_w, surface_h, zoom)` so a resize/zoom *drag*
     re-decodes once it settles (not every frame), and page-flipping between same-size pages never changes a
-    target, so it never re-decodes. 1:1 (`FitMode::Actual`) keeps full source res (it draws the texture at
-    `zoom` directly); zooming out in 1:1 is the one case that GPU-downscales, by design. The `TexturePool`
+    target, so it never re-decodes. 1:1 (`FitMode::Actual`) targets the displayed height too — `src_h × zoom`,
+    with `single_quad` sizing the box from the *source* dims so it's decode-independent — so zooming **out**
+    re-decodes to the shown size (HQ resize, GPU samples 1:1) instead of GPU-downscaling a full-res texture;
+    `target_dims` still caps at the source height, so at zoom ≥ 1 it keeps full res and magnification
+    GPU-upscales (the one allowed GPU resample). The `TexturePool`
     is globally bounded (`max_total`) with eviction, since exact targets mint more distinct texture sizes.
   - There is intentionally **no GPU-downscale path**: a single bilinear blit can't match the HQ CPU resize,
     and a second GPU downscale is exactly what the invariant forbids. (An old dormant `Downscaler` blit was
     removed; recover it from git history if a *high-quality* GPU resize is ever attempted.) The only GPU
     resampling is the page-draw sampler, which is a no-op at the 1:1 sizes the exact targets produce — see
-    the `decode_target_matches_drawn_size` test in `app.rs`, which proves the decode target equals the drawn
-    size.
+    the `decode_target_matches_drawn_size{,_rotated,_actual_zoomed_out}` tests in `app.rs`, which prove the
+    decode target equals the drawn size (GPU samples 1:1) across fits, 90° rotation, and 1:1 zoom-out.
 
 ### Central state and the frame loop
 - **`app.rs` (~1.7k lines) — `State`** is the winit `ApplicationHandler` and owns everything: gpu, egui,

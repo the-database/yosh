@@ -37,7 +37,6 @@ use crate::update;
 // Otherwise pages decode larger than shown and the GPU re-downscales them with a
 // plain bilinear (no mipmaps) → halftone aliasing/moiré.
 const MIN_TARGET: u32 = 32; // floor so extreme zoom-out still decodes ~exact
-const MAX_TARGET: u32 = 3840;
 const WORKERS: usize = 8;
 const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
@@ -215,6 +214,10 @@ struct State {
     /// every frame. Page-flipping doesn't change it, so it never re-decodes.
     pending_view: (u32, u32, f32),
     view_settled: bool,
+    /// True while we've already logged a "settled view is GPU-downscaling" warning
+    /// for the current occurrence, so the tripwire fires once per episode, not per
+    /// frame. Cleared as soon as the view returns to 1:1/upscale.
+    gpu_downscale_warned: bool,
     /// Page index the Tab info overlay text was built for (None = rebuild needed).
     info_for: Option<usize>,
     /// The anchor page currently waiting to decode and when that wait began,
@@ -842,6 +845,7 @@ impl ApplicationHandler for App {
             tex_pool,
             pending_view: (0, 0, 1.0),
             view_settled: false,
+            gpu_downscale_warned: false,
             info_for: None,
             loading_pending: None,
             toast: None,
@@ -1519,6 +1523,12 @@ impl State {
         src_h: f32,
         zoom: f32,
     ) -> f32 {
+        // 1:1 now draws at native × zoom regardless of the decoded texture size
+        // (see single_quad), so its native scale is exactly `zoom` — the
+        // decoded_h/src_h correction below applies only to the fit-scaled modes.
+        if fit == FitMode::Actual {
+            return zoom;
+        }
         let ((sw, sh), (fit_w, fit_h)) = (screen, content);
         fit_scale(fit, sw, sh, fit_w, fit_h) * zoom * decoded_h / src_h.max(1.0)
     }
@@ -1592,6 +1602,87 @@ impl State {
         (scale * 100.0).max(0.0)
     }
 
+    /// Device-px per *decoded texel* for the in-view anchor — i.e. exactly how the
+    /// GPU sampler scales the texture at draw time. `1.0` = sampling 1:1 (the HQ CPU
+    /// resize did all the work); `>1` = GPU upscale (zoom-past-native magnification,
+    /// the one allowed GPU resample); `<1` = GPU downscale (the soft/moiré path —
+    /// only ever valid as a transient while a re-decode is in flight). `None` before
+    /// the anchor is decoded.
+    fn gpu_sample_scale(&self) -> Option<f32> {
+        if self.scroll_mode {
+            let t = self.cache.get(self.index)?;
+            let sw = self.gpu.config.width.max(1) as f32;
+            return Some(sw * self.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
+        }
+        // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
+        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
+        let native = Self::anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
+        Some(native * src_h / dec_h.max(1.0))
+    }
+
+    /// The in-view anchor's full resize pipeline for the info overlay:
+    /// `"<CPU resize path>  →  <GPU sampling state>"`. Empty until decoded.
+    /// `(CPU resize-path label, GPU sample scale, re-decode-pending)` for the
+    /// in-view anchor — `None` until it's decoded. `pending` means the texture's
+    /// decode target no longer matches the *current* desired target, so a re-decode
+    /// is due: any GPU downscale right now is transient and will converge. So
+    /// `!pending && scale < 1` is the only genuine single-resize-invariant violation
+    /// (decoded at the intended target, yet the GPU still has to shrink it).
+    fn anchor_resize_state(&self) -> Option<(&'static str, f32, bool)> {
+        let src = self.source.as_ref()?;
+        let len = src.len();
+        if len == 0 {
+            return None;
+        }
+        let anchor = if self.scroll_mode {
+            self.index
+        } else {
+            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+        };
+        let t = self.cache.get(anchor)?;
+        let s = self.gpu_sample_scale()?;
+        let pending = t.target_h != self.page_target_h(anchor);
+        Some((t.path.label(), s, pending))
+    }
+
+    /// The in-view anchor's full resize pipeline for the info overlay:
+    /// `"<CPU resize path>  →  <GPU sampling state>"`. Empty until decoded.
+    fn resize_path_label(&self) -> String {
+        let Some((cpu, s, pending)) = self.anchor_resize_state() else {
+            return String::new();
+        };
+        let gpu = if (s - 1.0).abs() <= 0.01 {
+            "GPU 1:1".to_string()
+        } else if s > 1.0 {
+            format!("GPU \u{2191}{s:.2}\u{d7} (magnify)")
+        } else if pending {
+            format!("GPU \u{2193}{s:.2}\u{d7} (re-decoding\u{2026})")
+        } else {
+            format!("GPU \u{2193}{s:.2}\u{d7} (LQ \u{2014} STUCK)")
+        };
+        format!("{cpu}  \u{2192}  {gpu}")
+    }
+
+    /// Refresh the live resize readout (`ui.resize_path`) and fire a one-shot debug
+    /// warning only on a *genuine* violation: the anchor is decoded at its intended
+    /// target (no re-decode pending) yet the GPU is still downscaling it. Re-decode
+    /// transients (a fresh page still at its prefetch-guessed size, a zoom/resize not
+    /// yet settled) are expected and are not warned.
+    fn update_resize_readout(&mut self) {
+        let stuck = !self.scroll_mode
+            && matches!(self.anchor_resize_state(), Some((_, s, pending)) if !pending && s < 0.99);
+        if stuck && !self.gpu_downscale_warned {
+            eprintln!(
+                "yosh: WARNING — view at its decode target is still GPU-downscaling (single-resize invariant violated): {}",
+                self.resize_path_label()
+            );
+            self.gpu_downscale_warned = true;
+        } else if !stuck {
+            self.gpu_downscale_warned = false;
+        }
+        self.ui.resize_path = self.resize_path_label();
+    }
+
     /// The active zoom ladder: the fixed presets plus the current page's
     /// fit-to-window and fit-to-width stops (which depend on its resolution),
     /// in-range, sorted, and de-duplicated. In scroll mode the two fit stops are
@@ -1615,12 +1706,17 @@ impl State {
             }
         }
         for p in stops {
-            if (lo..=hi).contains(&p) {
+            // Splice a fit stop only if it isn't essentially on a value already in
+            // the ladder. Otherwise a fit level a hair off a round preset (e.g. a
+            // fit-window of 69.99% next to the 70% preset) shadows the preset, and
+            // zoom snaps to 69.99% / 70.01% instead of a clean 70%. Keeping the
+            // round preset still gets the "(Fit window/width)" toast label via the
+            // `near()` check in `zoom_to_preset`.
+            if (lo..=hi).contains(&p) && !ladder.iter().any(|&q| (q - p).abs() <= q * 1e-3) {
                 ladder.push(p);
             }
         }
         ladder.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        ladder.dedup_by(|a, b| (*a - *b).abs() <= *b * 1e-3); // merge a fit stop on a preset
         ladder
     }
 
@@ -1732,13 +1828,26 @@ impl State {
         // shader then turns the texture inside this (rotated) bounding box. The box
         // dimensions stay whole texels at the fit scale, so 1:1 sampling holds (the
         // decode target in `page_target_h` is rotation-aware to match).
-        let (ew, eh) = if self.rotation % 2 == 1 {
-            (t.h as f32, t.w as f32)
+        let (dw, dh) = if self.fit == FitMode::Actual {
+            // 1:1: size from the *source* dims × zoom, not the decoded dims, so the
+            // displayed box is the same native size whether the texture is full res
+            // (zoom ≥ 1) or re-decoded smaller for zoom-out — the latter then samples
+            // 1:1 instead of the GPU bilinear-downscaling a full-res texture.
+            let (nw, nh) = if self.rotation % 2 == 1 {
+                (t.src_h as f32, t.src_w as f32)
+            } else {
+                (t.src_w as f32, t.src_h as f32)
+            };
+            (nw * self.zoom, nh * self.zoom)
         } else {
-            (t.w as f32, t.h as f32)
+            let (ew, eh) = if self.rotation % 2 == 1 {
+                (t.h as f32, t.w as f32)
+            } else {
+                (t.w as f32, t.h as f32)
+            };
+            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            (ew * s, eh * s)
         };
-        let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
-        let (dw, dh) = (ew * s, eh * s);
         // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
         // fractional offset would make the bilinear sampler blend every column
         // 50/50 with its neighbour — a horizontal smear that also beats against
@@ -2148,12 +2257,33 @@ impl State {
     /// (so a display larger than native means full-res + GPU upscale, the one
     /// allowed exception). 1:1 keeps full source res (it draws at `zoom` directly).
     fn page_target_h(&self, index: usize) -> u32 {
+        let aspect = self.page_aspect(index).max(0.001);
+        // Cap the decode target so neither the texture height nor its aspect-derived
+        // width exceeds the GPU's real max texture size. This replaces a former fixed
+        // 3840 cap, which forced the GPU to *upscale* (and thus moiré) any page taller
+        // than 3840 px viewed near native — the texture couldn't be decoded to the
+        // shown size, so the GPU resampled it. Now the HQ CPU resize hits the display
+        // size and the GPU stays 1:1 below native, all the way up to what the GPU can
+        // hold. (`target_dims` still caps at the source height, so it never upscales.)
+        let max_dim = crate::decode::MAX_TEX_DIM.load(std::sync::atomic::Ordering::Relaxed);
+        let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(MIN_TARGET);
         if self.fit == FitMode::Actual && !self.scroll_mode {
-            return u32::MAX;
+            // 1:1 displays at native × zoom. Target that height so the page decodes
+            // to its *shown* size: `target_dims` caps at the source height, so
+            // zoom ≥ 1 keeps full res (magnification GPU-upscales, the one allowed
+            // GPU resample) while zoom < 1 decodes smaller → the HQ CPU resize does
+            // the reduction and the GPU samples 1:1 (no bilinear-downscale moiré).
+            // (Rotation-independent: a 90° turn swaps which screen edge the texture
+            // height maps to, but the target works out to src_h × zoom either way.)
+            return match self.cache.get(index) {
+                Some(t) => {
+                    ((t.src_h as f32 * self.zoom).round() as u32).clamp(MIN_TARGET, max_h)
+                }
+                None => u32::MAX, // native size unknown yet: decode full, re-decode once cached
+            };
         }
         let sw = self.gpu.config.width.max(1) as f32;
         let sh = self.gpu.config.height.max(1) as f32;
-        let aspect = self.page_aspect(index).max(0.001);
         let target = if self.scroll_mode {
             // Continuous strip: width-fit at width sw*zoom, height follows aspect.
             sw * self.zoom / aspect
@@ -2178,7 +2308,7 @@ impl State {
             // the target is the box width (box_h * content_aspect); else box height.
             if rotated { box_h * content_aspect } else { box_h }
         };
-        (target.round() as u32).clamp(MIN_TARGET, MAX_TARGET)
+        (target.round() as u32).clamp(MIN_TARGET, max_h)
     }
 
     /// Debounce the decode view. While the surface size or zoom is changing (a
@@ -2459,6 +2589,7 @@ impl State {
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
         // and the active toast (dropped once it expires).
         self.ui.zoom_pct = self.effective_zoom_pct();
+        self.update_resize_readout();
         if let Some((_, t)) = &self.toast
             && t.elapsed() >= TOAST_DURATION
         {
@@ -2862,6 +2993,59 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    // Single-resize invariant in 1:1 (Actual) fit when zoomed *out* (the fixed
+    // path): the page targets its displayed native×zoom height, decodes to that,
+    // and is drawn at the same size — so the GPU samples 1:1 and never bilinear-
+    // downscales a full-res texture. (Surface size is irrelevant in 1:1.)
+    #[test]
+    fn decode_target_matches_drawn_size_actual_zoomed_out() {
+        for (src_w, src_h) in [(1500.0_f32, 5200.0), (5200.0, 1500.0), (2048.0, 2048.0)] {
+            let _ = src_w; // 1:1 sizes off src_h × zoom; width follows the same scale
+            for zoom in [0.1_f32, 0.27, 0.5, 0.99] {
+                // page_target_h (Actual): displayed height = src_h × zoom; target_dims
+                // caps at the source height (no cap here since zoom < 1).
+                let target = (src_h * zoom).round().max(1.0);
+                let th = target.min(src_h); // decoded texture height
+                let drawn = src_h * zoom; // single_quad draws the box at src_h × zoom
+                let gpu_scale = drawn / th; // displayed ÷ decoded — must be ~1 (no resize)
+                assert!(
+                    (gpu_scale - 1.0).abs() <= 0.01,
+                    "actual {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (drawn {drawn}, texture {th})",
+                );
+            }
+        }
+    }
+
+    // A source taller than the *former* fixed 3840 cap, viewed below native, must
+    // decode to its displayed height — capped only by the GPU's real max texture
+    // size, aspect-aware so the width fits too — so the GPU samples 1:1. The old
+    // 3840 cap forced a GPU upscale (e.g. a 5207px page at 80–90% → ↑1.08–1.22×),
+    // which beats against the screentone → moiré. This models `page_target_h`'s cap.
+    #[test]
+    fn large_page_decodes_to_display_not_a_fixed_cap() {
+        let max_dim = 8192u32; // default MAX_TEX_DIM (the GPU's real limit)
+        for (src_w, src_h) in [(3600.0_f32, 5207.0), (5207.0, 3600.0), (4000.0, 6000.0)] {
+            let aspect = src_w / src_h;
+            let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(super::MIN_TARGET);
+            for zoom in [0.5_f32, 0.74, 0.8, 0.9, 1.0] {
+                // page_target_h (Actual): displayed height = src_h × zoom, clamped to max_h.
+                let target = ((src_h * zoom).round() as u32).clamp(super::MIN_TARGET, max_h);
+                let th = (target as f32).min(src_h); // target_dims caps at source
+                let tw = (th * aspect).round() as u32; // width follows source aspect
+                let display = src_h * zoom; // single_quad (Actual) draws at src_h × zoom
+                let gpu_scale = display / th;
+                assert!(
+                    (gpu_scale - 1.0).abs() <= 0.01,
+                    "src {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (display {display}, tex {th})"
+                );
+                assert!(
+                    th as u32 <= max_dim && tw <= max_dim,
+                    "src {src_w}x{src_h} z {zoom}: texture {tw}x{th} exceeds GPU max {max_dim}"
+                );
             }
         }
     }

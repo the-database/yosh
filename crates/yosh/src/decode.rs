@@ -55,6 +55,33 @@ fn check_fits(tw: u32, th: u32) -> Result<(), String> {
     }
 }
 
+/// Which CPU resize path produced a page. Surfaced in the info overlay so the
+/// active pipeline — and whether the GPU then has to resize at all — is visible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResizePath {
+    /// No downscale: decoded at native (target ≥ source). The GPU draws it 1:1, or
+    /// upscales for zoom-past-native magnification.
+    None,
+    /// Grayscale source, resampled in true linear light (Catmull-Rom) then
+    /// re-encoded through the Dot Gain 20% curve (the screentone-safe path).
+    GrayLinear,
+    /// Color source detected as visually gray: collapsed to luma + the gray path.
+    GrayFromColor,
+    /// Color source: Lanczos3 in gamma space (ICC→sRGB first if the page was tagged).
+    Color,
+}
+
+impl ResizePath {
+    pub fn label(self) -> &'static str {
+        match self {
+            ResizePath::None => "none (native res)",
+            ResizePath::GrayLinear => "gray linear-light (Catmull-Rom + Dot Gain)",
+            ResizePath::GrayFromColor => "gray-from-color (Catmull-Rom + Dot Gain)",
+            ResizePath::Color => "color (Lanczos3)",
+        }
+    }
+}
+
 /// A decoded, downscaled page ready for GPU upload.
 pub struct DecodedImage {
     pub w: u32,
@@ -66,6 +93,8 @@ pub struct DecodedImage {
     pub src_h: u32,
     /// true => single-channel R8; false => RGBA8.
     pub gray: bool,
+    /// Which CPU resize path produced this image (for the info overlay).
+    pub path: ResizePath,
     pub pixels: Vec<u8>,
 }
 
@@ -241,6 +270,7 @@ pub fn to_rgba_image(img: DecodedImage) -> DecodedImage {
         src_w: img.src_w,
         src_h: img.src_h,
         gray: false,
+        path: img.path,
         pixels,
     }
 }
@@ -339,7 +369,7 @@ fn downscale_gray(
         .chunks_exact(2)
         .map(|c| enc[u16::from_ne_bytes([c[0], c[1]]) as usize])
         .collect();
-    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: true, pixels })
+    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: true, path: ResizePath::GrayLinear, pixels })
 }
 
 /// Color strategy (MangaJaNai `standard_resize`): Lanczos3 in gamma space, no
@@ -361,7 +391,7 @@ fn downscale_color(
             &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Lanczos3)),
         )
         .map_err(|e| format!("resize: {e}"))?;
-    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, pixels: dst.into_vec() })
+    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, path: ResizePath::Color, pixels: dst.into_vec() })
 }
 
 /// Decode page bytes (any supported format) and downscale to `target_h` on CPU,
@@ -403,7 +433,7 @@ pub fn decode_and_downscale(
         if !opaque {
             premultiply_alpha(&mut full);
         }
-        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, pixels: full });
+        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, path: ResizePath::None, pixels: full });
     }
 
     if gray_by_channels {
@@ -412,7 +442,9 @@ pub fn decode_and_downscale(
     } else if opaque && rgba_is_grayscale(&full, GRAYSCALE_THRESHOLD) {
         // Color-stored but visually gray (and opaque) → collapse to luma, gray
         // strategy. Transparent images skip this so their alpha is preserved.
-        downscale_gray(&rgba_to_luma(&full), w, h, tw, th, resizer)
+        let mut img = downscale_gray(&rgba_to_luma(&full), w, h, tw, th, resizer)?;
+        img.path = ResizePath::GrayFromColor; // same gray path, but source was color
+        Ok(img)
     } else {
         if !opaque {
             premultiply_alpha(&mut full);
@@ -448,7 +480,7 @@ fn downscale_rgba_frame(
     let (tw, th) = target_dims(w, h, target_h);
     check_fits(tw, th)?;
     if tw == w && th == h {
-        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels: rgba });
+        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: false, path: ResizePath::None, pixels: rgba });
     }
     downscale_color(&rgba, w, h, tw, th, resizer)
 }
@@ -500,7 +532,7 @@ fn decode_ico(bytes: &[u8]) -> Result<Vec<DecodedImage>, String> {
         if !is_opaque(&pixels) {
             premultiply_alpha(&mut pixels);
         }
-        out.push(DecodedImage { w, h, src_w: w, src_h: h, gray: false, pixels });
+        out.push(DecodedImage { w, h, src_w: w, src_h: h, gray: false, path: ResizePath::None, pixels });
     }
     if out.is_empty() {
         return Err("ico: no entries".into());

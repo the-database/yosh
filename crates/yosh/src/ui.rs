@@ -38,6 +38,10 @@ pub struct UiState {
     /// Current zoom percent (native-relative), appended live to the info overlay
     /// (refreshed every frame so it tracks zooming without rebuilding page info).
     pub zoom_pct: f32,
+    /// Live resize-pipeline readout for the in-view page (CPU path → GPU state),
+    /// appended to the info overlay each frame so HQ vs. a stray GPU resize is
+    /// always visible. Empty when nothing is decoded yet.
+    pub resize_path: String,
     /// Transient toast message (boundary reached, zoom level); None when idle.
     pub toast: Option<String>,
     /// Whether to show the centered loading spinner (the current page's decode
@@ -518,6 +522,18 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                                         .monospace(),
                                 );
                                 ui.end_row();
+                                if !st.resize_path.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new("Resize")
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&st.resize_path)
+                                            .color(egui::Color32::WHITE)
+                                            .monospace(),
+                                    );
+                                    ui.end_row();
+                                }
                             });
                     });
             });
