@@ -8,12 +8,14 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::cache::PageCache;
-use crate::layout::Layout;
-use crate::page::{fit_scale, FitMode};
+use crate::decode::MAX_TEX_DIM;
+use crate::layout::{self, Layout};
+use crate::page::{fit_scale, FitMode, PageTexture, MAX_QUADS};
 use crate::pool::DecodePool;
+use crate::prefetch::desired_window;
 use crate::source::PageSource;
 use crate::texpool::TexturePool;
 
@@ -128,6 +130,12 @@ pub fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
 /// *full* reduction in one pass and the GPU samples 1:1 — the single-resize
 /// invariant. Below it, extreme zoom-out would otherwise decode a sub-pixel page.
 pub const MIN_TARGET: u32 = 32;
+
+/// Prefetch window: base pages ahead (`FWD`, widened up to `FWD_MAX` with flip
+/// velocity) and behind (`BACK`) the read position.
+pub const FWD: usize = 16;
+pub const BACK: usize = 6;
+pub const FWD_MAX: usize = 40;
 
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
 pub struct Quad {
@@ -260,5 +268,780 @@ impl Reader {
             gpu_downscale_warned: false,
             pan_edge_at: None,
         }
+    }
+}
+
+impl Reader {
+    pub fn current_overflows(&self) -> bool {
+        let Some(pt) = self.cache.get(self.index) else {
+            return false;
+        };
+        let (sw, sh) = (self.viewport.w.max(1) as f32, self.viewport.h.max(1) as f32);
+        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32) * self.zoom;
+        pt.h as f32 * s > sh + 0.5
+    }
+
+    /// Top edge (screen px): centered, then panned by `pan_y`, clamped so the
+    /// page can't pull away from the viewport edge when larger than it.
+    pub fn vertical_top(&self, dh: f32, sh: f32) -> f32 {
+        let maxp = ((dh - sh) / 2.0).max(0.0);
+        (sh - dh) / 2.0 + self.pan_y.clamp(-maxp, maxp)
+    }
+
+    /// Left edge (screen px): centered, then panned by `pan_x`, clamped.
+    pub fn horizontal_left(&self, dw: f32, sw: f32) -> f32 {
+        let maxp = ((dw - sw) / 2.0).max(0.0);
+        (sw - dw) / 2.0 + self.pan_x.clamp(-maxp, maxp)
+    }
+
+    /// Displayed height of the current page under the active fit + zoom.
+    pub fn current_display_h(&self) -> f32 {
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+        match self.cache.get(self.index) {
+            Some(t) => {
+                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
+            }
+            None => sh,
+        }
+    }
+
+    /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h)` — the inputs
+    /// `anchor_native_scale` needs, computed once and shared by `anchor_scale`
+    /// (current fit/zoom) and `fit_native_pct` (an arbitrary fit at zoom 1). `None`
+    /// in scroll mode (no facing-pair layout) or before the anchor is decoded.
+    pub fn anchor_metrics(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
+        if self.scroll_mode {
+            return None;
+        }
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+        let len = self.source.as_ref()?.len();
+        if len == 0 {
+            return None;
+        }
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let ta = self.cache.get(a)?;
+        // Wide (landscape) page is shown alone; otherwise pair with `b` if ready.
+        let force_single = ta.w > ta.h;
+        let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
+        let (fit_w, fit_h, dec_h) = match tb {
+            Some(tb) => {
+                let h_ref = ta.h.max(tb.h) as f32;
+                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
+                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
+                (wa + wb, h_ref, h_ref)
+            }
+            None => (ta.w as f32, ta.h as f32, ta.h as f32),
+        };
+        Some((sw, sh, fit_w, fit_h, dec_h, ta.src_h.max(1) as f32))
+    }
+
+    /// device-px-per-native-px of the in-view anchor page, matching exactly what
+    /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
+    /// isn't decoded yet.
+    pub fn anchor_scale(&self) -> Option<f32> {
+        if self.scroll_mode {
+            // Strip pages are laid out at width = sw * zoom (height follows aspect).
+            let sw = self.viewport.w.max(1) as f32;
+            let t = self.cache.get(self.index)?;
+            return Some(sw * self.zoom / t.src_w.max(1) as f32);
+        }
+        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
+        Some(anchor_native_scale(
+            self.fit,
+            (sw, sh),
+            (fit_w, fit_h),
+            dec_h,
+            src_h,
+            self.zoom,
+        ))
+    }
+
+    /// The native zoom % the current anchor would display at under `fit` at zoom 1
+    /// — used to splice fit-to-window / fit-to-width stops into the zoom ladder.
+    /// `None` in scroll mode (handled inline in `zoom_ladder`) or before decode.
+    pub fn fit_native_pct(&self, fit: FitMode) -> Option<f32> {
+        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
+        Some(anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, 1.0) * 100.0)
+    }
+
+    /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
+    /// = 100%), for the toast + info overlay. Derived from the same scale the
+    /// renderer draws, so it tracks fit-to-window upscaling and facing pairs
+    /// exactly. Falls back to the raw factor while the anchor isn't decoded.
+    pub fn effective_zoom_pct(&self) -> f32 {
+        let scale = self.anchor_scale().unwrap_or(self.zoom);
+        (scale * 100.0).max(0.0)
+    }
+
+    /// Device-px per *decoded texel* for the in-view anchor — i.e. exactly how the
+    /// GPU sampler scales the texture at draw time. `1.0` = sampling 1:1 (the HQ CPU
+    /// resize did all the work); `>1` = GPU upscale (zoom-past-native magnification,
+    /// the one allowed GPU resample); `<1` = GPU downscale (the soft/moiré path —
+    /// only ever valid as a transient while a re-decode is in flight). `None` before
+    /// the anchor is decoded.
+    pub fn gpu_sample_scale(&self) -> Option<f32> {
+        if self.scroll_mode {
+            let t = self.cache.get(self.index)?;
+            let sw = self.viewport.w.max(1) as f32;
+            return Some(sw * self.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
+        }
+        // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
+        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
+        let native = anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
+        Some(native * src_h / dec_h.max(1.0))
+    }
+
+    /// The in-view anchor's full resize pipeline for the info overlay:
+    /// `"<CPU resize path>  →  <GPU sampling state>"`. Empty until decoded.
+    /// `(CPU resize-path label, GPU sample scale, re-decode-pending)` for the
+    /// in-view anchor — `None` until it's decoded. `pending` means the texture's
+    /// decode target no longer matches the *current* desired target, so a re-decode
+    /// is due: any GPU downscale right now is transient and will converge. So
+    /// `!pending && scale < 1` is the only genuine single-resize-invariant violation
+    /// (decoded at the intended target, yet the GPU still has to shrink it).
+    pub fn anchor_resize_state(&self) -> Option<(&'static str, f32, bool)> {
+        let src = self.source.as_ref()?;
+        let len = src.len();
+        if len == 0 {
+            return None;
+        }
+        let anchor = if self.scroll_mode {
+            self.index
+        } else {
+            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+        };
+        let t = self.cache.get(anchor)?;
+        let s = self.gpu_sample_scale()?;
+        let pending = t.target_h != self.page_target_h(anchor);
+        Some((t.path.label(), s, pending))
+    }
+
+    /// The in-view anchor's full resize pipeline for the info overlay:
+    /// `"<CPU resize path>  →  <GPU sampling state>"`. Empty until decoded.
+    pub fn resize_path_label(&self) -> String {
+        let Some((cpu, s, pending)) = self.anchor_resize_state() else {
+            return String::new();
+        };
+        let gpu = if (s - 1.0).abs() <= 0.01 {
+            "GPU 1:1".to_string()
+        } else if s > 1.0 {
+            format!("GPU \u{2191}{s:.2}\u{d7} (magnify)")
+        } else if pending {
+            format!("GPU \u{2193}{s:.2}\u{d7} (re-decoding\u{2026})")
+        } else {
+            format!("GPU \u{2193}{s:.2}\u{d7} (LQ \u{2014} STUCK)")
+        };
+        format!("{cpu}  \u{2192}  {gpu}")
+    }
+
+    /// Refresh the live resize readout (`ui.resize_path`) and fire a one-shot debug
+    /// warning only on a *genuine* violation: the anchor is decoded at its intended
+    /// target (no re-decode pending) yet the GPU is still downscaling it. Re-decode
+    /// transients (a fresh page still at its prefetch-guessed size, a zoom/resize not
+    /// yet settled) are expected and are not warned.
+    pub fn update_resize_readout(&mut self) {
+        let stuck = !self.scroll_mode
+            && matches!(self.anchor_resize_state(), Some((_, s, pending)) if !pending && s < 0.99);
+        if stuck && !self.gpu_downscale_warned {
+            eprintln!(
+                "yosh: WARNING — view at its decode target is still GPU-downscaling (single-resize invariant violated): {}",
+                self.resize_path_label()
+            );
+            self.gpu_downscale_warned = true;
+        } else if !stuck {
+            self.gpu_downscale_warned = false;
+        }
+    }
+
+    /// The active zoom ladder: the fixed presets plus the current page's
+    /// fit-to-window and fit-to-width stops (which depend on its resolution),
+    /// in-range, sorted, and de-duplicated. In scroll mode the two fit stops are
+    /// the page's width-fit (the zoom-1 strip) and height-fit native percents.
+    pub fn zoom_ladder(&self) -> Vec<f32> {
+        let mut ladder = zoom_presets();
+        let (lo, hi) = (MIN_ZOOM_PCT * 100.0, MAX_ZOOM_PCT * 100.0);
+        let mut stops: Vec<f32> = Vec::new();
+        if self.scroll_mode {
+            if let Some(t) = self.cache.get(self.index) {
+                let sw = self.viewport.w.max(1) as f32;
+                let sh = self.viewport.h.max(1) as f32;
+                stops.push(sw / t.src_w.max(1) as f32 * 100.0); // fit width (strip @ zoom 1)
+                stops.push(sh / t.src_h.max(1) as f32 * 100.0); // fit window (height fills)
+            }
+        } else {
+            for f in [FitMode::Window, FitMode::Width] {
+                if let Some(p) = self.fit_native_pct(f) {
+                    stops.push(p);
+                }
+            }
+        }
+        for p in stops {
+            // Splice a fit stop only if it isn't essentially on a value already in
+            // the ladder. Otherwise a fit level a hair off a round preset (e.g. a
+            // fit-window of 69.99% next to the 70% preset) shadows the preset, and
+            // zoom snaps to 69.99% / 70.01% instead of a clean 70%. Keeping the
+            // round preset still gets the "(Fit window/width)" toast label via the
+            // `near()` check in `zoom_to_preset`.
+            if (lo..=hi).contains(&p) && !ladder.iter().any(|&q| (q - p).abs() <= q * 1e-3) {
+                ladder.push(p);
+            }
+        }
+        ladder.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ladder
+    }
+
+    /// Snap zoom to the next ladder stop above/below the current native %. The
+    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
+    /// step can land exactly on fit-to-window / fit-to-width. Works in both
+    /// page-flip and scroll modes (both derive from `effective_zoom_pct`).
+    pub fn clamp_zoom_native(&mut self) {
+        if self.zoom > 0.0
+            && let Some(s) = self.anchor_scale()
+        {
+            let base = s / self.zoom;
+            if base > 0.0 {
+                self.zoom = clamp_zoom_multiplier(self.zoom, base);
+            }
+        }
+    }
+
+    /// Clamp stored pan to the current page's overflow so dragging/zooming can't
+    /// strand the view in an empty region.
+    pub fn clamp_pan(&mut self) {
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+        if self.scroll_mode {
+            let cw = sw * self.zoom;
+            let mx = ((cw - sw) / 2.0).max(0.0);
+            self.pan_x = self.pan_x.clamp(-mx, mx);
+            return;
+        }
+        if let Some(t) = self.cache.get(self.index) {
+            // Match single_quad's rotated bounding box so pan clamps to the
+            // displayed (possibly turned) page, not the source orientation.
+            let single = self.layout == Layout::Single || t.w > t.h;
+            let (ew, eh) = if single && self.rotation % 2 == 1 {
+                (t.h as f32, t.w as f32)
+            } else {
+                (t.w as f32, t.h as f32)
+            };
+            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            let mx = ((ew * s - sw) / 2.0).max(0.0);
+            let my = ((eh * s - sh) / 2.0).max(0.0);
+            self.pan_x = self.pan_x.clamp(-mx, mx);
+            self.pan_y = self.pan_y.clamp(-my, my);
+        }
+    }
+
+    pub fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
+        // A 90°/270° turn swaps the page's effective width/height for fitting; the
+        // shader then turns the texture inside this (rotated) bounding box. The box
+        // dimensions stay whole texels at the fit scale, so 1:1 sampling holds (the
+        // decode target in `page_target_h` is rotation-aware to match).
+        let (dw, dh) = if self.fit == FitMode::Actual {
+            // 1:1: size from the *source* dims × zoom, not the decoded dims, so the
+            // displayed box is the same native size whether the texture is full res
+            // (zoom ≥ 1) or re-decoded smaller for zoom-out — the latter then samples
+            // 1:1 instead of the GPU bilinear-downscaling a full-res texture.
+            let (nw, nh) = if self.rotation % 2 == 1 {
+                (t.src_h as f32, t.src_w as f32)
+            } else {
+                (t.src_w as f32, t.src_h as f32)
+            };
+            (nw * self.zoom, nh * self.zoom)
+        } else {
+            let (ew, eh) = if self.rotation % 2 == 1 {
+                (t.h as f32, t.w as f32)
+            } else {
+                (t.w as f32, t.h as f32)
+            };
+            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            (ew * s, eh * s)
+        };
+        // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
+        // fractional offset would make the bilinear sampler blend every column
+        // 50/50 with its neighbour — a horizontal smear that also beats against
+        // halftone screentones. Whole-pixel placement samples texel centers 1:1.
+        quad_from_px(
+            0,
+            idx,
+            self.horizontal_left(dw, sw).round(),
+            self.vertical_top(dh, sh).round(),
+            dw.round(),
+            dh.round(),
+            sw,
+            sh,
+            self.rotation as u32,
+        )
+    }
+
+    /// Compute the quads to draw this frame (1 for single/last-held, 2 for a
+    /// ready spread). Only includes pages present in the cache.
+    pub fn build_quads(&self) -> Vec<Quad> {
+        let Some(src) = &self.source else {
+            return Vec::new();
+        };
+        let len = src.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let ta = self.cache.get(a);
+        // Wide (landscape) page is a double-spread image → show it alone.
+        let force_single = ta.map_or(false, |t| t.w > t.h);
+        let b = if force_single { None } else { b };
+        let tb = b.and_then(|bi| self.cache.get(bi).map(|t| (bi, t)));
+
+        match (ta, tb) {
+            (Some(ta), Some((bi, tb))) => {
+                // Facing pages share a display height. Size each to a common
+                // reference height (its width following its own aspect ratio)
+                // before fitting the pair to the window. Aspect ratios are
+                // stable across decode resolutions, so if the two pages are
+                // momentarily decoded at different heights — e.g. mid re-decode
+                // after a fullscreen toggle / resize, where one updates a frame
+                // before the other — neither page jumps size. (Identical to
+                // per-pixel sizing when both heights already match.)
+                let h_ref = ta.h.max(tb.h) as f32;
+                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
+                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
+                let combined_w = wa + wb;
+                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref) * self.zoom;
+                let x0 = self.horizontal_left(combined_w * s, sw);
+                let dh = h_ref * s;
+                // Screen order: LTR puts the lower index on the left; RTL reverses.
+                let (l_idx, wl, r_idx, wr) = match self.direction {
+                    Direction::Ltr => (a, wa, bi, wb),
+                    Direction::Rtl => (bi, wb, a, wa),
+                };
+                let (dwl, dwr) = (wl * s, wr * s);
+                // Snap to the pixel grid (see single_quad). The right page starts
+                // at the left's snapped right edge, so there's no sub-pixel seam.
+                let yt = self.vertical_top(dh, sh).round();
+                let dhr = dh.round();
+                let xl = x0.round();
+                let dwl_r = dwl.round();
+                vec![
+                    quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
+                    quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
+                ]
+            }
+            (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
+            _ => {
+                // Anchor not decoded yet: hold the last-drawn page if still cached.
+                if let Some(li) = self.last_drawn
+                    && let Some(t) = self.cache.get(li)
+                {
+                    return vec![self.single_quad(li, t, sw, sh)];
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    pub fn page_display_h(&self, i: usize, sw: f32) -> f32 {
+        let cw = sw * self.zoom; // strip content width (zoomable)
+        match self.cache.get(i) {
+            Some(t) => cw * (t.h as f32 / t.w as f32),
+            None => cw * self.est_aspect,
+        }
+    }
+
+    pub fn normalize(&mut self) {
+        let len = match &self.source {
+            Some(s) => s.len(),
+            None => return,
+        };
+        if len == 0 {
+            return;
+        }
+        let sw = self.viewport.w.max(1) as f32;
+        while self.index + 1 < len {
+            let h = self.page_display_h(self.index, sw);
+            if self.top_offset >= h {
+                self.top_offset -= h;
+                self.index += 1;
+            } else {
+                break;
+            }
+        }
+        while self.top_offset < 0.0 && self.index > 0 {
+            self.index -= 1;
+            self.top_offset += self.page_display_h(self.index, sw);
+        }
+        if self.index == 0 && self.top_offset < 0.0 {
+            self.top_offset = 0.0;
+        }
+        if self.index + 1 >= len {
+            let vh = self.viewport.h as f32;
+            let max_off = (self.page_display_h(len - 1, sw) - vh).max(0.0);
+            if self.top_offset > max_off {
+                self.top_offset = max_off;
+            }
+        }
+    }
+
+    /// Build the visible vertical-strip quads (width-fit, stacked top to bottom).
+    pub fn build_scroll_quads(&self) -> Vec<Quad> {
+        let Some(src) = &self.source else {
+            return Vec::new();
+        };
+        let len = src.len();
+        if len == 0 {
+            return Vec::new();
+        }
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+        let mut quads = Vec::new();
+        let cw = sw * self.zoom; // strip width (zoom); centered with horizontal pan
+        let x = self.horizontal_left(cw, sw);
+        let mut y = -self.top_offset;
+        let mut i = self.index;
+        let mut slot = 0;
+        while i < len && y < sh && slot < MAX_QUADS {
+            let dh = self.page_display_h(i, sw);
+            if y + dh > 0.0 {
+                if self.cache.get(i).is_some() {
+                    quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
+                    slot += 1;
+                }
+            }
+            y += dh;
+            i += 1;
+        }
+        quads
+    }
+
+    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
+    /// and register them with egui.
+    pub fn dynamic_fwd(&mut self) -> usize {
+        let now = Instant::now();
+        while let Some(&t) = self.nav_times.front() {
+            if now.duration_since(t) > Duration::from_millis(800) {
+                self.nav_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        (FWD + self.nav_times.len() * 4).min(FWD_MAX)
+    }
+
+    /// Begin opening `path`. The source is built on a background thread (see
+    /// `build_source`) so a slow network-share open never freezes the UI — the
+    /// current page stays on screen under the spinner until the new source lands
+    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
+    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
+    pub fn page_aspect(&self, index: usize) -> f32 {
+        if let Some(t) = self.cache.get(index) {
+            return t.src_w as f32 / t.src_h.max(1) as f32;
+        }
+        if let Some(t) = self.cache.get(self.index) {
+            return t.src_w as f32 / t.src_h.max(1) as f32;
+        }
+        1.0 / self.est_aspect.max(0.01) // est_aspect is h / w
+    }
+
+    /// The *exact* decode target (on-screen displayed pixel height) for page
+    /// `index` under the active fit/zoom/layout. Decoding each page to this height
+    /// makes the HQ CPU resize the only resample and the GPU sample 1:1 — the
+    /// single-resize invariant. `target_dims` later caps it at the source height
+    /// (so a display larger than native means full-res + GPU upscale, the one
+    /// allowed exception). 1:1 keeps full source res (it draws at `zoom` directly).
+    pub fn page_target_h(&self, index: usize) -> u32 {
+        let aspect = self.page_aspect(index).max(0.001);
+        // Cap the decode target so neither the texture height nor its aspect-derived
+        // width exceeds the GPU's real max texture size. This replaces a former fixed
+        // 3840 cap, which forced the GPU to *upscale* (and thus moiré) any page taller
+        // than 3840 px viewed near native — the texture couldn't be decoded to the
+        // shown size, so the GPU resampled it. Now the HQ CPU resize hits the display
+        // size and the GPU stays 1:1 below native, all the way up to what the GPU can
+        // hold. (`target_dims` still caps at the source height, so it never upscales.)
+        let max_dim = MAX_TEX_DIM.load(std::sync::atomic::Ordering::Relaxed);
+        let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(MIN_TARGET);
+        if self.fit == FitMode::Actual && !self.scroll_mode {
+            // 1:1 displays at native × zoom. Target that height so the page decodes
+            // to its *shown* size: `target_dims` caps at the source height, so
+            // zoom ≥ 1 keeps full res (magnification GPU-upscales, the one allowed
+            // GPU resample) while zoom < 1 decodes smaller → the HQ CPU resize does
+            // the reduction and the GPU samples 1:1 (no bilinear-downscale moiré).
+            // (Rotation-independent: a 90° turn swaps which screen edge the texture
+            // height maps to, but the target works out to src_h × zoom either way.)
+            return match self.cache.get(index) {
+                Some(t) => {
+                    ((t.src_h as f32 * self.zoom).round() as u32).clamp(MIN_TARGET, max_h)
+                }
+                None => u32::MAX, // native size unknown yet: decode full, re-decode once cached
+            };
+        }
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+        let target = if self.scroll_mode {
+            // Continuous strip: width-fit at width sw*zoom, height follows aspect.
+            sw * self.zoom / aspect
+        } else {
+            // A page is drawn alone when layout is Single or it's a wide
+            // (landscape) page that force-shows alone — only then does rotation
+            // apply. `content_aspect` is the on-screen box's width/height.
+            let single = self.layout == Layout::Single || aspect > 1.0;
+            let rotated = single && self.rotation % 2 == 1;
+            let content_aspect = if rotated {
+                1.0 / aspect // rotated single page: box is the inverse of the source
+            } else if self.layout == Layout::Spread && aspect <= 1.0 {
+                // Pair two non-wide pages (assume a same-size facing page — exact
+                // for uniform volumes; wide pages always show alone).
+                aspect * 2.0
+            } else {
+                aspect
+            };
+            let box_h = fit_scale(self.fit, sw, sh, content_aspect, 1.0) * self.zoom;
+            // Decode target = the texture height that draws 1:1. For a rotated
+            // single page the texture's height lands along the screen *width*, so
+            // the target is the box width (box_h * content_aspect); else box height.
+            if rotated { box_h * content_aspect } else { box_h }
+        };
+        (target.round() as u32).clamp(MIN_TARGET, max_h)
+    }
+
+    /// Debounce the decode view. While the surface size or zoom is changing (a
+    /// resize/zoom drag) the view is "unsettled" and `prefetch` won't re-decode
+    /// cached pages for a target change — it just keeps showing the old textures.
+    /// Once the value holds for a frame the view settles and stale pages re-decode
+    /// in place (no black frame). Page-flipping leaves the view settled, so it
+    /// never re-decodes.
+    pub fn update_decode_view(&mut self) {
+        let desired = (self.viewport.w, self.viewport.h, self.zoom);
+        self.view_settled = desired == self.pending_view;
+        self.pending_view = desired;
+    }
+
+    /// Recompute the prefetch window and hand it to the pool with each page's exact
+    /// decode target. A page is queued if it's missing, or (once the view has
+    /// settled) if its decoded target no longer matches its current exact target —
+    /// then it re-decodes at the new resolution and overwrites in place.
+    pub fn prefetch(&mut self) {
+        let fwd = self.dynamic_fwd();
+        let settled = self.view_settled;
+        let Some(src) = &self.source else {
+            return;
+        };
+        let len = src.len();
+        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, BACK)
+            .into_iter()
+            .filter(|i| !self.failed.contains_key(i))
+            .filter_map(|i| {
+                let want = self.page_target_h(i);
+                match self.cache.get(i) {
+                    None => Some((i, want)),
+                    Some(p) => (settled && p.target_h != want).then_some((i, want)),
+                }
+            })
+            .collect();
+        if let Some(pool) = &self.pool {
+            pool.set_jobs(jobs);
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    // A 2048-tall portrait page on a 4K (2160-tall) screen, fit-to-window and
+    // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
+    #[test]
+    fn anchor_native_scale_fit_to_window_reports_upscale() {
+        let s = super::anchor_native_scale(
+            super::FitMode::Window,
+            (3840.0, 2160.0),
+            (1448.0, 2048.0),
+            2048.0,
+            2048.0,
+            1.0,
+        );
+        assert!((s - 2160.0 / 2048.0).abs() < 1e-4, "got {s}");
+    }
+
+    // 1:1 (Actual) at zoom 1 is exactly native: 100%.
+    #[test]
+    fn anchor_native_scale_actual_is_unity() {
+        let s = super::anchor_native_scale(
+            super::FitMode::Actual,
+            (3840.0, 2160.0),
+            (1448.0, 2048.0),
+            2048.0,
+            2048.0,
+            1.0,
+        );
+        assert!((s - 1.0).abs() < 1e-6, "got {s}");
+    }
+
+    // Proof of the single-resize invariant (page-flip path): a page decoded to
+    // its per-page target (the displayed height `page_target_h` computes) is drawn
+    // by `build_quads` at that *same* height, so the GPU sampler maps 1 texel : 1
+    // pixel and adds no second resize. Checks the decode target and the draw size
+    // agree across fit modes, aspects, zooms, and surface sizes.
+    #[test]
+    fn decode_target_matches_drawn_size() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
+                    for zoom in [0.1_f32, 0.5, 1.0] {
+                        // Decode target = the page's displayed height (page_target_h).
+                        let th = (fit_scale(fit, sw, sh, aspect, 1.0) * zoom).round().max(1.0);
+                        let tw = (th * aspect).round().max(1.0);
+                        // build_quads draws that decoded (tw x th) texture at height:
+                        let drawn = th * fit_scale(fit, sw, sh, tw, th) * zoom;
+                        assert!(
+                            (drawn - th).abs() <= 2.0,
+                            "fit {} a {aspect} z {zoom} {sw}x{sh}: drawn {drawn} vs texture {th}",
+                            fit.label(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Single-resize invariant under a 90°/270° turn: `page_target_h` swaps the
+    // aspect and returns the on-screen box *width* as the decode target (texture
+    // height), then `single_quad` turns the texture inside the rotated box. The
+    // turned texture's height must still map 1 texel : 1 pixel along the screen
+    // width — i.e. the rotated-draw fit scale stays ~1, so no second GPU resize.
+    #[test]
+    fn decode_target_matches_drawn_size_rotated() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
+                    for zoom in [0.1_f32, 0.5, 1.0] {
+                        // page_target_h (rotated): content_aspect = 1/aspect, the
+                        // target is the box width = box_h * content_aspect.
+                        let box_h = fit_scale(fit, sw, sh, 1.0 / aspect, 1.0) * zoom;
+                        let th = (box_h / aspect).round().max(1.0); // texture height (target)
+                        let tw = (th * aspect).round().max(1.0); // texture width (source aspect)
+                        // single_quad swaps (w,h) for the odd rotation: ew = th, eh = tw.
+                        let s = fit_scale(fit, sw, sh, th, tw) * zoom;
+                        let drawn_w = th * s; // screen width the turned texture's height fills
+                        assert!(
+                            (drawn_w - th).abs() <= 2.0,
+                            "rot fit {} a {aspect} z {zoom} {sw}x{sh}: drawn_w {drawn_w} vs texture-h {th}",
+                            fit.label(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Single-resize invariant in 1:1 (Actual) fit when zoomed *out* (the fixed
+    // path): the page targets its displayed native×zoom height, decodes to that,
+    // and is drawn at the same size — so the GPU samples 1:1 and never bilinear-
+    // downscales a full-res texture. (Surface size is irrelevant in 1:1.)
+    #[test]
+    fn decode_target_matches_drawn_size_actual_zoomed_out() {
+        for (src_w, src_h) in [(1500.0_f32, 5200.0), (5200.0, 1500.0), (2048.0, 2048.0)] {
+            let _ = src_w; // 1:1 sizes off src_h × zoom; width follows the same scale
+            for zoom in [0.1_f32, 0.27, 0.5, 0.99] {
+                // page_target_h (Actual): displayed height = src_h × zoom; target_dims
+                // caps at the source height (no cap here since zoom < 1).
+                let target = (src_h * zoom).round().max(1.0);
+                let th = target.min(src_h); // decoded texture height
+                let drawn = src_h * zoom; // single_quad draws the box at src_h × zoom
+                let gpu_scale = drawn / th; // displayed ÷ decoded — must be ~1 (no resize)
+                assert!(
+                    (gpu_scale - 1.0).abs() <= 0.01,
+                    "actual {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (drawn {drawn}, texture {th})",
+                );
+            }
+        }
+    }
+
+    // A source taller than the *former* fixed 3840 cap, viewed below native, must
+    // decode to its displayed height — capped only by the GPU's real max texture
+    // size, aspect-aware so the width fits too — so the GPU samples 1:1. The old
+    // 3840 cap forced a GPU upscale (e.g. a 5207px page at 80–90% → ↑1.08–1.22×),
+    // which beats against the screentone → moiré. This models `page_target_h`'s cap.
+    #[test]
+    fn large_page_decodes_to_display_not_a_fixed_cap() {
+        let max_dim = 8192u32; // default MAX_TEX_DIM (the GPU's real limit)
+        for (src_w, src_h) in [(3600.0_f32, 5207.0), (5207.0, 3600.0), (4000.0, 6000.0)] {
+            let aspect = src_w / src_h;
+            let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(super::MIN_TARGET);
+            for zoom in [0.5_f32, 0.74, 0.8, 0.9, 1.0] {
+                // page_target_h (Actual): displayed height = src_h × zoom, clamped to max_h.
+                let target = ((src_h * zoom).round() as u32).clamp(super::MIN_TARGET, max_h);
+                let th = (target as f32).min(src_h); // target_dims caps at source
+                let tw = (th * aspect).round() as u32; // width follows source aspect
+                let display = src_h * zoom; // single_quad (Actual) draws at src_h × zoom
+                let gpu_scale = display / th;
+                assert!(
+                    (gpu_scale - 1.0).abs() <= 0.01,
+                    "src {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (display {display}, tex {th})"
+                );
+                assert!(
+                    th as u32 <= max_dim && tw <= max_dim,
+                    "src {src_w}x{src_h} z {zoom}: texture {tw}x{th} exceeds GPU max {max_dim}"
+                );
+            }
+        }
+    }
+
+    // The fit-multiplier clamp maps to native bounds: far zoom-out hits the 5%
+    // floor, far zoom-in hits the 20000% ceiling, mid values pass through.
+    #[test]
+    fn zoom_multiplier_clamps_to_native_bounds() {
+        let base = 2160.0_f32 / 2048.0; // native scale at zoom = 1 (fit-to-window)
+        let lo = super::clamp_zoom_multiplier(1e-6, base);
+        assert!((lo * base - super::MIN_ZOOM_PCT).abs() < 1e-4, "lo eff {}", lo * base);
+        let hi = super::clamp_zoom_multiplier(1e9, base);
+        assert!((hi * base - super::MAX_ZOOM_PCT).abs() < 1e-2, "hi eff {}", hi * base);
+        let mid = super::clamp_zoom_multiplier(1.0, base);
+        assert!((mid - 1.0).abs() < 1e-6, "mid {mid}");
+    }
+
+    // The BandiView ladder: 5, 10..300 by 10, 320..500 by 20, 550..20000 by 50.
+    #[test]
+    fn zoom_ladder_shape() {
+        let p = super::zoom_presets();
+        assert_eq!(p.first().copied(), Some(5.0));
+        assert_eq!(p.last().copied(), Some(20000.0));
+        assert!(p.windows(2).all(|w| w[1] > w[0]), "strictly increasing");
+        for v in [10.0, 100.0, 300.0, 320.0, 500.0, 550.0, 20000.0] {
+            assert!(p.contains(&v), "ladder missing {v}");
+        }
+        let idx = |v: f32| p.iter().position(|&x| x == v).unwrap();
+        assert_eq!(p[idx(300.0) + 1], 320.0, "300 -> 320 (step 20)");
+        assert_eq!(p[idx(500.0) + 1], 550.0, "500 -> 550 (step 50)");
+    }
+
+    // +/- step to the neighbouring fixed stop, clamping at the ends.
+    #[test]
+    fn zoom_stepping_fixed() {
+        let p = super::zoom_presets();
+        let up = |c: f32| super::next_zoom_preset(&p, c, true);
+        let dn = |c: f32| super::next_zoom_preset(&p, c, false);
+        assert_eq!(up(71.0), 80.0);
+        assert_eq!(up(80.0), 90.0);
+        assert_eq!(up(300.0), 320.0);
+        assert_eq!(up(500.0), 550.0);
+        assert_eq!(up(20000.0), 20000.0, "clamps at the top");
+        assert_eq!(dn(5.0), 5.0, "clamps at the bottom");
+        assert_eq!(dn(95.0), 90.0);
+        assert_eq!(dn(320.0), 300.0);
+        assert_eq!(dn(550.0), 500.0);
+    }
+
+    // A spliced fit-% (e.g. 71.34) becomes a reachable stop between fixed presets.
+    #[test]
+    fn zoom_stepping_dynamic_stop() {
+        let ladder = vec![70.0, 71.34, 80.0, 90.0];
+        assert_eq!(super::next_zoom_preset(&ladder, 70.0, true), 71.34);
+        assert_eq!(super::next_zoom_preset(&ladder, 71.34, true), 80.0);
+        assert_eq!(super::next_zoom_preset(&ladder, 71.34, false), 70.0);
     }
 }
