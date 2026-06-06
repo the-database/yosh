@@ -113,3 +113,40 @@ pub fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
     let (lo, hi) = (MIN_ZOOM_PCT / base, MAX_ZOOM_PCT / base);
     zoom.clamp(lo.min(hi), lo.max(hi))
 }
+
+/// Decode-target height floor. Each page's decode target tracks its exact
+/// on-screen size (see `page_target_h`) so the HQ linear-light CPU resize does the
+/// *full* reduction in one pass and the GPU samples 1:1 — the single-resize
+/// invariant. Below it, extreme zoom-out would otherwise decode a sub-pixel page.
+pub const MIN_TARGET: u32 = 32;
+
+/// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
+pub struct Quad {
+    pub slot: usize,
+    pub page_index: usize,
+    pub scale: [f32; 2],
+    pub offset: [f32; 2],
+    pub rot: u32, // 0/1/2/3 = 0/90/180/270° CW (single-page draws only; 0 for spreads)
+}
+
+/// Build a [`Quad`] from pixel-space placement — top-left `(x_px, y_px)` and size
+/// `(dw, dh)` within a `(sw, sh)` surface — converting to NDC scale + offset.
+pub fn quad_from_px(
+    slot: usize,
+    page_index: usize,
+    x_px: f32,
+    y_px: f32,
+    dw: f32,
+    dh: f32,
+    sw: f32,
+    sh: f32,
+    rot: u32,
+) -> Quad {
+    Quad {
+        slot,
+        page_index,
+        scale: [2.0 * dw / sw, 2.0 * dh / sh],
+        offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
+        rot,
+    }
+}

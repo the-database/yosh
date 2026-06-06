@@ -28,19 +28,13 @@ use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, Sev
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::prefetch::desired_window;
 use yosh_engine::reader::{
-    anchor_native_scale, clamp_zoom_multiplier, next_zoom_preset, zoom_presets, Direction, Viewport,
-    MAX_ZOOM_PCT, MIN_ZOOM_PCT,
+    anchor_native_scale, clamp_zoom_multiplier, next_zoom_preset, quad_from_px, zoom_presets,
+    Direction, Quad, Viewport, MAX_ZOOM_PCT, MIN_TARGET, MIN_ZOOM_PCT,
 };
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
 
-// Decode target height tracks each page's exact on-screen size (see
-// `page_target_h`) so the high-quality linear-light CPU resize does the *full*
-// reduction in one pass and the GPU samples 1:1 — the single-resize invariant.
-// Otherwise pages decode larger than shown and the GPU re-downscales them with a
-// plain bilinear (no mipmaps) → halftone aliasing/moiré.
-const MIN_TARGET: u32 = 32; // floor so extreme zoom-out still decodes ~exact
 const WORKERS: usize = 8;
 const CACHE_CAP: usize = 48;
 const FWD: usize = 16;
@@ -635,15 +629,6 @@ fn reveal_in_explorer(path: &std::path::Path) {
     if let Some(dir) = path.parent() {
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
-}
-
-/// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
-struct Quad {
-    slot: usize,
-    page_index: usize,
-    scale: [f32; 2],
-    offset: [f32; 2],
-    rot: u32, // 0/1/2/3 = 0/90/180/270° CW (single-page draws only; 0 for spreads)
 }
 
 impl App {
@@ -1725,26 +1710,6 @@ impl State {
         }
     }
 
-    fn quad_from_px(
-        slot: usize,
-        page_index: usize,
-        x_px: f32,
-        y_px: f32,
-        dw: f32,
-        dh: f32,
-        sw: f32,
-        sh: f32,
-        rot: u32,
-    ) -> Quad {
-        Quad {
-            slot,
-            page_index,
-            scale: [2.0 * dw / sw, 2.0 * dh / sh],
-            offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
-            rot,
-        }
-    }
-
     fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
         // A 90°/270° turn swaps the page's effective width/height for fitting; the
         // shader then turns the texture inside this (rotated) bounding box. The box
@@ -1774,7 +1739,7 @@ impl State {
         // fractional offset would make the bilinear sampler blend every column
         // 50/50 with its neighbour — a horizontal smear that also beats against
         // halftone screentones. Whole-pixel placement samples texel centers 1:1.
-        Self::quad_from_px(
+        quad_from_px(
             0,
             idx,
             self.horizontal_left(dw, sw).round(),
@@ -1837,8 +1802,8 @@ impl State {
                 let xl = x0.round();
                 let dwl_r = dwl.round();
                 vec![
-                    Self::quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
-                    Self::quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
+                    quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
+                    quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
                 ]
             }
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
@@ -1941,7 +1906,7 @@ impl State {
             let dh = self.page_display_h(i, sw);
             if y + dh > 0.0 {
                 if self.cache.get(i).is_some() {
-                    quads.push(Self::quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
+                    quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
                     slot += 1;
                 }
             }
