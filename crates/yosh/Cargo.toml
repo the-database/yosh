@@ -4,37 +4,31 @@ version = "0.1.36"
 edition = "2024"
 
 [dependencies]
+# The reusable decode/render core: the DecodePool, HQ decode path, page/texture/
+# cache layer, source backends, layout math, and the wgpu device context. The
+# page-decode crates (png/jpeg-decoder/image/jxl-oxide/psd/qcms/fast_image_resize/
+# ico) and archive crates (zip/unrar/sevenz-rust2) live there, not here.
+yosh-engine = { path = "../yosh-engine" }
 winit = "0.30.13"
 wgpu = "29.0.3"
-pollster = "0.4"
-bytemuck = { version = "1", features = ["derive"] }
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
 egui-winit = "0.34.3"
 rfd = "0.17"
-png = "0.18"
-jpeg-decoder = "0.3"
+# The shell still uses a few engine deps directly: `image` for the window icon,
+# the info-overlay format probe, and egui cover thumbnails; `jxl-oxide` only to
+# name a JXL's pixel format in that overlay (the engine does the real decode);
+# `fast_image_resize` for the thumbnail Resizer; `natord` to sort library volumes.
 image = "0.25"
-# Pure-Rust JPEG XL decoder (no C toolchain). default-features = false keeps out
-# the optional lcms2 (C) / image / rayon features — yosh color-manages via qcms
-# and parallelizes across pages in the DecodePool, so JXL decodes single-threaded.
 jxl-oxide = { version = "0.12", default-features = false }
-# Pure-Rust PSD parser. Used to render a PSD's flattened composite (8-bit RGB);
-# PSD is browsable inside folders/archives but is *not* a registered file type.
-psd = "0.3"
 fast_image_resize = "6"
-qcms = "0.3"
 natord = "1"
-zip = "8"
-unrar = "0.5"
-sevenz-rust2 = "0.21"
 directories = "5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Self-update against public GitHub releases (pure-Rust TLS via rustls + ring).
 ureq = "2"
 self-replace = "1"
-ico = "0.5"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
@@ -57,4 +51,5 @@ winresource = "0.1"
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so
 # the standard `cargo build` needs no C toolchain. Enabling it requires nasm +
 # dav1d (or a vendored build): `cargo build --release -p yosh --features avif`.
-avif = ["image/avif-native"]
+# Forwarded to the engine, which owns the decode path (image/avif-native).
+avif = ["yosh-engine/avif"]

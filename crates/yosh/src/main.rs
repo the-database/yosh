@@ -7,19 +7,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod cache;
 mod config;
-mod decode;
 mod gpu;
-mod icc;
-mod layout;
 mod library;
-mod page;
-mod pool;
-mod prefetch;
-mod source;
-mod texpool;
-mod tone;
 mod ui;
 mod update;
 
