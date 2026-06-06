@@ -1081,10 +1081,6 @@ impl State {
         self.toast("Shown in Explorer");
     }
 
-    /// Flip one view in `dir`. Returns `true` if the position actually changed.
-    /// At the first/last page it raises a toast and returns `false`; while the
-    /// current page is still decoding in step mode it just returns `false`.
-
     /// Open the previous (`delta < 0`) or next (`delta > 0`) sibling volume of
     /// the same kind — folder ↔ folder, archive ↔ archive — in natural-sort
     /// order within the current volume's parent directory (`[` / `]`). The
@@ -1314,10 +1310,8 @@ impl State {
         }
     }
 
-    /// Does the current page overflow the window vertically under the active fit?
-
-    /// Keep (index, top_offset) in range using best-known page heights, so the
-    /// anchor stays valid as nearby pages decode (and their real heights land).
+    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
+    /// and register them with egui.
     fn decode_thumbnails(&mut self, budget: usize) {
         let mut done = 0;
         for i in 0..self.library.volumes.len() {
@@ -1350,7 +1344,11 @@ impl State {
         }
     }
 
-    /// Forward look-ahead distance, widened when flipping quickly.
+    /// Begin opening `path`. The source is built on a background thread (see
+    /// `build_source`) so a slow network-share open never freezes the UI — the
+    /// current page stays on screen under the spinner until the new source lands
+    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
+    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
     fn open(&mut self, path: &Path) {
         self.open_gen = self.open_gen.wrapping_add(1);
         let generation = self.open_gen;
@@ -1506,10 +1504,8 @@ impl State {
         ]
     }
 
-    /// Source aspect (w / h) for page `index`: from its decoded texture if present,
-    /// else the in-view anchor's, else the running estimate. Used to size the decode
-    /// target before the page itself is decoded (exact for the usual uniform-size
-    /// volume; corrected in place once the page's own dimensions are known).
+    /// The in-view anchor page if it is an animated (GIF/WebP) page with its texture
+    /// decoded — the page the mini playback controls govern.
     fn anim_anchor(&self) -> Option<usize> {
         if self.library_view {
             return None;
