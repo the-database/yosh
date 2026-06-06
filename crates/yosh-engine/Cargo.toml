@@ -1,0 +1,15 @@
+[package]
+name = "yosh-engine"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "yosh_engine"
+
+[features]
+# AVIF decode via the image crate's native (dav1d) backend. OFF by default so the
+# standard build needs no C toolchain. The `yosh` app forwards its own `avif`
+# feature to this one. Enabling requires nasm + dav1d (see CI).
+avif = []
+
+[dependencies]

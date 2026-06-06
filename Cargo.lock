@@ -5195,8 +5195,13 @@ dependencies = [
  "windows-sys 0.59.0",
  "winit",
  "winresource",
+ "yosh-engine",
  "zip",
 ]
+
+[[package]]
+name = "yosh-engine"
+version = "0.1.0"
 
 [[package]]
 name = "zerocopy"
