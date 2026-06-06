@@ -10,6 +10,19 @@ name = "yosh_engine"
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so the
 # standard build needs no C toolchain. The `yosh` app forwards its own `avif`
 # feature to this one. Enabling requires nasm + dav1d (see CI).
-avif = []
+avif = ["image/avif-native"]
 
 [dependencies]
+image = "0.25"
+png = "0.18"
+jpeg-decoder = "0.3"
+# Pure-Rust JPEG XL decoder (no C toolchain). default-features = false keeps out
+# the optional lcms2 (C) / image / rayon features — color is managed via qcms and
+# pages parallelize across the DecodePool, so JXL decodes single-threaded.
+jxl-oxide = { version = "0.12", default-features = false }
+# Pure-Rust PSD parser (renders a PSD's flattened 8-bit RGB composite).
+psd = "0.3"
+fast_image_resize = "6"
+qcms = "0.3"
+# ICO container parsing (multi-image .ico → layered pages) and re-encoding.
+ico = "0.5"

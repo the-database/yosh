@@ -5202,6 +5202,16 @@ dependencies = [
 [[package]]
 name = "yosh-engine"
 version = "0.1.0"
+dependencies = [
+ "fast_image_resize",
+ "ico",
+ "image",
+ "jpeg-decoder",
+ "jxl-oxide",
+ "png 0.18.1",
+ "psd",
+ "qcms",
+]
 
 [[package]]
 name = "zerocopy"

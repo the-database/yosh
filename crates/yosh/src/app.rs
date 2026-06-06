@@ -19,7 +19,7 @@ use fast_image_resize::Resizer;
 
 use crate::cache::PageCache;
 use crate::config;
-use crate::decode::decode_and_downscale;
+use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library};
 use crate::page::{fit_scale, FitMode, PagePipeline, PageTexture, MAX_QUADS};
@@ -2046,7 +2046,7 @@ impl State {
                 continue;
             };
             let img = match decode_and_downscale(&bytes, THUMB_H, &mut self.thumb_resizer) {
-                Ok(img) => crate::decode::to_rgba_image(img), // egui samples RGBA
+                Ok(img) => yosh_engine::decode::to_rgba_image(img), // egui samples RGBA
                 Err(_) => continue,
             };
             // Library thumbnail (registered with egui, not stored in the page
@@ -2211,9 +2211,9 @@ impl State {
                 } else {
                     format!("{w} × {h}")
                 };
-                let color = crate::icc::extract_icc(b)
+                let color = yosh_engine::icc::extract_icc(b)
                     .as_deref()
-                    .and_then(|p| crate::icc::describe(p))
+                    .and_then(|p| yosh_engine::icc::describe(p))
                     .unwrap_or_else(|| "—".to_string());
                 (res, detail, human_size(b.len() as u64), color)
             }
@@ -2265,7 +2265,7 @@ impl State {
         // shown size, so the GPU resampled it. Now the HQ CPU resize hits the display
         // size and the GPU stays 1:1 below native, all the way up to what the GPU can
         // hold. (`target_dims` still caps at the source height, so it never upscales.)
-        let max_dim = crate::decode::MAX_TEX_DIM.load(std::sync::atomic::Ordering::Relaxed);
+        let max_dim = yosh_engine::decode::MAX_TEX_DIM.load(std::sync::atomic::Ordering::Relaxed);
         let max_h = ((max_dim as f32 / aspect.max(1.0)).floor() as u32).max(MIN_TARGET);
         if self.fit == FitMode::Actual && !self.scroll_mode {
             // 1:1 displays at native × zoom. Target that height so the page decodes

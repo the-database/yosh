@@ -47,7 +47,7 @@ impl Gpu {
             ..Default::default()
         }))
         .expect("request device");
-        crate::decode::MAX_TEX_DIM.store(
+        yosh_engine::decode::MAX_TEX_DIM.store(
             device.limits().max_texture_dimension_2d,
             std::sync::atomic::Ordering::Relaxed,
         );
