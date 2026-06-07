@@ -4,9 +4,12 @@
 // pull advapi32 in transitively (windows-sys), but the engine links standalone
 // — e.g. `cargo test -p yosh-engine` — so request it here for Windows targets.
 // A duplicate link directive is harmless for the app build. Gated on the
-// *target* OS (not the host) so cross-compiles (e.g. to Android) don't emit it.
+// *target* OS (not the host) so cross-compiles (e.g. to Android) don't emit it,
+// and on the `rar` feature so a no-RAR build (which omits `unrar`) needn't link it.
 fn main() {
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    let rar = std::env::var_os("CARGO_FEATURE_RAR").is_some();
+    let windows = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows");
+    if rar && windows {
         println!("cargo:rustc-link-lib=dylib=advapi32");
     }
 }
