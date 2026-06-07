@@ -3,7 +3,10 @@ package com.thedatabase.yosh;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
 import android.os.ParcelFileDescriptor;
+import android.provider.Settings;
 import android.util.Log;
 
 // A thin NativeActivity subclass that exists only to bridge the Storage Access
@@ -26,6 +29,27 @@ public class YoshActivity extends NativeActivity {
         String u = pickedUri;
         pickedUri = null;
         return u;
+    }
+
+    /** True if the app has all-files access (so it can browse the library by path). */
+    public boolean hasAllFiles() {
+        if (Build.VERSION.SDK_INT >= 30) {
+            return Environment.isExternalStorageManager();
+        }
+        return true; // pre-Android-11 uses the legacy storage model
+    }
+
+    /** Open Settings so the user can grant all-files access. Called from native. */
+    public void requestAllFiles() {
+        runOnUiThread(() -> {
+            try {
+                Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                intent.setData(Uri.parse("package:" + getPackageName()));
+                startActivity(intent);
+            } catch (Exception e) {
+                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+            }
+        });
     }
 
     /** Launch the SAF document picker. Called from native via JNI. */

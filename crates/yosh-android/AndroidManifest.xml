@@ -7,6 +7,11 @@
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
 
+    <!-- Browse a comic library folder directly (like Perfect Viewer / the desktop).
+         A "special" permission the user grants once in Settings; fine for a
+         sideloaded personal app. -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
     <application
         android:label="yosh"
         android:allowBackup="true"
