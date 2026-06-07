@@ -92,6 +92,9 @@ struct App {
     page_pipeline: PagePipeline,
     reader: Reader,
     anim_origin: Instant,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 impl ApplicationHandler for Shell {
@@ -150,6 +153,20 @@ impl ApplicationHandler for Shell {
         surface.configure(&ctx.device, &config);
 
         let page_pipeline = PagePipeline::new(&ctx.device, config.format);
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            None,
+            None,
+            Some(8192),
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &ctx.device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let budget = Budget::derive(device_mem_budget_mb(), cpus);
         log::info!("budget: {budget:?} ({cpus} cpus)");
@@ -174,6 +191,9 @@ impl ApplicationHandler for Shell {
             page_pipeline,
             reader,
             anim_origin: Instant::now(),
+            egui_ctx,
+            egui_state,
+            egui_renderer,
         });
         // Dev fallback: open a pushed test comic if present (restores its position).
         if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
@@ -196,6 +216,12 @@ impl ApplicationHandler for Shell {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Let egui see the event first (seekbar drag); gate nav on what it consumes.
+        let egui_consumed = if let Some(app) = self.app.as_mut() {
+            app.egui_state.on_window_event(&app.window, &event).consumed
+        } else {
+            false
+        };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -210,7 +236,7 @@ impl ApplicationHandler for Shell {
                 phase: TouchPhase::Started,
                 location,
                 ..
-            }) => self.on_tap(location.x, location.y),
+            }) if !egui_consumed => self.on_tap(location.x, location.y),
             WindowEvent::RedrawRequested => {
                 // A picker result may have landed while we were backgrounded.
                 if self.picker_pending {
@@ -377,6 +403,28 @@ fn device_mem_budget_mb() -> u64 {
     (total / 8).max(256)
 }
 
+/// Bottom seekbar: "page / total" + a draggable slider that requests a jump.
+/// Hidden for a single-page source.
+fn seekbar(ctx: &egui::Context, cur: usize, len: usize, seek_to: &mut Option<usize>) {
+    if len <= 1 {
+        return;
+    }
+    egui::TopBottomPanel::bottom("seekbar").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(format!("{} / {}", cur + 1, len));
+            let mut p = cur;
+            // Span the slider across the rest of the bar.
+            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
+            if ui
+                .add(egui::Slider::new(&mut p, 0..=len - 1).show_value(false))
+                .changed()
+            {
+                *seek_to = Some(p);
+            }
+        });
+    });
+}
+
 // --- JNI bridge to YoshActivity ---------------------------------------------
 
 /// Launch the SAF document picker via `YoshActivity.openDocument()`.
@@ -529,7 +577,63 @@ impl App {
                 }
             }
         }
-        self.ctx.queue.submit([enc.finish()]);
+        // egui chrome (seekbar) over the page, in the same encoder.
+        let raw_input = self.egui_state.take_egui_input(&self.window);
+        let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
+        let cur = self.reader.index;
+        let mut seek_to: Option<usize> = None;
+        let full_output = self
+            .egui_ctx
+            .run(raw_input, |ctx| seekbar(ctx, cur, len, &mut seek_to));
+        self.egui_state
+            .handle_platform_output(&self.window, full_output.platform_output);
+        if let Some(p) = seek_to {
+            self.reader.goto(p);
+        }
+        let ppp = self.egui_ctx.pixels_per_point();
+        let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ppp,
+        };
+        for (id, delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.ctx.device, &self.ctx.queue, *id, delta);
+        }
+        let user_cmds = self.egui_renderer.update_buffers(
+            &self.ctx.device,
+            &self.ctx.queue,
+            &mut enc,
+            &primitives,
+            &screen,
+        );
+        {
+            let mut egui_pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer.render(&mut egui_pass, &primitives, &screen);
+        }
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        self.ctx
+            .queue
+            .submit(user_cmds.into_iter().chain(std::iter::once(enc.finish())));
         self.window.pre_present_notify();
         frame.present();
         // TODO(power): redraw on-demand instead of continuously — needs a reliable
