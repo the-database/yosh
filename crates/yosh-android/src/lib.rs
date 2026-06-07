@@ -138,7 +138,8 @@ impl ApplicationHandler for Shell {
 
         let page_pipeline = PagePipeline::new(&ctx.device, config.format);
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let budget = Budget::derive(256, cpus);
+        let budget = Budget::derive(device_mem_budget_mb(), cpus);
+        log::info!("budget: {budget:?} ({cpus} cpus)");
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
         let mut reader = Reader::new(
             ctx.device.clone(),
@@ -280,6 +281,26 @@ fn attach_source(
     reader.index = 0;
     reader.source = Some(src);
     reader.prefetch();
+}
+
+/// Memory (MB) the reader may use for its page cache + GPU textures, from
+/// `/proc/meminfo`. Decoded pages and GPU textures are *native* allocations, not
+/// bounded by the (small) Java heap, so a healthy slice of device RAM is fine —
+/// more cache + a wider prefetch window means fewer stalls seeking heavy pages.
+fn device_mem_budget_mb() -> u64 {
+    let total = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("MemTotal:"))?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(4096);
+    (total / 8).max(256)
 }
 
 // --- JNI bridge to YoshActivity ---------------------------------------------
