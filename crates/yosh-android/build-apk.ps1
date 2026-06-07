@@ -48,7 +48,7 @@ foreach ($a in $abis) {
 $classes = "$out\classes"
 New-Item -ItemType Directory -Force $classes | Out-Null
 $javaFiles = @((Get-ChildItem -Recurse "$proj\java" -Filter *.java).FullName)
-& "$JDK\bin\javac.exe" -nowarn -source 8 -target 8 -classpath $JAR -d $classes $javaFiles
+& "$JDK\bin\javac.exe" -encoding UTF-8 -nowarn -source 8 -target 8 -classpath $JAR -d $classes $javaFiles
 if ($LASTEXITCODE) { throw "javac failed" }
 $classFiles = @((Get-ChildItem -Recurse $classes -Filter *.class).FullName)
 & "$BT\d8.bat" --min-api 24 --lib $JAR --output "$out\stage" $classFiles

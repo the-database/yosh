@@ -19,3 +19,5 @@ wgpu = "29.0.3"
 winit = { version = "0.30.13", features = ["android-native-activity"] }
 android_logger = "0.14"
 log = "0.4"
+# JNI to the Java SAF bridge (YoshActivity): launch the picker + read the FD.
+jni = "0.21"
