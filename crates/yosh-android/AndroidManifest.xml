@@ -9,11 +9,10 @@
 
     <application
         android:label="yosh"
-        android:hasCode="false"
         android:allowBackup="true"
         android:extractNativeLibs="true">
         <activity
-            android:name="android.app.NativeActivity"
+            android:name="com.thedatabase.yosh.YoshActivity"
             android:exported="true"
             android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|uiMode">
             <meta-data
