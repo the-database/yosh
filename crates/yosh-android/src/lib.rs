@@ -15,7 +15,7 @@
 #![cfg(target_os = "android")]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,7 +33,7 @@ use yosh_engine::layout::Layout;
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
-use yosh_engine::source::{PageSource, ZipSource};
+use yosh_engine::source::{is_image_ext, FolderSource, PageSource, SevenzSource, ZipSource};
 use yosh_engine::texpool::TexturePool;
 
 /// Entry point android-activity calls on the native-activity thread.
@@ -49,6 +49,13 @@ fn android_main(app: AndroidApp) {
     // Per-comic reading positions persist in the app's private dir.
     let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
     let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
+    let lib_dir_file = app.internal_data_path().map(|p| p.join("libdir.txt"));
+    let init_lib_dir = lib_dir_file
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/storage/emulated/0"));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -61,6 +68,9 @@ fn android_main(app: AndroidApp) {
         positions,
         pos_path,
         current_key: None,
+        has_files: false,
+        init_lib_dir,
+        lib_dir_file,
     };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
@@ -80,6 +90,11 @@ struct Shell {
     pos_path: Option<PathBuf>,
     /// Identity of the currently-open comic, for saving its position.
     current_key: Option<String>,
+    /// Cached all-files-access state (refreshed on resume + library toggle).
+    has_files: bool,
+    /// The library dir to open the browser at (persisted across launches).
+    init_lib_dir: PathBuf,
+    lib_dir_file: Option<PathBuf>,
 }
 
 /// The live app: surface + the engine device context, the page pipeline, and the
@@ -95,6 +110,29 @@ struct App {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     egui_renderer: egui_wgpu::Renderer,
+    /// Library browser overlay state.
+    library_view: bool,
+    lib_dir: PathBuf,
+    lib_entries: Vec<Entry>,
+}
+
+/// A library browser row: a folder to descend into (or open if it holds images),
+/// or a comic archive to open.
+enum Entry {
+    Dir(PathBuf),
+    Comic(PathBuf),
+}
+
+/// Cross-shell actions an egui frame requests (handled after the egui run, since
+/// they need `Shell` state the reader/render path doesn't own).
+#[derive(Default)]
+struct FrameReqs {
+    /// Open this comic (by path).
+    open: Option<PathBuf>,
+    /// Request all-files access.
+    grant: bool,
+    /// Open the SAF single-file picker (fallback for files outside the library).
+    open_picker: bool,
 }
 
 impl ApplicationHandler for Shell {
@@ -104,7 +142,12 @@ impl ApplicationHandler for Shell {
                 .create_window(Window::default_attributes().with_title("yosh"))
                 .expect("create window"),
         );
-        log::info!("all-files access: {}", has_all_files(&self.android_app));
+        self.has_files = has_all_files(&self.android_app);
+        log::info!(
+            "all-files access: {} | scale {}",
+            self.has_files,
+            window.scale_factor()
+        );
         // Resume from background (incl. returning from the picker): rebuild only
         // the surface against the existing device + reader — no re-decode.
         if self.app.is_some() {
@@ -195,6 +238,9 @@ impl ApplicationHandler for Shell {
             egui_ctx,
             egui_state,
             egui_renderer,
+            library_view: false,
+            lib_dir: self.init_lib_dir.clone(),
+            lib_entries: Vec::new(),
         });
         // Dev fallback: open a pushed test comic if present (restores its position).
         if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
@@ -209,11 +255,14 @@ impl ApplicationHandler for Shell {
     }
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
-        // Persist the current position before the OS may kill us.
+        // Persist the current position + library dir before the OS may kill us.
         if let (Some(k), Some(app)) = (self.current_key.clone(), self.app.as_ref()) {
             self.positions.insert(k, app.reader.index);
         }
         self.save_positions();
+        if let (Some(f), Some(app)) = (self.lib_dir_file.clone(), self.app.as_ref()) {
+            let _ = std::fs::write(f, app.lib_dir.to_string_lossy().as_bytes());
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -246,8 +295,20 @@ impl ApplicationHandler for Shell {
                         self.open_picked(&uri);
                     }
                 }
-                if let Some(app) = self.app.as_mut() {
-                    app.render();
+                let has_files = self.has_files;
+                let reqs = match self.app.as_mut() {
+                    Some(app) => app.render(has_files),
+                    None => FrameReqs::default(),
+                };
+                if reqs.grant {
+                    request_all_files(&self.android_app);
+                }
+                if reqs.open_picker {
+                    launch_picker(&self.android_app);
+                    self.picker_pending = true;
+                }
+                if let Some(path) = reqs.open {
+                    self.open_path(path);
                 }
             }
             _ => {}
@@ -265,17 +326,25 @@ impl Shell {
         else {
             return;
         };
+        // When the library is open, every tap belongs to egui (the ✕ button closes
+        // it). egui's "consumed" flag lags a frame on a touch press, so without this
+        // a tap near the top would fall through here and toggle the library shut
+        // before egui could register the row's click.
+        if self.app.as_ref().map(|a| a.library_view).unwrap_or(false) {
+            return;
+        }
         if y < h * 0.12 {
-            // Top strip: grant all-files access if we don't have it yet, else open
-            // the picker. (Step 2 replaces this with the library browser.)
-            if has_all_files(&self.android_app) {
-                launch_picker(&self.android_app);
-                self.picker_pending = true;
-            } else {
-                log::info!("requesting all-files access");
-                request_all_files(&self.android_app);
+            // Top strip opens the library browser.
+            self.has_files = has_all_files(&self.android_app);
+            if let Some(app) = self.app.as_mut() {
+                app.library_view = true;
+                app.lib_entries = scan_dir(&app.lib_dir);
+                app.window.request_redraw();
             }
-        } else if let Some(app) = self.app.as_mut() {
+            return;
+        }
+        // Page nav.
+        if let Some(app) = self.app.as_mut() {
             if x < w / 3.0 {
                 app.reader.step(-1);
             } else {
@@ -289,6 +358,33 @@ impl Shell {
                 self.positions.insert(k, idx);
                 self.save_positions();
             }
+        }
+    }
+
+    /// Open a comic by path: route by type (archive / image folder) to an engine
+    /// source, then through `open_comic` (which restores its saved position).
+    fn open_path(&mut self, path: PathBuf) {
+        let src: Option<Arc<dyn PageSource>> = if path.is_dir() {
+            FolderSource::new(&path)
+                .ok()
+                .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+        } else {
+            match ext_lower(&path).as_deref() {
+                Some("cbz" | "zip") => ZipSource::new(&path)
+                    .ok()
+                    .map(|s| Arc::new(s) as Arc<dyn PageSource>),
+                Some("cb7" | "7z") => SevenzSource::new(&path)
+                    .ok()
+                    .map(|s| Arc::new(s) as Arc<dyn PageSource>),
+                _ => None,
+            }
+        };
+        match src {
+            Some(src) => {
+                log::info!("open {:?}: {} pages", path, src.len());
+                self.open_comic(path.to_string_lossy().into_owned(), src);
+            }
+            None => log::error!("could not open {path:?}"),
         }
     }
 
@@ -509,7 +605,7 @@ fn with_env<T>(
 }
 
 impl App {
-    fn render(&mut self) {
+    fn render(&mut self, has_files: bool) -> FrameReqs {
         self.reader.viewport = Viewport {
             w: self.config.width,
             h: self.config.height,
@@ -557,11 +653,11 @@ impl App {
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.ctx.device, &self.config);
                 self.window.request_redraw();
-                return;
+                return FrameReqs::default();
             }
             _ => {
                 self.window.request_redraw();
-                return;
+                return FrameReqs::default();
             }
         };
         let view = frame
@@ -601,18 +697,100 @@ impl App {
                 }
             }
         }
-        // egui chrome (seekbar) over the page, in the same encoder.
+        // egui chrome over the page: the library browser when open, else the seekbar.
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
         let cur = self.reader.index;
+        let library_view = self.library_view;
+        let lib_dir_str = self.lib_dir.display().to_string();
+        // Snapshot the rows the closure needs (owned), so it borrows no `self`.
+        let entries: Vec<(bool, String, PathBuf)> = self
+            .lib_entries
+            .iter()
+            .map(|e| match e {
+                Entry::Dir(p) => (true, name_of(p), p.clone()),
+                Entry::Comic(p) => (false, name_of(p), p.clone()),
+            })
+            .collect();
         let mut seek_to: Option<usize> = None;
-        let full_output = self
-            .egui_ctx
-            .run(raw_input, |ctx| seekbar(ctx, cur, len, &mut seek_to));
+        let mut reqs = FrameReqs::default();
+        let mut go_up = false;
+        let mut nav_to: Option<PathBuf> = None;
+        let mut close_lib = false;
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            if library_view {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if !has_files {
+                        ui.add_space(40.0);
+                        ui.label("Grant access to your files to browse your comics:");
+                        if ui.button("Grant all-files access").clicked() {
+                            reqs.grant = true;
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            if ui.button("⬆ Up").clicked() {
+                                go_up = true;
+                            }
+                            if ui.button("✕ Close").clicked() {
+                                close_lib = true;
+                            }
+                            if ui.button("Open file…").clicked() {
+                                reqs.open_picker = true;
+                            }
+                            ui.label(&lib_dir_str);
+                        });
+                        ui.separator();
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let w = ui.available_width();
+                            for (is_dir, label, path) in &entries {
+                                let txt = if *is_dir {
+                                    format!("📁  {label}")
+                                } else {
+                                    format!("📖  {label}")
+                                };
+                                // Big full-width rows so they're easy to tap.
+                                let btn = egui::Button::new(egui::RichText::new(txt).size(20.0))
+                                    .min_size(egui::vec2(w, 44.0));
+                                if ui.add(btn).clicked() {
+                                    if *is_dir {
+                                        nav_to = Some(path.clone());
+                                    } else {
+                                        reqs.open = Some(path.clone());
+                                        close_lib = true;
+                                    }
+                                }
+                                ui.add_space(4.0);
+                            }
+                        });
+                    }
+                });
+            } else {
+                seekbar(ctx, cur, len, &mut seek_to);
+            }
+        });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
         if let Some(p) = seek_to {
             self.reader.goto(p);
+        }
+        if go_up {
+            if let Some(parent) = self.lib_dir.parent() {
+                self.lib_dir = parent.to_path_buf();
+                self.lib_entries = scan_dir(&self.lib_dir);
+            }
+        }
+        if let Some(d) = nav_to {
+            // A folder of images is itself a comic; otherwise descend into it.
+            if is_image_folder(&d) {
+                reqs.open = Some(d);
+                close_lib = true;
+            } else {
+                self.lib_dir = d;
+                self.lib_entries = scan_dir(&self.lib_dir);
+            }
+        }
+        if close_lib {
+            self.library_view = false;
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
@@ -664,5 +842,60 @@ impl App {
         // "pending work" signal from the reader; a naive cache/settled check idled
         // before the first decode landed.
         self.window.request_redraw();
+        reqs
     }
+}
+
+/// Last path component as a display string.
+fn name_of(p: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
+
+fn ext_lower(p: &Path) -> Option<String> {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+}
+
+/// Is this a comic archive yosh can open on Android (RAR excluded)?
+fn is_comic_archive(p: &Path) -> bool {
+    matches!(ext_lower(p).as_deref(), Some("cbz" | "zip" | "cb7" | "7z"))
+}
+
+/// Does this directory directly contain image files (i.e. is itself a comic)?
+fn is_image_folder(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| rd.flatten().any(|e| e.path().is_file() && is_image_ext(&e.path())))
+        .unwrap_or(false)
+}
+
+/// List a directory's sub-folders + comic archives, folders first, natural order.
+fn scan_dir(dir: &Path) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            if p.is_dir() {
+                Some(Entry::Dir(p))
+            } else if is_comic_archive(&p) {
+                Some(Entry::Comic(p))
+            } else {
+                None
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        let key = |e: &Entry| match e {
+            Entry::Dir(p) => (0, name_of(p).to_lowercase()),
+            Entry::Comic(p) => (1, name_of(p).to_lowercase()),
+        };
+        let (ad, an) = key(a);
+        let (bd, bn) = key(b);
+        ad.cmp(&bd).then_with(|| natord::compare(&an, &bn))
+    });
+    entries
 }
