@@ -26,10 +26,11 @@ $abis = @(@{abi='arm64-v8a'; ndk='arm64-v8a';  triple='aarch64-linux-android'},
           @{abi='x86_64';    ndk='x86_64';     triple='x86_64-linux-android'})
 
 # --- 1. cross-compile the .so for each ABI -----------------------------------
-$profileFlag = if ($Profile -eq "release") { "--release" } else { "" }
 foreach ($a in $abis) {
     Write-Host "Building $($a.triple) ($Profile)..."
-    & cargo ndk --target $a.ndk --platform 24 build --package yosh-android $profileFlag
+    $cargoArgs = @('ndk', '--target', $a.ndk, '--platform', '24', 'build', '--package', 'yosh-android')
+    if ($Profile -eq 'release') { $cargoArgs += '--release' }
+    & cargo @cargoArgs
     if ($LASTEXITCODE) { throw "cargo ndk failed for $($a.triple)" }
 }
 
