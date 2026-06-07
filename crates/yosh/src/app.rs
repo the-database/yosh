@@ -623,7 +623,20 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
+        if let Some(state) = self.state.as_mut() {
+            // Resuming from background: the OS tore the surface down (Android does
+            // this on every background), but the device, decode pool, cache and
+            // reader state all survive. Make a fresh window + surface and carry on
+            // with no re-decode. Desktop fires `resumed` only once, so this branch
+            // is Android's; re-binding egui to the new window is the future Android
+            // shell's concern.
+            let attrs = Window::default_attributes()
+                .with_title("yosh")
+                .with_window_icon(window_icon());
+            let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+            state.gpu.recreate_surface(window.clone());
+            state.window = window;
+            state.window.request_redraw();
             return;
         }
         let mut settings = config::load();
