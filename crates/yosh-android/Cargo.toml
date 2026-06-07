@@ -21,3 +21,9 @@ android_logger = "0.14"
 log = "0.4"
 # JNI to the Java SAF bridge (YoshActivity): launch the picker + read the FD.
 jni = "0.21"
+# egui chrome (seekbar / library). Match the desktop's 0.34.3. egui-winit's
+# default features pull arboard (clipboard) + webbrowser (links) + X11/Wayland —
+# none apply on Android, so disable them.
+egui = "0.34.3"
+egui-wgpu = "0.34.3"
+egui-winit = { version = "0.34.3", default-features = false }
