@@ -4,6 +4,7 @@ import android.app.NativeActivity;
 import android.content.Intent;
 import android.net.Uri;
 import android.os.ParcelFileDescriptor;
+import android.util.Log;
 
 // A thin NativeActivity subclass that exists only to bridge the Storage Access
 // Framework, which the NDK can't reach: a bare NativeActivity receives no
@@ -15,8 +16,17 @@ import android.os.ParcelFileDescriptor;
 public class YoshActivity extends NativeActivity {
     private static final int PICK_REQUEST = 1001;
 
-    /** Set by onActivityResult; polled + cleared by the native side. */
+    /** Set by onActivityResult; read + cleared by the native side via takePickedUri. */
     public static volatile String pickedUri = null;
+
+    /** Read + clear the picked URI (null if none). An *instance* method so native
+     *  can call it on the activity object — a static call needs JNI FindClass,
+     *  which from the native thread can't see app (dex) classes. */
+    public String takePickedUri() {
+        String u = pickedUri;
+        pickedUri = null;
+        return u;
+    }
 
     /** Launch the SAF document picker. Called from native via JNI. */
     public void openDocument() {
@@ -46,10 +56,13 @@ public class YoshActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        Log.i("yosh_java", "onActivityResult req=" + requestCode + " res=" + resultCode
+                + " hasData=" + (data != null));
         if (requestCode == PICK_REQUEST && resultCode == RESULT_OK && data != null) {
             Uri uri = data.getData();
             if (uri != null) {
                 pickedUri = uri.toString();
+                Log.i("yosh_java", "pickedUri=" + pickedUri);
             }
         }
     }

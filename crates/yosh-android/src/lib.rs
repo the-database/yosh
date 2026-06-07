@@ -3,17 +3,23 @@
 //! Drives the reusable [`yosh_engine::reader::Reader`] in the winit frame loop —
 //! the same poll → decode-view debounce → prefetch → build-quads → draw sequence
 //! the desktop shell runs, minus the egui chrome. Renders real manga pages via
-//! the engine's decode pool + `PagePipeline`, with tap-zones to flip pages.
+//! the engine's decode pool + `PagePipeline`.
 //!
-//! Storage (step 1): opens `test.cbz` from the app's external files dir, pushed
-//! with `adb push`. The user-facing SAF picker (content:// → `from_bytes`) lands
-//! next. The whole crate is Android-only; the desktop shell is `crates/yosh`.
+//! Storage: a tap in the top strip opens the system document picker (SAF) through
+//! the `YoshActivity` Java bridge; the chosen `content://` file's bytes are read
+//! off its descriptor and handed to `ZipSource::from_bytes`. (A test `.cbz` from
+//! the app's external dir is also opened on launch, as a fallback for dev.)
+//! Tap left third = previous page, right two-thirds = next.
+//!
+//! The whole crate is Android-only; the desktop shell is `crates/yosh`.
 #![cfg(target_os = "android")]
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use jni::objects::{JObject, JString, JValue};
+use jni::JavaVM;
 use winit::application::ApplicationHandler;
 use winit::event::{Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -40,18 +46,27 @@ fn android_main(app: AndroidApp) {
     app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
     let data_path = app.external_data_path();
     let event_loop = EventLoop::builder()
-        .with_android_app(app)
+        .with_android_app(app.clone())
         .build()
         .expect("build event loop");
-    let mut shell = Shell { app: None, data_path };
+    let mut shell = Shell {
+        app: None,
+        data_path,
+        android_app: app,
+        picker_pending: false,
+    };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
 
 struct Shell {
     app: Option<App>,
     /// The app's external files dir (…/Android/data/<pkg>/files), where a test
-    /// comic is `adb push`ed until the SAF picker lands.
+    /// comic is `adb push`ed for dev until the picker is the only path.
     data_path: Option<PathBuf>,
+    /// Kept for JNI into the `YoshActivity` Java bridge (vm + activity pointers).
+    android_app: AndroidApp,
+    /// A document-picker launch is awaiting its result.
+    picker_pending: bool,
 }
 
 /// The live app: surface + the engine device context, the page pipeline, and the
@@ -73,17 +88,33 @@ impl ApplicationHandler for Shell {
                 .create_window(Window::default_attributes().with_title("yosh"))
                 .expect("create window"),
         );
-        // Resume from background: rebuild only the surface against the existing
-        // device + reader — no re-decode (the recreate_surface pattern).
-        if let Some(app) = self.app.as_mut() {
-            app.surface = app
-                .ctx
-                .instance
-                .create_surface(window.clone())
-                .expect("recreate surface");
-            app.surface.configure(&app.ctx.device, &app.config);
-            app.window = window.clone();
-            window.request_redraw();
+        // Resume from background (incl. returning from the picker): rebuild only
+        // the surface against the existing device + reader — no re-decode.
+        if self.app.is_some() {
+            {
+                let app = self.app.as_mut().unwrap();
+                app.surface = app
+                    .ctx
+                    .instance
+                    .create_surface(window.clone())
+                    .expect("recreate surface");
+                app.surface.configure(&app.ctx.device, &app.config);
+                app.window = window.clone();
+                app.window.request_redraw();
+            }
+            // Returning from the picker: Android delivers onActivityResult before
+            // onResume, so the URI is ready by now. (RedrawRequested polls too, as
+            // a backup in case the redraw loop isn't continuous.)
+            if self.picker_pending {
+                log::info!("resumed with picker_pending; polling");
+                match take_picked_uri(&self.android_app) {
+                    Some(uri) => {
+                        self.picker_pending = false;
+                        self.open_picked(&uri);
+                    }
+                    None => log::info!("resumed: no picked uri yet"),
+                }
+            }
             return;
         }
 
@@ -107,8 +138,6 @@ impl ApplicationHandler for Shell {
 
         let page_pipeline = PagePipeline::new(&ctx.device, config.format);
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        // A conservative per-app memory budget for now; a later step queries the
-        // device's real heap class. Desktop-equivalent budget plumbing.
         let budget = Budget::derive(256, cpus);
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
         let mut reader = Reader::new(
@@ -123,7 +152,18 @@ impl ApplicationHandler for Shell {
             Direction::Ltr,
             0,
         );
-        self.open_test_comic(&mut reader, &ctx);
+        // Dev fallback: open a pushed test comic if present.
+        if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
+            if cbz.exists() {
+                match ZipSource::new(&cbz) {
+                    Ok(src) => {
+                        log::info!("opened {:?}: {} pages", cbz, src.len());
+                        attach_source(&mut reader, &ctx.device, &ctx.queue, Arc::new(src));
+                    }
+                    Err(e) => log::error!("open {cbz:?} failed: {e}"),
+                }
+            }
+        }
 
         window.request_redraw();
         self.app = Some(App {
@@ -138,66 +178,167 @@ impl ApplicationHandler for Shell {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(app) = self.app.as_mut() else {
-            return;
-        };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                app.config.width = size.width.max(1);
-                app.config.height = size.height.max(1);
-                app.surface.configure(&app.ctx.device, &app.config);
-                app.window.request_redraw();
+                if let Some(app) = self.app.as_mut() {
+                    app.config.width = size.width.max(1);
+                    app.config.height = size.height.max(1);
+                    app.surface.configure(&app.ctx.device, &app.config);
+                    app.window.request_redraw();
+                }
             }
-            // Tap-zones: left third = previous page, right two-thirds = next.
             WindowEvent::Touch(Touch {
                 phase: TouchPhase::Started,
                 location,
                 ..
-            }) => {
-                if location.x < app.config.width as f64 / 3.0 {
-                    app.reader.step(-1);
-                } else {
-                    app.reader.step(1);
+            }) => self.on_tap(location.x, location.y),
+            WindowEvent::RedrawRequested => {
+                // A picker result may have landed while we were backgrounded.
+                if self.picker_pending {
+                    if let Some(uri) = take_picked_uri(&self.android_app) {
+                        self.picker_pending = false;
+                        self.open_picked(&uri);
+                    }
                 }
-                app.window.request_redraw();
+                if let Some(app) = self.app.as_mut() {
+                    app.render();
+                }
             }
-            WindowEvent::RedrawRequested => app.render(),
             _ => {}
         }
     }
 }
 
 impl Shell {
-    fn open_test_comic(&self, reader: &mut Reader, ctx: &GpuContext) {
-        let Some(dp) = &self.data_path else {
-            log::warn!("no external data path; nothing to open");
+    /// Tap-zones: top strip opens the picker; otherwise left third = prev, rest = next.
+    fn on_tap(&mut self, x: f64, y: f64) {
+        let Some((w, h)) = self
+            .app
+            .as_ref()
+            .map(|a| (a.config.width as f64, a.config.height as f64))
+        else {
             return;
         };
-        let cbz = dp.join("test.cbz");
-        if !cbz.exists() {
-            log::warn!("no test comic at {cbz:?} — `adb push` a .cbz there");
-            return;
-        }
-        match ZipSource::new(&cbz) {
-            Ok(src) => {
-                let src: Arc<dyn PageSource> = Arc::new(src);
-                log::info!("opened {:?}: {} pages", cbz, src.len());
-                reader.pool = Some(DecodePool::new(
-                    src.clone(),
-                    ctx.device.clone(),
-                    ctx.queue.clone(),
-                    reader.tex_pool.clone(),
-                    reader.workers,
-                ));
-                reader.cache.clear();
-                reader.index = 0;
-                reader.source = Some(src);
-                reader.prefetch();
+        if y < h * 0.12 {
+            launch_picker(&self.android_app);
+            self.picker_pending = true;
+        } else if let Some(app) = self.app.as_mut() {
+            if x < w / 3.0 {
+                app.reader.step(-1);
+            } else {
+                app.reader.step(1);
             }
-            Err(e) => log::error!("open {cbz:?} failed: {e}"),
+            app.window.request_redraw();
         }
     }
+
+    /// Read the chosen content:// file's bytes off its descriptor and open it.
+    fn open_picked(&mut self, uri: &str) {
+        let fd = open_fd(&self.android_app, uri);
+        if fd < 0 {
+            log::warn!("openFd failed for {uri}");
+            return;
+        }
+        // We own the fd (Java detachFd'd it); reading to end + drop closes it.
+        let mut file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let mut bytes = Vec::new();
+        if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
+            log::error!("read picked fd: {e}");
+            return;
+        }
+        drop(file);
+        let Some(app) = self.app.as_mut() else { return };
+        match ZipSource::from_bytes(bytes) {
+            Ok(src) => {
+                log::info!("picked comic: {} pages", src.len());
+                attach_source(&mut app.reader, &app.ctx.device.clone(), &app.ctx.queue.clone(), Arc::new(src));
+                app.window.request_redraw();
+            }
+            Err(e) => log::error!("from_bytes: {e}"),
+        }
+    }
+}
+
+/// Point the reader at a new page source: rebuild the decode pool, reset state,
+/// kick prefetch. Shared by the test-comic open and the picker.
+fn attach_source(
+    reader: &mut Reader,
+    device: &Arc<wgpu::Device>,
+    queue: &Arc<wgpu::Queue>,
+    src: Arc<dyn PageSource>,
+) {
+    reader.pool = Some(DecodePool::new(
+        src.clone(),
+        device.clone(),
+        queue.clone(),
+        reader.tex_pool.clone(),
+        reader.workers,
+    ));
+    reader.cache.clear();
+    reader.failed.clear();
+    reader.index = 0;
+    reader.source = Some(src);
+    reader.prefetch();
+}
+
+// --- JNI bridge to YoshActivity ---------------------------------------------
+
+/// Launch the SAF document picker via `YoshActivity.openDocument()`.
+fn launch_picker(app: &AndroidApp) {
+    match with_env(app, |env, activity| {
+        env.call_method(activity, "openDocument", "()V", &[])?;
+        Ok(())
+    }) {
+        Ok(()) => log::info!("launched document picker"),
+        Err(e) => log::error!("launch picker failed: {e}"),
+    }
+}
+
+/// Take the picked content:// URI (string) if one has arrived, else None.
+fn take_picked_uri(app: &AndroidApp) -> Option<String> {
+    with_env(app, |env, activity| {
+        let res = env.call_method(activity, "takePickedUri", "()Ljava/lang/String;", &[])?;
+        let obj = res.l()?;
+        if obj.is_null() {
+            return Ok(None);
+        }
+        let s: String = env.get_string(&JString::from(obj))?.into();
+        Ok(Some(s))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Open a content:// URI to an owned file descriptor (-1 on failure).
+fn open_fd(app: &AndroidApp, uri: &str) -> i32 {
+    with_env(app, |env, activity| {
+        let juri = env.new_string(uri)?;
+        let res = env.call_method(
+            activity,
+            "openFd",
+            "(Ljava/lang/String;)I",
+            &[JValue::Object(&juri)],
+        )?;
+        Ok(res.i()?)
+    })
+    .unwrap_or(-1)
+}
+
+/// Run a closure with an attached `JNIEnv` and the `YoshActivity` instance,
+/// clearing any pending Java exception afterwards.
+fn with_env<T>(
+    app: &AndroidApp,
+    f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<T>,
+) -> jni::errors::Result<T> {
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
+    let mut env = vm.attach_current_thread()?;
+    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
+    let r = f(&mut env, &activity);
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    r
 }
 
 impl App {
@@ -271,7 +412,6 @@ impl App {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        // #202020 (non-sRGB surface → stored byte is value*255).
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: 32.0 / 255.0,
                             g: 32.0 / 255.0,
@@ -297,9 +437,9 @@ impl App {
         self.ctx.queue.submit([enc.finish()]);
         self.window.pre_present_notify();
         frame.present();
-        // TODO(power): redraw on-demand (only while decoding / unsettled) instead
-        // of continuously — needs a reliable "pending work" signal from the reader;
-        // a naive cache/settled check idled before the first decode landed.
+        // TODO(power): redraw on-demand instead of continuously — needs a reliable
+        // "pending work" signal from the reader; a naive cache/settled check idled
+        // before the first decode landed.
         self.window.request_redraw();
     }
 }
