@@ -289,9 +289,14 @@ impl ApplicationHandler for Shell {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Let egui see the event first (seekbar drag); gate nav on what it consumes.
+        // Let egui see the event first (seekbar drag); gate nav on what it consumes,
+        // and wake the loop if egui wants to repaint (e.g. a slider being dragged).
         let egui_consumed = if let Some(app) = self.app.as_mut() {
-            app.egui_state.on_window_event(&app.window, &event).consumed
+            let resp = app.egui_state.on_window_event(&app.window, &event);
+            if resp.repaint {
+                app.window.request_redraw();
+            }
+            resp.consumed
         } else {
             false
         };
@@ -1037,10 +1042,18 @@ impl App {
             .submit(user_cmds.into_iter().chain(std::iter::once(enc.finish())));
         self.window.pre_present_notify();
         frame.present();
-        // TODO(power): redraw on-demand instead of continuously — needs a reliable
-        // "pending work" signal from the reader; a naive cache/settled check idled
-        // before the first decode landed.
-        self.window.request_redraw();
+        // On-demand redraw: idle on a settled, decoded reading page. Keep going
+        // while the library is open (covers stream in / scrolling), the decode view
+        // hasn't settled (resize/zoom re-decode), or the current page is still
+        // decoding (not yet cached and not failed). Nav/zoom/pan and egui repaints
+        // wake the loop via request_redraw in the event handler.
+        let idx = self.reader.index;
+        let page_pending = self.reader.source.is_some()
+            && self.reader.cache.get(idx).is_none()
+            && !self.reader.failed.contains_key(&idx);
+        if self.library_view || !self.reader.view_settled || page_pending {
+            self.window.request_redraw();
+        }
         reqs
     }
 }
