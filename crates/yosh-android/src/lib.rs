@@ -104,6 +104,7 @@ impl ApplicationHandler for Shell {
                 .create_window(Window::default_attributes().with_title("yosh"))
                 .expect("create window"),
         );
+        log::info!("all-files access: {}", has_all_files(&self.android_app));
         // Resume from background (incl. returning from the picker): rebuild only
         // the surface against the existing device + reader — no re-decode.
         if self.app.is_some() {
@@ -265,8 +266,15 @@ impl Shell {
             return;
         };
         if y < h * 0.12 {
-            launch_picker(&self.android_app);
-            self.picker_pending = true;
+            // Top strip: grant all-files access if we don't have it yet, else open
+            // the picker. (Step 2 replaces this with the library browser.)
+            if has_all_files(&self.android_app) {
+                launch_picker(&self.android_app);
+                self.picker_pending = true;
+            } else {
+                log::info!("requesting all-files access");
+                request_all_files(&self.android_app);
+            }
         } else if let Some(app) = self.app.as_mut() {
             if x < w / 3.0 {
                 app.reader.step(-1);
@@ -436,6 +444,22 @@ fn launch_picker(app: &AndroidApp) {
         Ok(()) => log::info!("launched document picker"),
         Err(e) => log::error!("launch picker failed: {e}"),
     }
+}
+
+/// True if the app holds all-files access (can browse the library by path).
+fn has_all_files(app: &AndroidApp) -> bool {
+    with_env(app, |env, activity| {
+        Ok(env.call_method(activity, "hasAllFiles", "()Z", &[])?.z()?)
+    })
+    .unwrap_or(false)
+}
+
+/// Open Settings so the user can grant all-files access.
+fn request_all_files(app: &AndroidApp) {
+    let _ = with_env(app, |env, activity| {
+        env.call_method(activity, "requestAllFiles", "()V", &[])?;
+        Ok(())
+    });
 }
 
 /// Take the picked content:// URI (string) if one has arrived, else None.
