@@ -131,11 +131,41 @@ pub fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
 /// invariant. Below it, extreme zoom-out would otherwise decode a sub-pixel page.
 pub const MIN_TARGET: u32 = 32;
 
-/// Prefetch window: base pages ahead (`FWD`, widened up to `FWD_MAX` with flip
-/// velocity) and behind (`BACK`) the read position.
-pub const FWD: usize = 16;
-pub const BACK: usize = 6;
-pub const FWD_MAX: usize = 40;
+/// Per-device resource budget, derived from the memory the app may spend on
+/// decoded pages + GPU textures and the CPU count. Desktop-class inputs
+/// (≥ ~384 MB, ≥ 8 cores) reproduce the historical fixed budgets exactly; small
+/// Android heaps scale every dimension down to stay under the OOM killer. A shell
+/// supplies the inputs (`available_parallelism`, a RAM/heap probe).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Budget {
+    /// Decode worker threads.
+    pub workers: usize,
+    /// Bounded decoded-page cache size.
+    pub cache_cap: usize,
+    /// Global cap on recycled GPU textures.
+    pub texpool_max: usize,
+    /// Base forward prefetch window (pages ahead of the read position).
+    pub fwd: usize,
+    /// Forward window when widened by flip velocity.
+    pub fwd_max: usize,
+    /// Backward prefetch window (pages behind).
+    pub back: usize,
+}
+
+impl Budget {
+    /// Derive the budget. `mem_budget_mb` is the memory the reader may use for its
+    /// page cache + textures (desktop: a fraction of system RAM; Android: roughly
+    /// the per-app heap). Clamps keep desktop at the long-standing values.
+    pub fn derive(mem_budget_mb: u64, cpus: usize) -> Self {
+        let workers = cpus.clamp(2, 8);
+        let cache_cap = ((mem_budget_mb / 8) as usize).clamp(16, 48);
+        let texpool_max = (cache_cap / 2).clamp(8, 24);
+        let fwd = (cache_cap / 3).clamp(6, 16);
+        let fwd_max = (fwd * 5 / 2).clamp(12, 40);
+        let back = (fwd / 2).clamp(3, 6);
+        Self { workers, cache_cap, texpool_max, fwd, fwd_max, back }
+    }
+}
 
 /// A quad to draw this frame (NDC scale + top-left offset), referencing a cached page.
 pub struct Quad {
@@ -223,6 +253,10 @@ pub struct Reader {
     /// Transient messages (boundary hit, zoom level) emitted by nav/zoom commands;
     /// the shell drains these each frame into its timed on-screen toast.
     pub pending_toasts: Vec<String>,
+    // Prefetch window, from the device `Budget` (replaces the old fixed consts).
+    pub fwd: usize,
+    pub fwd_max: usize,
+    pub back: usize,
 }
 
 impl Reader {
@@ -231,8 +265,7 @@ impl Reader {
         device: Arc<wgpu::Device>,
         queue: Arc<wgpu::Queue>,
         tex_pool: Arc<TexturePool>,
-        cache_cap: usize,
-        workers: usize,
+        budget: Budget,
         fit: FitMode,
         layout: Layout,
         scroll_mode: bool,
@@ -241,13 +274,13 @@ impl Reader {
         start_index: usize,
     ) -> Self {
         Self {
-            cache: PageCache::new(cache_cap, tex_pool.clone()),
+            cache: PageCache::new(budget.cache_cap, tex_pool.clone()),
             device,
             queue,
             tex_pool,
             source: None,
             pool: None,
-            workers,
+            workers: budget.workers,
             failed: HashMap::new(),
             index: 0,
             start_index,
@@ -271,6 +304,9 @@ impl Reader {
             gpu_downscale_warned: false,
             pan_edge_at: None,
             pending_toasts: Vec::new(),
+            fwd: budget.fwd,
+            fwd_max: budget.fwd_max,
+            back: budget.back,
         }
     }
 
@@ -739,7 +775,7 @@ impl Reader {
                 break;
             }
         }
-        (FWD + self.nav_times.len() * 4).min(FWD_MAX)
+        (self.fwd + self.nav_times.len() * 4).min(self.fwd_max)
     }
 
     /// Source aspect (w / h) for page `index`: from its decoded texture if present,
@@ -840,7 +876,7 @@ impl Reader {
             return;
         };
         let len = src.len();
-        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, BACK)
+        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, self.back)
             .into_iter()
             .filter(|i| !self.failed.contains_key(i))
             .filter_map(|i| {
@@ -860,6 +896,47 @@ impl Reader {
 
 #[cfg(test)]
 mod tests {
+    use super::Budget;
+
+    // Desktop-class inputs reproduce the historical fixed budget exactly.
+    #[test]
+    fn budget_desktop_matches_legacy_fixed_values() {
+        let b = Budget::derive(8192 / 16, 8); // 512 MB slice, 8 cores
+        assert_eq!(b.workers, 8);
+        assert_eq!(b.cache_cap, 48);
+        assert_eq!(b.texpool_max, 24);
+        assert_eq!(b.fwd, 16);
+        assert_eq!(b.fwd_max, 40);
+        assert_eq!(b.back, 6);
+    }
+
+    // A small Android-class heap scales every dimension down, but never below the
+    // floors (so seeking still works on a tiny device).
+    #[test]
+    fn budget_small_heap_scales_down_with_floors() {
+        let small = Budget::derive(192, 8); // ~192 MB app heap
+        assert!(small.cache_cap < 48 && small.cache_cap >= 16, "{}", small.cache_cap);
+        assert!(small.texpool_max < 24 && small.texpool_max >= 8);
+        assert!(small.fwd < 16 && small.fwd >= 6);
+        // Extreme floor: a tiny budget + few cores still yields a usable reader.
+        let tiny = Budget::derive(8, 1);
+        assert_eq!(tiny.workers, 2, "at least 2 workers");
+        assert_eq!(tiny.cache_cap, 16, "cache floor");
+        assert_eq!(tiny.texpool_max, 8, "texpool floor");
+        assert_eq!(tiny.fwd, 6, "fwd floor");
+        assert_eq!(tiny.back, 3, "back floor");
+    }
+
+    // The cache cap is monotonic in the memory budget (more RAM never shrinks it).
+    #[test]
+    fn budget_cache_monotonic_in_memory() {
+        let caps: Vec<usize> = [64u64, 128, 256, 384, 512, 4096]
+            .iter()
+            .map(|&m| Budget::derive(m, 8).cache_cap)
+            .collect();
+        assert!(caps.windows(2).all(|w| w[1] >= w[0]), "{caps:?}");
+    }
+
     // A 2048-tall portrait page on a 4K (2160-tall) screen, fit-to-window and
     // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
     #[test]
