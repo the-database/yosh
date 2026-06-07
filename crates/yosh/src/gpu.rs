@@ -11,6 +11,11 @@ use winit::window::Window;
 use yosh_engine::gpu::GpuContext;
 
 pub struct Gpu {
+    /// The reusable device/queue context. Kept (rather than dropped after setup)
+    /// so the surface can be rebuilt against the *same* device after the OS tears
+    /// it down on background (Android) — the decode pool, cache, and GPU textures,
+    /// all device-owned, survive across the gap.
+    ctx: GpuContext,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub surface: wgpu::Surface<'static>,
@@ -44,15 +49,29 @@ impl Gpu {
         };
         surface.configure(&ctx.device, &config);
 
-        // Keep the device/queue (Arc-shared with the pool); the context's
-        // instance + adapter drop here, exactly as in the pre-split code.
         Self {
             device: ctx.device.clone(),
             queue: ctx.queue.clone(),
+            adapter_info: ctx.adapter_info.clone(),
             surface,
             config,
-            adapter_info: ctx.adapter_info.clone(),
+            ctx,
         }
+    }
+
+    /// Rebuild the surface against the existing device for a (new) window — after
+    /// the OS destroyed the old one on background. Only the window-bound surface
+    /// is replaced; the device, decode pool, cache and textures are untouched, so
+    /// the reader resumes without re-decoding. Reuses the chosen format/size, so
+    /// it stays consistent with what egui-wgpu was told.
+    pub fn recreate_surface(&mut self, window: Arc<Window>) {
+        let surface = self
+            .ctx
+            .instance
+            .create_surface(window)
+            .expect("recreate surface");
+        surface.configure(&self.ctx.device, &self.config);
+        self.surface = surface;
     }
 
     pub fn resize(&mut self, w: u32, h: u32) {
