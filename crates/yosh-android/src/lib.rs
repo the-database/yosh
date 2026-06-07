@@ -71,6 +71,7 @@ fn android_main(app: AndroidApp) {
         has_files: false,
         init_lib_dir,
         lib_dir_file,
+        touch_start: None,
     };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
@@ -95,6 +96,8 @@ struct Shell {
     /// The library dir to open the browser at (persisted across launches).
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
+    /// Where the current single-finger touch started (for swipe-vs-tap).
+    touch_start: Option<(f64, f64)>,
 }
 
 /// The live app: surface + the engine device context, the page pipeline, and the
@@ -283,10 +286,23 @@ impl ApplicationHandler for Shell {
                 }
             }
             WindowEvent::Touch(Touch {
-                phase: TouchPhase::Started,
-                location,
-                ..
-            }) if !egui_consumed => self.on_tap(location.x, location.y),
+                phase, location, ..
+            }) => {
+                let library = self.app.as_ref().map(|a| a.library_view).unwrap_or(false);
+                match phase {
+                    TouchPhase::Started if !library => {
+                        self.touch_start = Some((location.x, location.y));
+                    }
+                    TouchPhase::Ended => {
+                        if let Some((sx, sy)) = self.touch_start.take() {
+                            if !library && !egui_consumed {
+                                self.handle_gesture(sx, sy, location.x, location.y);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
             WindowEvent::RedrawRequested => {
                 // A picker result may have landed while we were backgrounded.
                 if self.picker_pending {
@@ -317,7 +333,33 @@ impl ApplicationHandler for Shell {
 }
 
 impl Shell {
-    /// Tap-zones: top strip opens the picker; otherwise left third = prev, rest = next.
+    /// A single-finger gesture ended: a horizontal swipe flips a page, otherwise
+    /// it's a tap.
+    fn handle_gesture(&mut self, sx: f64, sy: f64, ex: f64, ey: f64) {
+        let w = self.app.as_ref().map(|a| a.config.width as f64).unwrap_or(1.0);
+        let (dx, dy) = (ex - sx, ey - sy);
+        if dx.abs() > w * 0.08 && dx.abs() > dy.abs() * 1.4 {
+            // Swipe: left = next, right = previous (LTR).
+            self.flip(if dx < 0.0 { 1 } else { -1 });
+        } else {
+            self.on_tap(sx, sy);
+        }
+    }
+
+    /// Flip `dir` pages and persist the new position.
+    fn flip(&mut self, dir: i64) {
+        if let Some(app) = self.app.as_mut() {
+            app.reader.step(dir);
+            app.window.request_redraw();
+            let idx = app.reader.index;
+            if let Some(k) = self.current_key.clone() {
+                self.positions.insert(k, idx);
+                self.save_positions();
+            }
+        }
+    }
+
+    /// Tap-zones: top strip opens the library; otherwise left third = prev, rest = next.
     fn on_tap(&mut self, x: f64, y: f64) {
         let Some((w, h)) = self
             .app
@@ -343,21 +385,11 @@ impl Shell {
             }
             return;
         }
-        // Page nav.
-        if let Some(app) = self.app.as_mut() {
-            if x < w / 3.0 {
-                app.reader.step(-1);
-            } else {
-                app.reader.step(1);
-            }
-            app.window.request_redraw();
-            let idx = app.reader.index;
-            // Persist on each turn (tiny file, sub-ms) so position survives a hard
-            // kill, not just a clean background.
-            if let Some(k) = self.current_key.clone() {
-                self.positions.insert(k, idx);
-                self.save_positions();
-            }
+        // Page nav: left third = previous, rest = next.
+        if x < w / 3.0 {
+            self.flip(-1);
+        } else {
+            self.flip(1);
         }
     }
 
@@ -513,20 +545,28 @@ fn seekbar(ctx: &egui::Context, cur: usize, len: usize, seek_to: &mut Option<usi
     if len <= 1 {
         return;
     }
-    egui::TopBottomPanel::bottom("seekbar").show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.label(format!("{} / {}", cur + 1, len));
-            let mut p = cur;
-            // Span the slider across the rest of the bar.
-            ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
-            if ui
-                .add(egui::Slider::new(&mut p, 0..=len - 1).show_value(false))
-                .changed()
-            {
-                *seek_to = Some(p);
-            }
+    // A floating pill lifted off the bottom edge (the very edge collides with the
+    // system gesture bar + is awkward to grab), fattened for touch.
+    let sw = ctx.screen_rect().width();
+    egui::Area::new(egui::Id::new("seekbar"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width((sw * 0.8).min(900.0));
+                ui.spacing_mut().interact_size.y = 32.0;
+                ui.horizontal(|ui| {
+                    let mut p = cur;
+                    ui.label(egui::RichText::new(format!("{} / {}", cur + 1, len)).size(18.0));
+                    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
+                    if ui
+                        .add(egui::Slider::new(&mut p, 0..=len - 1).show_value(false))
+                        .changed()
+                    {
+                        *seek_to = Some(p);
+                    }
+                });
+            });
         });
-    });
 }
 
 // --- JNI bridge to YoshActivity ---------------------------------------------
