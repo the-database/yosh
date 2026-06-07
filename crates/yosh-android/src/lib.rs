@@ -49,7 +49,7 @@ fn android_main(app: AndroidApp) {
     // Per-comic reading positions persist in the app's private dir.
     let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
     let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
-    let lib_dir_file = app.internal_data_path().map(|p| p.join("libdir.txt"));
+    let lib_dir_file = app.internal_data_path().map(|p| p.join("libroot.txt"));
     let init_lib_dir = lib_dir_file
         .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -121,8 +121,16 @@ struct App {
     egui_renderer: egui_wgpu::Renderer,
     /// Library browser overlay state.
     library_view: bool,
+    /// The configured library root (persisted); the browser can't go above it.
+    lib_root: PathBuf,
     lib_dir: PathBuf,
     lib_entries: Vec<Entry>,
+    /// Decoded cover thumbnails by comic path (egui textures), filled off-thread.
+    thumbs: HashMap<PathBuf, egui::TextureHandle>,
+    thumb_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
+    thumb_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
+    /// The dir whose covers were queued for decode (so we don't re-queue).
+    thumb_dir: Option<PathBuf>,
 }
 
 /// A library browser row: a folder to descend into (or open if it holds images),
@@ -236,6 +244,7 @@ impl ApplicationHandler for Shell {
             Direction::Ltr,
             0,
         );
+        let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         self.app = Some(App {
             window: window.clone(),
             ctx,
@@ -248,8 +257,13 @@ impl ApplicationHandler for Shell {
             egui_state,
             egui_renderer,
             library_view: false,
+            lib_root: self.init_lib_dir.clone(),
             lib_dir: self.init_lib_dir.clone(),
             lib_entries: Vec::new(),
+            thumbs: HashMap::new(),
+            thumb_rx,
+            thumb_tx,
+            thumb_dir: None,
         });
         // Dev fallback: open a pushed test comic if present (restores its position).
         if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
@@ -270,7 +284,7 @@ impl ApplicationHandler for Shell {
         }
         self.save_positions();
         if let (Some(f), Some(app)) = (self.lib_dir_file.clone(), self.app.as_ref()) {
-            let _ = std::fs::write(f, app.lib_dir.to_string_lossy().as_bytes());
+            let _ = std::fs::write(f, app.lib_root.to_string_lossy().as_bytes());
         }
     }
 
@@ -457,6 +471,7 @@ impl Shell {
             self.has_files = has_all_files(&self.android_app);
             if let Some(app) = self.app.as_mut() {
                 app.library_view = true;
+                app.lib_dir = app.lib_root.clone();
                 app.lib_entries = scan_dir(&app.lib_dir);
                 app.window.request_redraw();
             }
@@ -473,22 +488,7 @@ impl Shell {
     /// Open a comic by path: route by type (archive / image folder) to an engine
     /// source, then through `open_comic` (which restores its saved position).
     fn open_path(&mut self, path: PathBuf) {
-        let src: Option<Arc<dyn PageSource>> = if path.is_dir() {
-            FolderSource::new(&path)
-                .ok()
-                .map(|s| Arc::new(s) as Arc<dyn PageSource>)
-        } else {
-            match ext_lower(&path).as_deref() {
-                Some("cbz" | "zip") => ZipSource::new(&path)
-                    .ok()
-                    .map(|s| Arc::new(s) as Arc<dyn PageSource>),
-                Some("cb7" | "7z") => SevenzSource::new(&path)
-                    .ok()
-                    .map(|s| Arc::new(s) as Arc<dyn PageSource>),
-                _ => None,
-            }
-        };
-        match src {
+        match build_source(&path) {
             Some(src) => {
                 log::info!("open {:?}: {} pages", path, src.len());
                 self.open_comic(path.to_string_lossy().into_owned(), src);
@@ -722,6 +722,26 @@ fn with_env<T>(
 }
 
 impl App {
+    /// Queue a background cover decode for the comics in the current library dir
+    /// (once per dir; results stream back via `thumb_rx`).
+    fn queue_covers(&mut self) {
+        if self.thumb_dir.as_deref() == Some(self.lib_dir.as_path()) {
+            return;
+        }
+        self.thumb_dir = Some(self.lib_dir.clone());
+        let paths: Vec<PathBuf> = self
+            .lib_entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Comic(p) if !self.thumbs.contains_key(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        if !paths.is_empty() {
+            spawn_cover_decode(paths, self.thumb_tx.clone());
+        }
+    }
+
     fn render(&mut self, has_files: bool) -> FrameReqs {
         self.reader.viewport = Viewport {
             w: self.config.width,
@@ -814,6 +834,16 @@ impl App {
                 }
             }
         }
+        // Drain decoded covers into egui textures; queue any new ones for this dir.
+        while let Ok((path, img)) = self.thumb_rx.try_recv() {
+            let handle =
+                self.egui_ctx
+                    .load_texture(path.to_string_lossy(), img, egui::TextureOptions::default());
+            self.thumbs.insert(path, handle);
+        }
+        if self.library_view {
+            self.queue_covers();
+        }
         // egui chrome over the page: the library browser when open, else the seekbar.
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -821,12 +851,16 @@ impl App {
         let library_view = self.library_view;
         let lib_dir_str = self.lib_dir.display().to_string();
         // Snapshot the rows the closure needs (owned), so it borrows no `self`.
-        let entries: Vec<(bool, String, PathBuf)> = self
+        let entries: Vec<(bool, String, PathBuf, Option<egui::TextureHandle>)> = self
             .lib_entries
             .iter()
-            .map(|e| match e {
-                Entry::Dir(p) => (true, name_of(p), p.clone()),
-                Entry::Comic(p) => (false, name_of(p), p.clone()),
+            .map(|e| {
+                let (is_dir, p) = match e {
+                    Entry::Dir(p) => (true, p),
+                    Entry::Comic(p) => (false, p),
+                };
+                let thumb = if is_dir { None } else { self.thumbs.get(p).cloned() };
+                (is_dir, name_of(p), p.clone(), thumb)
             })
             .collect();
         let mut seek_to: Option<usize> = None;
@@ -834,6 +868,8 @@ impl App {
         let mut go_up = false;
         let mut nav_to: Option<PathBuf> = None;
         let mut close_lib = false;
+        let mut set_root = false;
+        let at_root = self.lib_dir == self.lib_root;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if library_view {
                 egui::CentralPanel::default().show(ctx, |ui| {
@@ -845,38 +881,81 @@ impl App {
                         }
                     } else {
                         ui.horizontal(|ui| {
-                            if ui.button("⬆ Up").clicked() {
+                            ui.spacing_mut().button_padding = egui::vec2(14.0, 10.0);
+                            if !at_root
+                                && ui.button(egui::RichText::new("⬆ Up").size(18.0)).clicked()
+                            {
                                 go_up = true;
                             }
-                            if ui.button("✕ Close").clicked() {
+                            if ui.button(egui::RichText::new("✕ Close").size(18.0)).clicked() {
                                 close_lib = true;
                             }
-                            if ui.button("Open file…").clicked() {
+                            if ui
+                                .button(egui::RichText::new("📌 Set as library").size(18.0))
+                                .clicked()
+                            {
+                                set_root = true;
+                            }
+                            if ui.button(egui::RichText::new("Open file…").size(18.0)).clicked() {
                                 reqs.open_picker = true;
                             }
-                            ui.label(&lib_dir_str);
                         });
+                        ui.label(egui::RichText::new(&lib_dir_str).size(13.0));
                         ui.separator();
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            let w = ui.available_width();
-                            for (is_dir, label, path) in &entries {
-                                let txt = if *is_dir {
-                                    format!("📁  {label}")
-                                } else {
-                                    format!("📖  {label}")
-                                };
-                                // Big full-width rows so they're easy to tap.
-                                let btn = egui::Button::new(egui::RichText::new(txt).size(20.0))
-                                    .min_size(egui::vec2(w, 44.0));
-                                if ui.add(btn).clicked() {
-                                    if *is_dir {
-                                        nav_to = Some(path.clone());
-                                    } else {
-                                        reqs.open = Some(path.clone());
-                                        close_lib = true;
+                            let cell = egui::vec2(168.0, 256.0);
+                            let cols =
+                                ((ui.available_width() / (cell.x + 10.0)).floor() as usize).max(1);
+                            for row in entries.chunks(cols) {
+                                ui.horizontal(|ui| {
+                                    for (is_dir, label, path, thumb) in row {
+                                        let clicked = ui
+                                            .allocate_ui(cell, |ui| {
+                                                ui.vertical(|ui| {
+                                                    let r = if *is_dir {
+                                                        ui.add_sized(
+                                                            [cell.x, 200.0],
+                                                            egui::Button::new(
+                                                                egui::RichText::new("📁").size(80.0),
+                                                            ),
+                                                        )
+                                                    } else if let Some(t) = thumb {
+                                                        ui.add(egui::ImageButton::new(
+                                                            egui::Image::new(t).fit_to_exact_size(
+                                                                egui::vec2(cell.x, 200.0),
+                                                            ),
+                                                        ))
+                                                    } else {
+                                                        ui.add_sized(
+                                                            [cell.x, 200.0],
+                                                            egui::Button::new(
+                                                                egui::RichText::new("…").size(28.0),
+                                                            ),
+                                                        )
+                                                    };
+                                                    ui.add_sized(
+                                                        [cell.x, 34.0],
+                                                        egui::Label::new(
+                                                            egui::RichText::new(label.as_str())
+                                                                .size(13.0),
+                                                        )
+                                                        .truncate(),
+                                                    );
+                                                    r.clicked()
+                                                })
+                                                .inner
+                                            })
+                                            .inner;
+                                        if clicked {
+                                            if *is_dir {
+                                                nav_to = Some(path.clone());
+                                            } else {
+                                                reqs.open = Some(path.clone());
+                                                close_lib = true;
+                                            }
+                                        }
                                     }
-                                }
-                                ui.add_space(4.0);
+                                });
                             }
                         });
                     }
@@ -890,7 +969,10 @@ impl App {
         if let Some(p) = seek_to {
             self.reader.goto(p);
         }
-        if go_up {
+        if set_root {
+            self.lib_root = self.lib_dir.clone();
+        }
+        if go_up && self.lib_dir != self.lib_root {
             if let Some(parent) = self.lib_dir.parent() {
                 self.lib_dir = parent.to_path_buf();
                 self.lib_entries = scan_dir(&self.lib_dir);
@@ -986,6 +1068,54 @@ fn is_image_folder(dir: &Path) -> bool {
     std::fs::read_dir(dir)
         .map(|rd| rd.flatten().any(|e| e.path().is_file() && is_image_ext(&e.path())))
         .unwrap_or(false)
+}
+
+/// Build an engine page source from a comic path (archive or image folder).
+fn build_source(path: &Path) -> Option<Arc<dyn PageSource>> {
+    if path.is_dir() {
+        FolderSource::new(path)
+            .ok()
+            .map(|s| Arc::new(s) as Arc<dyn PageSource>)
+    } else {
+        match ext_lower(path).as_deref() {
+            Some("cbz" | "zip") => ZipSource::new(path)
+                .ok()
+                .map(|s| Arc::new(s) as Arc<dyn PageSource>),
+            Some("cb7" | "7z") => SevenzSource::new(path)
+                .ok()
+                .map(|s| Arc::new(s) as Arc<dyn PageSource>),
+            _ => None,
+        }
+    }
+}
+
+/// Decode a comic's cover (page 0) to a small egui image.
+fn decode_cover(path: &Path, resizer: &mut fast_image_resize::Resizer) -> Option<egui::ColorImage> {
+    let src = build_source(path)?;
+    if src.len() == 0 {
+        return None;
+    }
+    let bytes = src.read_page(0).ok()?;
+    let decoded = yosh_engine::decode::decode_and_downscale(&bytes, 320, resizer).ok()?;
+    let rgba = yosh_engine::decode::to_rgba_image(decoded);
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.w as usize, rgba.h as usize],
+        &rgba.pixels,
+    ))
+}
+
+/// Spawn a worker that decodes the given comics' covers and streams them back.
+fn spawn_cover_decode(paths: Vec<PathBuf>, tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>) {
+    std::thread::spawn(move || {
+        let mut resizer = fast_image_resize::Resizer::new();
+        for path in paths {
+            if let Some(img) = decode_cover(&path, &mut resizer) {
+                if tx.send((path, img)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
 }
 
 /// List a directory's sub-folders + comic archives, folders first, natural order.
