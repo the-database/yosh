@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pure-NativeActivity app: no Java/Dex (hasCode=false). The framework
+     NativeActivity loads libyosh_android.so via the lib_name meta-data, which
+     calls android-activity's ANativeActivity_onCreate -> our android_main. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.thedatabase.yosh">
+
+    <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="34" />
+
+    <application
+        android:label="yosh"
+        android:hasCode="false"
+        android:allowBackup="true"
+        android:extractNativeLibs="true">
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|uiMode">
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="yosh_android" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
