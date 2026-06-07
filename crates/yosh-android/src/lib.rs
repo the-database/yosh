@@ -14,6 +14,7 @@
 //! The whole crate is Android-only; the desktop shell is `crates/yosh`.
 #![cfg(target_os = "android")]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,6 +46,9 @@ fn android_main(app: AndroidApp) {
     // A reader should keep the screen awake while a page is up.
     app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
     let data_path = app.external_data_path();
+    // Per-comic reading positions persist in the app's private dir.
+    let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
+    let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -54,6 +58,9 @@ fn android_main(app: AndroidApp) {
         data_path,
         android_app: app,
         picker_pending: false,
+        positions,
+        pos_path,
+        current_key: None,
     };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
@@ -67,6 +74,12 @@ struct Shell {
     android_app: AndroidApp,
     /// A document-picker launch is awaiting its result.
     picker_pending: bool,
+    /// Per-comic last-read page, keyed by comic identity (content:// URI or path).
+    positions: HashMap<String, usize>,
+    /// Where `positions` persists (app's private dir).
+    pos_path: Option<PathBuf>,
+    /// Identity of the currently-open comic, for saving its position.
+    current_key: Option<String>,
 }
 
 /// The live app: surface + the engine device context, the page pipeline, and the
@@ -141,7 +154,7 @@ impl ApplicationHandler for Shell {
         let budget = Budget::derive(device_mem_budget_mb(), cpus);
         log::info!("budget: {budget:?} ({cpus} cpus)");
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
-        let mut reader = Reader::new(
+        let reader = Reader::new(
             ctx.device.clone(),
             ctx.queue.clone(),
             tex_pool,
@@ -153,22 +166,8 @@ impl ApplicationHandler for Shell {
             Direction::Ltr,
             0,
         );
-        // Dev fallback: open a pushed test comic if present.
-        if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
-            if cbz.exists() {
-                match ZipSource::new(&cbz) {
-                    Ok(src) => {
-                        log::info!("opened {:?}: {} pages", cbz, src.len());
-                        attach_source(&mut reader, &ctx.device, &ctx.queue, Arc::new(src));
-                    }
-                    Err(e) => log::error!("open {cbz:?} failed: {e}"),
-                }
-            }
-        }
-
-        window.request_redraw();
         self.app = Some(App {
-            window,
+            window: window.clone(),
             ctx,
             surface,
             config,
@@ -176,6 +175,24 @@ impl ApplicationHandler for Shell {
             reader,
             anim_origin: Instant::now(),
         });
+        // Dev fallback: open a pushed test comic if present (restores its position).
+        if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
+            if cbz.exists() {
+                match ZipSource::new(&cbz) {
+                    Ok(src) => self.open_comic(cbz.to_string_lossy().into_owned(), Arc::new(src)),
+                    Err(e) => log::error!("open {cbz:?} failed: {e}"),
+                }
+            }
+        }
+        window.request_redraw();
+    }
+
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // Persist the current position before the OS may kill us.
+        if let (Some(k), Some(app)) = (self.current_key.clone(), self.app.as_ref()) {
+            self.positions.insert(k, app.reader.index);
+        }
+        self.save_positions();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -231,7 +248,50 @@ impl Shell {
                 app.reader.step(1);
             }
             app.window.request_redraw();
+            let idx = app.reader.index;
+            // Persist on each turn (tiny file, sub-ms) so position survives a hard
+            // kill, not just a clean background.
+            if let Some(k) = self.current_key.clone() {
+                self.positions.insert(k, idx);
+                self.save_positions();
+            }
         }
+    }
+
+    /// Point the reader at `src` (identity `key`): save the outgoing comic's
+    /// position, restore this one's, attach the source. Persists to disk.
+    fn open_comic(&mut self, key: String, src: Arc<dyn PageSource>) {
+        if let (Some(old), Some(app)) = (self.current_key.clone(), self.app.as_ref()) {
+            self.positions.insert(old, app.reader.index);
+        }
+        let start = self
+            .positions
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .min(src.len().saturating_sub(1));
+        if let Some(app) = self.app.as_mut() {
+            attach_source(
+                &mut app.reader,
+                &app.ctx.device.clone(),
+                &app.ctx.queue.clone(),
+                src,
+                start,
+            );
+            app.window.request_redraw();
+        }
+        self.current_key = Some(key.clone());
+        self.positions.insert(key, start);
+        self.save_positions();
+    }
+
+    fn save_positions(&self) {
+        let Some(path) = &self.pos_path else { return };
+        let mut out = String::new();
+        for (k, v) in &self.positions {
+            out.push_str(&format!("{v}\t{k}\n"));
+        }
+        let _ = std::fs::write(path, out);
     }
 
     /// Read the chosen content:// file's bytes off its descriptor and open it.
@@ -249,12 +309,10 @@ impl Shell {
             return;
         }
         drop(file);
-        let Some(app) = self.app.as_mut() else { return };
         match ZipSource::from_bytes(bytes) {
             Ok(src) => {
                 log::info!("picked comic: {} pages", src.len());
-                attach_source(&mut app.reader, &app.ctx.device.clone(), &app.ctx.queue.clone(), Arc::new(src));
-                app.window.request_redraw();
+                self.open_comic(uri.to_string(), Arc::new(src));
             }
             Err(e) => log::error!("from_bytes: {e}"),
         }
@@ -268,6 +326,7 @@ fn attach_source(
     device: &Arc<wgpu::Device>,
     queue: &Arc<wgpu::Queue>,
     src: Arc<dyn PageSource>,
+    start: usize,
 ) {
     reader.pool = Some(DecodePool::new(
         src.clone(),
@@ -278,9 +337,24 @@ fn attach_source(
     ));
     reader.cache.clear();
     reader.failed.clear();
-    reader.index = 0;
+    reader.index = start;
     reader.source = Some(src);
     reader.prefetch();
+}
+
+/// Load the persisted per-comic positions (one `index\tkey` line each).
+fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
+    let mut map = HashMap::new();
+    if let Ok(s) = std::fs::read_to_string(path) {
+        for line in s.lines() {
+            if let Some((idx, key)) = line.split_once('\t') {
+                if let Ok(i) = idx.parse() {
+                    map.insert(key.to_string(), i);
+                }
+            }
+        }
+    }
+    map
 }
 
 /// Memory (MB) the reader may use for its page cache + GPU textures, from
