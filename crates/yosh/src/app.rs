@@ -24,7 +24,7 @@ use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
-use yosh_engine::reader::{next_zoom_preset, Direction, Reader, Viewport};
+use yosh_engine::reader::{Direction, Reader, Viewport};
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
@@ -902,31 +902,31 @@ impl State {
             Action::Forward => {
                 if self.reader.scroll_mode {
                     let vh = self.reader.viewport.h as f32;
-                    self.scroll_by(vh * 0.9);
+                    self.reader.scroll_by(vh * 0.9);
                 } else {
-                    self.step(1);
+                    self.reader.step(1);
                 }
             }
             Action::Backward => {
                 if self.reader.scroll_mode {
                     let vh = self.reader.viewport.h as f32;
-                    self.scroll_by(-vh * 0.9);
+                    self.reader.scroll_by(-vh * 0.9);
                 } else {
-                    self.step(-1);
+                    self.reader.step(-1);
                 }
             }
             // In RTL, "left" advances the story; in LTR, "right" does. (Page-flip only.)
             Action::Right if !self.reader.scroll_mode => {
-                self.step(if self.reader.direction == Direction::Ltr { 1 } else { -1 });
+                self.reader.step(if self.reader.direction == Direction::Ltr { 1 } else { -1 });
             }
             Action::Left if !self.reader.scroll_mode => {
-                self.step(if self.reader.direction == Direction::Ltr { -1 } else { 1 });
+                self.reader.step(if self.reader.direction == Direction::Ltr { -1 } else { 1 });
             }
             Action::Right | Action::Left => {}
-            Action::First => self.goto(0),
+            Action::First => self.reader.goto(0),
             Action::Last => {
                 if let Some(s) = &self.reader.source {
-                    self.goto(s.len().saturating_sub(1));
+                    self.reader.goto(s.len().saturating_sub(1));
                 }
             }
             Action::CycleFit if self.reader.scroll_mode => {
@@ -950,8 +950,8 @@ impl State {
                 self.settings.fit = fit_to_u8(self.reader.fit);
                 config::save(&self.settings);
             }
-            Action::ZoomIn => self.zoom_to_preset(true),
-            Action::ZoomOut => self.zoom_to_preset(false),
+            Action::ZoomIn => self.reader.zoom_to_preset(true),
+            Action::ZoomOut => self.reader.zoom_to_preset(false),
             Action::PresetWindow => self.apply_view(FitMode::Window, false, None),
             Action::PresetWidth => self.apply_view(FitMode::Width, false, None),
             Action::PresetActual => self.apply_view(FitMode::Actual, false, None),
@@ -1081,53 +1081,6 @@ impl State {
         self.toast("Shown in Explorer");
     }
 
-    /// Flip one view in `dir`. Returns `true` if the position actually changed.
-    /// At the first/last page it raises a toast and returns `false`; while the
-    /// current page is still decoding in step mode it just returns `false`.
-    fn step(&mut self, dir: i64) -> bool {
-        let Some(src) = &self.reader.source else { return false };
-        let len = src.len();
-        if len == 0 {
-            return false;
-        }
-        // "Step" seek (default; toggle "jump" with J): don't flip while the
-        // current page is still decoding, so you see every page instead of
-        // skipping past it. "Jump" skips ahead for fast long-distance seeks. A
-        // *failed* page never lands in the cache, so allow stepping past it —
-        // otherwise next/prev gets stuck on an unopenable page.
-        if !self.reader.jump {
-            let cur = layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
-            if !self.reader.cache.contains(cur) && !self.reader.failed.contains_key(&cur) {
-                return false;
-            }
-        }
-        let next = if dir > 0 {
-            layout::next_view(self.reader.layout, self.reader.index, len, self.reader.spread_offset)
-        } else {
-            layout::prev_view(self.reader.layout, self.reader.index, len, self.reader.spread_offset)
-        };
-        if next != self.reader.index {
-            self.reader.nav_times.push_back(Instant::now());
-            self.goto(next);
-            true
-        } else {
-            // Nowhere to go — let the reader know why seeking did nothing.
-            self.toast(if dir > 0 { "Last page" } else { "First page" });
-            false
-        }
-    }
-
-    fn goto(&mut self, index: usize) {
-        self.reader.index = index;
-        self.reader.pan_x = 0.0;
-        self.reader.pan_y = 0.0; // start new page centered
-        self.reader.top_offset = 0.0;
-        if let Some(k) = &self.volume_key {
-            self.settings.last_pages.insert(k.clone(), index);
-        }
-        self.reader.prefetch();
-    }
-
     /// Open the previous (`delta < 0`) or next (`delta > 0`) sibling volume of
     /// the same kind — folder ↔ folder, archive ↔ archive — in natural-sort
     /// order within the current volume's parent directory (`[` / `]`). The
@@ -1231,7 +1184,7 @@ impl State {
                 MouseScrollDelta::LineDelta(_, y) => y * SCROLL_WHEEL_PX,
                 MouseScrollDelta::PixelDelta(p) => p.y as f32,
             };
-            self.scroll_by(-dy_px); // wheel down (y<0) scrolls the strip down
+            self.reader.scroll_by(-dy_px); // wheel down (y<0) scrolls the strip down
             return;
         }
         let dy = match delta {
@@ -1244,7 +1197,7 @@ impl State {
         let overflow = self.reader.current_overflows();
         if !overflow {
             // Page fits: wheel flips (down = forward).
-            self.step(if dy < 0.0 { 1 } else { -1 });
+            self.reader.step(if dy < 0.0 { 1 } else { -1 });
             return;
         }
         // Vertical pan in px. At the top/bottom edge, hard-stop first: a scroll
@@ -1266,7 +1219,7 @@ impl State {
                 // Parked at the top: flip to the previous page only after dwelling.
                 if dwelt {
                     self.reader.pan_edge_at = None;
-                    self.reader.pan_y = if self.step(-1) { -1.0e6 } else { maxp };
+                    self.reader.pan_y = if self.reader.step(-1) { -1.0e6 } else { maxp };
                 } else {
                     self.reader.pan_y = maxp; // hold the stop
                     self.reader.pan_edge_at.get_or_insert(now);
@@ -1280,7 +1233,7 @@ impl State {
                 // Parked at the bottom: flip to the next page only after dwelling.
                 if dwelt {
                     self.reader.pan_edge_at = None;
-                    self.reader.pan_y = if self.step(1) { 1.0e6 } else { -maxp };
+                    self.reader.pan_y = if self.reader.step(1) { 1.0e6 } else { -maxp };
                 } else {
                     self.reader.pan_y = -maxp; // hold the stop
                     self.reader.pan_edge_at.get_or_insert(now);
@@ -1357,62 +1310,8 @@ impl State {
         }
     }
 
-    /// Does the current page overflow the window vertically under the active fit?
-    fn zoom_to_preset(&mut self, zoom_in: bool) {
-        let cur = self.reader.effective_zoom_pct();
-        let mut label: Option<&'static str> = None;
-        if self.reader.anchor_scale().is_some() && cur > 0.0 {
-            let ladder = self.reader.zoom_ladder();
-            let target = next_zoom_preset(&ladder, cur, zoom_in);
-            // Tag the stop if it is this page's fit-to-window / fit-to-width level.
-            if !self.reader.scroll_mode {
-                let near = |p: Option<f32>| p.is_some_and(|p| (p - target).abs() <= target * 1e-3);
-                if near(self.reader.fit_native_pct(FitMode::Window)) {
-                    label = Some("Fit window");
-                } else if near(self.reader.fit_native_pct(FitMode::Width)) {
-                    label = Some("Fit width");
-                }
-            }
-            self.reader.zoom *= target / cur; // rescale the fit-multiplier to hit target %
-        } else {
-            // Anchor not decoded yet: coarse step; the next press snaps once it lands.
-            self.reader.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
-        }
-        self.reader.clamp_zoom_native();
-        self.reader.clamp_pan();
-        let pct = self.reader.effective_zoom_pct();
-        match label {
-            // Fit label on its own line so the "Zoom %" line stays centered
-            // (the toast is center-aligned), aligned across zoom levels.
-            Some(l) => self.toast(format!("Zoom {pct:.2}%\n({l})")),
-            None => self.toast(format!("Zoom {pct:.2}%")),
-        }
-    }
-
-    fn scroll_by(&mut self, dy: f32) {
-        let len = match &self.reader.source {
-            Some(s) => s.len(),
-            None => return,
-        };
-        let before = self.reader.index;
-        let before_off = self.reader.top_offset;
-        self.reader.top_offset += dy;
-        self.reader.normalize();
-        if self.reader.index != before {
-            self.reader.nav_times.push_back(Instant::now());
-        } else if dy.abs() > 0.5 && (self.reader.top_offset - before_off).abs() < 0.5 {
-            // The strip didn't move despite a scroll — clamped at an end.
-            if dy < 0.0 && self.reader.index == 0 && self.reader.top_offset <= 0.5 {
-                self.toast("First page");
-            } else if dy > 0.0 && self.reader.index + 1 >= len {
-                self.toast("Last page");
-            }
-        }
-        self.reader.prefetch();
-    }
-
-    /// Keep (index, top_offset) in range using best-known page heights, so the
-    /// anchor stays valid as nearby pages decode (and their real heights land).
+    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
+    /// and register them with egui.
     fn decode_thumbnails(&mut self, budget: usize) {
         let mut done = 0;
         for i in 0..self.library.volumes.len() {
@@ -1445,7 +1344,11 @@ impl State {
         }
     }
 
-    /// Forward look-ahead distance, widened when flipping quickly.
+    /// Begin opening `path`. The source is built on a background thread (see
+    /// `build_source`) so a slow network-share open never freezes the UI — the
+    /// current page stays on screen under the spinner until the new source lands
+    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
+    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
     fn open(&mut self, path: &Path) {
         self.open_gen = self.open_gen.wrapping_add(1);
         let generation = self.open_gen;
@@ -1601,10 +1504,8 @@ impl State {
         ]
     }
 
-    /// Source aspect (w / h) for page `index`: from its decoded texture if present,
-    /// else the in-view anchor's, else the running estimate. Used to size the decode
-    /// target before the page itself is decoded (exact for the usual uniform-size
-    /// volume; corrected in place once the page's own dimensions are known).
+    /// The in-view anchor page if it is an animated (GIF/WebP) page with its texture
+    /// decoded — the page the mini playback controls govern.
     fn anim_anchor(&self) -> Option<usize> {
         if self.library_view {
             return None;
@@ -1852,6 +1753,16 @@ impl State {
         self.ui.zoom_pct = self.reader.effective_zoom_pct();
         self.reader.update_resize_readout();
         self.ui.resize_path = self.reader.resize_path_label();
+        // Drain transient messages the reader queued (boundary hit, zoom level)
+        // into the shell's timed toast.
+        if let Some(m) = self.reader.pending_toasts.drain(..).last() {
+            self.toast(m);
+        }
+        // Persist the read position: the reader owns `index`, the shell owns the
+        // volume key + settings. Cheap per-frame; flushed to disk on exit.
+        if let Some(k) = &self.volume_key {
+            self.settings.last_pages.insert(k.clone(), self.reader.index);
+        }
         if let Some((_, t)) = &self.toast
             && t.elapsed() >= TOAST_DURATION
         {
@@ -2053,7 +1964,7 @@ impl State {
         {
             let page = page.min(src.len().saturating_sub(1));
             if page != self.reader.index {
-                self.goto(page);
+                self.reader.goto(page);
             }
         }
         // Animation control-panel clicks (drained after the egui frame).

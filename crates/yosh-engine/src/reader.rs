@@ -220,6 +220,9 @@ pub struct Reader {
     /// When the zoomed-page wheel-pan first parked at the top/bottom edge (gates
     /// the hard-stop dwell before flipping).
     pub pan_edge_at: Option<Instant>,
+    /// Transient messages (boundary hit, zoom level) emitted by nav/zoom commands;
+    /// the shell drains these each frame into its timed on-screen toast.
+    pub pending_toasts: Vec<String>,
 }
 
 impl Reader {
@@ -267,11 +270,18 @@ impl Reader {
             view_settled: false,
             gpu_downscale_warned: false,
             pan_edge_at: None,
+            pending_toasts: Vec::new(),
         }
+    }
+
+    /// Queue a transient message; the shell drains it into its timed toast.
+    pub fn toast(&mut self, msg: impl Into<String>) {
+        self.pending_toasts.push(msg.into());
     }
 }
 
 impl Reader {
+    /// Does the current page overflow the window vertically under the active fit?
     pub fn current_overflows(&self) -> bool {
         let Some(pt) = self.cache.get(self.index) else {
             return false;
@@ -492,10 +502,8 @@ impl Reader {
         ladder
     }
 
-    /// Snap zoom to the next ladder stop above/below the current native %. The
-    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
-    /// step can land exactly on fit-to-window / fit-to-width. Works in both
-    /// page-flip and scroll modes (both derive from `effective_zoom_pct`).
+    /// Clamp the page-flip zoom so the page's *effective native* zoom stays within
+    /// [`MIN_ZOOM_PCT`, `MAX_ZOOM_PCT`]. No-op until the anchor page is decoded.
     pub fn clamp_zoom_native(&mut self) {
         if self.zoom > 0.0
             && let Some(s) = self.anchor_scale()
@@ -652,6 +660,8 @@ impl Reader {
         }
     }
 
+    /// Keep `(index, top_offset)` in range using best-known page heights, so the
+    /// scroll anchor stays valid as nearby pages decode (and their real heights land).
     pub fn normalize(&mut self) {
         let len = match &self.source {
             Some(s) => s.len(),
@@ -717,8 +727,9 @@ impl Reader {
         quads
     }
 
-    /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
-    /// and register them with egui.
+    /// Forward prefetch-window width: base `FWD`, widened by recent flip velocity
+    /// (flips in the last ~0.8 s) up to `FWD_MAX`, so fast seeking buffers further
+    /// ahead.
     pub fn dynamic_fwd(&mut self) -> usize {
         let now = Instant::now();
         while let Some(&t) = self.nav_times.front() {
@@ -731,11 +742,10 @@ impl Reader {
         (FWD + self.nav_times.len() * 4).min(FWD_MAX)
     }
 
-    /// Begin opening `path`. The source is built on a background thread (see
-    /// `build_source`) so a slow network-share open never freezes the UI — the
-    /// current page stays on screen under the spinner until the new source lands
-    /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
-    /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
+    /// Source aspect (w / h) for page `index`: from its decoded texture if present,
+    /// else the in-view anchor's, else the running estimate. Used to size the decode
+    /// target before the page itself is decoded (exact for the usual uniform-size
+    /// volume; corrected in place once the page's own dimensions are known).
     pub fn page_aspect(&self, index: usize) -> f32 {
         if let Some(t) = self.cache.get(index) {
             return t.src_w as f32 / t.src_h.max(1) as f32;
@@ -853,7 +863,7 @@ mod tests {
     // A 2048-tall portrait page on a 4K (2160-tall) screen, fit-to-window and
     // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
     #[test]
-    fn anchor_native_scale_fit_to_window_reports_upscale() {
+    pub fn anchor_native_scale_fit_to_window_reports_upscale() {
         let s = super::anchor_native_scale(
             super::FitMode::Window,
             (3840.0, 2160.0),
@@ -867,7 +877,7 @@ mod tests {
 
     // 1:1 (Actual) at zoom 1 is exactly native: 100%.
     #[test]
-    fn anchor_native_scale_actual_is_unity() {
+    pub fn anchor_native_scale_actual_is_unity() {
         let s = super::anchor_native_scale(
             super::FitMode::Actual,
             (3840.0, 2160.0),
@@ -885,7 +895,7 @@ mod tests {
     // pixel and adds no second resize. Checks the decode target and the draw size
     // agree across fit modes, aspects, zooms, and surface sizes.
     #[test]
-    fn decode_target_matches_drawn_size() {
+    pub fn decode_target_matches_drawn_size() {
         use crate::page::{fit_scale, FitMode};
         for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
             for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
@@ -913,7 +923,7 @@ mod tests {
     // turned texture's height must still map 1 texel : 1 pixel along the screen
     // width — i.e. the rotated-draw fit scale stays ~1, so no second GPU resize.
     #[test]
-    fn decode_target_matches_drawn_size_rotated() {
+    pub fn decode_target_matches_drawn_size_rotated() {
         use crate::page::{fit_scale, FitMode};
         for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
             for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
@@ -943,7 +953,7 @@ mod tests {
     // and is drawn at the same size — so the GPU samples 1:1 and never bilinear-
     // downscales a full-res texture. (Surface size is irrelevant in 1:1.)
     #[test]
-    fn decode_target_matches_drawn_size_actual_zoomed_out() {
+    pub fn decode_target_matches_drawn_size_actual_zoomed_out() {
         for (src_w, src_h) in [(1500.0_f32, 5200.0), (5200.0, 1500.0), (2048.0, 2048.0)] {
             let _ = src_w; // 1:1 sizes off src_h × zoom; width follows the same scale
             for zoom in [0.1_f32, 0.27, 0.5, 0.99] {
@@ -967,7 +977,7 @@ mod tests {
     // 3840 cap forced a GPU upscale (e.g. a 5207px page at 80–90% → ↑1.08–1.22×),
     // which beats against the screentone → moiré. This models `page_target_h`'s cap.
     #[test]
-    fn large_page_decodes_to_display_not_a_fixed_cap() {
+    pub fn large_page_decodes_to_display_not_a_fixed_cap() {
         let max_dim = 8192u32; // default MAX_TEX_DIM (the GPU's real limit)
         for (src_w, src_h) in [(3600.0_f32, 5207.0), (5207.0, 3600.0), (4000.0, 6000.0)] {
             let aspect = src_w / src_h;
@@ -994,7 +1004,7 @@ mod tests {
     // The fit-multiplier clamp maps to native bounds: far zoom-out hits the 5%
     // floor, far zoom-in hits the 20000% ceiling, mid values pass through.
     #[test]
-    fn zoom_multiplier_clamps_to_native_bounds() {
+    pub fn zoom_multiplier_clamps_to_native_bounds() {
         let base = 2160.0_f32 / 2048.0; // native scale at zoom = 1 (fit-to-window)
         let lo = super::clamp_zoom_multiplier(1e-6, base);
         assert!((lo * base - super::MIN_ZOOM_PCT).abs() < 1e-4, "lo eff {}", lo * base);
@@ -1006,7 +1016,7 @@ mod tests {
 
     // The BandiView ladder: 5, 10..300 by 10, 320..500 by 20, 550..20000 by 50.
     #[test]
-    fn zoom_ladder_shape() {
+    pub fn zoom_ladder_shape() {
         let p = super::zoom_presets();
         assert_eq!(p.first().copied(), Some(5.0));
         assert_eq!(p.last().copied(), Some(20000.0));
@@ -1021,7 +1031,7 @@ mod tests {
 
     // +/- step to the neighbouring fixed stop, clamping at the ends.
     #[test]
-    fn zoom_stepping_fixed() {
+    pub fn zoom_stepping_fixed() {
         let p = super::zoom_presets();
         let up = |c: f32| super::next_zoom_preset(&p, c, true);
         let dn = |c: f32| super::next_zoom_preset(&p, c, false);
@@ -1038,10 +1048,112 @@ mod tests {
 
     // A spliced fit-% (e.g. 71.34) becomes a reachable stop between fixed presets.
     #[test]
-    fn zoom_stepping_dynamic_stop() {
+    pub fn zoom_stepping_dynamic_stop() {
         let ladder = vec![70.0, 71.34, 80.0, 90.0];
         assert_eq!(super::next_zoom_preset(&ladder, 70.0, true), 71.34);
         assert_eq!(super::next_zoom_preset(&ladder, 71.34, true), 80.0);
         assert_eq!(super::next_zoom_preset(&ladder, 71.34, false), 70.0);
+    }
+}
+
+impl Reader {
+    /// Flip one view in `dir`. Returns `true` if the position actually changed. At
+    /// the first/last page it queues a toast and returns `false`; in step mode while
+    /// the current page is still decoding it just returns `false`.
+    pub fn step(&mut self, dir: i64) -> bool {
+        let Some(src) = &self.source else { return false };
+        let len = src.len();
+        if len == 0 {
+            return false;
+        }
+        // "Step" seek (default; toggle "jump" with J): don't flip while the
+        // current page is still decoding, so you see every page instead of
+        // skipping past it. "Jump" skips ahead for fast long-distance seeks. A
+        // *failed* page never lands in the cache, so allow stepping past it —
+        // otherwise next/prev gets stuck on an unopenable page.
+        if !self.jump {
+            let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
+            if !self.cache.contains(cur) && !self.failed.contains_key(&cur) {
+                return false;
+            }
+        }
+        let next = if dir > 0 {
+            layout::next_view(self.layout, self.index, len, self.spread_offset)
+        } else {
+            layout::prev_view(self.layout, self.index, len, self.spread_offset)
+        };
+        if next != self.index {
+            self.nav_times.push_back(Instant::now());
+            self.goto(next);
+            true
+        } else {
+            // Nowhere to go — let the reader know why seeking did nothing.
+            self.toast(if dir > 0 { "Last page" } else { "First page" });
+            false
+        }
+    }
+
+    pub fn goto(&mut self, index: usize) {
+        self.index = index;
+        self.pan_x = 0.0;
+        self.pan_y = 0.0; // start new page centered
+        self.top_offset = 0.0;
+        // The shell persists the read position (it owns the volume key + settings).
+        self.prefetch();
+    }
+    /// Snap zoom to the next ladder stop above/below the current native %. The
+    /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
+    /// step can land exactly on fit-to-window / fit-to-width.
+    pub fn zoom_to_preset(&mut self, zoom_in: bool) {
+        let cur = self.effective_zoom_pct();
+        let mut label: Option<&'static str> = None;
+        if self.anchor_scale().is_some() && cur > 0.0 {
+            let ladder = self.zoom_ladder();
+            let target = next_zoom_preset(&ladder, cur, zoom_in);
+            // Tag the stop if it is this page's fit-to-window / fit-to-width level.
+            if !self.scroll_mode {
+                let near = |p: Option<f32>| p.is_some_and(|p| (p - target).abs() <= target * 1e-3);
+                if near(self.fit_native_pct(FitMode::Window)) {
+                    label = Some("Fit window");
+                } else if near(self.fit_native_pct(FitMode::Width)) {
+                    label = Some("Fit width");
+                }
+            }
+            self.zoom *= target / cur; // rescale the fit-multiplier to hit target %
+        } else {
+            // Anchor not decoded yet: coarse step; the next press snaps once it lands.
+            self.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
+        }
+        self.clamp_zoom_native();
+        self.clamp_pan();
+        let pct = self.effective_zoom_pct();
+        match label {
+            // Fit label on its own line so the "Zoom %" line stays centered
+            // (the toast is center-aligned), aligned across zoom levels.
+            Some(l) => self.toast(format!("Zoom {pct:.2}%\n({l})")),
+            None => self.toast(format!("Zoom {pct:.2}%")),
+        }
+    }
+
+    pub fn scroll_by(&mut self, dy: f32) {
+        let len = match &self.source {
+            Some(s) => s.len(),
+            None => return,
+        };
+        let before = self.index;
+        let before_off = self.top_offset;
+        self.top_offset += dy;
+        self.normalize();
+        if self.index != before {
+            self.nav_times.push_back(Instant::now());
+        } else if dy.abs() > 0.5 && (self.top_offset - before_off).abs() < 0.5 {
+            // The strip didn't move despite a scroll — clamped at an end.
+            if dy < 0.0 && self.index == 0 && self.top_offset <= 0.5 {
+                self.toast("First page");
+            } else if dy > 0.0 && self.index + 1 >= len {
+                self.toast("Last page");
+            }
+        }
+        self.prefetch();
     }
 }
