@@ -1,0 +1,2 @@
+# APK build artifacts (the .so / .apk / debug keystore are reproduced by build-apk.ps1)
+out/
