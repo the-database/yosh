@@ -29,7 +29,7 @@ use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
 
 use yosh_engine::gpu::GpuContext;
-use yosh_engine::layout::Layout;
+use yosh_engine::layout::{view_start, Layout};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
@@ -56,6 +56,12 @@ fn android_main(app: AndroidApp) {
         .map(|s| PathBuf::from(s.trim()))
         .filter(|p| p.is_dir())
         .unwrap_or_else(|| PathBuf::from("/storage/emulated/0"));
+    // Persisted viewing options (direction / layout / fit); default RTL manga order.
+    let view_file = app.internal_data_path().map(|p| p.join("view.txt"));
+    let init_view = view_file
+        .as_deref()
+        .map(load_view)
+        .unwrap_or((Direction::Rtl, Layout::Single, FitMode::Window));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -71,6 +77,8 @@ fn android_main(app: AndroidApp) {
         has_files: false,
         init_lib_dir,
         lib_dir_file,
+        init_view,
+        view_file,
         touches: HashMap::new(),
         gesture_start: None,
         pinch: None,
@@ -98,6 +106,9 @@ struct Shell {
     /// The library dir to open the browser at (persisted across launches).
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
+    /// Persisted viewing options (direction, layout, fit) + where they live.
+    init_view: (Direction, Layout, FitMode),
+    view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
     /// Single-finger gesture start (for swipe-vs-tap on release).
@@ -131,6 +142,12 @@ struct App {
     thumb_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
     /// The dir whose covers were queued for decode (so we don't re-queue).
     thumb_dir: Option<PathBuf>,
+    /// Reading chrome: seekbar + zone hints show when `controls`; the gear opens
+    /// the viewing-options popup.
+    controls: bool,
+    show_options: bool,
+    /// Where viewing options persist (mirrors Shell.view_file).
+    view_file: Option<PathBuf>,
 }
 
 /// A library browser row: a folder to descend into (or open if it holds images),
@@ -215,6 +232,18 @@ impl ApplicationHandler for Shell {
 
         let page_pipeline = PagePipeline::new(&ctx.device, config.format);
         let egui_ctx = egui::Context::default();
+        // egui's bundled fonts have no CJK glyphs; add the system Noto Sans CJK as a
+        // fallback so Japanese comic / file names render instead of tofu squares.
+        if let Ok(bytes) = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc") {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
+            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts.families.entry(fam).or_default().push("cjk".to_owned());
+            }
+            egui_ctx.set_fonts(fonts);
+        }
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -237,11 +266,11 @@ impl ApplicationHandler for Shell {
             ctx.queue.clone(),
             tex_pool,
             budget,
-            FitMode::Window,
-            Layout::Single,
-            false, // scroll_mode: page-flip
-            false, // jump: step mode
-            Direction::Ltr,
+            self.init_view.2, // fit
+            self.init_view.1, // layout
+            false,            // scroll_mode: page-flip
+            false,            // jump: step mode
+            self.init_view.0, // direction (default RTL)
             0,
         );
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
@@ -264,6 +293,9 @@ impl ApplicationHandler for Shell {
             thumb_rx,
             thumb_tx,
             thumb_dir: None,
+            controls: true,
+            show_options: false,
+            view_file: self.view_file.clone(),
         });
         // Dev fallback: open a pushed test comic if present (restores its position).
         if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
@@ -431,7 +463,14 @@ impl Shell {
         let is_swipe = dx.abs() > w * 0.08 && dx.abs() > dy.abs() * 1.4;
         if is_swipe {
             if zoom <= 1.001 {
-                self.flip(if dx < 0.0 { 1 } else { -1 });
+                let rtl = self
+                    .app
+                    .as_ref()
+                    .map(|a| a.reader.direction == Direction::Rtl)
+                    .unwrap_or(false);
+                // Drag metaphor: LTR swipe-left = next; RTL swipe-right = next.
+                let next = if rtl { dx > 0.0 } else { dx < 0.0 };
+                self.flip(if next { 1 } else { -1 });
             }
             // else: a drag while zoomed was a pan, not a flip.
         } else {
@@ -455,7 +494,8 @@ impl Shell {
         }
     }
 
-    /// Tap-zones: top strip opens the library; otherwise left third = prev, rest = next.
+    /// Tap-zones: top strip opens the library; thin side edges flip (direction-aware);
+    /// the large center toggles the reading chrome (seekbar + hints).
     fn on_tap(&mut self, x: f64, y: f64) {
         let Some((w, h)) = self
             .app
@@ -471,7 +511,7 @@ impl Shell {
         if self.app.as_ref().map(|a| a.library_view).unwrap_or(false) {
             return;
         }
-        if y < h * 0.12 {
+        if y < h * 0.10 {
             // Top strip opens the library browser.
             self.has_files = has_all_files(&self.android_app);
             if let Some(app) = self.app.as_mut() {
@@ -482,11 +522,24 @@ impl Shell {
             }
             return;
         }
-        // Page nav: left third = previous, rest = next.
-        if x < w / 3.0 {
-            self.flip(-1);
-        } else {
-            self.flip(1);
+        let rtl = self
+            .app
+            .as_ref()
+            .map(|a| a.reader.direction == Direction::Rtl)
+            .unwrap_or(false);
+        if x < w * 0.12 {
+            // Left edge: next in RTL, previous in LTR.
+            self.flip(if rtl { 1 } else { -1 });
+        } else if x > w * 0.88 {
+            // Right edge: previous in RTL, next in LTR.
+            self.flip(if rtl { -1 } else { 1 });
+        } else if let Some(app) = self.app.as_mut() {
+            // Center: toggle the reading chrome (also closes the options popup).
+            app.controls = !app.controls;
+            if !app.controls {
+                app.show_options = false;
+            }
+            app.window.request_redraw();
         }
     }
 
@@ -587,6 +640,40 @@ fn attach_source(
 }
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
+/// Parse persisted viewing options ("dir,layout,fit"); default RTL / single / window.
+fn load_view(path: &Path) -> (Direction, Layout, FitMode) {
+    let (mut dir, mut lay, mut fit) = (Direction::Rtl, Layout::Single, FitMode::Window);
+    if let Ok(s) = std::fs::read_to_string(path) {
+        let t: Vec<&str> = s.trim().split(',').collect();
+        if t.first() == Some(&"ltr") {
+            dir = Direction::Ltr;
+        }
+        if t.get(1) == Some(&"spread") {
+            lay = Layout::Spread;
+        }
+        fit = match t.get(2) {
+            Some(&"width") => FitMode::Width,
+            Some(&"height") => FitMode::Height,
+            Some(&"actual") => FitMode::Actual,
+            _ => FitMode::Window,
+        };
+    }
+    (dir, lay, fit)
+}
+
+/// Persist viewing options as "dir,layout,fit".
+fn save_view(path: &Path, dir: Direction, lay: Layout, fit: FitMode) {
+    let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
+    let l = if lay == Layout::Spread { "spread" } else { "single" };
+    let f = match fit {
+        FitMode::Width => "width",
+        FitMode::Height => "height",
+        FitMode::Actual => "actual",
+        FitMode::Window => "window",
+    };
+    let _ = std::fs::write(path, format!("{d},{l},{f}"));
+}
+
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
     let mut map = HashMap::new();
     if let Ok(s) = std::fs::read_to_string(path) {
@@ -623,7 +710,13 @@ fn device_mem_budget_mb() -> u64 {
 
 /// Bottom seekbar: "page / total" + a draggable slider that requests a jump.
 /// Hidden for a single-page source.
-fn seekbar(ctx: &egui::Context, cur: usize, len: usize, seek_to: &mut Option<usize>) {
+fn seekbar(
+    ctx: &egui::Context,
+    cur: usize,
+    len: usize,
+    seek_to: &mut Option<usize>,
+    open_options: &mut bool,
+) {
     if len <= 1 {
         return;
     }
@@ -639,12 +732,136 @@ fn seekbar(ctx: &egui::Context, cur: usize, len: usize, seek_to: &mut Option<usi
                 ui.horizontal(|ui| {
                     let mut p = cur;
                     ui.label(egui::RichText::new(format!("{} / {}", cur + 1, len)).size(18.0));
+                    if ui.button(egui::RichText::new("⚙").size(20.0)).clicked() {
+                        *open_options = true;
+                    }
                     ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
                     if ui
                         .add(egui::Slider::new(&mut p, 0..=len - 1).show_value(false))
                         .changed()
                     {
                         *seek_to = Some(p);
+                    }
+                });
+            });
+        });
+}
+
+/// Faint labels over the tap zones (shown with the controls) so the layout is
+/// discoverable. Painted, NOT laid out as widgets: an egui Area registers under
+/// the pointer and makes the tap report "consumed", blocking the edge/top zones.
+/// A background-layer painter does no hit-testing, so taps fall through to nav.
+fn zone_hints(ctx: &egui::Context, rtl: bool) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new("zone_hints"),
+    ));
+    let rect = ctx.screen_rect();
+    let font = egui::FontId::proportional(18.0);
+    let draw = |pos: egui::Pos2, anchor: egui::Align2, text: &str| {
+        // A dark rounded backing keeps the label legible over light pages.
+        let galley =
+            painter.layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::from_white_alpha(235));
+        let r = anchor.anchor_size(pos, galley.size());
+        painter.rect_filled(
+            r.expand2(egui::vec2(10.0, 6.0)),
+            6.0,
+            egui::Color32::from_black_alpha(180),
+        );
+        painter.galley(r.min, galley, egui::Color32::from_white_alpha(235));
+    };
+    draw(
+        egui::pos2(rect.center().x, rect.top() + 56.0),
+        egui::Align2::CENTER_CENTER,
+        "📚 Library",
+    );
+    let (left, right) = if rtl { ("Next ›", "‹ Prev") } else { ("‹ Prev", "Next ›") };
+    draw(
+        egui::pos2(rect.left() + 40.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        left,
+    );
+    draw(
+        egui::pos2(rect.right() - 40.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER,
+        right,
+    );
+}
+
+/// Viewing-options popup (from the seekbar gear): reading direction, page layout,
+/// fit. Records the chosen value into the `set_*` outs; the caller applies it.
+#[allow(clippy::too_many_arguments)]
+fn options_popup(
+    ctx: &egui::Context,
+    dir: Direction,
+    layout: Layout,
+    fit: FitMode,
+    set_dir: &mut Option<Direction>,
+    set_layout: &mut Option<Layout>,
+    set_fit: &mut Option<FitMode>,
+    toggle_offset: &mut bool,
+) {
+    egui::Area::new(egui::Id::new("view_options"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
+
+                ui.label(egui::RichText::new("Reading direction").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(dir == Direction::Ltr, egui::RichText::new("→ LTR").size(16.0))
+                        .clicked()
+                    {
+                        *set_dir = Some(Direction::Ltr);
+                    }
+                    if ui
+                        .selectable_label(dir == Direction::Rtl, egui::RichText::new("← RTL").size(16.0))
+                        .clicked()
+                    {
+                        *set_dir = Some(Direction::Rtl);
+                    }
+                });
+
+                ui.label(egui::RichText::new("Page layout").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(layout == Layout::Single, egui::RichText::new("Single").size(16.0))
+                        .clicked()
+                    {
+                        *set_layout = Some(Layout::Single);
+                    }
+                    if ui
+                        .selectable_label(layout == Layout::Spread, egui::RichText::new("Two-page").size(16.0))
+                        .clicked()
+                    {
+                        *set_layout = Some(Layout::Spread);
+                    }
+                });
+                // Shift which pages are paired together (e.g. so a cover sits alone).
+                if layout == Layout::Spread
+                    && ui
+                        .button(egui::RichText::new("Shift page pairing").size(16.0))
+                        .clicked()
+                {
+                    *toggle_offset = true;
+                }
+
+                ui.label(egui::RichText::new("Fit").strong());
+                ui.horizontal(|ui| {
+                    for (f, text) in [
+                        (FitMode::Window, "Window"),
+                        (FitMode::Width, "Width"),
+                        (FitMode::Height, "Height"),
+                        (FitMode::Actual, "1:1"),
+                    ] {
+                        if ui
+                            .selectable_label(fit == f, egui::RichText::new(text).size(16.0))
+                            .clicked()
+                        {
+                            *set_fit = Some(f);
+                        }
                     }
                 });
             });
@@ -744,6 +961,13 @@ impl App {
             .collect();
         if !paths.is_empty() {
             spawn_cover_decode(paths, self.thumb_tx.clone());
+        }
+    }
+
+    /// Write the current viewing options to disk (immediate, like positions).
+    fn persist_view(&self) {
+        if let Some(f) = &self.view_file {
+            save_view(f, self.reader.direction, self.reader.layout, self.reader.fit);
         }
     }
 
@@ -854,6 +1078,12 @@ impl App {
         let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
         let cur = self.reader.index;
         let library_view = self.library_view;
+        let controls = self.controls;
+        let show_options = self.show_options;
+        let rtl = self.reader.direction == Direction::Rtl;
+        let cur_dir = self.reader.direction;
+        let cur_layout = self.reader.layout;
+        let cur_fit = self.reader.fit;
         let lib_dir_str = self.lib_dir.display().to_string();
         // Snapshot the rows the closure needs (owned), so it borrows no `self`.
         let entries: Vec<(bool, String, PathBuf, Option<egui::TextureHandle>)> = self
@@ -874,6 +1104,11 @@ impl App {
         let mut nav_to: Option<PathBuf> = None;
         let mut close_lib = false;
         let mut set_root = false;
+        let mut open_options = false;
+        let mut set_dir: Option<Direction> = None;
+        let mut set_layout: Option<Layout> = None;
+        let mut set_fit: Option<FitMode> = None;
+        let mut toggle_offset = false;
         let at_root = self.lib_dir == self.lib_root;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if library_view {
@@ -965,8 +1200,21 @@ impl App {
                         });
                     }
                 });
-            } else {
-                seekbar(ctx, cur, len, &mut seek_to);
+            } else if controls {
+                seekbar(ctx, cur, len, &mut seek_to, &mut open_options);
+                zone_hints(ctx, rtl);
+                if show_options {
+                    options_popup(
+                        ctx,
+                        cur_dir,
+                        cur_layout,
+                        cur_fit,
+                        &mut set_dir,
+                        &mut set_layout,
+                        &mut set_fit,
+                        &mut toggle_offset,
+                    );
+                }
             }
         });
         self.egui_state
@@ -995,6 +1243,30 @@ impl App {
         }
         if close_lib {
             self.library_view = false;
+        }
+        if open_options {
+            self.show_options = !self.show_options;
+        }
+        if let Some(d) = set_dir {
+            self.reader.direction = d;
+            self.persist_view();
+        }
+        if let Some(l) = set_layout {
+            self.reader.layout = l;
+            self.reader.index = view_start(l, self.reader.index, self.reader.spread_offset);
+            self.reader.prefetch();
+            self.persist_view();
+        }
+        if let Some(f) = set_fit {
+            self.reader.fit = f;
+            self.reader.prefetch();
+            self.persist_view();
+        }
+        if toggle_offset {
+            self.reader.spread_offset ^= 1;
+            self.reader.index =
+                view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+            self.reader.prefetch();
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
