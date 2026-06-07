@@ -24,10 +24,16 @@ pub struct TexturePool {
 
 impl TexturePool {
     pub fn new() -> Self {
+        Self::with_max_total(24)
+    }
+
+    /// Create with a specific global texture cap (supplied by the device `Budget`
+    /// so constrained devices keep less VRAM live).
+    pub fn with_max_total(max_total: usize) -> Self {
         Self {
             inner: Mutex::new(Inner::default()),
             max_per_bucket: 8,
-            max_total: 24,
+            max_total,
         }
     }
 

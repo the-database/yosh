@@ -24,13 +24,45 @@ use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
-use yosh_engine::reader::{Direction, Reader, Viewport};
+use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
 
-const WORKERS: usize = 8;
-const CACHE_CAP: usize = 48;
+/// Memory (MB) the reader may spend on its page cache + GPU textures. A slice of
+/// system RAM on the desktop; an Android shell would pass its per-app heap class.
+/// Falls back to a generous value (→ the full desktop budget) when RAM is unknown.
+fn detect_mem_budget_mb() -> u64 {
+    (total_ram_mb().unwrap_or(8192) / 16).max(64)
+}
+
+#[cfg(windows)]
+fn total_ram_mb() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut s: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    s.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: `s` is a correctly-sized, zeroed MEMORYSTATUSEX with dwLength set.
+    (unsafe { GlobalMemoryStatusEx(&mut s) } != 0).then_some(s.ullTotalPhys / (1024 * 1024))
+}
+
+#[cfg(target_os = "linux")]
+fn total_ram_mb() -> Option<u64> {
+    // /proc/meminfo line: "MemTotal:   16384000 kB"
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = info
+        .lines()
+        .find_map(|l| l.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kb / 1024)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn total_ram_mb() -> Option<u64> {
+    None
+}
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
 /// Library cover thumbnail height, and how many to decode per frame.
@@ -642,7 +674,12 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
         let page_pipeline = PagePipeline::new(&gpu.device, gpu.config.format);
-        let tex_pool = Arc::new(TexturePool::new());
+        // Size the reader's resource budget to the device: CPU count + a slice of
+        // system RAM. Desktop reproduces the historical fixed budget; a constrained
+        // device (e.g. Android) scales cache / textures / prefetch down.
+        let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let budget = Budget::derive(detect_mem_budget_mb(), cpus);
+        let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
 
         let mut ui = UiState::default();
         ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
@@ -679,8 +716,7 @@ impl ApplicationHandler for App {
             gpu.device.clone(),
             gpu.queue.clone(),
             tex_pool,
-            CACHE_CAP,
-            WORKERS,
+            budget,
             fit_from_u8(settings.fit),
             if settings.layout_spread {
                 Layout::Spread
@@ -1388,7 +1424,7 @@ impl State {
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
             self.reader.tex_pool.clone(),
-            WORKERS,
+            self.reader.workers,
         ));
         self.reader.cache.clear();
         self.reader.failed.clear();
