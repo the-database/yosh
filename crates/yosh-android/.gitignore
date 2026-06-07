@@ -1,2 +1,5 @@
-# APK build artifacts (the .so / .apk / debug keystore are reproduced by build-apk.ps1)
+# APK build artifacts (the .so / .apk are reproduced by build-apk.ps1)
 out/
+# Persistent debug-signing key (kept out of out/ so the signature is stable across
+# builds; regenerated on first build if missing).
+debug.keystore
