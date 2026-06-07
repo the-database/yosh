@@ -7,6 +7,12 @@ edition = "2024"
 name = "yosh_engine"
 
 [features]
+default = ["rar"]
+# RAR/CBR support via the `unrar` crate (bundled UnRAR C++). ON by default. The
+# UnRAR source uses `lutimes`, absent from Android's Bionic libc, so it can't
+# cross-compile to Android — an Android shell builds the engine with
+# `--no-default-features` to drop it (folder / CBZ / 7z still work).
+rar = ["dep:unrar"]
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so the
 # standard build needs no C toolchain. The `yosh` app forwards its own `avif`
 # feature to this one. Enabling requires nasm + dav1d (see CI).
@@ -33,5 +39,5 @@ natord = "1"
 # Archive page sources: zip/cbz (parallel reads), rar/cbr + 7z/cb7 (sequential —
 # a reader thread decompresses into an in-memory map served to readers).
 zip = "8"
-unrar = "0.5"
+unrar = { version = "0.5", optional = true }
 sevenz-rust2 = "0.21"
