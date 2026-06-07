@@ -27,3 +27,5 @@ jni = "0.21"
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
 egui-winit = { version = "0.34.3", default-features = false }
+# Natural-order sort for the library (vol 2 before vol 10).
+natord = "1"

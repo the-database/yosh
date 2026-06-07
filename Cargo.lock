@@ -5314,6 +5314,7 @@ dependencies = [
  "egui-winit",
  "jni 0.21.1",
  "log",
+ "natord",
  "wgpu",
  "winit",
  "yosh-engine",
