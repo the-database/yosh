@@ -2,10 +2,16 @@
 //! index, for the decode pool. Implementations: folder (M1.2), zip + rar (M1.6).
 
 mod folder;
+// RAR (CBR) is gated behind the on-by-default `rar` feature: the bundled UnRAR
+// C++ (`unrar`) uses `lutimes`, which Android's Bionic libc lacks, so it can't
+// cross-compile to Android. A shell that targets Android builds without it; the
+// other formats (folder / CBZ / 7z) are unaffected.
+#[cfg(feature = "rar")]
 mod rar;
 mod sevenz;
 mod ziparc;
 pub use folder::FolderSource;
+#[cfg(feature = "rar")]
 pub use rar::RarSource;
 pub use sevenz::SevenzSource;
 pub use ziparc::ZipSource;
