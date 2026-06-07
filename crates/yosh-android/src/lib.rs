@@ -71,7 +71,9 @@ fn android_main(app: AndroidApp) {
         has_files: false,
         init_lib_dir,
         lib_dir_file,
-        touch_start: None,
+        touches: HashMap::new(),
+        gesture_start: None,
+        pinch: None,
     };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
@@ -96,8 +98,12 @@ struct Shell {
     /// The library dir to open the browser at (persisted across launches).
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
-    /// Where the current single-finger touch started (for swipe-vs-tap).
-    touch_start: Option<(f64, f64)>,
+    /// Active touch points by finger id, for swipe / pinch-zoom / pan.
+    touches: HashMap<u64, (f64, f64)>,
+    /// Single-finger gesture start (for swipe-vs-tap on release).
+    gesture_start: Option<(f64, f64)>,
+    /// Active pinch: (initial finger distance, zoom when it began).
+    pinch: Option<(f64, f32)>,
 }
 
 /// The live app: surface + the engine device context, the page pipeline, and the
@@ -286,23 +292,11 @@ impl ApplicationHandler for Shell {
                 }
             }
             WindowEvent::Touch(Touch {
-                phase, location, ..
-            }) => {
-                let library = self.app.as_ref().map(|a| a.library_view).unwrap_or(false);
-                match phase {
-                    TouchPhase::Started if !library => {
-                        self.touch_start = Some((location.x, location.y));
-                    }
-                    TouchPhase::Ended => {
-                        if let Some((sx, sy)) = self.touch_start.take() {
-                            if !library && !egui_consumed {
-                                self.handle_gesture(sx, sy, location.x, location.y);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+                phase,
+                location,
+                id,
+                ..
+            }) => self.handle_touch(phase, id, location.x, location.y, egui_consumed),
             WindowEvent::RedrawRequested => {
                 // A picker result may have landed while we were backgrounded.
                 if self.picker_pending {
@@ -333,23 +327,106 @@ impl ApplicationHandler for Shell {
 }
 
 impl Shell {
-    /// A single-finger gesture ended: a horizontal swipe flips a page, otherwise
-    /// it's a tap.
+    /// Route a touch event into swipe/tap (one finger) or pinch-zoom/pan (two).
+    fn handle_touch(&mut self, phase: TouchPhase, id: u64, x: f64, y: f64, egui_consumed: bool) {
+        let library = self.app.as_ref().map(|a| a.library_view).unwrap_or(false);
+        match phase {
+            TouchPhase::Started => {
+                self.touches.insert(id, (x, y));
+                if library {
+                    return;
+                }
+                if self.touches.len() == 1 {
+                    self.gesture_start = Some((x, y));
+                } else if self.touches.len() == 2 {
+                    // Begin a pinch; cancel the single-finger gesture.
+                    self.gesture_start = None;
+                    if let Some(d) = self.touch_distance() {
+                        let z = self.app.as_ref().map(|a| a.reader.zoom).unwrap_or(1.0);
+                        self.pinch = Some((d, z));
+                    }
+                }
+            }
+            TouchPhase::Moved => {
+                let prev = self.touches.insert(id, (x, y));
+                if library {
+                    return;
+                }
+                if let Some((d0, z0)) = self.pinch {
+                    // Pinch → zoom (engine re-decodes HQ once it settles).
+                    if d0 > 1.0 {
+                        if let Some(d) = self.touch_distance() {
+                            if let Some(app) = self.app.as_mut() {
+                                app.reader.zoom = z0 * (d / d0) as f32;
+                                app.reader.clamp_zoom_native();
+                                app.window.request_redraw();
+                            }
+                        }
+                    }
+                } else if self.touches.len() == 1 {
+                    // Single finger while zoomed in → pan.
+                    let zoomed = self.app.as_ref().map(|a| a.reader.zoom > 1.001).unwrap_or(false);
+                    if zoomed {
+                        if let (Some((px, py)), Some(app)) = (prev, self.app.as_mut()) {
+                            app.reader.pan_x += (x - px) as f32;
+                            app.reader.pan_y += (y - py) as f32;
+                            app.reader.clamp_pan();
+                            app.window.request_redraw();
+                        }
+                    }
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.touches.remove(&id);
+                if self.touches.len() < 2 {
+                    self.pinch = None;
+                }
+                if self.touches.is_empty() {
+                    if let Some((sx, sy)) = self.gesture_start.take() {
+                        if !library && !egui_consumed {
+                            self.handle_gesture(sx, sy, x, y);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Distance between the first two active touch points.
+    fn touch_distance(&self) -> Option<f64> {
+        let mut it = self.touches.values();
+        let a = it.next()?;
+        let b = it.next()?;
+        Some(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt())
+    }
+
+    /// A single-finger gesture ended: a horizontal swipe flips (only when not
+    /// zoomed, where a drag is a pan instead), otherwise it's a tap.
     fn handle_gesture(&mut self, sx: f64, sy: f64, ex: f64, ey: f64) {
-        let w = self.app.as_ref().map(|a| a.config.width as f64).unwrap_or(1.0);
+        let (w, zoom) = self
+            .app
+            .as_ref()
+            .map(|a| (a.config.width as f64, a.reader.zoom))
+            .unwrap_or((1.0, 1.0));
         let (dx, dy) = (ex - sx, ey - sy);
-        if dx.abs() > w * 0.08 && dx.abs() > dy.abs() * 1.4 {
-            // Swipe: left = next, right = previous (LTR).
-            self.flip(if dx < 0.0 { 1 } else { -1 });
+        let is_swipe = dx.abs() > w * 0.08 && dx.abs() > dy.abs() * 1.4;
+        if is_swipe {
+            if zoom <= 1.001 {
+                self.flip(if dx < 0.0 { 1 } else { -1 });
+            }
+            // else: a drag while zoomed was a pan, not a flip.
         } else {
             self.on_tap(sx, sy);
         }
     }
 
-    /// Flip `dir` pages and persist the new position.
+    /// Flip `dir` pages (resetting zoom/pan to fit) and persist the new position.
     fn flip(&mut self, dir: i64) {
         if let Some(app) = self.app.as_mut() {
             app.reader.step(dir);
+            app.reader.zoom = 1.0;
+            app.reader.pan_x = 0.0;
+            app.reader.pan_y = 0.0;
             app.window.request_redraw();
             let idx = app.reader.index;
             if let Some(k) = self.current_key.clone() {
