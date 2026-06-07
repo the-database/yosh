@@ -1,0 +1,21 @@
+[package]
+name = "yosh-android"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "yosh_android"
+# Android loads the app as a shared library; android-activity calls `android_main`.
+crate-type = ["cdylib"]
+
+# The shell is Android-only (the desktop shell is `crates/yosh`). Keeping the deps
+# under a target gate means a host `cargo build` over the workspace compiles this
+# crate to an empty cdylib instantly, with no winit/wgpu/engine pulled in.
+[target.'cfg(target_os = "android")'.dependencies]
+# RAR is dropped on Android (its bundled C++ won't cross-compile); folder / CBZ /
+# 7z page sources remain.
+yosh-engine = { path = "../yosh-engine", default-features = false }
+wgpu = "29.0.3"
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+android_logger = "0.14"
+log = "0.4"
