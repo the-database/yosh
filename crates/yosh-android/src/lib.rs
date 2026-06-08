@@ -881,6 +881,7 @@ fn seekbar(
     len: usize,
     rtl: bool,
     spread: bool,
+    buffered: &[usize],
     seek_to: &mut Option<usize>,
     open_options: &mut bool,
     open_info: &mut bool,
@@ -894,22 +895,91 @@ fn seekbar(
     // A floating pill lifted off the bottom edge (the very edge collides with the
     // system gesture bar + is awkward to grab), fattened for touch.
     let sw = ctx.screen_rect().width();
+    // Translucent panel so the page shows through behind the controls. Keep the
+    // popup's color/stroke/rounding, just drop the fill's alpha.
+    let frame = egui::Frame::popup(&ctx.style());
+    let f = frame.fill;
+    let frame = frame.fill(egui::Color32::from_rgba_unmultiplied(f.r(), f.g(), f.b(), 200));
     egui::Area::new(egui::Id::new("seekbar"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            frame.show(ui, |ui| {
                 ui.set_width((sw * 0.85).min(960.0));
                 ui.spacing_mut().interact_size.y = 30.0;
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("{} / {}", cur + 1, len)).size(18.0));
+                    // Right-pad the current page to the total's digit width in a
+                    // monospace font, so "1 / 200" and "200 / 200" occupy the same
+                    // width and the slider doesn't shift as the page number grows.
+                    let digits = len.to_string().len();
+                    ui.label(
+                        egui::RichText::new(format!("{:>digits$} / {}", cur + 1, len))
+                            .size(18.0)
+                            .monospace(),
+                    );
                     ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
+                    // Slider colors, fully opaque (the handle must never be translucent).
+                    // egui ties the idle handle's fill to the rail-behind color
+                    // (widgets.inactive.bg_fill), so keep that bright blue unconditionally
+                    // — the handle is then always solid blue. The trailing portion (rail
+                    // start → handle) is selection.bg_fill; in RTL (manga order) that's the
+                    // UNSEEKED side, so paint it neutral grey so the unread part reads as
+                    // clearly not-there. (In LTR the trailing side is the read side, so the
+                    // track reads inverted there — we optimise for RTL; the handle stays
+                    // correctly blue.) A white ring keeps the handle legible against blue.
+                    let seeked = egui::Color32::from_rgb(96, 185, 255); // bright blue: handle + seeked rail
+                    let unseeked = egui::Color32::from_rgb(120, 124, 130); // neutral grey: unseeked track
+                    let ring = egui::Stroke::new(2.0, egui::Color32::WHITE);
+                    let v = ui.visuals_mut();
+                    v.selection.bg_fill = unseeked;
+                    v.widgets.inactive.bg_fill = seeked;
+                    v.widgets.hovered.bg_fill = seeked;
+                    v.widgets.active.bg_fill = seeked;
+                    v.widgets.inactive.fg_stroke = ring;
+                    v.widgets.hovered.fg_stroke = ring;
+                    v.widgets.active.fg_stroke = ring;
                     // RTL: map so page 1 sits on the right and progress runs leftward.
                     let mut sv = if rtl { len - 1 - cur } else { cur };
-                    if ui
-                        .add(egui::Slider::new(&mut sv, 0..=len - 1).show_value(false))
-                        .changed()
-                    {
+                    let resp = ui.add(
+                        egui::Slider::new(&mut sv, 0..=len - 1)
+                            .show_value(false)
+                            .trailing_fill(true),
+                    );
+                    if resp.changed() {
                         *seek_to = Some(if rtl { len - 1 - sv } else { sv });
+                    }
+                    // mpv-style cache bar: a thin strip along the bottom of the rail
+                    // marking buffered (decode-ahead ready) pages — denser ahead of
+                    // the handle than behind, since the pipeline reads forward.
+                    if !buffered.is_empty() {
+                        let track = resp.rect;
+                        let r = track.height() / 2.5; // egui's slider handle radius
+                        let x0 = track.left() + r;
+                        let x1 = track.right() - r;
+                        let span = (x1 - x0).max(1.0);
+                        let last = (len - 1) as f32;
+                        let half = (span / last * 0.5).max(0.75); // half a page-step wide
+                        let yb = track.bottom() - 1.0;
+                        let yt = yb - 2.0;
+                        // Muted + translucent so it stays subordinate to the blue
+                        // handle/rail — bonus info, not a competing element.
+                        let buf = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
+                        let p = ui.painter();
+                        for &i in buffered {
+                            if i >= len {
+                                continue;
+                            }
+                            // Mirror the slider's own RTL value transform so ticks
+                            // line up with where the handle sits for that page.
+                            let sv_i = if rtl { last - i as f32 } else { i as f32 };
+                            let xc = x0 + sv_i / last * span;
+                            let a = (xc - half).clamp(x0, x1);
+                            let b = (xc + half).clamp(x0, x1);
+                            p.rect_filled(
+                                egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
+                                0.0,
+                                buf,
+                            );
+                        }
                     }
                 });
                 // One centered row of big touch buttons. The nav arrows are POSITIONAL
@@ -1456,6 +1526,8 @@ impl App {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
         let cur = self.reader.index;
+        // Buffered (decode-ahead ready) page indices for the seekbar's cache bar.
+        let buffered: Vec<usize> = self.reader.cache.buffered_indices().collect();
         let library_view = self.library_view;
         let controls = self.controls;
         let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
@@ -1601,6 +1673,7 @@ impl App {
                     len,
                     rtl,
                     cur_layout == Layout::Spread,
+                    &buffered,
                     &mut seek_to,
                     &mut open_options,
                     &mut open_info,

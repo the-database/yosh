@@ -70,6 +70,9 @@ pub struct UiState {
     pub seek_rtl: bool,
     pub seek_style: SeekbarStyle,
     pub seek_request: Option<usize>,
+    /// Page indices currently buffered (decode-ahead ready set), painted as an
+    /// mpv-style cache bar under the seekbar track. Refilled by the app each frame.
+    pub seek_buffered: Vec<usize>,
     /// Pointer is over the seekbar this frame. Lets the app keep routing the
     /// mouse wheel to the reader (the bar isn't scrollable) while egui still
     /// gets clicks/drags for seeking.
@@ -186,6 +189,30 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                         [egui::pos2(x0, cy), egui::pos2(x1, cy)],
                         egui::Stroke::new(8.0, egui::Color32::from_white_alpha(60)),
                     );
+                    // mpv-style cache bar: a thin strip just under the track marking
+                    // which pages are buffered (the decode-ahead ready set). The
+                    // pipeline keeps more pages ahead than behind, so the band sits
+                    // asymmetrically around the handle.
+                    if !st.seek_buffered.is_empty() {
+                        // Muted + translucent so it reads as secondary info — never
+                        // louder than the progress fill (alpha 190) or the handle.
+                        let buf = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
+                        let half = (span / last * 0.5).max(0.75); // half a page-step wide
+                        let (yt, yb) = (cy + 6.0, cy + 8.0);
+                        for &i in &st.seek_buffered {
+                            if i >= total {
+                                continue;
+                            }
+                            let xc = x_of(i as f32 / last);
+                            let a = (xc - half).clamp(x0, x1);
+                            let b = (xc + half).clamp(x0, x1);
+                            p.rect_filled(
+                                egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
+                                0.0,
+                                buf,
+                            );
+                        }
+                    }
                     let start_x = if rtl { x1 } else { x0 };
                     p.line_segment(
                         [egui::pos2(start_x, cy), egui::pos2(handle_x, cy)],

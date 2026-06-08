@@ -32,6 +32,13 @@ impl PageCache {
         self.map.get(&index)
     }
 
+    /// Indices of pages currently buffered (decoded + GPU-uploaded, ready to draw
+    /// instantly) — the set the seekbar's cache bar visualizes. Bounded by the
+    /// prefetch window (~`back + fwd + 1` entries clustered around the read position).
+    pub fn buffered_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.map.keys().copied()
+    }
+
     pub fn clear(&mut self) {
         for (_, page) in self.map.drain() {
             page.recycle(&self.pool);
