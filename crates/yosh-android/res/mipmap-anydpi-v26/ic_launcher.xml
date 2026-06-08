@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- API 26+ adaptive icon: the launcher masks foreground+background to its own
+     shape (circle / squircle). Background is the flat brand purple; foreground is
+     the logo padded into the safe zone (see gen-icons.ps1). API 24-25 falls back
+     to the per-density ic_launcher.png. -->
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+</adaptive-icon>
