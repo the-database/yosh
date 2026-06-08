@@ -142,9 +142,11 @@ struct App {
     thumb_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
     /// The dir whose covers were queued for decode (so we don't re-queue).
     thumb_dir: Option<PathBuf>,
-    /// Reading chrome: seekbar + zone hints show when `controls`; the gear opens
-    /// the viewing-options popup.
+    /// Reading chrome: seekbar shows when `controls`; the gear opens the
+    /// viewing-options popup. The zone hints show only briefly after the controls
+    /// are revealed (see `controls_shown_at`), so they don't clutter while reading.
     controls: bool,
+    controls_shown_at: Instant,
     show_options: bool,
     /// Where viewing options persist (mirrors Shell.view_file).
     view_file: Option<PathBuf>,
@@ -167,6 +169,10 @@ struct FrameReqs {
     grant: bool,
     /// Open the SAF single-file picker (fallback for files outside the library).
     open_picker: bool,
+    /// Seekbar page button: reading-order step (-1 prev / +1 next).
+    page_nav: i64,
+    /// Seekbar book button: open the prev/next sibling comic in the folder (-1/+1).
+    book_nav: i64,
 }
 
 impl ApplicationHandler for Shell {
@@ -295,6 +301,7 @@ impl ApplicationHandler for Shell {
             thumb_tx,
             thumb_dir: None,
             controls: true,
+            controls_shown_at: Instant::now(),
             show_options: false,
             view_file: self.view_file.clone(),
         });
@@ -371,6 +378,12 @@ impl ApplicationHandler for Shell {
                 }
                 if let Some(path) = reqs.open {
                     self.open_path(path);
+                }
+                if reqs.page_nav != 0 {
+                    self.flip(reqs.page_nav);
+                }
+                if reqs.book_nav != 0 {
+                    self.open_sibling_book(reqs.book_nav);
                 }
             }
             _ => {}
@@ -512,7 +525,7 @@ impl Shell {
         if self.app.as_ref().map(|a| a.library_view).unwrap_or(false) {
             return;
         }
-        if y < h * 0.10 {
+        if y < h * TOP_ZONE as f64 {
             // Top strip opens the library browser.
             self.has_files = has_all_files(&self.android_app);
             if let Some(app) = self.app.as_mut() {
@@ -528,19 +541,46 @@ impl Shell {
             .as_ref()
             .map(|a| a.reader.direction == Direction::Rtl)
             .unwrap_or(false);
-        if x < w * 0.12 {
+        if x < w * EDGE_ZONE as f64 {
             // Left edge: next in RTL, previous in LTR.
             self.flip(if rtl { 1 } else { -1 });
-        } else if x > w * 0.88 {
+        } else if x > w * (1.0 - EDGE_ZONE as f64) {
             // Right edge: previous in RTL, next in LTR.
             self.flip(if rtl { -1 } else { 1 });
         } else if let Some(app) = self.app.as_mut() {
             // Center: toggle the reading chrome (also closes the options popup).
             app.controls = !app.controls;
-            if !app.controls {
+            if app.controls {
+                app.controls_shown_at = Instant::now(); // re-show the zone hints
+            } else {
                 app.show_options = false;
             }
             app.window.request_redraw();
+        }
+    }
+
+    /// Open the previous/next comic in the current comic's folder (`dir` = -1/+1),
+    /// natural-sorted like the library. No-op at the ends or for non-path sources.
+    fn open_sibling_book(&mut self, dir: i64) {
+        let Some(cur) = self.current_key.clone() else {
+            return;
+        };
+        let cur_path = PathBuf::from(&cur);
+        let Some(parent) = cur_path.parent() else {
+            return;
+        };
+        let comics: Vec<PathBuf> = scan_dir(parent)
+            .into_iter()
+            .filter_map(|e| match e {
+                Entry::Comic(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        if let Some(i) = comics.iter().position(|p| *p == cur_path) {
+            let j = i as i64 + dir;
+            if (0..comics.len() as i64).contains(&j) {
+                self.open_path(comics[j as usize].clone());
+            }
         }
     }
 
@@ -717,12 +757,18 @@ fn device_mem_budget_mb() -> u64 {
 
 /// Bottom seekbar: "page / total" + a draggable slider that requests a jump.
 /// Hidden for a single-page source.
+#[allow(clippy::too_many_arguments)]
 fn seekbar(
     ctx: &egui::Context,
     cur: usize,
     len: usize,
+    rtl: bool,
+    spread: bool,
     seek_to: &mut Option<usize>,
     open_options: &mut bool,
+    page_nav: &mut i64,
+    book_nav: &mut i64,
+    toggle_offset: &mut bool,
 ) {
     if len <= 1 {
         return;
@@ -731,39 +777,78 @@ fn seekbar(
     // system gesture bar + is awkward to grab), fattened for touch.
     let sw = ctx.screen_rect().width();
     egui::Area::new(egui::Id::new("seekbar"))
-        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -48.0))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_width((sw * 0.8).min(900.0));
-                ui.spacing_mut().interact_size.y = 32.0;
+                ui.set_width((sw * 0.85).min(960.0));
+                ui.spacing_mut().interact_size.y = 30.0;
                 ui.horizontal(|ui| {
-                    let mut p = cur;
                     ui.label(egui::RichText::new(format!("{} / {}", cur + 1, len)).size(18.0));
                     if ui.button(egui::RichText::new("⚙").size(20.0)).clicked() {
                         *open_options = true;
                     }
                     ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
+                    // RTL: map so page 1 sits on the right and progress runs leftward.
+                    let mut sv = if rtl { len - 1 - cur } else { cur };
                     if ui
-                        .add(egui::Slider::new(&mut p, 0..=len - 1).show_value(false))
+                        .add(egui::Slider::new(&mut sv, 0..=len - 1).show_value(false))
                         .changed()
                     {
-                        *seek_to = Some(p);
+                        *seek_to = Some(if rtl { len - 1 - sv } else { sv });
+                    }
+                });
+                // Button row. Arrows are POSITIONAL (left = leftward in reading); the
+                // action they trigger flips with direction. Outer = book, inner = page.
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    let btn = |ui: &mut egui::Ui, txt: &str| {
+                        ui.add_sized([54.0, 38.0], egui::Button::new(egui::RichText::new(txt).size(22.0)))
+                            .clicked()
+                    };
+                    if btn(ui, "«") {
+                        *book_nav = if rtl { 1 } else { -1 };
+                    }
+                    if btn(ui, "‹") {
+                        *page_nav = if rtl { 1 } else { -1 };
+                    }
+                    if spread && btn(ui, "↔") {
+                        *toggle_offset = true;
+                    }
+                    if btn(ui, "›") {
+                        *page_nav = if rtl { -1 } else { 1 };
+                    }
+                    if btn(ui, "»") {
+                        *book_nav = if rtl { -1 } else { 1 };
                     }
                 });
             });
         });
 }
 
-/// Faint labels over the tap zones (shown with the controls) so the layout is
-/// discoverable. Painted, NOT laid out as widgets: an egui Area registers under
-/// the pointer and makes the tap report "consumed", blocking the edge/top zones.
-/// A background-layer painter does no hit-testing, so taps fall through to nav.
+/// Tap-zone fractions, shared with `on_tap`: top strip opens the library, the side
+/// edges flip.
+const TOP_ZONE: f32 = 0.10;
+const EDGE_ZONE: f32 = 0.20;
+
+/// Faint labels + outlines over the tap zones (shown briefly with the controls) so
+/// the layout is discoverable. Painted, NOT laid out as widgets: an egui Area
+/// registers under the pointer and makes the tap report "consumed", blocking the
+/// edge/top zones. A background-layer painter does no hit-testing, so taps fall
+/// through to nav.
 fn zone_hints(ctx: &egui::Context, rtl: bool) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Background,
         egui::Id::new("zone_hints"),
     ));
     let rect = ctx.screen_rect();
+    // Outline the tap zones (top strip + side edges) so the layout reads at a glance.
+    let stroke = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(110));
+    let ty = rect.top() + rect.height() * TOP_ZONE;
+    let lx = rect.left() + rect.width() * EDGE_ZONE;
+    let rx = rect.right() - rect.width() * EDGE_ZONE;
+    painter.hline(rect.x_range(), ty, stroke);
+    painter.vline(lx, egui::Rangef::new(ty, rect.bottom()), stroke);
+    painter.vline(rx, egui::Rangef::new(ty, rect.bottom()), stroke);
     let font = egui::FontId::proportional(18.0);
     let draw = |pos: egui::Pos2, anchor: egui::Align2, text: &str| {
         // A dark rounded backing keeps the label legible over light pages.
@@ -1110,6 +1195,7 @@ impl App {
         let cur = self.reader.index;
         let library_view = self.library_view;
         let controls = self.controls;
+        let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
         let show_options = self.show_options;
         let rtl = self.reader.direction == Direction::Rtl;
         let cur_dir = self.reader.direction;
@@ -1142,6 +1228,8 @@ impl App {
         let mut set_fit: Option<FitMode> = None;
         let mut set_jump: Option<bool> = None;
         let mut toggle_offset = false;
+        let mut page_nav: i64 = 0;
+        let mut book_nav: i64 = 0;
         let at_root = self.lib_dir == self.lib_root;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if library_view {
@@ -1234,8 +1322,21 @@ impl App {
                     }
                 });
             } else if controls {
-                seekbar(ctx, cur, len, &mut seek_to, &mut open_options);
-                zone_hints(ctx, rtl);
+                seekbar(
+                    ctx,
+                    cur,
+                    len,
+                    rtl,
+                    cur_layout == Layout::Spread,
+                    &mut seek_to,
+                    &mut open_options,
+                    &mut page_nav,
+                    &mut book_nav,
+                    &mut toggle_offset,
+                );
+                if hints_visible {
+                    zone_hints(ctx, rtl);
+                }
                 if show_options {
                     options_popup(
                         ctx,
@@ -1307,6 +1408,8 @@ impl App {
                 view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
             self.reader.prefetch();
         }
+        reqs.page_nav = page_nav;
+        reqs.book_nav = book_nav;
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
         let screen = egui_wgpu::ScreenDescriptor {
@@ -1361,7 +1464,11 @@ impl App {
         // Keep drawing while the library is open, the view hasn't settled, or the
         // current page isn't HQ yet (missing, or only the LQ seek-tier — so it
         // sharpens to HQ once seeking stops).
-        if self.library_view || !self.reader.view_settled || !self.reader.view_is_hq() {
+        if self.library_view
+            || !self.reader.view_settled
+            || !self.reader.view_is_hq()
+            || hints_visible
+        {
             self.window.request_redraw();
         }
         reqs

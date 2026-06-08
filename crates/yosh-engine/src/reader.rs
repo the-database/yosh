@@ -908,16 +908,24 @@ impl Reader {
         }
     }
 
-    /// Whether the in-view page(s) are decoded at full HQ (or failed). False while
-    /// a page is missing or only LQ-decoded — the shell keeps redrawing until the
-    /// HQ upgrade lands (so the page sharpens after seeking stops).
+    /// Whether the in-view page(s) are decoded at full HQ *for the current target*
+    /// (or failed). False while a page is missing, only LQ-decoded, or decoded at a
+    /// stale target (after a rotation/resize/zoom) — the shell keeps redrawing until
+    /// the HQ re-decode lands, so it sharpens and never leaves a GPU-downscaled
+    /// (moiré) texture on screen.
     pub fn view_is_hq(&self) -> bool {
         let Some(src) = &self.source else {
             return true;
         };
         let len = src.len();
         let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ok = |i: usize| self.failed.contains_key(&i) || self.cache.get(i).is_some_and(|p| !p.lq);
+        let ok = |i: usize| {
+            self.failed.contains_key(&i)
+                || self
+                    .cache
+                    .get(i)
+                    .is_some_and(|p| !p.lq && p.target_h == self.page_target_h(i))
+        };
         ok(a) && b.is_none_or(ok)
     }
 
