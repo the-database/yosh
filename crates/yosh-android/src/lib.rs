@@ -5,10 +5,11 @@
 //! the desktop shell runs, minus the egui chrome. Renders real manga pages via
 //! the engine's decode pool + `PagePipeline`.
 //!
-//! Storage: a tap in the top strip opens the system document picker (SAF) through
-//! the `YoshActivity` Java bridge; the chosen `content://` file's bytes are read
-//! off its descriptor and handed to `ZipSource::from_bytes`. (A test `.cbz` from
-//! the app's external dir is also opened on launch, as a fallback for dev.)
+//! Storage: a tap in the top strip opens the library browser; the "Open file…"
+//! button there launches the system document picker (SAF) through the
+//! `YoshActivity` Java bridge, and the chosen `content://` file's bytes are read
+//! off its descriptor and handed to `ZipSource::from_bytes`. With nothing open, an
+//! empty-state helper explains how to open a comic.
 //! Tap left third = previous page, right two-thirds = next.
 //!
 //! The whole crate is Android-only; the desktop shell is `crates/yosh`.
@@ -29,7 +30,7 @@ use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
 
 use yosh_engine::gpu::GpuContext;
-use yosh_engine::layout::{view_start, Layout};
+use yosh_engine::layout::{view_pages, view_start, Layout};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Msg};
 use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
@@ -45,7 +46,6 @@ fn android_main(app: AndroidApp) {
     log::info!("yosh-android starting");
     // A reader should keep the screen awake while a page is up.
     app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
-    let data_path = app.external_data_path();
     // Per-comic reading positions persist in the app's private dir.
     let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
     let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
@@ -61,14 +61,13 @@ fn android_main(app: AndroidApp) {
     let init_view = view_file
         .as_deref()
         .map(load_view)
-        .unwrap_or((Direction::Rtl, Layout::Single, FitMode::Window, false));
+        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window, false));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
         .expect("build event loop");
     let mut shell = Shell {
         app: None,
-        data_path,
         android_app: app,
         picker_pending: false,
         positions,
@@ -88,9 +87,6 @@ fn android_main(app: AndroidApp) {
 
 struct Shell {
     app: Option<App>,
-    /// The app's external files dir (…/Android/data/<pkg>/files), where a test
-    /// comic is `adb push`ed for dev until the picker is the only path.
-    data_path: Option<PathBuf>,
     /// Kept for JNI into the `YoshActivity` Java bridge (vm + activity pointers).
     android_app: AndroidApp,
     /// A document-picker launch is awaiting its result.
@@ -107,14 +103,24 @@ struct Shell {
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
     /// Persisted viewing options (direction, layout, fit, jump) + where they live.
-    init_view: (Direction, Layout, FitMode, bool),
+    init_view: (Direction, LayoutMode, FitMode, bool),
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
     /// Single-finger gesture start (for swipe-vs-tap on release).
     gesture_start: Option<(f64, f64)>,
-    /// Active pinch: (initial finger distance, zoom when it began).
-    pinch: Option<(f64, f32)>,
+    /// Active pinch, captured at its start (see `Pinch`).
+    pinch: Option<Pinch>,
+}
+
+/// Active two-finger pinch, captured at start so each move can both scale
+/// about — and pan with — the finger midpoint (zoom-to-focal-point).
+#[derive(Clone, Copy)]
+struct Pinch {
+    dist0: f64,       // finger separation when the pinch began
+    zoom0: f32,       // reader.zoom when it began
+    pan0: (f32, f32), // reader.pan_x / pan_y when it began
+    mid0: (f64, f64), // finger midpoint (screen px) when it began
 }
 
 /// The live app: surface + the engine device context, the page pipeline, and the
@@ -148,6 +154,11 @@ struct App {
     controls: bool,
     controls_shown_at: Instant,
     show_options: bool,
+    show_info: bool,
+    /// The user's layout choice. `reader.layout` is the concrete `Single`/`Spread`
+    /// this resolves to (orientation-dependent for `Auto`); this is the source of
+    /// truth that persists. See `apply_resolved_layout`.
+    layout_mode: LayoutMode,
     /// Where viewing options persist (mirrors Shell.view_file).
     view_file: Option<PathBuf>,
 }
@@ -157,6 +168,45 @@ struct App {
 enum Entry {
     Dir(PathBuf),
     Comic(PathBuf),
+}
+
+/// The user's page-layout *choice*. The engine's `Layout` is binary
+/// (`Single`/`Spread`); this adds `Auto`, which the shell resolves to a concrete
+/// `Layout` from the live viewport each frame: portrait → single, landscape →
+/// two-page spread. So physically rotating the tablet switches modes — single while
+/// upright, spread when turned sideways for a double-page.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Single,
+    Spread,
+    Auto,
+}
+
+impl LayoutMode {
+    /// Resolve to a concrete engine `Layout` for a viewport of `w × h` px.
+    /// Landscape is strictly `w > h`; portrait and square fall to single.
+    fn resolve(self, w: u32, h: u32) -> Layout {
+        match self {
+            LayoutMode::Single => Layout::Single,
+            LayoutMode::Spread => Layout::Spread,
+            LayoutMode::Auto => {
+                if w > h {
+                    Layout::Spread
+                } else {
+                    Layout::Single
+                }
+            }
+        }
+    }
+
+    /// Persistence / info-overlay token.
+    fn label(self) -> &'static str {
+        match self {
+            LayoutMode::Single => "single",
+            LayoutMode::Spread => "spread",
+            LayoutMode::Auto => "auto",
+        }
+    }
 }
 
 /// Cross-shell actions an egui frame requests (handled after the egui run, since
@@ -169,6 +219,8 @@ struct FrameReqs {
     grant: bool,
     /// Open the SAF single-file picker (fallback for files outside the library).
     open_picker: bool,
+    /// Open the library browser (from the empty-state helper).
+    open_library: bool,
     /// Seekbar page button: reading-order step (-1 prev / +1 next).
     page_nav: i64,
     /// Seekbar book button: open the prev/next sibling comic in the folder (-1/+1).
@@ -273,8 +325,10 @@ impl ApplicationHandler for Shell {
             tex_pool,
             budget,
             self.init_view.2, // fit
-            self.init_view.1, // layout
-            false,            // scroll_mode: page-flip
+            // Concrete layout, resolved from the saved mode against the initial
+            // window size (so an `Auto` launch already matches the orientation).
+            self.init_view.1.resolve(config.width, config.height),
+            false, // scroll_mode: page-flip
             self.init_view.3, // jump (seek mode)
             self.init_view.0, // direction (default RTL)
             0,
@@ -303,17 +357,14 @@ impl ApplicationHandler for Shell {
             controls: true,
             controls_shown_at: Instant::now(),
             show_options: false,
+            show_info: false,
+            layout_mode: self.init_view.1,
             view_file: self.view_file.clone(),
         });
-        // Dev fallback: open a pushed test comic if present (restores its position).
-        if let Some(cbz) = self.data_path.as_ref().map(|p| p.join("test.cbz")) {
-            if cbz.exists() {
-                match ZipSource::new(&cbz) {
-                    Ok(src) => self.open_comic(cbz.to_string_lossy().into_owned(), Arc::new(src)),
-                    Err(e) => log::error!("open {cbz:?} failed: {e}"),
-                }
-            }
-        }
+        // Nothing is open on first launch — the empty-state helper (see `render`)
+        // explains how to open a comic. Restore the last comic? No: positions are
+        // per-comic, and we don't persist which one was last open, so we land on the
+        // empty state and let the user pick from the library / file picker.
         window.request_redraw();
     }
 
@@ -376,6 +427,9 @@ impl ApplicationHandler for Shell {
                     launch_picker(&self.android_app);
                     self.picker_pending = true;
                 }
+                if reqs.open_library {
+                    self.open_library();
+                }
                 if let Some(path) = reqs.open {
                     self.open_path(path);
                 }
@@ -406,9 +460,15 @@ impl Shell {
                 } else if self.touches.len() == 2 {
                     // Begin a pinch; cancel the single-finger gesture.
                     self.gesture_start = None;
-                    if let Some(d) = self.touch_distance() {
-                        let z = self.app.as_ref().map(|a| a.reader.zoom).unwrap_or(1.0);
-                        self.pinch = Some((d, z));
+                    if let (Some((d, mx, my)), Some(app)) =
+                        (self.two_finger_metrics(), self.app.as_ref())
+                    {
+                        self.pinch = Some(Pinch {
+                            dist0: d,
+                            zoom0: app.reader.zoom,
+                            pan0: (app.reader.pan_x, app.reader.pan_y),
+                            mid0: (mx, my),
+                        });
                     }
                 }
             }
@@ -417,15 +477,26 @@ impl Shell {
                 if library {
                     return;
                 }
-                if let Some((d0, z0)) = self.pinch {
-                    // Pinch → zoom (engine re-decodes HQ once it settles).
-                    if d0 > 1.0 {
-                        if let Some(d) = self.touch_distance() {
-                            if let Some(app) = self.app.as_mut() {
-                                app.reader.zoom = z0 * (d / d0) as f32;
-                                app.reader.clamp_zoom_native();
-                                app.window.request_redraw();
-                            }
+                if let Some(p) = self.pinch {
+                    // Pinch → zoom (engine re-decodes HQ once it settles), anchored
+                    // to the finger midpoint so the content under the fingers stays
+                    // put (and follows a two-finger drag).
+                    if p.dist0 > 1.0 {
+                        if let (Some((d, mx, my)), Some(app)) =
+                            (self.two_finger_metrics(), self.app.as_mut())
+                        {
+                            let (sw, sh) = (app.config.width as f32, app.config.height as f32);
+                            app.reader.zoom = p.zoom0 * (d / p.dist0) as f32;
+                            app.reader.clamp_zoom_native();
+                            // Actual (post-clamp) scale ratio: keep the content point
+                            // under the initial midpoint pinned to the current one.
+                            let k = app.reader.zoom / p.zoom0;
+                            app.reader.pan_x =
+                                mx as f32 - sw / 2.0 - k * (p.mid0.0 as f32 - sw / 2.0 - p.pan0.0);
+                            app.reader.pan_y =
+                                my as f32 - sh / 2.0 - k * (p.mid0.1 as f32 - sh / 2.0 - p.pan0.1);
+                            app.reader.clamp_pan();
+                            app.window.request_redraw();
                         }
                     }
                 } else if self.touches.len() == 1 {
@@ -457,12 +528,14 @@ impl Shell {
         }
     }
 
-    /// Distance between the first two active touch points.
-    fn touch_distance(&self) -> Option<f64> {
+    /// Distance and midpoint (screen px) of the first two active touch points.
+    /// Returning both from one call keeps them on the same finger pair.
+    fn two_finger_metrics(&self) -> Option<(f64, f64, f64)> {
         let mut it = self.touches.values();
         let a = it.next()?;
         let b = it.next()?;
-        Some(((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt())
+        let dist = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+        Some((dist, (a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
     }
 
     /// A single-finger gesture ended: a horizontal swipe flips (only when not
@@ -508,6 +581,19 @@ impl Shell {
         }
     }
 
+    /// Open the library browser at the configured root, refreshing all-files
+    /// access first (the browser shows the grant prompt if it's missing). Shared by
+    /// the top-strip tap and the empty-state "Browse library" button.
+    fn open_library(&mut self) {
+        self.has_files = has_all_files(&self.android_app);
+        if let Some(app) = self.app.as_mut() {
+            app.library_view = true;
+            app.lib_dir = app.lib_root.clone();
+            app.lib_entries = scan_dir(&app.lib_dir);
+            app.window.request_redraw();
+        }
+    }
+
     /// Tap-zones: top strip opens the library; thin side edges flip (direction-aware);
     /// the large center toggles the reading chrome (seekbar + hints).
     fn on_tap(&mut self, x: f64, y: f64) {
@@ -527,13 +613,7 @@ impl Shell {
         }
         if y < h * TOP_ZONE as f64 {
             // Top strip opens the library browser.
-            self.has_files = has_all_files(&self.android_app);
-            if let Some(app) = self.app.as_mut() {
-                app.library_view = true;
-                app.lib_dir = app.lib_root.clone();
-                app.lib_entries = scan_dir(&app.lib_dir);
-                app.window.request_redraw();
-            }
+            self.open_library();
             return;
         }
         let rtl = self
@@ -554,6 +634,7 @@ impl Shell {
                 app.controls_shown_at = Instant::now(); // re-show the zone hints
             } else {
                 app.show_options = false;
+                app.show_info = false;
             }
             app.window.request_redraw();
         }
@@ -683,17 +764,20 @@ fn attach_source(
 /// Load the persisted per-comic positions (one `index\tkey` line each).
 /// Parse persisted viewing options ("dir,layout,fit,seek"); default RTL / single
 /// / window / step.
-fn load_view(path: &Path) -> (Direction, Layout, FitMode, bool) {
+fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool) {
     let (mut dir, mut lay, mut fit, mut jump) =
-        (Direction::Rtl, Layout::Single, FitMode::Window, false);
+        (Direction::Rtl, LayoutMode::Single, FitMode::Window, false);
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
             dir = Direction::Ltr;
         }
-        if t.get(1) == Some(&"spread") {
-            lay = Layout::Spread;
-        }
+        // Layout slot gained "auto"; "single"/"spread" (and old files) still parse.
+        lay = match t.get(1) {
+            Some(&"spread") => LayoutMode::Spread,
+            Some(&"auto") => LayoutMode::Auto,
+            _ => LayoutMode::Single,
+        };
         fit = match t.get(2) {
             Some(&"width") => FitMode::Width,
             Some(&"height") => FitMode::Height,
@@ -708,9 +792,9 @@ fn load_view(path: &Path) -> (Direction, Layout, FitMode, bool) {
 }
 
 /// Persist viewing options as "dir,layout,fit,seek".
-fn save_view(path: &Path, dir: Direction, lay: Layout, fit: FitMode, jump: bool) {
+fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, jump: bool) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
-    let l = if lay == Layout::Spread { "spread" } else { "single" };
+    let l = lay.label();
     let f = match fit {
         FitMode::Width => "width",
         FitMode::Height => "height",
@@ -757,6 +841,39 @@ fn device_mem_budget_mb() -> u64 {
 
 /// Bottom seekbar: "page / total" + a draggable slider that requests a jump.
 /// Hidden for a single-page source.
+/// Image-info overlay as a closable centered popup (Android take on the "I"
+/// overlay): check it, then ✕ to dismiss — not a persistent overlay.
+fn info_popup(ctx: &egui::Context, lines: &[(String, String)], close: &mut bool) {
+    egui::Area::new(egui::Id::new("info_popup"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                ui.label(egui::RichText::new("Info").strong().size(18.0));
+                egui::Grid::new("info_grid")
+                    .num_columns(2)
+                    .spacing([18.0, 6.0])
+                    .show(ui, |ui| {
+                        for (k, v) in lines {
+                            ui.label(egui::RichText::new(k.as_str()).strong());
+                            ui.label(v.as_str());
+                            ui.end_row();
+                        }
+                    });
+                ui.add_space(6.0);
+                if ui
+                    .add_sized(
+                        [120.0, 40.0],
+                        egui::Button::new(egui::RichText::new("× Close").size(16.0)),
+                    )
+                    .clicked()
+                {
+                    *close = true;
+                }
+            });
+        });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn seekbar(
     ctx: &egui::Context,
@@ -766,6 +883,7 @@ fn seekbar(
     spread: bool,
     seek_to: &mut Option<usize>,
     open_options: &mut bool,
+    open_info: &mut bool,
     page_nav: &mut i64,
     book_nav: &mut i64,
     toggle_offset: &mut bool,
@@ -784,9 +902,6 @@ fn seekbar(
                 ui.spacing_mut().interact_size.y = 30.0;
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("{} / {}", cur + 1, len)).size(18.0));
-                    if ui.button(egui::RichText::new("⚙").size(20.0)).clicked() {
-                        *open_options = true;
-                    }
                     ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
                     // RTL: map so page 1 sits on the right and progress runs leftward.
                     let mut sv = if rtl { len - 1 - cur } else { cur };
@@ -797,29 +912,86 @@ fn seekbar(
                         *seek_to = Some(if rtl { len - 1 - sv } else { sv });
                     }
                 });
-                // Button row. Arrows are POSITIONAL (left = leftward in reading); the
-                // action they trigger flips with direction. Outer = book, inner = page.
-                ui.add_space(2.0);
+                // One centered row of big touch buttons. The nav arrows are POSITIONAL
+                // (left = leftward in reading); the action flips with direction. Outer
+                // arrows = book, inner = page; ⚙ options, ℹ info, ↔ pairing (spread).
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let btn = |ui: &mut egui::Ui, txt: &str| {
-                        ui.add_sized([54.0, 38.0], egui::Button::new(egui::RichText::new(txt).size(22.0)))
+                    let bw = 58.0;
+                    let count = if spread { 7 } else { 6 };
+                    let sp = ui.spacing().item_spacing.x;
+                    let total = count as f32 * bw + (count - 1) as f32 * sp;
+                    ui.add_space(((ui.available_width() - total) * 0.5).max(0.0));
+                    let big = |ui: &mut egui::Ui, txt: &str| {
+                        ui.add_sized([bw, 46.0], egui::Button::new(egui::RichText::new(txt).size(22.0)))
                             .clicked()
                     };
-                    if btn(ui, "«") {
+                    if big(ui, "⚙") {
+                        *open_options = true;
+                    }
+                    if big(ui, "«") {
                         *book_nav = if rtl { 1 } else { -1 };
                     }
-                    if btn(ui, "‹") {
+                    if big(ui, "‹") {
                         *page_nav = if rtl { 1 } else { -1 };
                     }
-                    if spread && btn(ui, "↔") {
+                    if spread && big(ui, "↔") {
                         *toggle_offset = true;
                     }
-                    if btn(ui, "›") {
+                    if big(ui, "›") {
                         *page_nav = if rtl { -1 } else { 1 };
                     }
-                    if btn(ui, "»") {
+                    if big(ui, "»") {
                         *book_nav = if rtl { -1 } else { 1 };
                     }
+                    if big(ui, "ℹ") {
+                        *open_info = true;
+                    }
+                });
+            });
+        });
+}
+
+/// Nothing-open helper: with no comic loaded the screen is otherwise just the dark
+/// clear color, so explain how to open one. Centered card with the two ways in —
+/// browse the library or pick a single file — plus the tap-the-top tip.
+fn empty_state(ctx: &egui::Context, open_library: &mut bool, open_picker: &mut bool) {
+    egui::Area::new(egui::Id::new("empty_state"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width((ctx.screen_rect().width() * 0.8).min(420.0));
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+                    ui.label(egui::RichText::new("📖").size(56.0));
+                    ui.label(egui::RichText::new("No comic open").strong().size(22.0));
+                    ui.label(
+                        egui::RichText::new("Open a comic to start reading.")
+                            .size(15.0)
+                            .color(egui::Color32::from_white_alpha(180)),
+                    );
+                    ui.add_space(4.0);
+                    ui.spacing_mut().button_padding = egui::vec2(18.0, 12.0);
+                    if ui
+                        .add(egui::Button::new(
+                            egui::RichText::new("📚 Browse library").size(18.0),
+                        ))
+                        .clicked()
+                    {
+                        *open_library = true;
+                    }
+                    if ui
+                        .add(egui::Button::new(egui::RichText::new("Open file…").size(18.0)))
+                        .clicked()
+                    {
+                        *open_picker = true;
+                    }
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new("Tip: tap the top of the screen any time to open your library.")
+                            .size(12.0)
+                            .color(egui::Color32::from_white_alpha(140)),
+                    );
                 });
             });
         });
@@ -841,14 +1013,19 @@ fn zone_hints(ctx: &egui::Context, rtl: bool) {
         egui::Id::new("zone_hints"),
     ));
     let rect = ctx.screen_rect();
-    // Outline the tap zones (top strip + side edges) so the layout reads at a glance.
-    let stroke = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(110));
+    // Outline the tap zones (top strip + side edges). Two-tone — a dark stroke under
+    // a lighter one — so the lines read on both white and dark manga pages.
+    let dark = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(120));
+    let light = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(200));
     let ty = rect.top() + rect.height() * TOP_ZONE;
     let lx = rect.left() + rect.width() * EDGE_ZONE;
     let rx = rect.right() - rect.width() * EDGE_ZONE;
-    painter.hline(rect.x_range(), ty, stroke);
-    painter.vline(lx, egui::Rangef::new(ty, rect.bottom()), stroke);
-    painter.vline(rx, egui::Rangef::new(ty, rect.bottom()), stroke);
+    let yr = egui::Rangef::new(ty, rect.bottom());
+    for s in [dark, light] {
+        painter.hline(rect.x_range(), ty, s);
+        painter.vline(lx, yr, s);
+        painter.vline(rx, yr, s);
+    }
     let font = egui::FontId::proportional(18.0);
     let draw = |pos: egui::Pos2, anchor: egui::Align2, text: &str| {
         // A dark rounded backing keeps the label legible over light pages.
@@ -886,11 +1063,12 @@ fn zone_hints(ctx: &egui::Context, rtl: bool) {
 fn options_popup(
     ctx: &egui::Context,
     dir: Direction,
-    layout: Layout,
+    layout: LayoutMode,
+    effective_spread: bool,
     fit: FitMode,
     jump: bool,
     set_dir: &mut Option<Direction>,
-    set_layout: &mut Option<Layout>,
+    set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
     set_jump: &mut Option<bool>,
     toggle_offset: &mut bool,
@@ -920,21 +1098,30 @@ fn options_popup(
 
                 ui.label(egui::RichText::new("Page layout").strong());
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(layout == Layout::Single, egui::RichText::new("Single").size(16.0))
-                        .clicked()
-                    {
-                        *set_layout = Some(Layout::Single);
-                    }
-                    if ui
-                        .selectable_label(layout == Layout::Spread, egui::RichText::new("Two-page").size(16.0))
-                        .clicked()
-                    {
-                        *set_layout = Some(Layout::Spread);
+                    for (m, text) in [
+                        (LayoutMode::Single, "Single"),
+                        (LayoutMode::Spread, "Two-page"),
+                        (LayoutMode::Auto, "Auto"),
+                    ] {
+                        if ui
+                            .selectable_label(layout == m, egui::RichText::new(text).size(16.0))
+                            .clicked()
+                        {
+                            *set_layout = Some(m);
+                        }
                     }
                 });
+                // Auto resolves to single in portrait and two-page in landscape.
+                if layout == LayoutMode::Auto {
+                    ui.label(
+                        egui::RichText::new("Single in portrait, two-page in landscape — rotate to switch.")
+                            .size(12.0)
+                            .color(egui::Color32::from_white_alpha(150)),
+                    );
+                }
                 // Shift which pages are paired together (e.g. so a cover sits alone).
-                if layout == Layout::Spread
+                // Shown whenever the *effective* layout is a spread (incl. Auto-landscape).
+                if effective_spread
                     && ui
                         .button(egui::RichText::new("Shift page pairing").size(16.0))
                         .clicked()
@@ -1074,16 +1261,88 @@ impl App {
         }
     }
 
+    /// Build the image-info overlay lines from the current page + reader state
+    /// (the Android take on the desktop's "I" overlay).
+    fn build_info(&self) -> Vec<(String, String)> {
+        let Some(src) = &self.reader.source else {
+            return Vec::new();
+        };
+        let len = src.len();
+        let idx = view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
+        let mut lines = vec![
+            ("File".to_string(), src.name(idx).to_string()),
+            ("Page".to_string(), format!("{} / {}", idx + 1, len)),
+            (
+                "Screen".to_string(),
+                format!("{} × {}", self.config.width, self.config.height),
+            ),
+        ];
+        if let Some(p) = self.reader.cache.get(idx) {
+            lines.push(("Source".to_string(), format!("{} × {}", p.src_w, p.src_h)));
+            lines.push(("Decoded".to_string(), format!("{} × {}", p.w, p.h)));
+            lines.push((
+                "Resize".to_string(),
+                if p.lq {
+                    "LQ (fast bilinear)".to_string()
+                } else {
+                    p.path.label().to_string()
+                },
+            ));
+            // Single-resize invariant readout: the GPU should sample 1:1.
+            let gpu = match self.reader.page_target_h(idx).cmp(&p.target_h) {
+                std::cmp::Ordering::Equal => "1:1",
+                std::cmp::Ordering::Greater => "↑ upscale",
+                std::cmp::Ordering::Less => "↓ downscale",
+            };
+            lines.push(("GPU".to_string(), gpu.to_string()));
+        } else {
+            lines.push(("Decoded".to_string(), "decoding…".to_string()));
+        }
+        lines.push((
+            "Zoom".to_string(),
+            format!("{:.0}%", self.reader.effective_zoom_pct()),
+        ));
+        lines.push(("Fit".to_string(), self.reader.fit.label().to_string()));
+        // For Auto, show the resolved layout too (e.g. "auto · spread").
+        let layout_str = match self.layout_mode {
+            LayoutMode::Auto => format!("auto · {}", self.reader.layout.label()),
+            m => m.label().to_string(),
+        };
+        lines.push(("Layout".to_string(), layout_str));
+        lines.push((
+            "Direction".to_string(),
+            self.reader.direction.label().to_string(),
+        ));
+        lines
+    }
+
     /// Write the current viewing options to disk (immediate, like positions).
+    /// Persists the layout *mode* (so `Auto` saves as "auto", not whatever
+    /// orientation it happened to resolve to).
     fn persist_view(&self) {
         if let Some(f) = &self.view_file {
             save_view(
                 f,
                 self.reader.direction,
-                self.reader.layout,
+                self.layout_mode,
                 self.reader.fit,
                 self.reader.jump,
             );
+        }
+    }
+
+    /// Resolve the layout mode against the current viewport and, if it differs from
+    /// the engine's concrete layout, switch — re-anchoring the read position into the
+    /// new view and re-prefetching. This is what makes `Auto` follow device rotation;
+    /// for fixed Single/Spread it's a per-frame no-op. Does NOT persist (the *mode*
+    /// is unchanged — only its orientation-dependent resolution).
+    fn apply_resolved_layout(&mut self) {
+        let desired = self.layout_mode.resolve(self.config.width, self.config.height);
+        if desired != self.reader.layout {
+            self.reader.layout = desired;
+            self.reader.index =
+                view_start(desired, self.reader.index, self.reader.spread_offset);
+            self.reader.prefetch();
         }
     }
 
@@ -1092,6 +1351,10 @@ impl App {
             w: self.config.width,
             h: self.config.height,
         };
+        // Resolve Auto → concrete layout from the current orientation *before* the
+        // decode view / prefetch / build-quads below read `reader.layout`, so a
+        // rotation switches this same frame (no one-frame flash of the old layout).
+        self.apply_resolved_layout();
         // Drain finished decodes into the cache.
         if let Some(pool) = &self.reader.pool {
             for msg in pool.poll() {
@@ -1197,9 +1460,14 @@ impl App {
         let controls = self.controls;
         let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
         let show_options = self.show_options;
+        let show_info = self.show_info;
+        let info_lines = if show_info { self.build_info() } else { Vec::new() };
         let rtl = self.reader.direction == Direction::Rtl;
         let cur_dir = self.reader.direction;
+        // Resolved concrete layout (apply_resolved_layout ran at the top of render),
+        // and the user's chosen mode for the popup's selection state.
         let cur_layout = self.reader.layout;
+        let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
         let cur_jump = self.reader.jump;
         let lib_dir_str = self.lib_dir.display().to_string();
@@ -1224,12 +1492,14 @@ impl App {
         let mut set_root = false;
         let mut open_options = false;
         let mut set_dir: Option<Direction> = None;
-        let mut set_layout: Option<Layout> = None;
+        let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
         let mut set_jump: Option<bool> = None;
         let mut toggle_offset = false;
         let mut page_nav: i64 = 0;
         let mut book_nav: i64 = 0;
+        let mut open_info = false;
+        let mut close_info = false;
         let at_root = self.lib_dir == self.lib_root;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if library_view {
@@ -1248,7 +1518,7 @@ impl App {
                             {
                                 go_up = true;
                             }
-                            if ui.button(egui::RichText::new("✕ Close").size(18.0)).clicked() {
+                            if ui.button(egui::RichText::new("× Close").size(18.0)).clicked() {
                                 close_lib = true;
                             }
                             if ui
@@ -1321,6 +1591,9 @@ impl App {
                         });
                     }
                 });
+            } else if len == 0 {
+                // No comic open: show the how-to-open helper instead of a blank screen.
+                empty_state(ctx, &mut reqs.open_library, &mut reqs.open_picker);
             } else if controls {
                 seekbar(
                     ctx,
@@ -1330,6 +1603,7 @@ impl App {
                     cur_layout == Layout::Spread,
                     &mut seek_to,
                     &mut open_options,
+                    &mut open_info,
                     &mut page_nav,
                     &mut book_nav,
                     &mut toggle_offset,
@@ -1341,7 +1615,8 @@ impl App {
                     options_popup(
                         ctx,
                         cur_dir,
-                        cur_layout,
+                        cur_layout_mode,
+                        cur_layout == Layout::Spread,
                         cur_fit,
                         cur_jump,
                         &mut set_dir,
@@ -1350,6 +1625,9 @@ impl App {
                         &mut set_jump,
                         &mut toggle_offset,
                     );
+                }
+                if show_info {
+                    info_popup(ctx, &info_lines, &mut close_info);
                 }
             }
         });
@@ -1383,15 +1661,22 @@ impl App {
         if open_options {
             self.show_options = !self.show_options;
         }
+        if open_info {
+            self.show_info = !self.show_info;
+        }
+        if close_info {
+            self.show_info = false;
+        }
         if let Some(d) = set_dir {
             self.reader.direction = d;
             self.persist_view();
         }
-        if let Some(l) = set_layout {
-            self.reader.layout = l;
-            self.reader.index = view_start(l, self.reader.index, self.reader.spread_offset);
-            self.reader.prefetch();
+        if let Some(m) = set_layout {
+            self.layout_mode = m;
             self.persist_view();
+            // Resolve + re-anchor immediately (no one-frame lag); for Auto this also
+            // sets the concrete layout to match the current orientation.
+            self.apply_resolved_layout();
         }
         if let Some(f) = set_fit {
             self.reader.fit = f;
