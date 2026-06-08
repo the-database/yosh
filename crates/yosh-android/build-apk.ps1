@@ -59,8 +59,15 @@ $classFiles = @((Get-ChildItem -Recurse $classes -Filter *.class).FullName)
 if ($LASTEXITCODE) { throw "d8 failed" }
 
 # --- 3. package + sign -------------------------------------------------------
+# Launcher icon + colours live in res/. aapt2 (unlike legacy aapt) can't link a raw
+# res dir: compile it to a .flat zip first, then pass that zip to link, which folds
+# it into base.apk as resources.arsc. No R.java is needed (resources are referenced
+# only from the manifest, not from the Java/native code).
+& "$BT\aapt2.exe" compile --dir "$proj\res" -o "$out\res.zip"
+if ($LASTEXITCODE) { throw "aapt2 compile failed" }
 & "$BT\aapt2.exe" link -o "$out\base.apk" -I $JAR --manifest "$proj\AndroidManifest.xml" `
-    --min-sdk-version 24 --target-sdk-version 34
+    "$out\res.zip" --min-sdk-version 24 --target-sdk-version 34
+if ($LASTEXITCODE) { throw "aapt2 link failed" }
 & "$JDK\bin\jar.exe" uf "$out\base.apk" -C "$out\stage" lib
 & "$JDK\bin\jar.exe" uf "$out\base.apk" -C "$out\stage" classes.dex
 & "$BT\zipalign.exe" -f 4 "$out\base.apk" "$out\aligned.apk"

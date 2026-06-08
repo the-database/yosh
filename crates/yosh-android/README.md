@@ -40,8 +40,13 @@ cargo install cargo-ndk
 ```
 
 Packaging is Gradle-free: `cargo-ndk` builds the per-ABI `.so`, then
-`aapt2 link` (manifest → base APK) + `jar` (add `lib/<abi>/`) + `zipalign` +
-`apksigner` (debug keystore). See `build-apk.ps1`.
+`aapt2 compile`/`link` (manifest + `res/` → base APK) + `jar` (add `lib/<abi>/`) +
+`zipalign` + `apksigner` (debug keystore). See `build-apk.ps1`.
+
+The launcher icon (an adaptive icon — the desktop monkey logo on the book's purple,
+plus a legacy PNG fallback) lives under `res/mipmap-*/` and is generated from
+`../yosh/assets/yosh.ico` by `./gen-icons.ps1` (ImageMagick). The PNGs are committed;
+re-run that script only when the logo changes.
 
 A host `cargo build` over the workspace compiles this crate to an empty cdylib
 (its deps are gated to `cfg(target_os = "android")`), so it doesn't affect desktop
