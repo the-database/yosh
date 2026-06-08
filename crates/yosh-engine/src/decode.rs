@@ -394,6 +394,52 @@ fn downscale_color(
     Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, path: ResizePath::Color, pixels: dst.into_vec() })
 }
 
+/// LQ grayscale: a fast 8-bit Bilinear downscale in gamma space. Skips the HQ
+/// cost — the 32M-px sRGB→linear pass, the U16 Catmull-Rom, and the Dot-Gain
+/// re-encode — so it's several times faster (and shows some screentone moiré).
+/// Used transiently while seeking; the page re-decodes via `downscale_gray` on
+/// settle.
+fn downscale_gray_fast(
+    gray: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let src = ImageRef::new(w, h, gray, PixelType::U8).map_err(|e| format!("resize src: {e}"))?;
+    let mut dst = Image::new(tw, target_h, PixelType::U8);
+    resizer
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
+        )
+        .map_err(|e| format!("resize: {e}"))?;
+    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: true, path: ResizePath::GrayLinear, pixels: dst.into_vec() })
+}
+
+/// LQ color: a fast 8-bit Bilinear downscale (vs the HQ Lanczos3).
+fn downscale_color_fast(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let src = ImageRef::new(w, h, rgba, PixelType::U8x4).map_err(|e| format!("resize src: {e}"))?;
+    let mut dst = Image::new(tw, target_h, PixelType::U8x4);
+    resizer
+        .resize(
+            &src,
+            &mut dst,
+            &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
+        )
+        .map_err(|e| format!("resize: {e}"))?;
+    Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, path: ResizePath::Color, pixels: dst.into_vec() })
+}
+
 /// Decode page bytes (any supported format) and downscale to `target_h` on CPU,
 /// picking the grayscale or color resize strategy.
 pub fn decode_and_downscale(
@@ -450,6 +496,28 @@ pub fn decode_and_downscale(
             premultiply_alpha(&mut full);
         }
         downscale_color(&full, w, h, tw, th, resizer)
+    }
+}
+
+/// LQ sibling of `decode_and_downscale`: decode + a cheap gamma-space Bilinear
+/// resize, skipping ICC color management, the visually-grayscale detection, and
+/// the linear-light path. The fast tier shown while seeking; a native-sized page
+/// (no downscale) returns the same pixels HQ would, so nothing is lost there.
+fn decode_and_downscale_lq(
+    bytes: &[u8],
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let (w, h, gray_by_channels, full, _profile) = decode_raw(bytes)?;
+    let (tw, th) = target_dims(w, h, target_h);
+    check_fits(tw, th)?;
+    if tw == w && th == h {
+        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, path: ResizePath::None, pixels: full });
+    }
+    if gray_by_channels {
+        downscale_gray_fast(&full, w, h, tw, th, resizer)
+    } else {
+        downscale_color_fast(&full, w, h, tw, th, resizer)
     }
 }
 
@@ -548,6 +616,7 @@ fn decode_ico(bytes: &[u8]) -> Result<Vec<DecodedImage>, String> {
 pub fn decode_page(
     bytes: &[u8],
     target_h: u32,
+    lq: bool,
     resizer: &mut Resizer,
 ) -> Result<DecodedPage, String> {
     // ICO: expose every contained image as a steppable layer (1 entry → still).
@@ -581,7 +650,15 @@ pub fn decode_page(
             return frames_to_page(frames, target_h, resizer);
         }
     }
-    Ok(DecodedPage::Still(decode_and_downscale(bytes, target_h, resizer)?))
+    // Stills: the seek hot path. LQ uses the fast gamma-space resize; HQ is the
+    // unchanged linear-light pipeline. (Animations/ICO above always decode HQ —
+    // rare, and not the seek bottleneck.)
+    let img = if lq {
+        decode_and_downscale_lq(bytes, target_h, resizer)?
+    } else {
+        decode_and_downscale(bytes, target_h, resizer)?
+    };
+    Ok(DecodedPage::Still(img))
 }
 
 #[cfg(test)]
@@ -610,7 +687,7 @@ mod tests {
     fn multiframe_gif_decodes_as_animation() {
         let bytes = encode_gif(vec![frame([255, 0, 0, 255]), frame([0, 0, 255, 255])]);
         let mut resizer = Resizer::new();
-        match decode_page(&bytes, 4, &mut resizer).unwrap() {
+        match decode_page(&bytes, 4, false, &mut resizer).unwrap() {
             DecodedPage::Animated(fs) => {
                 assert_eq!(fs.len(), 2, "both frames preserved");
                 assert!(fs.iter().all(|(img, _)| img.w == 4 && img.h == 4 && !img.gray));
@@ -626,7 +703,7 @@ mod tests {
         let bytes = encode_gif(vec![frame([0, 255, 0, 255])]);
         let mut resizer = Resizer::new();
         assert!(matches!(
-            decode_page(&bytes, 4, &mut resizer).unwrap(),
+            decode_page(&bytes, 4, false, &mut resizer).unwrap(),
             DecodedPage::Still(_)
         ));
     }
@@ -657,7 +734,7 @@ mod tests {
     fn psd_decodes_flattened_composite() {
         let bytes = minimal_rgb_psd();
         let mut resizer = Resizer::new();
-        match decode_page(&bytes, 4, &mut resizer).unwrap() {
+        match decode_page(&bytes, 4, false, &mut resizer).unwrap() {
             DecodedPage::Still(img) => {
                 assert_eq!((img.w, img.h), (4, 4));
                 assert!(!img.gray);
@@ -680,7 +757,7 @@ mod tests {
             w.write_image_data(&[0xFFu8; 2 * 2 * 4 * 2]).unwrap(); // 2×2 RGBA16
         }
         let mut resizer = Resizer::new();
-        match decode_page(&bytes, 2, &mut resizer).unwrap() {
+        match decode_page(&bytes, 2, false, &mut resizer).unwrap() {
             DecodedPage::Still(img) => {
                 assert_eq!((img.w, img.h), (2, 2));
                 assert!(!img.gray);
@@ -701,7 +778,7 @@ mod tests {
         let mut bytes = Vec::new();
         dir.write(&mut bytes).unwrap();
         let mut resizer = Resizer::new();
-        match decode_page(&bytes, 64, &mut resizer).unwrap() {
+        match decode_page(&bytes, 64, false, &mut resizer).unwrap() {
             DecodedPage::Layered(layers) => {
                 assert_eq!(layers.len(), 2);
                 assert_eq!((layers[0].w, layers[0].h), (32, 32), "largest layer first");
@@ -730,7 +807,7 @@ mod tests {
             w.write_image_data(&data).unwrap();
         }
         let mut resizer = Resizer::new();
-        match decode_page(&bytes, 2, &mut resizer).unwrap() {
+        match decode_page(&bytes, 2, false, &mut resizer).unwrap() {
             DecodedPage::Still(img) => {
                 assert!(!img.gray, "transparent image keeps the color/alpha path");
                 assert_eq!(&img.pixels[4..8], &[0, 0, 0, 0], "transparent RGB zeroed");
@@ -755,7 +832,7 @@ mod tests {
             img.write_to(&mut buf, fmt).unwrap();
             let bytes = buf.into_inner();
             let mut resizer = Resizer::new();
-            match decode_page(&bytes, 3, &mut resizer).unwrap() {
+            match decode_page(&bytes, 3, false, &mut resizer).unwrap() {
                 DecodedPage::Still(d) => assert_eq!((d.w, d.h), (5, 3), "{fmt:?} dims"),
                 _ => panic!("{fmt:?} should be a still"),
             }

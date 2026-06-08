@@ -233,6 +233,9 @@ pub struct Reader {
     pub pan_y: f32,
     pub direction: Direction,
     pub jump: bool, // seek mode (key J): true = skip ahead, false = step every page
+    /// Two-tier decode: LQ (fast) while seeking → HQ on settle. Off = always HQ
+    /// (the desktop's behavior).
+    two_tier: bool,
     pub nav_times: VecDeque<Instant>,
     pub scroll_mode: bool,
     pub top_offset: f32, // px the anchor page is scrolled above the viewport top
@@ -272,6 +275,7 @@ impl Reader {
         jump: bool,
         direction: Direction,
         start_index: usize,
+        two_tier: bool,
     ) -> Self {
         Self {
             cache: PageCache::new(budget.cache_cap, tex_pool.clone()),
@@ -307,6 +311,7 @@ impl Reader {
             fwd: budget.fwd,
             fwd_max: budget.fwd_max,
             back: budget.back,
+            two_tier,
         }
     }
 
@@ -876,20 +881,44 @@ impl Reader {
             return;
         };
         let len = src.len();
-        let jobs: Vec<(usize, u32)> = desired_window(self.index, len, fwd, self.back)
+        // Two-tier: if the page we're on isn't decoded yet (we've outrun the HQ
+        // decode), decode this window with the cheap LQ resize so it appears
+        // immediately. Once the anchor is cached the next prefetch wants HQ and
+        // upgrades the LQ pages in place. (Pages prefetched HQ-ahead stay HQ — no
+        // LQ flash when the buffer keeps up.)
+        let anchor = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
+        let lq = self.two_tier && !self.cache.contains(anchor);
+        let jobs: Vec<(usize, u32, bool)> = desired_window(self.index, len, fwd, self.back)
             .into_iter()
             .filter(|i| !self.failed.contains_key(i))
             .filter_map(|i| {
                 let want = self.page_target_h(i);
                 match self.cache.get(i) {
-                    None => Some((i, want)),
-                    Some(p) => (settled && p.target_h != want).then_some((i, want)),
+                    None => Some((i, want, lq)),
+                    Some(p) => {
+                        let target_stale = settled && p.target_h != want;
+                        let quality_stale = !lq && p.lq; // have LQ, now want HQ
+                        (target_stale || quality_stale).then_some((i, want, lq))
+                    }
                 }
             })
             .collect();
         if let Some(pool) = &self.pool {
             pool.set_jobs(jobs);
         }
+    }
+
+    /// Whether the in-view page(s) are decoded at full HQ (or failed). False while
+    /// a page is missing or only LQ-decoded — the shell keeps redrawing until the
+    /// HQ upgrade lands (so the page sharpens after seeking stops).
+    pub fn view_is_hq(&self) -> bool {
+        let Some(src) = &self.source else {
+            return true;
+        };
+        let len = src.len();
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let ok = |i: usize| self.failed.contains_key(&i) || self.cache.get(i).is_some_and(|p| !p.lq);
+        ok(a) && b.is_none_or(ok)
     }
 
 }

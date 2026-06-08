@@ -24,9 +24,9 @@ pub enum Msg {
 }
 
 struct JobState {
-    /// Pending decodes as `(page index, exact target height)` — the target is the
-    /// page's on-screen displayed height, computed per page by the scheduler.
-    jobs: Vec<(usize, u32)>,
+    /// Pending decodes as `(page index, exact target height, lq)` — the target is
+    /// the page's on-screen displayed height; `lq` requests the fast (seeking) tier.
+    jobs: Vec<(usize, u32, bool)>,
     inflight: HashSet<usize>,
     /// Indices the latest prefetch window still wants decoded (the raw `set_jobs`
     /// list, *before* the inflight filter). A worker checks this at its yield
@@ -92,7 +92,7 @@ impl DecodePool {
                 loop {
                     // Wait for and claim the highest-priority job (index + its
                     // exact, per-page decode target height).
-                    let (index, th): (usize, u32) = {
+                    let (index, th, lq): (usize, u32, bool) = {
                         let (m, cv) = &*shared;
                         let mut st = m.lock().unwrap();
                         loop {
@@ -127,7 +127,7 @@ impl DecodePool {
                         continue;
                     }
 
-                    let decoded = decode_page(&bytes, th, &mut resizer);
+                    let decoded = decode_page(&bytes, th, lq, &mut resizer);
 
                     // Bail before upload if the page left the window during the decode —
                     // skips the GPU upload, the texpool/cache churn, and a pointless `Done`.
@@ -158,7 +158,10 @@ impl DecodePool {
                     drop_inflight(index);
 
                     let msg = match page {
-                        Ok(page) => Msg::Done { index, page },
+                        Ok(mut page) => {
+                            page.lq = lq;
+                            Msg::Done { index, page }
+                        }
                         Err(error) => Msg::Failed { index, error },
                     };
                     if tx.send(msg).is_err() {
@@ -177,16 +180,16 @@ impl DecodePool {
 
     /// Replace the work list with `desired` (`(index, target_h)`, nearest-first),
     /// skipping pages already in flight. Wakes idle workers.
-    pub fn set_jobs(&self, desired: Vec<(usize, u32)>) {
+    pub fn set_jobs(&self, desired: Vec<(usize, u32, bool)>) {
         let (m, cv) = &*self.shared;
         let mut st = m.lock().unwrap();
         // `wanted` captures the full window (including in-flight indices that remain
         // in it) so legitimately-running decodes aren't falsely cancelled; the job
         // queue then drops in-flight pages to avoid re-decoding them.
-        st.wanted = desired.iter().map(|(i, _)| *i).collect();
-        let filtered: Vec<(usize, u32)> = desired
+        st.wanted = desired.iter().map(|(i, _, _)| *i).collect();
+        let filtered: Vec<(usize, u32, bool)> = desired
             .into_iter()
-            .filter(|(i, _)| !st.inflight.contains(i))
+            .filter(|(i, _, _)| !st.inflight.contains(i))
             .collect();
         st.jobs = filtered;
         drop(st);

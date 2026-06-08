@@ -744,6 +744,7 @@ impl ApplicationHandler for App {
                 Direction::Ltr
             },
             self.start_index,
+            false, // two_tier: desktop keeps the always-HQ pipeline
         );
         self.state = Some(State {
             window,
