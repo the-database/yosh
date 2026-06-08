@@ -5,7 +5,11 @@
 # Prereqs (one-time): the Android NDK, SDK build-tools/platform-tools/platform,
 # a JDK, the rustup android targets, and cargo-ndk. See README.md. Adjust the
 # paths below to your install if they differ.
-param([switch]$Run, [string]$Profile = "debug")
+# Defaults to release: the decode pipeline (fast_image_resize SIMD + image
+# decoders) is ~20-40x slower unoptimized, so debug APKs are too slow to read
+# real (high-res) comics. Pass -Profile debug for a faster-to-compile build when
+# iterating on non-decode code.
+param([switch]$Run, [string]$Profile = "release")
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"

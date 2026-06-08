@@ -61,7 +61,7 @@ fn android_main(app: AndroidApp) {
     let init_view = view_file
         .as_deref()
         .map(load_view)
-        .unwrap_or((Direction::Rtl, Layout::Single, FitMode::Window));
+        .unwrap_or((Direction::Rtl, Layout::Single, FitMode::Window, false));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -106,8 +106,8 @@ struct Shell {
     /// The library dir to open the browser at (persisted across launches).
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
-    /// Persisted viewing options (direction, layout, fit) + where they live.
-    init_view: (Direction, Layout, FitMode),
+    /// Persisted viewing options (direction, layout, fit, jump) + where they live.
+    init_view: (Direction, Layout, FitMode, bool),
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
@@ -269,9 +269,10 @@ impl ApplicationHandler for Shell {
             self.init_view.2, // fit
             self.init_view.1, // layout
             false,            // scroll_mode: page-flip
-            false,            // jump: step mode
+            self.init_view.3, // jump (seek mode)
             self.init_view.0, // direction (default RTL)
             0,
+            true, // two_tier: LQ while seeking → HQ on settle
         );
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         self.app = Some(App {
@@ -640,9 +641,11 @@ fn attach_source(
 }
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
-/// Parse persisted viewing options ("dir,layout,fit"); default RTL / single / window.
-fn load_view(path: &Path) -> (Direction, Layout, FitMode) {
-    let (mut dir, mut lay, mut fit) = (Direction::Rtl, Layout::Single, FitMode::Window);
+/// Parse persisted viewing options ("dir,layout,fit,seek"); default RTL / single
+/// / window / step.
+fn load_view(path: &Path) -> (Direction, Layout, FitMode, bool) {
+    let (mut dir, mut lay, mut fit, mut jump) =
+        (Direction::Rtl, Layout::Single, FitMode::Window, false);
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -657,12 +660,15 @@ fn load_view(path: &Path) -> (Direction, Layout, FitMode) {
             Some(&"actual") => FitMode::Actual,
             _ => FitMode::Window,
         };
+        if t.get(3) == Some(&"jump") {
+            jump = true;
+        }
     }
-    (dir, lay, fit)
+    (dir, lay, fit, jump)
 }
 
-/// Persist viewing options as "dir,layout,fit".
-fn save_view(path: &Path, dir: Direction, lay: Layout, fit: FitMode) {
+/// Persist viewing options as "dir,layout,fit,seek".
+fn save_view(path: &Path, dir: Direction, lay: Layout, fit: FitMode, jump: bool) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = if lay == Layout::Spread { "spread" } else { "single" };
     let f = match fit {
@@ -671,7 +677,8 @@ fn save_view(path: &Path, dir: Direction, lay: Layout, fit: FitMode) {
         FitMode::Actual => "actual",
         FitMode::Window => "window",
     };
-    let _ = std::fs::write(path, format!("{d},{l},{f}"));
+    let j = if jump { "jump" } else { "step" };
+    let _ = std::fs::write(path, format!("{d},{l},{f},{j}"));
 }
 
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
@@ -796,9 +803,11 @@ fn options_popup(
     dir: Direction,
     layout: Layout,
     fit: FitMode,
+    jump: bool,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<Layout>,
     set_fit: &mut Option<FitMode>,
+    set_jump: &mut Option<bool>,
     toggle_offset: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
@@ -862,6 +871,22 @@ fn options_popup(
                         {
                             *set_fit = Some(f);
                         }
+                    }
+                });
+
+                ui.label(egui::RichText::new("Seek mode").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(!jump, egui::RichText::new("Step").size(16.0))
+                        .clicked()
+                    {
+                        *set_jump = Some(false);
+                    }
+                    if ui
+                        .selectable_label(jump, egui::RichText::new("Jump (fast seek)").size(16.0))
+                        .clicked()
+                    {
+                        *set_jump = Some(true);
                     }
                 });
             });
@@ -967,7 +992,13 @@ impl App {
     /// Write the current viewing options to disk (immediate, like positions).
     fn persist_view(&self) {
         if let Some(f) = &self.view_file {
-            save_view(f, self.reader.direction, self.reader.layout, self.reader.fit);
+            save_view(
+                f,
+                self.reader.direction,
+                self.reader.layout,
+                self.reader.fit,
+                self.reader.jump,
+            );
         }
     }
 
@@ -1084,6 +1115,7 @@ impl App {
         let cur_dir = self.reader.direction;
         let cur_layout = self.reader.layout;
         let cur_fit = self.reader.fit;
+        let cur_jump = self.reader.jump;
         let lib_dir_str = self.lib_dir.display().to_string();
         // Snapshot the rows the closure needs (owned), so it borrows no `self`.
         let entries: Vec<(bool, String, PathBuf, Option<egui::TextureHandle>)> = self
@@ -1108,6 +1140,7 @@ impl App {
         let mut set_dir: Option<Direction> = None;
         let mut set_layout: Option<Layout> = None;
         let mut set_fit: Option<FitMode> = None;
+        let mut set_jump: Option<bool> = None;
         let mut toggle_offset = false;
         let at_root = self.lib_dir == self.lib_root;
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -1209,9 +1242,11 @@ impl App {
                         cur_dir,
                         cur_layout,
                         cur_fit,
+                        cur_jump,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
+                        &mut set_jump,
                         &mut toggle_offset,
                     );
                 }
@@ -1260,6 +1295,10 @@ impl App {
         if let Some(f) = set_fit {
             self.reader.fit = f;
             self.reader.prefetch();
+            self.persist_view();
+        }
+        if let Some(j) = set_jump {
+            self.reader.jump = j;
             self.persist_view();
         }
         if toggle_offset {
@@ -1319,11 +1358,10 @@ impl App {
         // hasn't settled (resize/zoom re-decode), or the current page is still
         // decoding (not yet cached and not failed). Nav/zoom/pan and egui repaints
         // wake the loop via request_redraw in the event handler.
-        let idx = self.reader.index;
-        let page_pending = self.reader.source.is_some()
-            && self.reader.cache.get(idx).is_none()
-            && !self.reader.failed.contains_key(&idx);
-        if self.library_view || !self.reader.view_settled || page_pending {
+        // Keep drawing while the library is open, the view hasn't settled, or the
+        // current page isn't HQ yet (missing, or only the LQ seek-tier — so it
+        // sharpens to HQ once seeking stops).
+        if self.library_view || !self.reader.view_settled || !self.reader.view_is_hq() {
             self.window.request_redraw();
         }
         reqs

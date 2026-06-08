@@ -141,6 +141,8 @@ pub struct PageTexture {
     /// used). Lets the cache detect pages decoded at a stale resolution after a
     /// zoom/resize and re-decode them in place without blanking the display.
     pub target_h: u32,
+    /// Decoded via the fast LQ (seeking) tier — re-decode to HQ once settled.
+    pub lq: bool,
     /// Extra frames/layers 1..N (frame 0 is `texture`/`view`). `None` for stills.
     /// Animation (GIF/WebP) frames share this page's size; `.ico` layers may each
     /// be a different size, so recycling keys off each texture's own dimensions.
@@ -222,6 +224,7 @@ impl PageTexture {
             gray,
             path: _,
             target_h: _,
+            lq: _,
             anim,
             frame0_delay_ms: _,
             anim_total_ms: _,
@@ -390,6 +393,7 @@ impl PagePipeline {
             gray: img.gray,
             path: img.path,
             target_h,
+            lq: false,
             anim: None,
             frame0_delay_ms: 0,
             anim_total_ms: 0,
