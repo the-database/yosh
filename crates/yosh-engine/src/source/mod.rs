@@ -33,6 +33,11 @@ pub trait PageSource: Send + Sync {
         let _ = index;
         None
     }
+    /// True if this source is a *partial* recovery of a truncated/damaged archive —
+    /// only the pages before the cutoff are present. Default: a complete source.
+    fn is_partial(&self) -> bool {
+        false
+    }
 }
 
 /// Format a UNIX-epoch second count as `YYYY-MM-DD HH:MM UTC` (no time-zone

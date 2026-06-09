@@ -60,9 +60,23 @@ impl Seek for Reader {
     }
 }
 
+/// How a page's bytes are located. A normal archive resolves names through the
+/// parsed central directory; a truncated/damaged archive that has no central
+/// directory is recovered by scanning local file headers from the front, recording
+/// each surviving entry's header offset for direct seek+read.
+enum Index {
+    Central,
+    /// Local-file-header byte offset per entry, parallel to `names`.
+    Local(Vec<u64>),
+}
+
 pub struct ZipSource {
     backend: Backend,
     names: Vec<String>,
+    index: Index,
+    /// True when opened by local-header recovery (central directory missing): the
+    /// archive is partial, so `names` holds only the pages that survived the cutoff.
+    partial: bool,
     /// Recycled parsed handles (each owns its own cursor over the archive).
     pool: Mutex<Vec<ZipArchive<Reader>>>,
 }
@@ -80,25 +94,96 @@ impl ZipSource {
     }
 
     fn build(backend: Backend) -> io::Result<Self> {
-        // `file_names()` reads straight from the in-memory central directory that
-        // `ZipArchive::new` already parsed — no per-entry seek/local-header read. A
-        // directory entry's name ends in `/`, so `is_image_name` rejects it; the
-        // explicit `/` guard is belt-and-suspenders for an oddly-named dir.
-        let names = {
-            let zip = ZipArchive::new(Self::fresh(&backend)?).map_err(to_io)?;
-            let mut names: Vec<String> = zip
-                .file_names()
-                .filter(|n| !n.ends_with('/') && is_image_name(n))
-                .map(|n| n.to_string())
-                .collect();
-            names.sort_by(|a, b| natord::compare(a, b));
-            names
-        };
-        Ok(Self {
-            backend,
-            names,
-            pool: Mutex::new(Vec::new()),
-        })
+        match ZipArchive::new(Self::fresh(&backend)?) {
+            // Normal archive: `file_names()` reads straight from the in-memory central
+            // directory `ZipArchive::new` already parsed — no per-entry seek. A dir
+            // entry's name ends in `/`, so `is_image_name` rejects it; the explicit
+            // `/` guard is belt-and-suspenders for an oddly-named dir.
+            Ok(zip) => {
+                let mut names: Vec<String> = zip
+                    .file_names()
+                    .filter(|n| !n.ends_with('/') && is_image_name(n))
+                    .map(|n| n.to_string())
+                    .collect();
+                names.sort_by(|a, b| natord::compare(a, b));
+                Ok(Self {
+                    backend,
+                    names,
+                    index: Index::Central,
+                    partial: false,
+                    pool: Mutex::new(Vec::new()),
+                })
+            }
+            // No usable central directory (truncated / damaged download, sync cut
+            // off mid-transfer): recover whatever complete pages exist by walking the
+            // local file headers from the front, BandiView-style.
+            Err(central_err) => {
+                let mut entries = Self::scan_local(&backend)?; // (name, local-header offset)
+                if entries.is_empty() {
+                    // Not a recoverable zip at all — report the original failure.
+                    return Err(to_io(central_err));
+                }
+                entries.sort_by(|a, b| natord::compare(&a.0, &b.0));
+                let (names, offsets): (Vec<String>, Vec<u64>) = entries.into_iter().unzip();
+                Ok(Self {
+                    backend,
+                    names,
+                    index: Index::Local(offsets),
+                    partial: true,
+                    pool: Mutex::new(Vec::new()),
+                })
+            }
+        }
+    }
+
+    /// Recover an archive with no central directory by reading local file headers
+    /// sequentially from the front. Returns `(image name, header byte offset)` for
+    /// every *complete* entry, stopping at the first truncated/garbage header or
+    /// truncated entry data — so a download cut off mid-page yields the pages before
+    /// the cut. Each entry is drained (not just dropped) to advance to the next
+    /// header and to detect a half-written final entry.
+    fn scan_local(backend: &Backend) -> io::Result<Vec<(String, u64)>> {
+        let mut reader = Self::fresh(backend)?;
+        let mut entries = Vec::new();
+        loop {
+            let off = match reader.stream_position() {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+            match zip::read::read_zipfile_from_stream(&mut reader) {
+                Ok(Some(mut file)) => {
+                    let name = file.name().to_string();
+                    let keep = !name.ends_with('/') && is_image_name(&name);
+                    // Drain past the data to reach the next header; a truncated final
+                    // entry errors here → stop without recording the incomplete page.
+                    if io::copy(&mut file, &mut io::sink()).is_err() {
+                        break;
+                    }
+                    if keep {
+                        entries.push((name, off));
+                    }
+                }
+                Ok(None) => break, // clean end of the local-header stream
+                Err(_) => break,   // truncated/garbage header → keep what we have
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Read one entry from a recovered (`Index::Local`) archive: seek to its local
+    /// header and let the streaming reader parse + decompress just that entry. A
+    /// fresh reader per call keeps parallel reads independent (no shared cursor).
+    fn read_local(&self, offset: u64) -> io::Result<Vec<u8>> {
+        let mut reader = Self::fresh(&self.backend)?;
+        reader.seek(SeekFrom::Start(offset))?;
+        match zip::read::read_zipfile_from_stream(&mut reader).map_err(to_io)? {
+            Some(mut entry) => {
+                let mut buf = Vec::with_capacity(entry.size() as usize);
+                entry.read_to_end(&mut buf)?;
+                Ok(buf)
+            }
+            None => Err(io::Error::other("no entry at recovered offset")),
+        }
     }
 
     /// A fresh, independent reader over the archive: a new file handle, or a new
@@ -143,6 +228,10 @@ impl PageSource for ZipSource {
     }
 
     fn read_page(&self, index: usize) -> io::Result<Vec<u8>> {
+        // Recovered archive: read directly from the entry's local-header offset.
+        if let Index::Local(offsets) = &self.index {
+            return self.read_local(offsets[index]);
+        }
         let name = &self.names[index];
         let mut zip = self.checkout()?;
         // Confine the `ZipFile` borrow to this block: `read_to_end` fully drains
@@ -164,12 +253,21 @@ impl PageSource for ZipSource {
 
     fn modified(&self, index: usize) -> Option<String> {
         // Lazy: only the Tab info overlay asks, and it already reads the full page
-        // there, so a one-off open for the timestamp is cheap. The central
-        // directory carries last-modified, but the zip crate only surfaces it via
-        // a `ZipFile`, so we open by name on demand rather than eagerly at `new`.
-        let mut zip = ZipArchive::new(Self::fresh(&self.backend).ok()?).ok()?;
-        let f = zip.by_name(self.names.get(index)?).ok()?;
-        f.last_modified().map(|dt| {
+        // there, so a one-off open for the timestamp is cheap. Both paths surface
+        // last-modified via a `ZipFile`: by name through the central directory, or —
+        // for a recovered archive — by seeking to the entry's local header.
+        let dt = match &self.index {
+            Index::Central => {
+                let mut zip = ZipArchive::new(Self::fresh(&self.backend).ok()?).ok()?;
+                zip.by_name(self.names.get(index)?).ok()?.last_modified()
+            }
+            Index::Local(offsets) => {
+                let mut reader = Self::fresh(&self.backend).ok()?;
+                reader.seek(SeekFrom::Start(*offsets.get(index)?)).ok()?;
+                zip::read::read_zipfile_from_stream(&mut reader).ok()??.last_modified()
+            }
+        };
+        dt.map(|dt| {
             format!(
                 "{:04}-{:02}-{:02} {:02}:{:02}",
                 dt.year(),
@@ -179,6 +277,10 @@ impl PageSource for ZipSource {
                 dt.minute()
             )
         })
+    }
+
+    fn is_partial(&self) -> bool {
+        self.partial
     }
 }
 
@@ -323,5 +425,48 @@ mod tests {
         let src = ZipSource::new(&path).unwrap();
         assert_eq!(src.modified(0).as_deref(), Some("2021-03-14 09:26"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recovers_pages_from_truncated_archive() {
+        // A complete 3-image zip, stored (uncompressed) so the layout is simple.
+        let mut buf = Vec::new();
+        {
+            let mut w = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (n, d) in [
+                ("01.png", b"PAGE-ONE".as_slice()),
+                ("02.png", b"PAGE-TWO"),
+                ("03.png", b"PAGE-THREE"),
+            ] {
+                w.start_file(n, opts).unwrap();
+                w.write_all(d).unwrap();
+            }
+            w.finish().unwrap();
+        }
+        // A complete archive opens via the central directory — not partial.
+        let full = ZipSource::from_bytes(buf.clone()).unwrap();
+        assert_eq!(full.len(), 3);
+        assert!(!full.is_partial());
+
+        // Cut into the 3rd local file header (PK\x03\x04): pages 1 & 2 are complete,
+        // page 3 and the central directory are gone — a download cut off mid-page.
+        let sig = [0x50u8, 0x4B, 0x03, 0x04];
+        let third = buf
+            .windows(4)
+            .enumerate()
+            .filter(|(_, w)| *w == sig)
+            .map(|(i, _)| i)
+            .nth(2)
+            .unwrap();
+        buf.truncate(third + 8);
+
+        // Recovery: the two complete pages survive, read back correctly, partial=true.
+        let part = ZipSource::from_bytes(buf).unwrap();
+        assert!(part.is_partial(), "opened via local-header recovery");
+        assert_eq!(part.len(), 2, "two complete pages before the cutoff");
+        assert_eq!(part.name(0), "01.png");
+        assert_eq!(part.read_page(0).unwrap(), b"PAGE-ONE");
+        assert_eq!(part.read_page(1).unwrap(), b"PAGE-TWO");
     }
 }

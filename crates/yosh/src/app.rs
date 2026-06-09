@@ -1721,7 +1721,12 @@ impl State {
             self.opening_key = None;
             match built {
                 Ok((source, key, start)) if source.len() > 0 => {
-                    self.set_source(source, &key, start)
+                    let partial = source.is_partial();
+                    let n = source.len();
+                    self.set_source(source, &key, start);
+                    if partial {
+                        self.toast(format!("Partial archive — {n} pages recovered"));
+                    }
                 }
                 Ok(_) => self.ui.status = "no images found".into(),
                 Err(e) => self.ui.status = format!("open failed: {e}"),
