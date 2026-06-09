@@ -1887,6 +1887,8 @@ impl State {
             self.ui.seek_style = ui::SeekbarStyle::Bar;
             self.ui.seek_buffered.clear();
             self.ui.seek_buffered.extend(self.reader.cache.buffered_indices());
+            self.ui.seek_lq_buffered.clear();
+            self.ui.seek_lq_buffered.extend(self.reader.lq_cache.buffered_indices());
             let win_h = self.reader.viewport.h.max(1) as f32;
             let near_bottom =
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
