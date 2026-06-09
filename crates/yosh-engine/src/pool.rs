@@ -30,12 +30,12 @@ struct JobState {
     /// is the page's on-screen displayed height; `lq` requests the fast (seeking) tier;
     /// `thumb` marks a whole-volume LQ-tier thumbnail (small target, routed separately).
     jobs: Vec<(usize, u32, bool, bool)>,
-    inflight: HashSet<(usize, bool)>,
+    inflight: HashSet<usize>,
     /// Indices the latest prefetch window still wants decoded (the raw `set_jobs`
     /// list, *before* the inflight filter). A worker checks this at its yield
     /// points and abandons a page that has fallen out of the window — so a far
     /// jump or fast scrub doesn't make workers finish now-offscreen decodes first.
-    wanted: HashSet<(usize, bool)>,
+    wanted: HashSet<usize>,
     running: bool,
 }
 
@@ -74,25 +74,23 @@ impl DecodePool {
             let tx = tx.clone();
             handles.push(std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
-                // Has this `(index, thumb)` job fallen out of the wanted set? If so,
-                // drop it from `inflight` (so it can be re-queued later) and report
-                // stale. Called at the read→decode and decode→upload boundaries to
-                // abandon work the latest navigation made useless. Keyed on (index,
-                // thumb) so a page's HQ and LQ-preview jobs are tracked independently
-                // — both can be in flight at once (cold-page preview).
-                let stale = |key: (usize, bool)| -> bool {
+                // Has `index` fallen out of the wanted window? If so, drop it from
+                // `inflight` (so it can be re-queued later) and report stale. Called
+                // at the read→decode and decode→upload boundaries to abandon work the
+                // latest navigation made useless.
+                let stale = |index: usize| -> bool {
                     let (m, _) = &*shared;
                     let mut st = m.lock().unwrap();
-                    if st.wanted.contains(&key) {
+                    if st.wanted.contains(&index) {
                         false
                     } else {
-                        st.inflight.remove(&key);
+                        st.inflight.remove(&index);
                         true
                     }
                 };
-                let drop_inflight = |key: (usize, bool)| {
+                let drop_inflight = |index: usize| {
                     let (m, _) = &*shared;
-                    m.lock().unwrap().inflight.remove(&key);
+                    m.lock().unwrap().inflight.remove(&index);
                 };
                 loop {
                     // Wait for and claim the highest-priority job (index + its
@@ -106,7 +104,7 @@ impl DecodePool {
                             }
                             if !st.jobs.is_empty() {
                                 let job = st.jobs.remove(0);
-                                st.inflight.insert((job.0, job.3));
+                                st.inflight.insert(job.0);
                                 break job;
                             }
                             st = cv.wait(st).unwrap();
@@ -116,7 +114,7 @@ impl DecodePool {
                     let bytes = match source.read_page(index) {
                         Ok(bytes) => bytes,
                         Err(e) => {
-                            drop_inflight((index, thumb));
+                            drop_inflight(index);
                             if tx
                                 .send(Msg::Failed { index, error: format!("read failed: {e}") })
                                 .is_err()
@@ -128,7 +126,7 @@ impl DecodePool {
                     };
 
                     // Bail before the expensive decode if the jump landed during the read.
-                    if stale((index, thumb)) {
+                    if stale(index) {
                         continue;
                     }
 
@@ -136,7 +134,7 @@ impl DecodePool {
 
                     // Bail before upload if the page left the window during the decode —
                     // skips the GPU upload, the texpool/cache churn, and a pointless `Done`.
-                    if stale((index, thumb)) {
+                    if stale(index) {
                         continue;
                     }
 
@@ -160,7 +158,7 @@ impl DecodePool {
                         Err(e) => Err(e),
                     };
 
-                    drop_inflight((index, thumb));
+                    drop_inflight(index);
 
                     let msg = match page {
                         Ok(mut page) => {
@@ -191,10 +189,10 @@ impl DecodePool {
         // `wanted` captures the full window (including in-flight indices that remain
         // in it) so legitimately-running decodes aren't falsely cancelled; the job
         // queue then drops in-flight pages to avoid re-decoding them.
-        st.wanted = desired.iter().map(|(i, _, _, t)| (*i, *t)).collect();
+        st.wanted = desired.iter().map(|(i, _, _, _)| *i).collect();
         let filtered: Vec<(usize, u32, bool, bool)> = desired
             .into_iter()
-            .filter(|(i, _, _, t)| !st.inflight.contains(&(*i, *t)))
+            .filter(|(i, _, _, _)| !st.inflight.contains(i))
             .collect();
         st.jobs = filtered;
         drop(st);
