@@ -19,14 +19,17 @@ use crate::page::{PagePipeline, PageTexture};
 use crate::texpool::TexturePool;
 
 pub enum Msg {
-    Done { index: usize, page: PageTexture },
+    /// A finished page. `thumb` distinguishes a whole-volume LQ *thumbnail* (routes
+    /// to the reader's `lq_cache`) from a normal window decode (routes to `cache`).
+    Done { index: usize, page: PageTexture, thumb: bool },
     Failed { index: usize, error: String },
 }
 
 struct JobState {
-    /// Pending decodes as `(page index, exact target height, lq)` — the target is
-    /// the page's on-screen displayed height; `lq` requests the fast (seeking) tier.
-    jobs: Vec<(usize, u32, bool)>,
+    /// Pending decodes as `(page index, exact target height, lq, thumb)` — the target
+    /// is the page's on-screen displayed height; `lq` requests the fast (seeking) tier;
+    /// `thumb` marks a whole-volume LQ-tier thumbnail (small target, routed separately).
+    jobs: Vec<(usize, u32, bool, bool)>,
     inflight: HashSet<usize>,
     /// Indices the latest prefetch window still wants decoded (the raw `set_jobs`
     /// list, *before* the inflight filter). A worker checks this at its yield
@@ -92,7 +95,7 @@ impl DecodePool {
                 loop {
                     // Wait for and claim the highest-priority job (index + its
                     // exact, per-page decode target height).
-                    let (index, th, lq): (usize, u32, bool) = {
+                    let (index, th, lq, thumb): (usize, u32, bool, bool) = {
                         let (m, cv) = &*shared;
                         let mut st = m.lock().unwrap();
                         loop {
@@ -160,7 +163,7 @@ impl DecodePool {
                     let msg = match page {
                         Ok(mut page) => {
                             page.lq = lq;
-                            Msg::Done { index, page }
+                            Msg::Done { index, page, thumb }
                         }
                         Err(error) => Msg::Failed { index, error },
                     };
@@ -180,16 +183,16 @@ impl DecodePool {
 
     /// Replace the work list with `desired` (`(index, target_h)`, nearest-first),
     /// skipping pages already in flight. Wakes idle workers.
-    pub fn set_jobs(&self, desired: Vec<(usize, u32, bool)>) {
+    pub fn set_jobs(&self, desired: Vec<(usize, u32, bool, bool)>) {
         let (m, cv) = &*self.shared;
         let mut st = m.lock().unwrap();
         // `wanted` captures the full window (including in-flight indices that remain
         // in it) so legitimately-running decodes aren't falsely cancelled; the job
         // queue then drops in-flight pages to avoid re-decoding them.
-        st.wanted = desired.iter().map(|(i, _, _)| *i).collect();
-        let filtered: Vec<(usize, u32, bool)> = desired
+        st.wanted = desired.iter().map(|(i, _, _, _)| *i).collect();
+        let filtered: Vec<(usize, u32, bool, bool)> = desired
             .into_iter()
-            .filter(|(i, _, _)| !st.inflight.contains(i))
+            .filter(|(i, _, _, _)| !st.inflight.contains(i))
             .collect();
         st.jobs = filtered;
         drop(st);

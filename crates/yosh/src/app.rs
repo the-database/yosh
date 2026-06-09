@@ -21,7 +21,7 @@ use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library};
 use yosh_engine::page::{FitMode, PagePipeline};
-use yosh_engine::pool::{DecodePool, Msg};
+use yosh_engine::pool::DecodePool;
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
@@ -1441,6 +1441,7 @@ impl State {
             self.reader.workers,
         ));
         self.reader.cache.clear();
+        self.reader.lq_cache.clear();
         self.reader.failed.clear();
         self.reader.last_drawn = None;
         self.info_for = None;
@@ -1543,7 +1544,7 @@ impl State {
             ),
         };
         let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
-        vec![
+        let mut lines = vec![
             ("File".to_string(), name),
             ("Page".to_string(), format!("{} / {}", index + 1, src.len())),
             ("Size".to_string(), size),
@@ -1551,7 +1552,21 @@ impl State {
             ("Resolution".to_string(), res),
             ("Format".to_string(), fmt),
             ("Color".to_string(), color),
-        ]
+        ];
+        // LQ preview tier: fill progress + what's on screen for this page (HQ
+        // full-res, the soft LQ thumbnail, or neither yet).
+        let showing = if self.reader.cache.contains(index) {
+            "HQ"
+        } else if self.reader.lq_cache.contains(index) {
+            "LQ preview"
+        } else {
+            "—"
+        };
+        lines.push((
+            "LQ tier".to_string(),
+            format!("{}/{} · {}", self.reader.lq_cache.len(), src.len(), showing),
+        ));
+        lines
     }
 
     /// The in-view anchor page if it is an animated (GIF/WebP) page with its texture
@@ -1702,20 +1717,9 @@ impl State {
             self.open(&p);
         }
 
-        // Drain finished decodes into the cache.
-        if let Some(pool) = &self.reader.pool {
-            for msg in pool.poll() {
-                match msg {
-                    Msg::Done { index, page } => {
-                        self.reader.est_aspect = page.h as f32 / page.w as f32;
-                        self.reader.cache.insert(index, page, self.reader.index);
-                    }
-                    Msg::Failed { index, error } => {
-                        self.reader.failed.insert(index, error);
-                    }
-                }
-            }
-        }
+        // Drain finished decodes into the right cache (full-res → cache, LQ-tier
+        // thumbnails → lq_cache) and record failures.
+        self.reader.drain_pool();
         // Apply finished background opens, newest generation only — a later
         // `[`/`]` bumps `open_gen`, so a stale in-flight result is discarded.
         while let Ok((generation, built)) = self.open_rx.try_recv() {
@@ -1910,7 +1914,7 @@ impl State {
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
-                self.reader.cache.get(q.page_index).map(|t| {
+                self.reader.page_texture(q.page_index).map(|t| {
                     // The animation under user control shows its selected frame;
                     // any other animated page free-runs on the wall clock; stills
                     // return their sole view. Continuous redraw drives both.

@@ -28,6 +28,21 @@ impl PageCache {
         self.map.contains_key(&index)
     }
 
+    /// Number of pages currently resident (used for the LQ-tier fill readout).
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    /// Eviction ceiling — used by the LQ tier to stop filling (and stop the redraw
+    /// loop) once a volume larger than the cache has filled what fits.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
     pub fn get(&self, index: usize) -> Option<&PageTexture> {
         self.map.get(&index)
     }
