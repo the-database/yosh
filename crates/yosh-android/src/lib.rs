@@ -688,6 +688,11 @@ impl Shell {
             .copied()
             .unwrap_or(0)
             .min(src.len().saturating_sub(1));
+        if src.is_partial() {
+            // No on-screen toast system on Android yet, so just log it; the archive
+            // still opens with the pages recovered before the truncation.
+            log::info!("partial archive recovered: {} pages", src.len());
+        }
         if let Some(app) = self.app.as_mut() {
             attach_source(
                 &mut app.reader,
