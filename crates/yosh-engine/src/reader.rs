@@ -988,6 +988,18 @@ impl Reader {
             tail.sort_by_key(|&i| (i as i64 - cur).abs());
             jobs.extend(tail.into_iter().map(|i| (i, LQ_THUMB_H, true, true)));
         }
+        // Cold-page preview: if an in-view page has neither a full-res nor a thumbnail
+        // texture, prepend a high-priority thumbnail so it decodes in parallel with the
+        // HQ window (dedup is per (index, thumb)) — page_texture then shows a soft
+        // preview at ~decompress time instead of a blank spinner while a big HQ decode
+        // finishes. Self-limits: enqueued only while the page is cold (e.g. the first
+        // page on open, or a jump into an un-warmed region).
+        let (va, vb) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        for p in [Some(va), vb].into_iter().flatten() {
+            if !self.cache.contains(p) && !self.lq_cache.contains(p) && !self.failed.contains_key(&p) {
+                jobs.insert(0, (p, LQ_THUMB_H, true, true));
+            }
+        }
         if let Some(pool) = &self.pool {
             pool.set_jobs(jobs);
         }
