@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 use yosh_engine::gpu::GpuContext;
 use yosh_engine::layout::{view_pages, view_start, Layout};
 use yosh_engine::page::{FitMode, PagePipeline};
-use yosh_engine::pool::{DecodePool, Msg};
+use yosh_engine::pool::DecodePool;
 use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, SevenzSource, ZipSource};
 use yosh_engine::texpool::TexturePool;
@@ -755,6 +755,7 @@ fn attach_source(
         reader.workers,
     ));
     reader.cache.clear();
+    reader.lq_cache.clear();
     reader.failed.clear();
     reader.index = start;
     reader.source = Some(src);
@@ -1383,6 +1384,18 @@ impl App {
             "Direction".to_string(),
             self.reader.direction.label().to_string(),
         ));
+        // LQ preview tier: fill progress + what's on screen for this page.
+        let showing = if self.reader.cache.contains(idx) {
+            "HQ"
+        } else if self.reader.lq_cache.contains(idx) {
+            "LQ preview"
+        } else {
+            "—"
+        };
+        lines.push((
+            "LQ tier".to_string(),
+            format!("{}/{} · {}", self.reader.lq_cache.len(), len, showing),
+        ));
         lines
     }
 
@@ -1425,20 +1438,9 @@ impl App {
         // decode view / prefetch / build-quads below read `reader.layout`, so a
         // rotation switches this same frame (no one-frame flash of the old layout).
         self.apply_resolved_layout();
-        // Drain finished decodes into the cache.
-        if let Some(pool) = &self.reader.pool {
-            for msg in pool.poll() {
-                match msg {
-                    Msg::Done { index, page } => {
-                        self.reader.est_aspect = page.h as f32 / page.w as f32;
-                        self.reader.cache.insert(index, page, self.reader.index);
-                    }
-                    Msg::Failed { index, error } => {
-                        self.reader.failed.insert(index, error);
-                    }
-                }
-            }
-        }
+        // Drain finished decodes into the right cache (full-res → cache, LQ-tier
+        // thumbnails → lq_cache) and record failures.
+        self.reader.drain_pool();
         self.reader.update_decode_view();
         self.reader.prefetch();
 
@@ -1447,7 +1449,7 @@ impl App {
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
-                self.reader.cache.get(q.page_index).map(|t| {
+                self.reader.page_texture(q.page_index).map(|t| {
                     let view = t.view_at(anim_t);
                     self.page_pipeline.prepare_quad(
                         &self.ctx.device,
@@ -1825,6 +1827,7 @@ impl App {
         if self.library_view
             || !self.reader.view_settled
             || !self.reader.view_is_hq()
+            || self.reader.lq_fill_pending()
             || hints_visible
         {
             self.window.request_redraw();

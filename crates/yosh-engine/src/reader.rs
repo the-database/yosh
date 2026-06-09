@@ -14,7 +14,7 @@ use crate::cache::PageCache;
 use crate::decode::MAX_TEX_DIM;
 use crate::layout::{self, Layout};
 use crate::page::{fit_scale, FitMode, PageTexture, MAX_QUADS};
-use crate::pool::DecodePool;
+use crate::pool::{DecodePool, Msg};
 use crate::prefetch::desired_window;
 use crate::source::PageSource;
 use crate::texpool::TexturePool;
@@ -150,6 +150,10 @@ pub struct Budget {
     pub fwd_max: usize,
     /// Backward prefetch window (pages behind).
     pub back: usize,
+    /// Eviction ceiling for the whole-volume LQ thumbnail cache (`lq_cache`). Large
+    /// enough to hold a normal volume's worth of tiny previews; for huge volumes the
+    /// cache's distance-eviction keeps the nearest pages.
+    pub lq_cap: usize,
 }
 
 impl Budget {
@@ -163,7 +167,8 @@ impl Budget {
         let fwd = (cache_cap / 3).clamp(6, 16);
         let fwd_max = (fwd * 5 / 2).clamp(12, 40);
         let back = (fwd / 2).clamp(3, 6);
-        Self { workers, cache_cap, texpool_max, fwd, fwd_max, back }
+        let lq_cap = cache_cap.saturating_mul(16);
+        Self { workers, cache_cap, texpool_max, fwd, fwd_max, back, lq_cap }
     }
 }
 
@@ -201,6 +206,11 @@ pub fn quad_from_px(
 /// Default h/w aspect estimate for not-yet-decoded pages in the scroll strip.
 pub const DEFAULT_ASPECT: f32 = 1.5;
 
+/// Decoded height (px) for whole-volume LQ-tier thumbnails — small enough that a
+/// full volume of previews is cheap (~0.2 MB/page gray), large enough to read which
+/// page you're on. Shown only transiently until the full-res page lands.
+pub const LQ_THUMB_H: u32 = 540;
+
 /// The platform-agnostic reading-state machine: navigation, zoom/pan, fit/layout,
 /// the continuous-scroll anchor, the decode-view debounce, and the engine
 /// resources (page source, decode pool, cache, texture pool) it drives. A shell
@@ -215,6 +225,11 @@ pub struct Reader {
     pub source: Option<Arc<dyn PageSource>>,
     pub pool: Option<DecodePool>,
     pub cache: PageCache,
+    /// Whole-volume LQ preview tier: one tiny `LQ_THUMB_H`-tall thumbnail per page,
+    /// filled at lowest priority and drawn as a transient fallback when the full-res
+    /// page isn't cached yet (instant seek/jump). Always on; bounded by its own cap
+    /// (`Budget::lq_cap`). Separate from the `two_tier` fast-filter flag (same-res).
+    pub lq_cache: PageCache,
     /// Worker count for the decode pool, kept so `set_source` can rebuild it.
     pub workers: usize,
     /// Pages whose decode errored, mapped to the error message (shown to the user).
@@ -279,6 +294,7 @@ impl Reader {
     ) -> Self {
         Self {
             cache: PageCache::new(budget.cache_cap, tex_pool.clone()),
+            lq_cache: PageCache::new(budget.lq_cap, tex_pool.clone()),
             device,
             queue,
             tex_pool,
@@ -318,6 +334,55 @@ impl Reader {
     /// Queue a transient message; the shell drains it into its timed toast.
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.pending_toasts.push(msg.into());
+    }
+
+    /// Drain finished decodes from the pool into the right cache — full-res pages to
+    /// `cache`, whole-volume LQ thumbnails to `lq_cache` — and record failures. Both
+    /// shells call this once per frame (replaces a duplicated poll loop).
+    pub fn drain_pool(&mut self) {
+        let msgs = match &self.pool {
+            Some(pool) => pool.poll(),
+            None => return,
+        };
+        for msg in msgs {
+            match msg {
+                Msg::Done { index, page, thumb } => {
+                    if thumb {
+                        self.lq_cache.insert(index, page, self.index);
+                    } else {
+                        self.est_aspect = page.h as f32 / page.w as f32;
+                        self.cache.insert(index, page, self.index);
+                    }
+                }
+                Msg::Failed { index, error } => {
+                    self.failed.insert(index, error);
+                }
+            }
+        }
+    }
+
+    /// The texture to draw for page `i`: the full-res page if cached, else the
+    /// whole-volume LQ thumbnail — a transient upscaled preview that `view_is_hq()`
+    /// still reports as not-HQ, so the view keeps redrawing until the full-res decode
+    /// lands and snaps in.
+    pub fn page_texture(&self, i: usize) -> Option<&PageTexture> {
+        self.cache.get(i).or_else(|| self.lq_cache.get(i))
+    }
+
+    /// True while the LQ thumbnail cache still has room *and* pages with neither a
+    /// full-res nor a thumbnail texture — the shell keeps redrawing so the background
+    /// fill (and its drain) completes. Once `lq_cache` is full (a volume larger than
+    /// `lq_cap` filled what fits) it returns false, so the loop idles instead of
+    /// spinning forever.
+    pub fn lq_fill_pending(&self) -> bool {
+        if self.lq_cache.len() >= self.lq_cache.cap() {
+            return false;
+        }
+        let Some(src) = &self.source else {
+            return false;
+        };
+        (0..src.len())
+            .any(|i| !self.cache.contains(i) && !self.lq_cache.contains(i) && !self.failed.contains_key(&i))
     }
 }
 
@@ -640,11 +705,11 @@ impl Reader {
         let sh = self.viewport.h.max(1) as f32;
 
         let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ta = self.cache.get(a);
+        let ta = self.page_texture(a);
         // Wide (landscape) page is a double-spread image → show it alone.
         let force_single = ta.map_or(false, |t| t.w > t.h);
         let b = if force_single { None } else { b };
-        let tb = b.and_then(|bi| self.cache.get(bi).map(|t| (bi, t)));
+        let tb = b.and_then(|bi| self.page_texture(bi).map(|t| (bi, t)));
 
         match (ta, tb) {
             (Some(ta), Some((bi, tb))) => {
@@ -682,9 +747,10 @@ impl Reader {
             }
             (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
             _ => {
-                // Anchor not decoded yet: hold the last-drawn page if still cached.
+                // Anchor has no texture yet (not even a thumbnail): hold the
+                // last-drawn page if it still has one.
                 if let Some(li) = self.last_drawn
-                    && let Some(t) = self.cache.get(li)
+                    && let Some(t) = self.page_texture(li)
                 {
                     return vec![self.single_quad(li, t, sw, sh)];
                 }
@@ -695,7 +761,7 @@ impl Reader {
 
     pub fn page_display_h(&self, i: usize, sw: f32) -> f32 {
         let cw = sw * self.zoom; // strip content width (zoomable)
-        match self.cache.get(i) {
+        match self.page_texture(i) {
             Some(t) => cw * (t.h as f32 / t.w as f32),
             None => cw * self.est_aspect,
         }
@@ -757,7 +823,7 @@ impl Reader {
         while i < len && y < sh && slot < MAX_QUADS {
             let dh = self.page_display_h(i, sw);
             if y + dh > 0.0 {
-                if self.cache.get(i).is_some() {
+                if self.page_texture(i).is_some() {
                     quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
                     slot += 1;
                 }
@@ -888,21 +954,43 @@ impl Reader {
         // LQ flash when the buffer keeps up.)
         let anchor = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
         let lq = self.two_tier && !self.cache.contains(anchor);
-        let jobs: Vec<(usize, u32, bool)> = desired_window(self.index, len, fwd, self.back)
-            .into_iter()
+        let window = desired_window(self.index, len, fwd, self.back);
+        let mut jobs: Vec<(usize, u32, bool, bool)> = window
+            .iter()
+            .copied()
             .filter(|i| !self.failed.contains_key(i))
             .filter_map(|i| {
                 let want = self.page_target_h(i);
                 match self.cache.get(i) {
-                    None => Some((i, want, lq)),
+                    None => Some((i, want, lq, false)),
                     Some(p) => {
                         let target_stale = settled && p.target_h != want;
                         let quality_stale = !lq && p.lq; // have LQ, now want HQ
-                        (target_stale || quality_stale).then_some((i, want, lq))
+                        (target_stale || quality_stale).then_some((i, want, lq, false))
                     }
                 }
             })
             .collect();
+        // Whole-volume LQ tier: append a lowest-priority tail of tiny thumbnail jobs
+        // for every page not in the HQ window, not already full-res cached, and not
+        // already thumbnailed — nearest-first so a scrub finds previews sooner. The
+        // by-index inflight dedup in `set_jobs` keeps these from colliding with the
+        // window, and the list self-empties as `lq_cache` fills. Stops once the cache
+        // is full so a volume larger than `lq_cap` doesn't churn every frame.
+        if self.lq_cache.len() < self.lq_cache.cap() {
+            let in_window: std::collections::HashSet<usize> = window.iter().copied().collect();
+            let mut tail: Vec<usize> = (0..len)
+                .filter(|i| {
+                    !in_window.contains(i)
+                        && !self.cache.contains(*i)
+                        && !self.lq_cache.contains(*i)
+                        && !self.failed.contains_key(i)
+                })
+                .collect();
+            let cur = self.index as i64;
+            tail.sort_by_key(|&i| (i as i64 - cur).abs());
+            jobs.extend(tail.into_iter().map(|i| (i, LQ_THUMB_H, true, true)));
+        }
         if let Some(pool) = &self.pool {
             pool.set_jobs(jobs);
         }
