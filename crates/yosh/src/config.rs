@@ -38,9 +38,6 @@ pub struct Settings {
     pub spread_offsets: HashMap<String, u8>,
     /// Whether the keys overlay has been shown once (first-launch onboarding).
     pub help_seen: bool,
-    /// "Jump" seek mode (key J): skip ahead past not-yet-decoded pages for fast
-    /// long-distance seeks. Default off = "step" (hold on each page; see them all).
-    pub jump: bool,
     /// Show the bottom seekbar (auto-hides; reveals when the cursor nears the
     /// bottom edge). Toggled with key `B`.
     pub seekbar_enabled: bool,
@@ -60,7 +57,6 @@ impl Default for Settings {
             last_pages: HashMap::new(),
             spread_offsets: HashMap::new(),
             help_seen: false,
-            jump: false,
             seekbar_enabled: true,
             window: None,
         }

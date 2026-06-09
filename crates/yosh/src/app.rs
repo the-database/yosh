@@ -737,7 +737,6 @@ impl ApplicationHandler for App {
                 Layout::Single
             },
             settings.scroll,
-            settings.jump,
             if settings.direction_rtl {
                 Direction::Rtl
             } else {
@@ -887,7 +886,6 @@ enum Action {
     ToggleAnimBar,
     PrevVolume,
     NextVolume,
-    ToggleJump,
     Rotate,
     ShowInExplorer,
     Quit,
@@ -909,7 +907,6 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyS => return Some(Action::ToggleLayout),
             KeyCode::KeyO => return Some(Action::ToggleSpreadOffset),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
-            KeyCode::KeyJ => return Some(Action::ToggleJump),
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
             KeyCode::KeyG => return Some(Action::ToggleAnimBar),
             KeyCode::KeyE => return Some(Action::ShowInExplorer),
@@ -1081,12 +1078,6 @@ impl State {
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
-            Action::ToggleJump => {
-                self.reader.jump = !self.reader.jump;
-                self.settings.jump = self.reader.jump;
-                config::save(&self.settings);
-                self.toast(if self.reader.jump { "Jump mode" } else { "Step mode" });
-            }
             Action::Rotate => {
                 self.reader.rotation = (self.reader.rotation + 1) % 4;
                 // Recenter: the rotated box has different bounds, so any prior pan
@@ -1860,7 +1851,7 @@ impl State {
                 self.reader.last_drawn = Some(anchor);
             }
             self.ui.status = format!(
-                "{}/{}{}{}",
+                "{}/{}{}",
                 self.reader.index + 1,
                 len,
                 if failed {
@@ -1870,7 +1861,6 @@ impl State {
                 } else {
                     ""
                 },
-                if self.reader.jump { "  [jump]" } else { "  [step]" }
             );
             self.ui.failed = fail_err.map(|reason| (src.name(anchor).to_string(), reason));
             // Show the centered spinner only after this page's decode has been

@@ -61,7 +61,7 @@ fn android_main(app: AndroidApp) {
     let init_view = view_file
         .as_deref()
         .map(load_view)
-        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window, false));
+        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -102,8 +102,8 @@ struct Shell {
     /// The library dir to open the browser at (persisted across launches).
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
-    /// Persisted viewing options (direction, layout, fit, jump) + where they live.
-    init_view: (Direction, LayoutMode, FitMode, bool),
+    /// Persisted viewing options (direction, layout, fit) + where they live.
+    init_view: (Direction, LayoutMode, FitMode),
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
@@ -329,7 +329,6 @@ impl ApplicationHandler for Shell {
             // window size (so an `Auto` launch already matches the orientation).
             self.init_view.1.resolve(config.width, config.height),
             false, // scroll_mode: page-flip
-            self.init_view.3, // jump (seek mode)
             self.init_view.0, // direction (default RTL)
             0,
             true, // two_tier: LQ while seeking → HQ on settle
@@ -763,11 +762,9 @@ fn attach_source(
 }
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
-/// Parse persisted viewing options ("dir,layout,fit,seek"); default RTL / single
-/// / window / step.
-fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool) {
-    let (mut dir, mut lay, mut fit, mut jump) =
-        (Direction::Rtl, LayoutMode::Single, FitMode::Window, false);
+/// Parse persisted viewing options ("dir,layout,fit"); default RTL / single / window.
+fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode) {
+    let (mut dir, mut lay, mut fit) = (Direction::Rtl, LayoutMode::Single, FitMode::Window);
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -785,15 +782,12 @@ fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool) {
             Some(&"actual") => FitMode::Actual,
             _ => FitMode::Window,
         };
-        if t.get(3) == Some(&"jump") {
-            jump = true;
-        }
     }
-    (dir, lay, fit, jump)
+    (dir, lay, fit)
 }
 
-/// Persist viewing options as "dir,layout,fit,seek".
-fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, jump: bool) {
+/// Persist viewing options as "dir,layout,fit".
+fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
     let f = match fit {
@@ -802,8 +796,7 @@ fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, jump: b
         FitMode::Actual => "actual",
         FitMode::Window => "window",
     };
-    let j = if jump { "jump" } else { "step" };
-    let _ = std::fs::write(path, format!("{d},{l},{f},{j}"));
+    let _ = std::fs::write(path, format!("{d},{l},{f}"));
 }
 
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
@@ -1137,11 +1130,9 @@ fn options_popup(
     layout: LayoutMode,
     effective_spread: bool,
     fit: FitMode,
-    jump: bool,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
-    set_jump: &mut Option<bool>,
     toggle_offset: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
@@ -1214,22 +1205,6 @@ fn options_popup(
                         {
                             *set_fit = Some(f);
                         }
-                    }
-                });
-
-                ui.label(egui::RichText::new("Seek mode").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(!jump, egui::RichText::new("Step").size(16.0))
-                        .clicked()
-                    {
-                        *set_jump = Some(false);
-                    }
-                    if ui
-                        .selectable_label(jump, egui::RichText::new("Jump (fast seek)").size(16.0))
-                        .clicked()
-                    {
-                        *set_jump = Some(true);
                     }
                 });
             });
@@ -1404,13 +1379,7 @@ impl App {
     /// orientation it happened to resolve to).
     fn persist_view(&self) {
         if let Some(f) = &self.view_file {
-            save_view(
-                f,
-                self.reader.direction,
-                self.layout_mode,
-                self.reader.fit,
-                self.reader.jump,
-            );
+            save_view(f, self.reader.direction, self.layout_mode, self.reader.fit);
         }
     }
 
@@ -1543,7 +1512,6 @@ impl App {
         let cur_layout = self.reader.layout;
         let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
-        let cur_jump = self.reader.jump;
         let lib_dir_str = self.lib_dir.display().to_string();
         // Snapshot the rows the closure needs (owned), so it borrows no `self`.
         let entries: Vec<(bool, String, PathBuf, Option<egui::TextureHandle>)> = self
@@ -1568,7 +1536,6 @@ impl App {
         let mut set_dir: Option<Direction> = None;
         let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
-        let mut set_jump: Option<bool> = None;
         let mut toggle_offset = false;
         let mut page_nav: i64 = 0;
         let mut book_nav: i64 = 0;
@@ -1693,11 +1660,9 @@ impl App {
                         cur_layout_mode,
                         cur_layout == Layout::Spread,
                         cur_fit,
-                        cur_jump,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
-                        &mut set_jump,
                         &mut toggle_offset,
                     );
                 }
@@ -1756,10 +1721,6 @@ impl App {
         if let Some(f) = set_fit {
             self.reader.fit = f;
             self.reader.prefetch();
-            self.persist_view();
-        }
-        if let Some(j) = set_jump {
-            self.reader.jump = j;
             self.persist_view();
         }
         if toggle_offset {
