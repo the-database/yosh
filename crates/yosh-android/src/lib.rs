@@ -876,6 +876,7 @@ fn seekbar(
     rtl: bool,
     spread: bool,
     buffered: &[usize],
+    lq_buffered: &[usize],
     seek_to: &mut Option<usize>,
     open_options: &mut bool,
     open_info: &mut bool,
@@ -941,10 +942,11 @@ fn seekbar(
                     if resp.changed() {
                         *seek_to = Some(if rtl { len - 1 - sv } else { sv });
                     }
-                    // mpv-style cache bar: a thin strip along the bottom of the rail
-                    // marking buffered (decode-ahead ready) pages — denser ahead of
-                    // the handle than behind, since the pipeline reads forward.
-                    if !buffered.is_empty() {
+                    // mpv-style cache bar: thin ticks along the bottom of the rail.
+                    // Faint wash = LQ preview thumbnails (whole volume once warm);
+                    // brighter ticks = decode-ahead HQ pages near the handle, drawn on
+                    // top. Both stay subordinate to the blue handle/rail.
+                    if !buffered.is_empty() || !lq_buffered.is_empty() {
                         let track = resp.rect;
                         let r = track.height() / 2.5; // egui's slider handle radius
                         let x0 = track.left() + r;
@@ -954,25 +956,26 @@ fn seekbar(
                         let half = (span / last * 0.5).max(0.75); // half a page-step wide
                         let yb = track.bottom() - 1.0;
                         let yt = yb - 2.0;
-                        // Muted + translucent so it stays subordinate to the blue
-                        // handle/rail — bonus info, not a competing element.
-                        let buf = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
+                        let lq_tick = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 55);
+                        let hq_tick = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
                         let p = ui.painter();
-                        for &i in buffered {
-                            if i >= len {
-                                continue;
+                        // LQ wash first, then HQ on top. Mirror the slider's own RTL
+                        // value transform so ticks line up with where the handle sits.
+                        for (set, color) in [(lq_buffered, lq_tick), (buffered, hq_tick)] {
+                            for &i in set {
+                                if i >= len {
+                                    continue;
+                                }
+                                let sv_i = if rtl { last - i as f32 } else { i as f32 };
+                                let xc = x0 + sv_i / last * span;
+                                let a = (xc - half).clamp(x0, x1);
+                                let b = (xc + half).clamp(x0, x1);
+                                p.rect_filled(
+                                    egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
+                                    0.0,
+                                    color,
+                                );
                             }
-                            // Mirror the slider's own RTL value transform so ticks
-                            // line up with where the handle sits for that page.
-                            let sv_i = if rtl { last - i as f32 } else { i as f32 };
-                            let xc = x0 + sv_i / last * span;
-                            let a = (xc - half).clamp(x0, x1);
-                            let b = (xc + half).clamp(x0, x1);
-                            p.rect_filled(
-                                egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
-                                0.0,
-                                buf,
-                            );
                         }
                     }
                 });
@@ -1499,6 +1502,7 @@ impl App {
         let cur = self.reader.index;
         // Buffered (decode-ahead ready) page indices for the seekbar's cache bar.
         let buffered: Vec<usize> = self.reader.cache.buffered_indices().collect();
+        let lq_buffered: Vec<usize> = self.reader.lq_cache.buffered_indices().collect();
         let library_view = self.library_view;
         let controls = self.controls;
         let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
@@ -1643,6 +1647,7 @@ impl App {
                     rtl,
                     cur_layout == Layout::Spread,
                     &buffered,
+                    &lq_buffered,
                     &mut seek_to,
                     &mut open_options,
                     &mut open_info,

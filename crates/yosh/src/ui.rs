@@ -73,6 +73,9 @@ pub struct UiState {
     /// Page indices currently buffered (decode-ahead ready set), painted as an
     /// mpv-style cache bar under the seekbar track. Refilled by the app each frame.
     pub seek_buffered: Vec<usize>,
+    /// Page indices with an LQ preview thumbnail (the whole volume once warm),
+    /// painted as a fainter wash beneath the HQ cache bar. Refilled each frame.
+    pub seek_lq_buffered: Vec<usize>,
     /// Pointer is over the seekbar this frame. Lets the app keep routing the
     /// mouse wheel to the reader (the bar isn't scrollable) while egui still
     /// gets clicks/drags for seeking.
@@ -193,12 +196,30 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     // which pages are buffered (the decode-ahead ready set). The
                     // pipeline keeps more pages ahead than behind, so the band sits
                     // asymmetrically around the handle.
+                    let half = (span / last * 0.5).max(0.75); // half a page-step wide
+                    let (yt, yb) = (cy + 6.0, cy + 8.0);
+                    // Faint wash: pages with an LQ preview thumbnail (the whole volume
+                    // once warm). Same green as the HQ bar but barely-there, so it
+                    // reads as a single cache bar with two intensities; the brighter
+                    // HQ ticks below draw on top.
+                    let lq_tick = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 55);
+                    for &i in &st.seek_lq_buffered {
+                        if i >= total {
+                            continue;
+                        }
+                        let xc = x_of(i as f32 / last);
+                        let a = (xc - half).clamp(x0, x1);
+                        let b = (xc + half).clamp(x0, x1);
+                        p.rect_filled(
+                            egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
+                            0.0,
+                            lq_tick,
+                        );
+                    }
                     if !st.seek_buffered.is_empty() {
                         // Muted + translucent so it reads as secondary info — never
                         // louder than the progress fill (alpha 190) or the handle.
                         let buf = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
-                        let half = (span / last * 0.5).max(0.75); // half a page-step wide
-                        let (yt, yb) = (cy + 6.0, cy + 8.0);
                         for &i in &st.seek_buffered {
                             if i >= total {
                                 continue;
