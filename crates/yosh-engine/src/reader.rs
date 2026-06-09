@@ -247,7 +247,6 @@ pub struct Reader {
     pub pan_x: f32,           // page-flip pan offset in screen px (from centered)
     pub pan_y: f32,
     pub direction: Direction,
-    pub jump: bool, // seek mode (key J): true = skip ahead, false = step every page
     /// Two-tier decode: LQ (fast) while seeking → HQ on settle. Off = always HQ
     /// (the desktop's behavior).
     two_tier: bool,
@@ -287,7 +286,6 @@ impl Reader {
         fit: FitMode,
         layout: Layout,
         scroll_mode: bool,
-        jump: bool,
         direction: Direction,
         start_index: usize,
         two_tier: bool,
@@ -313,7 +311,6 @@ impl Reader {
             pan_x: 0.0,
             pan_y: 0.0,
             direction,
-            jump,
             nav_times: VecDeque::new(),
             scroll_mode,
             top_offset: 0.0,
@@ -1259,25 +1256,29 @@ mod tests {
 }
 
 impl Reader {
-    /// Flip one view in `dir`. Returns `true` if the position actually changed. At
-    /// the first/last page it queues a toast and returns `false`; in step mode while
-    /// the current page is still decoding it just returns `false`.
+    /// Flip one view in `dir`. Returns `true` if the position actually changed; at
+    /// the first/last page it queues a toast and returns `false`.
+    ///
+    /// Seeking gates on the *preview*, not on HQ: while the current page has no
+    /// texture at all — not even the whole-volume LQ thumbnail — and that thumbnail
+    /// could still arrive, the flip is held, so a fast seek shows every page (as LQ)
+    /// rather than skipping past undecoded ones. Once the LQ cache is warm this
+    /// effectively never blocks (the replacement for the old step/jump toggle: LQ
+    /// makes "see every page" automatic at LQ speed). Two escapes keep nav unstuck:
+    /// a *failed* page (never cached) is allowed past, and a volume larger than the
+    /// LQ cap (cache full → its tail can't be thumbnailed) advances freely there.
     pub fn step(&mut self, dir: i64) -> bool {
         let Some(src) = &self.source else { return false };
         let len = src.len();
         if len == 0 {
             return false;
         }
-        // "Step" seek (default; toggle "jump" with J): don't flip while the
-        // current page is still decoding, so you see every page instead of
-        // skipping past it. "Jump" skips ahead for fast long-distance seeks. A
-        // *failed* page never lands in the cache, so allow stepping past it —
-        // otherwise next/prev gets stuck on an unopenable page.
-        if !self.jump {
-            let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
-            if !self.cache.contains(cur) && !self.failed.contains_key(&cur) {
-                return false;
-            }
+        let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
+        if self.page_texture(cur).is_none()
+            && !self.failed.contains_key(&cur)
+            && self.lq_cache.len() < self.lq_cache.cap()
+        {
+            return false;
         }
         let next = if dir > 0 {
             layout::next_view(self.layout, self.index, len, self.spread_offset)

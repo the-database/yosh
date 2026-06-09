@@ -47,7 +47,6 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `[` / `]` | previous / next book (folder or archive) |
 | Views | `9` fit window · `8` fit width · `0` 100% (1:1) · `7` two-page L→R · `6` two-page R→L |
 | `S` / `D` / `C` / `O` | spread ↔ single · direction RTL↔LTR · continuous scroll · shift spread pairing |
-| `J` | seek mode: **step** (see every page) ↔ **jump** (skip ahead) |
 | `R` | rotate 90° clockwise (single-page view; resets on opening a new book) |
 | `+` `-` | zoom; drag to pan |
 | `E` | show in Explorer (opens the folder and selects the file/archive) |
@@ -57,7 +56,7 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | double-click | fullscreen (middle of the page); `F11` also toggles |
 | `Esc` | quit |
 
-Reading position (per volume), reading direction, fit, layout, spread offset, scroll, seek mode,
+Reading position (per volume), reading direction, fit, layout, spread offset, scroll,
 and seekbar visibility are persisted.
 
 ## AVIF (optional)
