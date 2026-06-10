@@ -8,6 +8,10 @@ import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.View;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 
 // A thin NativeActivity subclass that exists only to bridge the Storage Access
 // Framework, which the NDK can't reach: a bare NativeActivity receives no
@@ -62,6 +66,55 @@ public class YoshActivity extends NativeActivity {
             intent.setType("*/*");
             startActivityForResult(intent, PICK_REQUEST);
         });
+    }
+
+    /** Hide/show the system bars (status + navigation). Called from native via JNI.
+     *  immersive=true → hide with swipe-to-reveal (sticky); false → show. The window
+     *  is always edge-to-edge (full-bleed): NativeActivity takes the window surface
+     *  directly, so it ignores fitSystemWindows and the surface spans the whole
+     *  screen regardless — the native side insets its own chrome (see
+     *  statusBarHeight) when the bars are shown. */
+    public void setImmersive(boolean immersive) {
+        runOnUiThread(() -> {
+            Window window = getWindow();
+            if (Build.VERSION.SDK_INT >= 30) {
+                window.setDecorFitsSystemWindows(false);
+                WindowInsetsController c = window.getInsetsController();
+                if (c != null) {
+                    int bars = WindowInsets.Type.statusBars()
+                             | WindowInsets.Type.navigationBars();
+                    if (immersive) {
+                        c.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                        c.hide(bars);
+                    } else {
+                        c.show(bars);
+                    }
+                }
+            } else {
+                // Pre-API-30: deprecated visibility flags.
+                View decor = window.getDecorView();
+                int layout = View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                           | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                           | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
+                if (immersive) {
+                    decor.setSystemUiVisibility(layout
+                        | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_FULLSCREEN
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+                } else {
+                    decor.setSystemUiVisibility(layout);
+                }
+            }
+        });
+    }
+
+    /** Status-bar height in px (0 if unknown). A constant from the platform
+     *  resource, so it doesn't depend on the bars' current (async) visibility — the
+     *  native side pads its top chrome by this while the bars are shown. */
+    public int statusBarHeight() {
+        int id = getResources().getIdentifier("status_bar_height", "dimen", "android");
+        return id > 0 ? getResources().getDimensionPixelSize(id) : 0;
     }
 
     /** Open a previously-picked content:// URI as an owned file descriptor (-1 on
