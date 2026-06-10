@@ -49,6 +49,12 @@ fn android_main(app: AndroidApp) {
     // Per-comic reading positions persist in the app's private dir.
     let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
     let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
+    // Reading progress (furthest page seen + total) → the library's read states.
+    let progress_path = app.internal_data_path().map(|p| p.join("progress.tsv"));
+    let progress = progress_path.as_deref().map(load_progress).unwrap_or_default();
+    // Series the user collapsed in the library (default expanded).
+    let collapsed_path = app.internal_data_path().map(|p| p.join("collapsed.txt"));
+    let collapsed = collapsed_path.as_deref().map(load_collapsed).unwrap_or_default();
     let lib_dir_file = app.internal_data_path().map(|p| p.join("libroot.txt"));
     let init_lib_dir = lib_dir_file
         .as_deref()
@@ -72,6 +78,10 @@ fn android_main(app: AndroidApp) {
         picker_pending: false,
         positions,
         pos_path,
+        progress,
+        progress_path,
+        collapsed,
+        collapsed_path,
         current_key: None,
         has_files: false,
         init_lib_dir,
@@ -99,6 +109,16 @@ struct Shell {
     positions: HashMap<String, usize>,
     /// Where `positions` persists (app's private dir).
     pos_path: Option<PathBuf>,
+    /// Per-comic reading progress: (furthest 1-based page reached, total pages).
+    /// Distinct from `positions` (the *current* page — re-reading from the start
+    /// must not unmark a finished volume). Drives the library's read/unread
+    /// fades and the series status labels.
+    progress: HashMap<String, (u32, u32)>,
+    progress_path: Option<PathBuf>,
+    /// Library series the user collapsed (storing the collapsed set makes
+    /// expanded the default for anything new).
+    collapsed: std::collections::HashSet<PathBuf>,
+    collapsed_path: Option<PathBuf>,
     /// Identity of the currently-open comic, for saving its position.
     current_key: Option<String>,
     /// Cached all-files-access state (refreshed on resume + library toggle).
@@ -187,8 +207,22 @@ struct App {
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     thumb_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
     thumb_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
-    /// The dir whose covers were queued for decode (so we don't re-queue).
-    thumb_dir: Option<PathBuf>,
+    /// Covers already queued for decode (lazy, per visible series section).
+    queued_covers: std::collections::HashSet<PathBuf>,
+    /// Frame stamp a cover was last drawn (LRU for the `thumbs` cap — a big
+    /// library would otherwise pin hundreds of MB of egui textures).
+    thumb_used: HashMap<PathBuf, u64>,
+    /// Monotonic render counter for `thumb_used`.
+    frame_no: u64,
+    /// The library's series sections (scanned off-thread; see `spawn_library_scan`).
+    series: Vec<Series>,
+    series_rx: std::sync::mpsc::Receiver<Vec<Series>>,
+    series_tx: std::sync::mpsc::Sender<Vec<Series>>,
+    /// A series scan is in flight ("Scanning…" placeholder).
+    series_pending: bool,
+    /// Library sub-mode: the old folder grid, kept solely for picking a new
+    /// library root ("Change library…"); false = the series view.
+    lib_browse: bool,
     /// Reading chrome: seekbar shows when `controls`; the gear opens the
     /// viewing-options popup. The zone hints show only briefly after the controls
     /// are revealed (see `controls_shown_at`), so they don't clutter while reading.
@@ -218,6 +252,147 @@ struct App {
 enum Entry {
     Dir(PathBuf),
     Comic(PathBuf),
+}
+
+/// One library series: a folder that directly holds volumes (comic archives
+/// and/or image-folder comics). Built by [`spawn_library_scan`].
+struct Series {
+    dir: PathBuf,
+    name: String,
+    volumes: Vec<PathBuf>,
+}
+
+/// A volume's read state, derived from the shell's progress/positions maps.
+#[derive(Clone, Copy, PartialEq)]
+enum VolState {
+    Unread,
+    /// Started but not finished; the fraction read (0..1) drives the progress bar.
+    InProgress(f32),
+    Finished,
+}
+
+/// Derive a volume's read state. `Finished` once the furthest page seen reached
+/// the total; a legacy `positions` entry without progress data counts as
+/// started (pre-tracking books can't claim a furthest page).
+fn vol_state(
+    progress: &HashMap<String, (u32, u32)>,
+    positions: &HashMap<String, usize>,
+    key: &str,
+) -> VolState {
+    match progress.get(key) {
+        Some(&(furthest, total)) if total > 0 && furthest >= total => VolState::Finished,
+        Some(&(furthest, total)) => {
+            VolState::InProgress(furthest as f32 / total.max(1) as f32)
+        }
+        None if positions.contains_key(key) => VolState::InProgress(0.0),
+        None => VolState::Unread,
+    }
+}
+
+/// The series header's right-side status label.
+fn series_status(states: &[VolState]) -> String {
+    let unread = states.iter().filter(|s| **s == VolState::Unread).count();
+    let reading = states.iter().any(|s| matches!(s, VolState::InProgress(_)));
+    if reading {
+        if unread > 0 {
+            format!("Reading · {unread} unread")
+        } else {
+            "Reading".to_string()
+        }
+    } else if unread > 0 {
+        format!("{unread} unread")
+    } else {
+        "Finished".to_string()
+    }
+}
+
+/// Max folder depth `spawn_library_scan` descends looking for series.
+const SERIES_MAX_DEPTH: usize = 5;
+
+/// Walk `root` off-thread and group its comics into [`Series`] — every folder
+/// that directly holds at least one volume. Sent back whole (drained in render
+/// like the cover decodes), so a deep tree or slow storage never hitches the UI.
+fn spawn_library_scan(root: PathBuf, tx: std::sync::mpsc::Sender<Vec<Series>>) {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if walk_series(&root, 0, &mut out) {
+            // The root itself is an image-folder comic: a one-volume "series".
+            out.push(Series {
+                name: name_of(&root),
+                volumes: vec![root.clone()],
+                dir: root,
+            });
+        }
+        // Path order keeps nested series next to their parents, naturally sorted.
+        out.sort_by(|a, b| {
+            natord::compare(
+                &a.dir.to_string_lossy().to_lowercase(),
+                &b.dir.to_string_lossy().to_lowercase(),
+            )
+        });
+        let _ = tx.send(out);
+    });
+}
+
+/// One `read_dir` per folder: image files make the folder itself a volume
+/// (returns true; the caller adds it and does not descend), archives become
+/// volumes, and remaining sub-folders recurse as potential series.
+fn walk_series(dir: &Path, depth: usize, out: &mut Vec<Series>) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    let mut volumes: Vec<PathBuf> = Vec::new();
+    let mut subdirs: Vec<PathBuf> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            subdirs.push(p);
+        } else if is_comic_archive(&p) {
+            volumes.push(p);
+        } else if is_image_ext(&p) {
+            return true; // an image-folder comic — the caller's volume
+        }
+    }
+    for d in subdirs {
+        if depth < SERIES_MAX_DEPTH && walk_series(&d, depth + 1, out) {
+            volumes.push(d);
+        }
+    }
+    if !volumes.is_empty() {
+        volumes.sort_by(|a, b| natord::compare(&name_of(a).to_lowercase(), &name_of(b).to_lowercase()));
+        out.push(Series {
+            name: name_of(dir),
+            dir: dir.to_path_buf(),
+            volumes,
+        });
+    }
+    false
+}
+
+/// Shell-owned state the library view reads each frame (the App is rebuilt on
+/// every resume, so durable state lives on the Shell and is lent to `render`).
+struct LibCtx<'a> {
+    progress: &'a HashMap<String, (u32, u32)>,
+    positions: &'a HashMap<String, usize>,
+    collapsed: &'a std::collections::HashSet<PathBuf>,
+    current_key: Option<&'a str>,
+}
+
+/// Per-frame owned snapshot of one series section for the egui closure.
+struct SectionRow {
+    dir: PathBuf,
+    name: String,
+    expanded: bool,
+    status: String,
+    /// Empty when collapsed (no need to clone what won't draw).
+    volumes: Vec<VolCell>,
+}
+
+/// Per-frame owned snapshot of one volume cell.
+struct VolCell {
+    path: PathBuf,
+    label: String,
+    thumb: Option<egui::TextureHandle>,
+    state: VolState,
+    is_current: bool,
 }
 
 /// The user's page-layout *choice*. The engine's `Layout` is binary
@@ -271,6 +446,8 @@ struct FrameReqs {
     open_picker: bool,
     /// Open the library browser (from the empty-state helper).
     open_library: bool,
+    /// Toggle a library series' collapsed state (persisted on the Shell).
+    toggle_series: Option<PathBuf>,
     /// Seekbar page button: reading-order step (-1 prev / +1 next).
     page_nav: i64,
     /// Seekbar book button: open the prev/next sibling comic in the folder (-1/+1).
@@ -390,6 +567,7 @@ impl ApplicationHandler for Shell {
         );
         reader.transition_enabled = self.init_view.3; // page-turn animation (persisted; default on)
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
+        let (series_tx, series_rx) = std::sync::mpsc::channel();
         self.app = Some(App {
             window: window.clone(),
             ctx,
@@ -408,7 +586,14 @@ impl ApplicationHandler for Shell {
             thumbs: HashMap::new(),
             thumb_rx,
             thumb_tx,
-            thumb_dir: None,
+            queued_covers: std::collections::HashSet::new(),
+            thumb_used: HashMap::new(),
+            frame_no: 0,
+            series: Vec::new(),
+            series_rx,
+            series_tx,
+            series_pending: false,
+            lib_browse: false,
             controls: true,
             controls_shown_at: Instant::now(),
             book_title: String::new(),
@@ -483,10 +668,31 @@ impl ApplicationHandler for Shell {
                 let status_px = *self
                     .status_bar_px
                     .get_or_insert_with(|| status_bar_height(&self.android_app));
-                let reqs = match self.app.as_mut() {
-                    Some(app) => app.render(has_files, status_px),
+                let reqs = match &mut self.app {
+                    Some(app) => app.render(
+                        has_files,
+                        status_px,
+                        LibCtx {
+                            progress: &self.progress,
+                            positions: &self.positions,
+                            collapsed: &self.collapsed,
+                            current_key: self.current_key.as_deref(),
+                        },
+                    ),
                     None => FrameReqs::default(),
                 };
+                // Keep the read-tracking map current (cheap; persisted with the
+                // position saves) — covers seekbar jumps applied inside render.
+                self.note_progress();
+                if let Some(dir) = reqs.toggle_series {
+                    if !self.collapsed.remove(&dir) {
+                        self.collapsed.insert(dir);
+                    }
+                    self.save_collapsed();
+                    if let Some(app) = self.app.as_ref() {
+                        app.window.request_redraw();
+                    }
+                }
                 if reqs.grant {
                     request_all_files(&self.android_app);
                 }
@@ -768,8 +974,10 @@ impl Shell {
         self.has_files = has_all_files(&self.android_app);
         if let Some(app) = self.app.as_mut() {
             app.library_view = true;
-            app.lib_dir = app.lib_root.clone();
-            app.lib_entries = scan_dir(&app.lib_dir);
+            app.lib_browse = false;
+            if app.series.is_empty() && !app.series_pending {
+                app.kick_series_scan();
+            }
             app.window.request_redraw();
         }
     }
@@ -1002,6 +1210,48 @@ impl Shell {
             out.push_str(&format!("{v}\t{k}\n"));
         }
         let _ = std::fs::write(path, out);
+        // Progress rides along: every position-save moment is also the right
+        // durability point for the read-tracking map (so they can't drift).
+        self.save_progress();
+    }
+
+    fn save_progress(&self) {
+        let Some(path) = &self.progress_path else { return };
+        let mut out = String::new();
+        for (k, (furthest, total)) in &self.progress {
+            out.push_str(&format!("{furthest}\t{total}\t{k}\n"));
+        }
+        let _ = std::fs::write(path, out);
+    }
+
+    fn save_collapsed(&self) {
+        let Some(path) = &self.collapsed_path else { return };
+        let mut out = String::new();
+        for p in &self.collapsed {
+            out.push_str(&format!("{}\n", p.display()));
+        }
+        let _ = std::fs::write(path, out);
+    }
+
+    /// Update the in-memory read-tracking entry for the open comic: the furthest
+    /// page the reader has had on screen (1-based; the far page of a spread
+    /// counts) and the volume's total. Called every rendered frame while reading
+    /// — cheap map math; the file write happens with `save_positions`.
+    fn note_progress(&mut self) {
+        let (Some(key), Some(app)) = (self.current_key.clone(), self.app.as_ref()) else {
+            return;
+        };
+        let Some(src) = &app.reader.source else { return };
+        let len = src.len();
+        if len == 0 {
+            return;
+        }
+        let (a, b) =
+            view_pages(app.reader.layout, app.reader.index, len, app.reader.spread_offset);
+        let seen = (b.unwrap_or(a) + 1) as u32;
+        let e = self.progress.entry(key).or_insert((0, 0));
+        e.0 = e.0.max(seen);
+        e.1 = len as u32;
     }
 
     /// Read the chosen content:// file's bytes off its descriptor and open it.
@@ -1094,6 +1344,28 @@ fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, anim: b
     };
     let a = if anim { "on" } else { "off" };
     let _ = std::fs::write(path, format!("{d},{l},{f},{a}"));
+}
+
+fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
+    let mut map = HashMap::new();
+    if let Ok(s) = std::fs::read_to_string(path) {
+        for line in s.lines() {
+            // `furthest \t total \t key` — key last (it's the free-form field).
+            if let Some((furthest, rest)) = line.split_once('\t')
+                && let Some((total, key)) = rest.split_once('\t')
+                && let (Ok(f), Ok(t)) = (furthest.parse(), total.parse())
+            {
+                map.insert(key.to_string(), (f, t));
+            }
+        }
+    }
+    map
+}
+
+fn load_collapsed(path: &std::path::Path) -> std::collections::HashSet<PathBuf> {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
+        .unwrap_or_default()
 }
 
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
@@ -1476,6 +1748,61 @@ fn empty_state(ctx: &egui::Context, open_library: &mut bool, open_picker: &mut b
 const TOP_ZONE: f32 = 0.10;
 const EDGE_ZONE: f32 = 0.20;
 
+/// One volume in a series row: cover (faded when finished, thin progress bar
+/// when started, highlight stroke when currently open) + truncated name.
+/// Clicking opens it.
+fn volume_cell(ui: &mut egui::Ui, v: &VolCell, reqs: &mut FrameReqs, close_lib: &mut bool) {
+    const CELL_W: f32 = 140.0;
+    const COVER_H: f32 = 186.0;
+    ui.allocate_ui(egui::vec2(CELL_W, COVER_H + 38.0), |ui| {
+        ui.vertical(|ui| {
+            let finished = v.state == VolState::Finished;
+            let r = if let Some(t) = &v.thumb {
+                let mut img = egui::Image::new(t).fit_to_exact_size(egui::vec2(CELL_W, COVER_H));
+                if finished {
+                    // Read volumes fade out (Chunky-style).
+                    img = img.tint(egui::Color32::from_white_alpha(72));
+                }
+                ui.add(egui::ImageButton::new(img))
+            } else {
+                ui.add_sized(
+                    [CELL_W, COVER_H],
+                    egui::Button::new(egui::RichText::new("…").size(24.0)),
+                )
+            };
+            let accent = ui.visuals().selection.bg_fill;
+            if v.is_current {
+                ui.painter().rect_stroke(
+                    r.rect,
+                    3.0,
+                    egui::Stroke::new(2.0, accent),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if let VolState::InProgress(frac) = v.state {
+                let y = r.rect.bottom() - 2.0;
+                let w = r.rect.width() * frac.clamp(0.02, 1.0);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(r.rect.left(), y),
+                        egui::pos2(r.rect.left() + w, y),
+                    ],
+                    egui::Stroke::new(3.0, accent),
+                );
+            }
+            let mut label = egui::RichText::new(v.label.as_str()).size(12.0);
+            if finished {
+                label = label.weak();
+            }
+            ui.add_sized([CELL_W, 30.0], egui::Label::new(label).truncate());
+            if r.clicked() {
+                reqs.open = Some(v.path.clone());
+                *close_lib = true;
+            }
+        });
+    });
+}
+
 /// Centered "Next/Previous book" card, shown after a flip ran out of pages:
 /// the sibling's cover (once its background decode lands) + title; tapping the
 /// cover — or repeating the boundary action — opens it (`book_nav`, the same
@@ -1807,24 +2134,12 @@ fn with_env<T>(
 }
 
 impl App {
-    /// Queue a background cover decode for the comics in the current library dir
-    /// (once per dir; results stream back via `thumb_rx`).
-    fn queue_covers(&mut self) {
-        if self.thumb_dir.as_deref() == Some(self.lib_dir.as_path()) {
-            return;
-        }
-        self.thumb_dir = Some(self.lib_dir.clone());
-        let paths: Vec<PathBuf> = self
-            .lib_entries
-            .iter()
-            .filter_map(|e| match e {
-                Entry::Comic(p) if !self.thumbs.contains_key(p) => Some(p.clone()),
-                _ => None,
-            })
-            .collect();
-        if !paths.is_empty() {
-            spawn_cover_decode(paths, self.thumb_tx.clone());
-        }
+    /// Start an off-thread series scan of the library root (results land via
+    /// `series_rx` in render).
+    fn kick_series_scan(&mut self) {
+        self.series_pending = true;
+        spawn_library_scan(self.lib_root.clone(), self.series_tx.clone());
+        self.window.request_redraw();
     }
 
     /// Build the image-info overlay lines from the current page + reader state
@@ -1925,7 +2240,8 @@ impl App {
         }
     }
 
-    fn render(&mut self, has_files: bool, status_bar_px: i32) -> FrameReqs {
+    fn render(&mut self, has_files: bool, status_bar_px: i32, lib: LibCtx<'_>) -> FrameReqs {
+        self.frame_no += 1;
         self.reader.viewport = Viewport {
             w: self.config.width,
             h: self.config.height,
@@ -2017,15 +2333,17 @@ impl App {
                 }
             }
         }
-        // Drain decoded covers into egui textures; queue any new ones for this dir.
+        // Drain decoded covers into egui textures, and any finished series scan.
         while let Ok((path, img)) = self.thumb_rx.try_recv() {
             let handle =
                 self.egui_ctx
                     .load_texture(path.to_string_lossy(), img, egui::TextureOptions::default());
+            self.thumb_used.insert(path.clone(), self.frame_no);
             self.thumbs.insert(path, handle);
         }
-        if self.library_view {
-            self.queue_covers();
+        while let Ok(series) = self.series_rx.try_recv() {
+            self.series = series;
+            self.series_pending = false;
         }
         // egui chrome over the page: the library browser when open, else the seekbar.
         let raw_input = self.egui_state.take_egui_input(&self.window);
@@ -2051,19 +2369,62 @@ impl App {
         let cur_transition = self.reader.transition_enabled;
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
-        // Snapshot the rows the closure needs (owned), so it borrows no `self`.
-        let entries: Vec<(bool, String, PathBuf, Option<egui::TextureHandle>)> = self
-            .lib_entries
-            .iter()
-            .map(|e| {
-                let (is_dir, p) = match e {
-                    Entry::Dir(p) => (true, p),
-                    Entry::Comic(p) => (false, p),
-                };
-                let thumb = if is_dir { None } else { self.thumbs.get(p).cloned() };
-                (is_dir, name_of(p), p.clone(), thumb)
-            })
-            .collect();
+        let lib_root_str = self.lib_root.display().to_string();
+        let browse = self.lib_browse;
+        let series_pending = self.series_pending;
+        // Browse mode (choose a library root) lists folders only — owned snapshot.
+        let entries: Vec<(String, PathBuf)> = if library_view && browse {
+            self.lib_entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Dir(p) => Some((name_of(p), p.clone())),
+                    Entry::Comic(_) => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        // Series-view snapshot: per-volume read state + covers, per-series status
+        // label + collapse state. Owned, so the closure borrows no `self`.
+        let sections: Vec<SectionRow> = if library_view && !browse {
+            self.series
+                .iter()
+                .map(|s| {
+                    let expanded = !lib.collapsed.contains(&s.dir);
+                    let states: Vec<VolState> = s
+                        .volumes
+                        .iter()
+                        .map(|v| vol_state(lib.progress, lib.positions, &v.to_string_lossy()))
+                        .collect();
+                    let status = series_status(&states);
+                    let volumes = if expanded {
+                        s.volumes
+                            .iter()
+                            .zip(&states)
+                            .map(|(v, st)| VolCell {
+                                label: name_of(v),
+                                thumb: self.thumbs.get(v).cloned(),
+                                state: *st,
+                                is_current: lib.current_key
+                                    == Some(v.to_string_lossy().as_ref()),
+                                path: v.clone(),
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    SectionRow {
+                        dir: s.dir.clone(),
+                        name: s.name.clone(),
+                        expanded,
+                        status,
+                        volumes,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Boundary prompt: lazily clear once its window lapses; visibility is
         // sampled ONCE here and reused for both the draw and the redraw guard
         // (the draw-time-consistency rule — see `Reader::animation_drawn`).
@@ -2090,6 +2451,13 @@ impl App {
         let mut nav_to: Option<PathBuf> = None;
         let mut close_lib = false;
         let mut set_root = false;
+        let mut enter_browse = false;
+        let mut leave_browse = false;
+        let mut rescan = false;
+        let mut toggle_series: Option<PathBuf> = None;
+        // Volume paths in expanded sections that were actually on screen this
+        // frame: bumps their cover LRU stamps + lazily queues missing decodes.
+        let mut visible_covers: Vec<PathBuf> = Vec::new();
         let mut open_options = false;
         let mut set_dir: Option<Direction> = None;
         let mut set_layout: Option<LayoutMode> = None;
@@ -2102,7 +2470,9 @@ impl App {
         let mut book_nav: i64 = 0;
         let mut open_info = false;
         let mut close_info = false;
-        let at_root = self.lib_dir == self.lib_root;
+        // Browse mode may climb anywhere (picking a new root); only the
+        // filesystem root has no Up.
+        let at_root = self.lib_dir.parent().is_none();
         // While the bars are shown the window is still full-bleed (NativeActivity
         // ignores fitSystemWindows), so inset the library's top chrome by the
         // status-bar height — otherwise the clock/icons cover the top buttons.
@@ -2117,16 +2487,17 @@ impl App {
                         if ui.button("Grant all-files access").clicked() {
                             reqs.grant = true;
                         }
-                    } else {
+                    } else if browse {
+                        // Choose-a-library-root folder browser (folders only).
                         ui.horizontal(|ui| {
                             ui.spacing_mut().button_padding = egui::vec2(14.0, 10.0);
+                            if ui.button(egui::RichText::new("← Back").size(18.0)).clicked() {
+                                leave_browse = true;
+                            }
                             if !at_root
                                 && ui.button(egui::RichText::new("⬆ Up").size(18.0)).clicked()
                             {
                                 go_up = true;
-                            }
-                            if ui.button(egui::RichText::new("× Close").size(18.0)).clicked() {
-                                close_lib = true;
                             }
                             if ui
                                 .button(egui::RichText::new("📌 Set as library").size(18.0))
@@ -2134,66 +2505,106 @@ impl App {
                             {
                                 set_root = true;
                             }
-                            if ui.button(egui::RichText::new("Open file…").size(18.0)).clicked() {
-                                reqs.open_picker = true;
-                            }
                         });
                         ui.label(egui::RichText::new(&lib_dir_str).size(13.0));
                         ui.separator();
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            let cell = egui::vec2(168.0, 256.0);
-                            let cols =
-                                ((ui.available_width() / (cell.x + 10.0)).floor() as usize).max(1);
-                            for row in entries.chunks(cols) {
-                                ui.horizontal(|ui| {
-                                    for (is_dir, label, path, thumb) in row {
-                                        let clicked = ui
-                                            .allocate_ui(cell, |ui| {
-                                                ui.vertical(|ui| {
-                                                    let r = if *is_dir {
-                                                        ui.add_sized(
-                                                            [cell.x, 200.0],
-                                                            egui::Button::new(
-                                                                egui::RichText::new("📁").size(80.0),
-                                                            ),
-                                                        )
-                                                    } else if let Some(t) = thumb {
-                                                        ui.add(egui::ImageButton::new(
-                                                            egui::Image::new(t).fit_to_exact_size(
-                                                                egui::vec2(cell.x, 200.0),
-                                                            ),
-                                                        ))
-                                                    } else {
-                                                        ui.add_sized(
-                                                            [cell.x, 200.0],
-                                                            egui::Button::new(
-                                                                egui::RichText::new("…").size(28.0),
-                                                            ),
-                                                        )
-                                                    };
-                                                    ui.add_sized(
-                                                        [cell.x, 34.0],
-                                                        egui::Label::new(
-                                                            egui::RichText::new(label.as_str())
-                                                                .size(13.0),
-                                                        )
-                                                        .truncate(),
-                                                    );
-                                                    r.clicked()
-                                                })
-                                                .inner
-                                            })
-                                            .inner;
-                                        if clicked {
-                                            if *is_dir {
-                                                nav_to = Some(path.clone());
-                                            } else {
-                                                reqs.open = Some(path.clone());
-                                                close_lib = true;
-                                            }
-                                        }
-                                    }
+                            for (label, path) in &entries {
+                                if ui
+                                    .add_sized(
+                                        [ui.available_width(), 44.0],
+                                        egui::Button::new(
+                                            egui::RichText::new(format!("📁 {label}")).size(16.0),
+                                        ),
+                                    )
+                                    .clicked()
+                                {
+                                    nav_to = Some(path.clone());
+                                }
+                            }
+                            if entries.is_empty() {
+                                ui.label(egui::RichText::new("(no sub-folders)").weak());
+                            }
+                        });
+                    } else {
+                        // Series view: collapsible sections, one horizontal
+                        // cover row per series (Chunky-style).
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(14.0, 10.0);
+                            if ui.button(egui::RichText::new("× Close").size(18.0)).clicked() {
+                                close_lib = true;
+                            }
+                            if ui
+                                .button(egui::RichText::new("📂 Change library…").size(18.0))
+                                .clicked()
+                            {
+                                enter_browse = true;
+                            }
+                            if ui.button(egui::RichText::new("Open file…").size(18.0)).clicked() {
+                                reqs.open_picker = true;
+                            }
+                            if ui.button(egui::RichText::new("⟳").size(18.0)).clicked() {
+                                rescan = true;
+                            }
+                        });
+                        ui.label(egui::RichText::new(&lib_root_str).size(13.0));
+                        ui.separator();
+                        if sections.is_empty() {
+                            ui.add_space(40.0);
+                            ui.vertical_centered(|ui| {
+                                ui.label(if series_pending {
+                                    "Scanning library…"
+                                } else {
+                                    "No comics found here — use “Change library…” to pick your comics folder."
                                 });
+                            });
+                        }
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for sec in &sections {
+                                // Full-width tappable header: chevron + name
+                                // left, status label right.
+                                let (rect, resp) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), 40.0),
+                                    egui::Sense::click(),
+                                );
+                                let chev = if sec.expanded { "▾" } else { "▸" };
+                                let strong = ui.visuals().strong_text_color();
+                                let weak = ui.visuals().weak_text_color();
+                                ui.painter().text(
+                                    rect.left_center() + egui::vec2(6.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("{chev}  {}", sec.name),
+                                    egui::FontId::proportional(18.0),
+                                    strong,
+                                );
+                                ui.painter().text(
+                                    rect.right_center() - egui::vec2(6.0, 0.0),
+                                    egui::Align2::RIGHT_CENTER,
+                                    &sec.status,
+                                    egui::FontId::proportional(13.0),
+                                    weak,
+                                );
+                                if resp.clicked() {
+                                    toggle_series = Some(sec.dir.clone());
+                                }
+                                if sec.expanded {
+                                    // Lazy covers: only sections actually on
+                                    // screen queue decodes / refresh their LRU.
+                                    if ui.is_rect_visible(rect) {
+                                        visible_covers
+                                            .extend(sec.volumes.iter().map(|v| v.path.clone()));
+                                    }
+                                    egui::ScrollArea::horizontal()
+                                        .id_salt(&sec.dir)
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                for v in &sec.volumes {
+                                                    volume_cell(ui, v, &mut reqs, &mut close_lib);
+                                                }
+                                            });
+                                        });
+                                }
+                                ui.add_space(8.0);
                             }
                         });
                     }
@@ -2264,26 +2675,65 @@ impl App {
             self.reader.goto(p);
         }
         if set_root {
+            // Browse mode picked a new library root: back to the series view
+            // and rescan it. (The root persists via `suspended`, as before.)
             self.lib_root = self.lib_dir.clone();
+            self.lib_browse = false;
+            self.kick_series_scan();
         }
-        if go_up && self.lib_dir != self.lib_root {
+        if enter_browse {
+            self.lib_browse = true;
+            self.lib_dir = self.lib_root.clone();
+            self.lib_entries = scan_dir(&self.lib_dir);
+        }
+        if leave_browse {
+            self.lib_browse = false;
+        }
+        if rescan {
+            self.kick_series_scan();
+        }
+        if go_up {
+            // Browse mode may climb past the current root — that's how a root
+            // *elsewhere* gets picked.
             if let Some(parent) = self.lib_dir.parent() {
                 self.lib_dir = parent.to_path_buf();
                 self.lib_entries = scan_dir(&self.lib_dir);
             }
         }
         if let Some(d) = nav_to {
-            // A folder of images is itself a comic; otherwise descend into it.
-            if is_image_folder(&d) {
-                reqs.open = Some(d);
-                close_lib = true;
-            } else {
-                self.lib_dir = d;
-                self.lib_entries = scan_dir(&self.lib_dir);
-            }
+            self.lib_dir = d;
+            self.lib_entries = scan_dir(&self.lib_dir);
         }
         if close_lib {
             self.library_view = false;
+        }
+        reqs.toggle_series = toggle_series;
+        // Lazy covers for the sections that were on screen: bump LRU stamps,
+        // queue the missing ones, and evict the least-recently-drawn past the
+        // cap (a big library would otherwise pin hundreds of MB of textures).
+        let mut to_decode: Vec<PathBuf> = Vec::new();
+        for p in visible_covers {
+            self.thumb_used.insert(p.clone(), self.frame_no);
+            if !self.thumbs.contains_key(&p) && self.queued_covers.insert(p.clone()) {
+                to_decode.push(p);
+            }
+        }
+        if !to_decode.is_empty() {
+            spawn_cover_decode(to_decode, self.thumb_tx.clone());
+        }
+        const THUMB_CAP: usize = 256;
+        if self.thumbs.len() > THUMB_CAP {
+            let mut by_age: Vec<(u64, PathBuf)> = self
+                .thumbs
+                .keys()
+                .map(|k| (self.thumb_used.get(k).copied().unwrap_or(0), k.clone()))
+                .collect();
+            by_age.sort();
+            for (_, k) in by_age.into_iter().take(self.thumbs.len() - THUMB_CAP) {
+                self.thumbs.remove(&k); // dropping the handle frees the texture
+                self.thumb_used.remove(&k);
+                self.queued_covers.remove(&k); // allow a later re-decode
+            }
         }
         if open_options {
             self.show_options = !self.show_options;
@@ -2393,6 +2843,26 @@ impl App {
         // Keep drawing while the library is open, the view hasn't settled, or the
         // current page isn't HQ yet (missing, or only the LQ seek-tier — so it
         // sharpens to HQ once seeking stops).
+        // Redraw-loop diagnostic: a rare, so-far-unreproducible post-resume state
+        // kept the loop running on a static screen (~144 fps). While rendering is
+        // continuous this logs which guard leg is responsible ~every 2 s; an idle
+        // app logs nothing. Remove once the culprit is caught in logcat.
+        if self.frame_no % 300 == 0 {
+            log::info!(
+                "redraw? lib={} unsettled={} not_hq={} lq={} hints={} anim={} prompt={} live={} egui={} surface={}x{}",
+                self.library_view,
+                !self.reader.view_settled,
+                !self.reader.view_is_hq(),
+                self.reader.lq_fill_pending(),
+                hints_visible,
+                self.reader.animation_drawn(),
+                prompt_visible,
+                drew_live_anim,
+                egui_animating,
+                self.config.width,
+                self.config.height
+            );
+        }
         if self.library_view
             || !self.reader.view_settled
             || !self.reader.view_is_hq()
@@ -2447,13 +2917,6 @@ fn ext_lower(p: &Path) -> Option<String> {
 /// Is this a comic archive yosh can open on Android (RAR excluded)?
 fn is_comic_archive(p: &Path) -> bool {
     matches!(ext_lower(p).as_deref(), Some("cbz" | "zip" | "cb7" | "7z"))
-}
-
-/// Does this directory directly contain image files (i.e. is itself a comic)?
-fn is_image_folder(dir: &Path) -> bool {
-    std::fs::read_dir(dir)
-        .map(|rd| rd.flatten().any(|e| e.path().is_file() && is_image_ext(&e.path())))
-        .unwrap_or(false)
 }
 
 /// Build an engine page source from a comic path (archive or image folder).
