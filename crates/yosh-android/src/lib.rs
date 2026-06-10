@@ -33,7 +33,7 @@ use yosh_engine::gpu::GpuContext;
 use yosh_engine::layout::{view_pages, view_start, Layout};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::DecodePool;
-use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
+use yosh_engine::reader::{drag_commits, drag_dir, Budget, Direction, Reader, Viewport};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, SevenzSource, ZipSource};
 use yosh_engine::texpool::TexturePool;
 
@@ -130,6 +130,23 @@ struct Shell {
     status_bar_px: Option<i32>,
 }
 
+/// How long the next/prev-book boundary prompt stays armed and on screen.
+const BOOK_PROMPT_MS: u64 = 3000;
+/// Width of the boundary prompt card, egui points.
+const BOOK_PROMPT_W_PT: f32 = 260.0;
+
+/// See [`App::book_prompt`].
+struct BookPrompt {
+    /// +1 = next book (armed at the last page), -1 = previous (first page).
+    dir: i64,
+    /// When it was armed (the confirm window + the card's visibility run from here).
+    at: Instant,
+    /// The resolved sibling comic, if any (None at the ends / for SAF sources).
+    sibling: Option<PathBuf>,
+    /// The sibling's display name (empty when `sibling` is None).
+    title: String,
+}
+
 /// Active two-finger pinch, captured at start so each move can both scale
 /// about — and pan with — the finger midpoint (zoom-to-focal-point).
 #[derive(Clone, Copy)]
@@ -173,6 +190,12 @@ struct App {
     /// Display name of the open comic (basename of `Shell::current_key`), shown
     /// atop the seekbar. Empty when nothing is open.
     book_title: String,
+    /// Armed boundary prompt: a next/prev action at the last/first page showed
+    /// a "Next/Previous book" card (cover + title once the cover decode lands);
+    /// repeating the action — or tapping the card — within [`BOOK_PROMPT_MS`]
+    /// opens the sibling. `sibling: None` ⇒ no neighbor (or a SAF-picked book,
+    /// which can't resolve folder siblings) — the card just names the boundary.
+    book_prompt: Option<BookPrompt>,
     show_options: bool,
     show_info: bool,
     /// The user's layout choice. `reader.layout` is the concrete `Single`/`Spread`
@@ -382,6 +405,7 @@ impl ApplicationHandler for Shell {
             controls: true,
             controls_shown_at: Instant::now(),
             book_title: String::new(),
+            book_prompt: None,
             show_options: false,
             show_info: false,
             layout_mode: self.init_view.1,
@@ -647,8 +671,25 @@ impl Shell {
                                 .is_some_and(|a| a.reader.drag_release(v as f32));
                             if committed {
                                 self.after_flip();
-                            } else if let Some(app) = self.app.as_mut() {
-                                app.window.request_redraw(); // play the snap-back
+                            } else {
+                                // A commit-strength swipe into the volume boundary
+                                // counts as intent to leave the book: arm/confirm
+                                // the next/prev-book prompt. (A reversal or a
+                                // sub-threshold release does not — same rules as
+                                // a real commit, via the shared drag_commits.)
+                                let edge_dir = self.app.as_ref().and_then(|a| {
+                                    let (sx, _) = start?;
+                                    let dxf = (x - sx) as f32;
+                                    let w = a.config.width as f32;
+                                    let dir = drag_dir(a.reader.direction, dxf);
+                                    (drag_commits(dxf, v as f32, w) && a.reader.at_edge(dir))
+                                        .then_some(dir)
+                                });
+                                if let Some(dir) = edge_dir {
+                                    self.boundary_hit(dir);
+                                } else if let Some(app) = self.app.as_mut() {
+                                    app.window.request_redraw(); // play the snap-back
+                                }
                             }
                         }
                         self.drag_samples.clear();
@@ -686,11 +727,15 @@ impl Shell {
         }
     }
 
-    /// Flip `dir` pages and persist the new position.
+    /// Flip `dir` pages and persist the new position. Running out of pages at a
+    /// volume boundary arms (or confirms) the next/prev-book prompt instead.
     fn flip(&mut self, dir: i64) {
         let Some(app) = self.app.as_mut() else { return };
-        app.reader.step(dir);
-        self.after_flip();
+        if app.reader.step(dir) {
+            self.after_flip();
+        } else if self.app.as_ref().is_some_and(|a| a.reader.at_edge(dir)) {
+            self.boundary_hit(dir);
+        }
     }
 
     /// Post-flip bookkeeping shared by tap flips and committed drags (the step
@@ -755,29 +800,53 @@ impl Shell {
         } else if x > w * (1.0 - EDGE_ZONE as f64) {
             // Right edge: previous in RTL, next in LTR.
             self.flip(if rtl { -1 } else { 1 });
-        } else if let Some(app) = self.app.as_mut() {
-            // Center: toggle the reading chrome (also closes the options popup).
-            app.controls = !app.controls;
-            if app.controls {
-                app.controls_shown_at = Instant::now(); // re-show the zone hints
-            } else {
-                app.show_options = false;
-                app.show_info = false;
+        } else {
+            // A tap on the armed next/prev-book card confirms it. The card is
+            // also a real egui button, but egui's consumed flag lags a frame on
+            // touch presses (see the library note above), so a quick tap can
+            // fall through to here — hit-test the card's centered rect
+            // ourselves. (When egui *does* consume it, this never runs and the
+            // button sets `book_nav`; either way the prompt clears before the
+            // other path could fire, so a tap can't double-advance.)
+            let confirm_dir = self.app.as_ref().and_then(|app| {
+                let p = app.book_prompt.as_ref()?;
+                let ppp = app.egui_ctx.pixels_per_point() as f64;
+                let half_w = (BOOK_PROMPT_W_PT as f64 / 2.0 + 12.0) * ppp;
+                let half_h = 200.0 * ppp;
+                let inside = (x - w / 2.0).abs() < half_w && (y - h / 2.0).abs() < half_h;
+                (inside
+                    && p.sibling.is_some()
+                    && p.at.elapsed().as_millis() < BOOK_PROMPT_MS as u128)
+                    .then_some(p.dir)
+            });
+            if let Some(dir) = confirm_dir {
+                if let Some(app) = self.app.as_mut() {
+                    app.book_prompt = None;
+                }
+                self.open_sibling_book(dir);
+                return;
             }
-            app.window.request_redraw();
+            if let Some(app) = self.app.as_mut() {
+                // Center: toggle the reading chrome (also closes the options popup).
+                app.controls = !app.controls;
+                if app.controls {
+                    app.controls_shown_at = Instant::now(); // re-show the zone hints
+                } else {
+                    app.show_options = false;
+                    app.show_info = false;
+                }
+                app.window.request_redraw();
+            }
         }
     }
 
-    /// Open the previous/next comic in the current comic's folder (`dir` = -1/+1),
-    /// natural-sorted like the library. No-op at the ends or for non-path sources.
-    fn open_sibling_book(&mut self, dir: i64) {
-        let Some(cur) = self.current_key.clone() else {
-            return;
-        };
+    /// The previous/next comic in the current comic's folder (`dir` = -1/+1),
+    /// natural-sorted like the library. `None` at the ends or for non-path
+    /// (SAF-picked) sources, whose keys aren't filesystem paths.
+    fn sibling_book_path(&self, dir: i64) -> Option<PathBuf> {
+        let cur = self.current_key.clone()?;
         let cur_path = PathBuf::from(&cur);
-        let Some(parent) = cur_path.parent() else {
-            return;
-        };
+        let parent = cur_path.parent()?;
         let comics: Vec<PathBuf> = scan_dir(parent)
             .into_iter()
             .filter_map(|e| match e {
@@ -785,11 +854,60 @@ impl Shell {
                 _ => None,
             })
             .collect();
-        if let Some(i) = comics.iter().position(|p| *p == cur_path) {
-            let j = i as i64 + dir;
-            if (0..comics.len() as i64).contains(&j) {
-                self.open_path(comics[j as usize].clone());
+        let i = comics.iter().position(|p| *p == cur_path)?;
+        let j = i as i64 + dir;
+        (0..comics.len() as i64)
+            .contains(&j)
+            .then(|| comics[j as usize].clone())
+    }
+
+    /// Open the previous/next comic in the current comic's folder (`dir` = -1/+1).
+    /// No-op at the ends or for non-path sources.
+    fn open_sibling_book(&mut self, dir: i64) {
+        if let Some(p) = self.sibling_book_path(dir) {
+            self.open_path(p);
+        }
+    }
+
+    /// A next/prev action ran out of pages (`Reader::at_edge`). First hit arms
+    /// the "Next/Previous book" prompt (resolving the sibling once and kicking
+    /// its cover decode); a repeat in the same direction within the window opens
+    /// it. (Tapping the card directly is handled by its egui button / `on_tap`.)
+    fn boundary_hit(&mut self, dir: i64) {
+        let confirm = self
+            .app
+            .as_ref()
+            .and_then(|a| a.book_prompt.as_ref())
+            .is_some_and(|p| {
+                p.dir == dir
+                    && p.sibling.is_some()
+                    && p.at.elapsed().as_millis() < BOOK_PROMPT_MS as u128
+            });
+        if confirm {
+            if let Some(app) = self.app.as_mut() {
+                app.book_prompt = None;
             }
+            self.open_sibling_book(dir);
+            return;
+        }
+        let sibling = self.sibling_book_path(dir);
+        let title = sibling.as_deref().map(name_of).unwrap_or_default();
+        if let Some(app) = self.app.as_mut() {
+            if let Some(p) = &sibling
+                && !app.thumbs.contains_key(p)
+            {
+                // Cover preview: same off-thread pipeline as the library; the
+                // result lands via the per-frame `thumb_rx` drain and the card
+                // picks it up while the prompt is still showing.
+                spawn_cover_decode(vec![p.clone()], app.thumb_tx.clone());
+            }
+            app.book_prompt = Some(BookPrompt {
+                dir,
+                at: Instant::now(),
+                sibling,
+                title,
+            });
+            app.window.request_redraw();
         }
     }
 
@@ -831,6 +949,7 @@ impl Shell {
                 start,
             );
             app.book_title = book_display_name(&key);
+            app.book_prompt = None; // a boundary prompt belongs to the old book
             app.window.request_redraw();
         }
         self.current_key = Some(key.clone());
@@ -854,6 +973,7 @@ impl Shell {
             app.reader.lq_cache.clear();
             app.reader.failed.clear();
             app.book_title.clear();
+            app.book_prompt = None;
             app.controls = false;
             app.show_options = false;
             app.show_info = false;
@@ -1341,6 +1461,67 @@ fn empty_state(ctx: &egui::Context, open_library: &mut bool, open_picker: &mut b
 /// edges flip.
 const TOP_ZONE: f32 = 0.10;
 const EDGE_ZONE: f32 = 0.20;
+
+/// Centered "Next/Previous book" card, shown after a flip ran out of pages:
+/// the sibling's cover (once its background decode lands) + title; tapping the
+/// cover — or repeating the boundary action — opens it (`book_nav`, the same
+/// request the seekbar's book buttons use). With no sibling (last book in the
+/// folder, or a SAF-picked comic) it just names the boundary.
+fn book_prompt_card(
+    ctx: &egui::Context,
+    dir: i64,
+    title: &str,
+    thumb: Option<&egui::TextureHandle>,
+    has_sibling: bool,
+    book_nav: &mut i64,
+) {
+    egui::Area::new(egui::Id::new("book_prompt"))
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.set_width(BOOK_PROMPT_W_PT);
+                ui.vertical_centered(|ui| {
+                    if !has_sibling {
+                        ui.label(
+                            egui::RichText::new(if dir > 0 { "Last page" } else { "First page" })
+                                .size(18.0)
+                                .strong(),
+                        );
+                        return;
+                    }
+                    ui.label(
+                        egui::RichText::new(if dir > 0 { "Next book" } else { "Previous book" })
+                            .size(18.0)
+                            .strong(),
+                    );
+                    ui.add_space(8.0);
+                    let cover_w = BOOK_PROMPT_W_PT - 24.0;
+                    let clicked = if let Some(t) = thumb {
+                        ui.add(egui::ImageButton::new(
+                            egui::Image::new(t).fit_to_exact_size(egui::vec2(cover_w, 240.0)),
+                        ))
+                        .clicked()
+                    } else {
+                        // Cover still decoding: placeholder button, same action.
+                        ui.add_sized(
+                            [cover_w, 120.0],
+                            egui::Button::new(egui::RichText::new("📖").size(48.0)),
+                        )
+                        .clicked()
+                    };
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(title).size(14.0)).truncate(),
+                    );
+                    ui.label(egui::RichText::new("tap again to open").size(12.0).weak());
+                    if clicked {
+                        *book_nav = dir;
+                    }
+                });
+            });
+        });
+}
 
 /// Faint labels + outlines over the tap zones (shown briefly with the controls) so
 /// the layout is discoverable. Painted, NOT laid out as widgets: an egui Area
@@ -1861,6 +2042,26 @@ impl App {
                 (is_dir, name_of(p), p.clone(), thumb)
             })
             .collect();
+        // Boundary prompt: lazily clear once its window lapses; visibility is
+        // sampled ONCE here and reused for both the draw and the redraw guard
+        // (the draw-time-consistency rule — see `Reader::animation_drawn`).
+        if self
+            .book_prompt
+            .as_ref()
+            .is_some_and(|p| p.at.elapsed().as_millis() >= BOOK_PROMPT_MS as u128)
+        {
+            self.book_prompt = None;
+        }
+        let prompt_card: Option<(i64, String, Option<egui::TextureHandle>, bool)> =
+            if !library_view && len > 0 {
+                self.book_prompt.as_ref().map(|p| {
+                    let thumb = p.sibling.as_ref().and_then(|s| self.thumbs.get(s)).cloned();
+                    (p.dir, p.title.clone(), thumb, p.sibling.is_some())
+                })
+            } else {
+                None
+            };
+        let prompt_visible = prompt_card.is_some();
         let mut seek_to: Option<usize> = None;
         let mut reqs = FrameReqs::default();
         let mut go_up = false;
@@ -2021,6 +2222,11 @@ impl App {
                     info_popup(ctx, &info_lines, &mut close_info);
                 }
             }
+            // Next/prev-book boundary prompt — over the page, chrome or not.
+            // (`prompt_card` is None in the library / empty state.)
+            if let Some((dir, title, thumb, has_sibling)) = &prompt_card {
+                book_prompt_card(ctx, *dir, title, thumb.as_ref(), *has_sibling, &mut book_nav);
+            }
         });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
@@ -2175,6 +2381,7 @@ impl App {
             // the frame above drew it mid-fade — freezing a half-faded ghost of
             // the outgoing page on screen (the decision must match the draw).
             || self.reader.animation_drawn() // page-turn / drag frame was drawn
+            || prompt_visible // boundary prompt on screen (timed; same sample as draw)
             || drew_live_anim // a GIF/WebP is playing on screen
             || egui_animating // egui fade/feedback animation mid-flight
         {

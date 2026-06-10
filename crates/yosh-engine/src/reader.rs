@@ -1678,6 +1678,24 @@ impl Reader {
         self.step_styled(dir, 0.0)
     }
 
+    /// Is the reader at the volume boundary in `dir` (last view for `dir > 0`,
+    /// first view for `dir < 0`)? Distinguishes a real boundary from the other
+    /// reasons `step` can return false (e.g. the LQ warm-up gate) — a shell uses
+    /// this to offer "next/previous book" when a flip runs out of pages.
+    pub fn at_edge(&self, dir: i64) -> bool {
+        let Some(src) = &self.source else { return false };
+        let len = src.len();
+        if len == 0 {
+            return false;
+        }
+        let next = if dir > 0 {
+            layout::next_view(self.layout, self.index, len, self.spread_offset)
+        } else {
+            layout::prev_view(self.layout, self.index, len, self.spread_offset)
+        };
+        next == self.index
+    }
+
     /// `step` with an explicit transition start offset: 0 for a tap flip; the
     /// dragged page displacement for a committed interactive drag, so the same
     /// slide+fade+blur animation picks up where the finger left the page.
