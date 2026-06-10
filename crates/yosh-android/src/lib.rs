@@ -1003,6 +1003,52 @@ impl Shell {
         if self.app.as_ref().map(|a| a.library_view).unwrap_or(false) {
             return;
         }
+        // While the next/prev-book prompt is up it acts like a lightweight modal.
+        // Tapping the card — or the same next/prev-page edge zone that armed it
+        // (the one the card anchors to) — opens the sibling: the "tap again to
+        // open" gesture. Any *other* tap just dismisses the prompt and is
+        // swallowed (e.g. tapping the opposite edge dismisses instead of paging
+        // back; center/top neither toggle chrome nor open the library).
+        if self.app.as_ref().is_some_and(|a| a.book_prompt.is_some()) {
+            let confirm_dir = self.app.as_ref().and_then(|app| {
+                let p = app.book_prompt.as_ref()?;
+                let rtl = app.reader.direction == Direction::Rtl;
+                let on_left = book_prompt_on_left(p.dir, rtl);
+                // The confirm edge is the one whose page-flip matches p.dir (left
+                // in RTL for next / LTR for prev, mirrored) — the side the card
+                // anchors to. Its whole vertical strip confirms, card or not.
+                let on_edge = if on_left {
+                    x < w * EDGE_ZONE as f64
+                } else {
+                    x > w * (1.0 - EDGE_ZONE as f64)
+                };
+                // Card rect: anchored 16pt in from that edge, ~centered vertically
+                // (covers the card's center-side half that's past the edge zone).
+                let ppp = app.egui_ctx.pixels_per_point() as f64;
+                let half_w = (BOOK_PROMPT_W_PT as f64 / 2.0 + 12.0) * ppp;
+                let half_h = 200.0 * ppp;
+                let cx = if on_left {
+                    (16.0 + BOOK_PROMPT_W_PT as f64 / 2.0) * ppp
+                } else {
+                    w - (16.0 + BOOK_PROMPT_W_PT as f64 / 2.0) * ppp
+                };
+                let on_card = (x - cx).abs() < half_w && (y - h / 2.0).abs() < half_h;
+                ((on_card || on_edge)
+                    && p.sibling.is_some()
+                    && p.at.elapsed().as_millis() < BOOK_PROMPT_MS as u128)
+                    .then_some(p.dir)
+            });
+            if let Some(dir) = confirm_dir {
+                if let Some(app) = self.app.as_mut() {
+                    app.book_prompt = None;
+                }
+                self.open_sibling_book(dir);
+            } else if let Some(app) = self.app.as_mut() {
+                app.book_prompt = None; // any other tap dismisses, swallowed
+                app.window.request_redraw();
+            }
+            return;
+        }
         if y < h * TOP_ZONE as f64 {
             // Top strip opens the library browser.
             self.open_library();
@@ -1019,50 +1065,18 @@ impl Shell {
         } else if x > w * (1.0 - EDGE_ZONE as f64) {
             // Right edge: previous in RTL, next in LTR.
             self.flip(if rtl { -1 } else { 1 });
-        } else {
-            // A tap on the armed next/prev-book card confirms it. The card is
-            // also a real egui button, but egui's consumed flag lags a frame on
-            // touch presses (see the library note above), so a quick tap can
-            // fall through to here — hit-test the card's centered rect
-            // ourselves. (When egui *does* consume it, this never runs and the
-            // button sets `book_nav`; either way the prompt clears before the
-            // other path could fire, so a tap can't double-advance.)
-            let confirm_dir = self.app.as_ref().and_then(|app| {
-                let p = app.book_prompt.as_ref()?;
-                let ppp = app.egui_ctx.pixels_per_point() as f64;
-                let half_w = (BOOK_PROMPT_W_PT as f64 / 2.0 + 12.0) * ppp;
-                let half_h = 200.0 * ppp;
-                // Same edge anchoring as the draw (16pt inset from the side).
-                let rtl = app.reader.direction == Direction::Rtl;
-                let cx = if book_prompt_on_left(p.dir, rtl) {
-                    (16.0 + BOOK_PROMPT_W_PT as f64 / 2.0) * ppp
-                } else {
-                    w - (16.0 + BOOK_PROMPT_W_PT as f64 / 2.0) * ppp
-                };
-                let inside = (x - cx).abs() < half_w && (y - h / 2.0).abs() < half_h;
-                (inside
-                    && p.sibling.is_some()
-                    && p.at.elapsed().as_millis() < BOOK_PROMPT_MS as u128)
-                    .then_some(p.dir)
-            });
-            if let Some(dir) = confirm_dir {
-                if let Some(app) = self.app.as_mut() {
-                    app.book_prompt = None;
-                }
-                self.open_sibling_book(dir);
-                return;
+        } else if let Some(app) = self.app.as_mut() {
+            // Center: toggle the reading chrome (also closes the options popup).
+            // (An armed book prompt is handled by the gate above, so it never
+            // reaches here.)
+            app.controls = !app.controls;
+            if app.controls {
+                app.controls_shown_at = Instant::now(); // re-show the zone hints
+            } else {
+                app.show_options = false;
+                app.show_info = false;
             }
-            if let Some(app) = self.app.as_mut() {
-                // Center: toggle the reading chrome (also closes the options popup).
-                app.controls = !app.controls;
-                if app.controls {
-                    app.controls_shown_at = Instant::now(); // re-show the zone hints
-                } else {
-                    app.show_options = false;
-                    app.show_info = false;
-                }
-                app.window.request_redraw();
-            }
+            app.window.request_redraw();
         }
     }
 
