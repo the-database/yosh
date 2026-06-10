@@ -1955,6 +1955,14 @@ impl App {
         });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
+        // egui-driven animations (panel fade-ins, the empty-state card, button
+        // feedback) request immediate repaints via `repaint_delay == 0`. The redraw
+        // guard below must honor that or those animations freeze on their first
+        // frame now that the loop genuinely idles between events.
+        let egui_animating = full_output
+            .viewport_output
+            .values()
+            .any(|v| v.repaint_delay.is_zero());
         if let Some(p) = seek_to {
             self.reader.goto(p);
         }
@@ -2095,6 +2103,7 @@ impl App {
             || hints_visible
             || self.reader.transition_active()
             || drew_live_anim // a GIF/WebP is playing on screen
+            || egui_animating // egui fade/feedback animation mid-flight
         {
             self.window.request_redraw();
         }
