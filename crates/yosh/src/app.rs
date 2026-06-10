@@ -15,6 +15,7 @@ use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use fast_image_resize::Resizer;
+use notify::Watcher as _; // brings the `.watch()` method into scope
 
 use crate::config;
 use yosh_engine::decode::decode_and_downscale;
@@ -188,6 +189,22 @@ struct State {
     sib_cache: Option<(PathBuf, bool, Vec<PathBuf>)>,
     sib_tx: std::sync::mpsc::Sender<(PathBuf, bool, Vec<PathBuf>)>,
     sib_rx: std::sync::mpsc::Receiver<(PathBuf, bool, Vec<PathBuf>)>,
+
+    // Live folder refresh: an OS filesystem watch on the open folder, so images
+    // added/removed on disk appear without reopening. `watcher` holds the notify
+    // handle (dropping it unwatches; recreated per folder open in `set_source`);
+    // its events arrive on `watch_rx` from notify's own thread. A change sets
+    // `watch_dirty` (a debounce stamp); once it's been quiet briefly, an off-thread
+    // `FolderSource` rebuild is spawned (gated by `rescanning`) and handed back on
+    // `rescan_rx`, tagged with the `open_gen` it started under so a volume switch
+    // discards a stale result — mirroring the `open_gen` guard on `open_rx`.
+    watcher: Option<notify::RecommendedWatcher>,
+    watch_tx: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
+    watch_rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    watch_dirty: Option<Instant>,
+    rescanning: bool,
+    rescan_tx: std::sync::mpsc::Sender<(u64, Option<Arc<dyn PageSource>>)>,
+    rescan_rx: std::sync::mpsc::Receiver<(u64, Option<Arc<dyn PageSource>>)>,
 }
 
 /// Result of constructing a page source: `(source, volume-key path, explicit
@@ -725,6 +742,10 @@ impl ApplicationHandler for App {
         // Channels for background archive opens and sibling-volume prescans.
         let (open_tx, open_rx) = std::sync::mpsc::channel();
         let (sib_tx, sib_rx) = std::sync::mpsc::channel();
+        // Channels for the live-folder-refresh watcher: raw notify events in, and
+        // off-thread `FolderSource` rebuilds out.
+        let (watch_tx, watch_rx) = std::sync::mpsc::channel();
+        let (rescan_tx, rescan_rx) = std::sync::mpsc::channel();
         let reader = Reader::new(
             gpu.device.clone(),
             gpu.queue.clone(),
@@ -785,6 +806,13 @@ impl ApplicationHandler for App {
             sib_cache: None,
             sib_tx,
             sib_rx,
+            watcher: None,
+            watch_tx,
+            watch_rx,
+            watch_dirty: None,
+            rescanning: false,
+            rescan_tx,
+            rescan_rx,
         });
     }
 
@@ -1444,9 +1472,80 @@ impl State {
         self.reader.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
         self.reader.prefetch();
+        // Live folder refresh: watch a folder for added/removed images (archives
+        // can't grow, so this tears the watcher down for them).
+        self.install_folder_watch(path);
         // Warm the sibling-volume list for this folder in the background, so the
         // first `[`/`]` press doesn't pay the parent-dir scan on the main thread.
         self.warm_sib_cache(path);
+    }
+
+    /// (Re)install the live-folder-refresh watcher for `path`, or tear it down when
+    /// `path` is not a directory (archives/single files can't grow). `build_source`
+    /// hands `set_source` the *directory* for both folder and single-image opens, so
+    /// a `path.is_dir()` test covers "opened one image, then siblings appear" too.
+    /// A `notify` failure is non-fatal — the feature is simply inactive for that volume.
+    fn install_folder_watch(&mut self, path: &Path) {
+        // Reset any pending refresh carried over from the previous volume, and drop
+        // the old watch (dropping the watcher unregisters it).
+        self.watch_dirty = None;
+        self.rescanning = false;
+        self.watcher = None;
+        if !path.is_dir() {
+            return;
+        }
+        if let Ok(mut w) = notify::recommended_watcher(self.watch_tx.clone())
+            && w.watch(path, notify::RecursiveMode::NonRecursive).is_ok()
+        {
+            self.watcher = Some(w);
+        }
+    }
+
+    /// Drive the live-folder-refresh watcher each frame: coalesce filesystem-change
+    /// events into a debounce stamp, kick off a debounced off-thread `FolderSource`
+    /// rebuild once the folder has been quiet briefly, and apply a finished rebuild to
+    /// the reader (which preserves the read position and decoded cache by filename).
+    fn poll_folder_watch(&mut self) {
+        // Coalesce incoming change events. A bulk copy fires many — collapse them to a
+        // single dirty stamp. Pure access events (reads) don't change the listing.
+        while let Ok(ev) = self.watch_rx.try_recv() {
+            if matches!(&ev, Ok(e) if !e.kind.is_access()) {
+                self.watch_dirty = Some(Instant::now());
+            }
+        }
+        // Once the burst has settled, spawn one rescan of the open folder off-thread
+        // (a big `read_dir` shouldn't touch the UI thread). `rescanning` prevents
+        // overlap; the watcher is only present for folders, so this never fires
+        // for archives. Tag the result with the current `open_gen`.
+        const DEBOUNCE: Duration = Duration::from_millis(250);
+        if let Some(since) = self.watch_dirty
+            && since.elapsed() >= DEBOUNCE
+            && !self.rescanning
+            && self.watcher.is_some()
+            && let Some(dir) = self.ui.opened.clone()
+        {
+            self.watch_dirty = None;
+            self.rescanning = true;
+            let generation = self.open_gen;
+            let tx = self.rescan_tx.clone();
+            std::thread::spawn(move || {
+                let built = FolderSource::new(&dir)
+                    .ok()
+                    .map(|s| Arc::new(s) as Arc<dyn PageSource>);
+                // Always send (even on a transient read error) so `rescanning` clears.
+                let _ = tx.send((generation, built));
+            });
+        }
+        // Apply finished rebuilds — newest generation only (a `[`/`]` volume switch
+        // bumped `open_gen`, exactly like the `open_rx` guard above).
+        while let Ok((generation, built)) = self.rescan_rx.try_recv() {
+            self.rescanning = false;
+            if generation == self.open_gen
+                && let Some(source) = built
+            {
+                self.reader.apply_refreshed_source(source);
+            }
+        }
     }
 
     /// Scan the current volume's folder for sibling volumes on a background
@@ -1736,6 +1835,8 @@ impl State {
         while let Ok(entry) = self.sib_rx.try_recv() {
             self.sib_cache = Some(entry);
         }
+        // Live folder refresh: react to images added/removed in the open folder.
+        self.poll_folder_watch();
         // Auto-update: pick up the background check result and any apply result.
         if let Some(rx) = self.update_rx.take() {
             match rx.try_recv() {

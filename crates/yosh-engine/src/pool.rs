@@ -30,6 +30,10 @@ struct JobState {
     /// is the page's on-screen displayed height; `lq` requests the fast (seeking) tier;
     /// `thumb` marks a whole-volume LQ-tier thumbnail (small target, routed separately).
     jobs: Vec<(usize, u32, bool, bool)>,
+    /// The source workers read from. Lives here (rather than captured per worker) so a
+    /// live folder refresh can swap in a grown listing via `set_source` without tearing
+    /// down and rebuilding the thread pool. A worker clones it while claiming a job.
+    source: Arc<dyn PageSource>,
     inflight: HashSet<usize>,
     /// Indices the latest prefetch window still wants decoded (the raw `set_jobs`
     /// list, *before* the inflight filter). A worker checks this at its yield
@@ -56,6 +60,7 @@ impl DecodePool {
         let shared = Arc::new((
             Mutex::new(JobState {
                 jobs: Vec::new(),
+                source,
                 inflight: HashSet::new(),
                 wanted: HashSet::new(),
                 running: true,
@@ -67,7 +72,6 @@ impl DecodePool {
 
         for _ in 0..workers {
             let shared = shared.clone();
-            let source = source.clone();
             let device = device.clone();
             let queue = queue.clone();
             let tex_pool = tex_pool.clone();
@@ -94,8 +98,10 @@ impl DecodePool {
                 };
                 loop {
                     // Wait for and claim the highest-priority job (index + its
-                    // exact, per-page decode target height).
-                    let (index, th, lq, thumb): (usize, u32, bool, bool) = {
+                    // exact, per-page decode target height), grabbing the current
+                    // source under the same lock so a live `set_source` swap is
+                    // picked up on the next claimed job.
+                    let (index, th, lq, thumb, source): (usize, u32, bool, bool, Arc<dyn PageSource>) = {
                         let (m, cv) = &*shared;
                         let mut st = m.lock().unwrap();
                         loop {
@@ -103,9 +109,10 @@ impl DecodePool {
                                 return;
                             }
                             if !st.jobs.is_empty() {
-                                let job = st.jobs.remove(0);
-                                st.inflight.insert(job.0);
-                                break job;
+                                let (i, h, lq, thumb) = st.jobs.remove(0);
+                                st.inflight.insert(i);
+                                let source = st.source.clone();
+                                break (i, h, lq, thumb, source);
                             }
                             st = cv.wait(st).unwrap();
                         }
@@ -197,6 +204,16 @@ impl DecodePool {
         st.jobs = filtered;
         drop(st);
         cv.notify_all();
+    }
+
+    /// Swap the source the workers read from, without tearing down the thread pool.
+    /// Used when a live folder refresh grows the page list by *appending* (existing
+    /// indices unchanged): in-flight decodes stay valid, and there is no worker-join
+    /// hitch while new pages are landing. A reorder that shifts indices instead rebuilds
+    /// the pool (in `Reader::apply_refreshed_source`) so stale in-flight results can't land.
+    pub fn set_source(&self, source: Arc<dyn PageSource>) {
+        let (m, _) = &*self.shared;
+        m.lock().unwrap().source = source;
     }
 
     /// Drain finished pages (non-blocking).

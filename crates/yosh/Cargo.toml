@@ -29,6 +29,10 @@ serde_json = "1"
 # Self-update against public GitHub releases (pure-Rust TLS via rustls + ring).
 ureq = "2"
 self-replace = "1"
+# Live folder refresh: an OS filesystem watch (ReadDirectoryChangesW / inotify /
+# FSEvents) on the open folder, so images added on disk appear without reopening.
+# Pure-Rust, no C toolchain.
+notify = "6"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
