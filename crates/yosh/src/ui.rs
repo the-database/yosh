@@ -20,11 +20,14 @@ pub struct UiState {
     pub dir_label: &'static str,
     pub fit_label: &'static str,
     pub layout_label: &'static str,
+    /// Whether the page-turn transition is on (for the "Turn:" button label).
+    pub transition_on: bool,
 
     // Requests raised by clicks, consumed by the app after the frame.
     pub req_toggle_dir: bool,
     pub req_cycle_fit: bool,
     pub req_toggle_layout: bool,
+    pub req_toggle_transition: bool,
     pub req_toggle_library: bool,
     pub clicked_volume: Option<usize>,
     pub help_open: bool,
@@ -446,6 +449,13 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
                 st.req_toggle_layout = true;
             }
+            if ui
+                .button(format!("Turn: {}", if st.transition_on { "on" } else { "off" }))
+                .on_hover_text("Page-turn transition (slide + fade on flip) — key T")
+                .clicked()
+            {
+                st.req_toggle_transition = true;
+            }
             if ui.button("? Help").clicked() {
                 st.help_open = !st.help_open;
             }
@@ -523,6 +533,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                 ui.label("R   rotate 90° (clockwise)");
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");
+                ui.label("T   page-turn transition (slide + fade on flip)");
                 ui.label("G   show/hide the animation panel (animated GIF / WebP)");
                 ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();

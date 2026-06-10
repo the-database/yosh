@@ -41,6 +41,11 @@ pub struct Settings {
     /// Show the bottom seekbar (auto-hides; reveals when the cursor nears the
     /// bottom edge). Toggled with key `B`.
     pub seekbar_enabled: bool,
+    /// Animate page flips with a quick slide + soft fade on the outgoing page
+    /// (page-flip mode only). Toggled with key `T`. Off by default on desktop — a
+    /// fast sweep across a large monitor is more fatiguing than on a phone (Android
+    /// enables it unconditionally in its own shell).
+    pub page_transition_enabled: bool,
     /// Last window geometry (size/position/maximized). None until first saved.
     pub window: Option<WindowState>,
 }
@@ -58,6 +63,7 @@ impl Default for Settings {
             spread_offsets: HashMap::new(),
             help_seen: false,
             seekbar_enabled: true,
+            page_transition_enabled: false, // desktop default off; Android shell forces on
             window: None,
         }
     }
