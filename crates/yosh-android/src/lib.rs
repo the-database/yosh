@@ -399,9 +399,14 @@ impl ApplicationHandler for Shell {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Let egui see the event first (seekbar drag); gate nav on what it consumes,
         // and wake the loop if egui wants to repaint (e.g. a slider being dragged).
+        // RedrawRequested itself is exempt: egui-winit reports `repaint: true` for it
+        // ("paint now", not "schedule another frame"), so honoring it would re-arm a
+        // redraw from within every frame — a feedback loop that silently defeats the
+        // on-demand guard at the end of `render` and burns battery rendering a static
+        // page at display refresh rate. (Same bug + fix as the desktop shell.)
         let egui_consumed = if let Some(app) = self.app.as_mut() {
             let resp = app.egui_state.on_window_event(&app.window, &event);
-            if resp.repaint {
+            if resp.repaint && !matches!(event, WindowEvent::RedrawRequested) {
                 app.window.request_redraw();
             }
             resp.consumed
@@ -1665,10 +1670,15 @@ impl App {
 
         let quads = self.reader.build_quads();
         let anim_t = self.anim_origin.elapsed();
+        // Did this frame draw a free-running animation (GIF/WebP)? The end-of-frame
+        // redraw guard keeps the loop alive while one is on screen — without this,
+        // animations only advance on input events.
+        let mut drew_live_anim = false;
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
                 self.reader.page_texture(q.page_index).map(|t| {
+                    drew_live_anim |= t.is_animation();
                     let view = t.view_at(anim_t);
                     self.page_pipeline.prepare_quad(
                         &self.ctx.device,
@@ -2084,6 +2094,7 @@ impl App {
             || self.reader.lq_fill_pending()
             || hints_visible
             || self.reader.transition_active()
+            || drew_live_anim // a GIF/WebP is playing on screen
         {
             self.window.request_redraw();
         }
