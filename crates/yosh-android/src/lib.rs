@@ -154,6 +154,9 @@ struct App {
     /// are revealed (see `controls_shown_at`), so they don't clutter while reading.
     controls: bool,
     controls_shown_at: Instant,
+    /// Display name of the open comic (basename of `Shell::current_key`), shown
+    /// atop the seekbar. Empty when nothing is open.
+    book_title: String,
     show_options: bool,
     show_info: bool,
     /// The user's layout choice. `reader.layout` is the concrete `Single`/`Spread`
@@ -362,6 +365,7 @@ impl ApplicationHandler for Shell {
             thumb_dir: None,
             controls: true,
             controls_shown_at: Instant::now(),
+            book_title: String::new(),
             show_options: false,
             show_info: false,
             layout_mode: self.init_view.1,
@@ -729,6 +733,7 @@ impl Shell {
                 src,
                 start,
             );
+            app.book_title = book_display_name(&key);
             app.window.request_redraw();
         }
         self.current_key = Some(key.clone());
@@ -751,6 +756,7 @@ impl Shell {
             app.reader.cache.clear();
             app.reader.lq_cache.clear();
             app.reader.failed.clear();
+            app.book_title.clear();
             app.controls = false;
             app.show_options = false;
             app.show_info = false;
@@ -931,6 +937,7 @@ fn info_popup(ctx: &egui::Context, lines: &[(String, String)], close: &mut bool)
 #[allow(clippy::too_many_arguments)]
 fn seekbar(
     ctx: &egui::Context,
+    title: &str,
     cur: usize,
     len: usize,
     rtl: bool,
@@ -966,17 +973,47 @@ fn seekbar(
             frame.show(ui, |ui| {
                 ui.set_width((sw * 0.85).min(960.0));
                 ui.spacing_mut().interact_size.y = 30.0;
+                // Book filename atop the pill, centered and filling the width;
+                // `.truncate()` ellipsizes a long name instead of widening the
+                // (fixed-width) pill.
+                if !title.is_empty() {
+                    ui.vertical_centered_justified(|ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(title).size(15.0).strong())
+                                .truncate(),
+                        );
+                    });
+                    ui.add_space(2.0);
+                }
                 ui.horizontal(|ui| {
-                    // Right-pad the current page to the total's digit width in a
-                    // monospace font, so "1 / 200" and "200 / 200" occupy the same
-                    // width and the slider doesn't shift as the page number grows.
+                    // Page indicator split across the slider — current page on the
+                    // reading-start side, total on the far side (LTR: cur | slider | total;
+                    // RTL mirrored, matching the slider's value transform below). Both are
+                    // monospace boxes sized to the total's digit width, so the two ends are
+                    // equal width and the slider — and thus the whole pill — stays centered.
                     let digits = len.to_string().len();
-                    ui.label(
-                        egui::RichText::new(format!("{:>digits$} / {}", cur + 1, len))
-                            .size(18.0)
-                            .monospace(),
-                    );
-                    ui.spacing_mut().slider_width = (ui.available_width() - 8.0).max(120.0);
+                    let num_w = ui
+                        .painter()
+                        .layout_no_wrap(
+                            "0".repeat(digits),
+                            egui::FontId::monospace(18.0),
+                            egui::Color32::WHITE,
+                        )
+                        .size()
+                        .x
+                        .ceil()
+                        + 6.0;
+                    let sp = ui.spacing().item_spacing.x;
+                    ui.spacing_mut().slider_width =
+                        (ui.available_width() - 2.0 * (num_w + sp) - 2.0).max(120.0);
+                    let num = |ui: &mut egui::Ui, n: usize| {
+                        ui.add_sized(
+                            [num_w, 24.0],
+                            egui::Label::new(
+                                egui::RichText::new(n.to_string()).size(18.0).monospace(),
+                            ),
+                        );
+                    };
                     // Slider colors, fully opaque (the handle must never be translucent).
                     // egui ties the idle handle's fill to the rail-behind color
                     // (widgets.inactive.bg_fill), so keep that bright blue unconditionally
@@ -997,6 +1034,8 @@ fn seekbar(
                     v.widgets.inactive.fg_stroke = ring;
                     v.widgets.hovered.fg_stroke = ring;
                     v.widgets.active.fg_stroke = ring;
+                    // Leading number: total in RTL (page 1 is on the right), current in LTR.
+                    num(ui, if rtl { len } else { cur + 1 });
                     // RTL: map so page 1 sits on the right and progress runs leftward.
                     let mut sv = if rtl { len - 1 - cur } else { cur };
                     let resp = ui.add(
@@ -1007,6 +1046,8 @@ fn seekbar(
                     if resp.changed() {
                         *seek_to = Some(if rtl { len - 1 - sv } else { sv });
                     }
+                    // Trailing number: current in RTL, total in LTR.
+                    num(ui, if rtl { cur + 1 } else { len });
                     // mpv-style cache bar: thin ticks along the bottom of the rail.
                     // Faint wash = LQ preview thumbnails (whole volume once warm);
                     // brighter ticks = decode-ahead HQ pages near the handle, drawn on
@@ -1472,6 +1513,7 @@ impl App {
         let len = src.len();
         let idx = view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
         let mut lines = vec![
+            ("Book".to_string(), self.book_title.clone()),
             ("File".to_string(), src.name(idx).to_string()),
             ("Page".to_string(), format!("{} / {}", idx + 1, len)),
             (
@@ -1666,6 +1708,7 @@ impl App {
         let lq_buffered: Vec<usize> = self.reader.lq_cache.buffered_indices().collect();
         let library_view = self.library_view;
         let controls = self.controls;
+        let book_title = self.book_title.clone();
         let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
         let show_options = self.show_options;
         let show_info = self.show_info;
@@ -1808,6 +1851,7 @@ impl App {
             } else if controls {
                 seekbar(
                     ctx,
+                    &book_title,
                     cur,
                     len,
                     rtl,
@@ -2001,6 +2045,24 @@ fn name_of(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
+
+/// Human-readable book name from a `current_key` (a filesystem path or a
+/// content:// URI). Paths → basename; SAF document URIs (e.g.
+/// `…/document/primary:Manga/Title.cbz`) → last decoded segment after `/` or `:`.
+fn book_display_name(key: &str) -> String {
+    if key.starts_with("content://") {
+        // Minimal percent-decode of just the separators SAF uses, then take the
+        // final component. Good enough for a display name; fall back to the raw
+        // key if there's nothing better to show.
+        let decoded = key.replace("%2F", "/").replace("%2f", "/").replace("%3A", ":");
+        let last = decoded
+            .rsplit(['/', ':'])
+            .find(|s| !s.is_empty())
+            .unwrap_or(key);
+        return last.to_string();
+    }
+    name_of(Path::new(key))
 }
 
 fn ext_lower(p: &Path) -> Option<String> {
