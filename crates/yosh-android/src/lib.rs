@@ -225,6 +225,8 @@ struct FrameReqs {
     page_nav: i64,
     /// Seekbar book button: open the prev/next sibling comic in the folder (-1/+1).
     book_nav: i64,
+    /// Seekbar close button: close the current comic, back to the empty state.
+    close_book: bool,
 }
 
 impl ApplicationHandler for Shell {
@@ -290,18 +292,21 @@ impl ApplicationHandler for Shell {
 
         let page_pipeline = PagePipeline::new(&ctx.device, config.format);
         let egui_ctx = egui::Context::default();
-        // egui's bundled fonts have no CJK glyphs; add the system Noto Sans CJK as a
-        // fallback so Japanese comic / file names render instead of tofu squares.
+        // One font set: Phosphor icon glyphs (seekbar buttons) plus a CJK fallback.
+        // Phosphor is installed unconditionally; egui's bundled fonts have no CJK
+        // glyphs, so add the system Noto Sans CJK as a fallback when present so
+        // Japanese comic / file names render instead of tofu squares.
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
         if let Ok(bytes) = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc") {
-            let mut fonts = egui::FontDefinitions::default();
             fonts
                 .font_data
                 .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts.families.entry(fam).or_default().push("cjk".to_owned());
             }
-            egui_ctx.set_fonts(fonts);
         }
+        egui_ctx.set_fonts(fonts);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -437,6 +442,9 @@ impl ApplicationHandler for Shell {
                 }
                 if reqs.book_nav != 0 {
                     self.open_sibling_book(reqs.book_nav);
+                }
+                if reqs.close_book {
+                    self.close_comic();
                 }
             }
             _ => {}
@@ -708,6 +716,28 @@ impl Shell {
         self.save_positions();
     }
 
+    /// Close the current comic: persist its position, tear down the page source
+    /// (the inverse of `attach_source`), and fall back to the empty "no comic open"
+    /// state (`len == 0` renders `empty_state`).
+    fn close_comic(&mut self) {
+        if let (Some(k), Some(app)) = (self.current_key.clone(), self.app.as_ref()) {
+            self.positions.insert(k, app.reader.index);
+        }
+        self.save_positions();
+        self.current_key = None;
+        if let Some(app) = self.app.as_mut() {
+            app.reader.pool = None;
+            app.reader.source = None;
+            app.reader.cache.clear();
+            app.reader.lq_cache.clear();
+            app.reader.failed.clear();
+            app.controls = false;
+            app.show_options = false;
+            app.show_info = false;
+            app.window.request_redraw();
+        }
+    }
+
     fn save_positions(&self) {
         let Some(path) = &self.pos_path else { return };
         let mut out = String::new();
@@ -880,6 +910,8 @@ fn seekbar(
     len: usize,
     rtl: bool,
     spread: bool,
+    fit: FitMode,
+    zoomed: bool,
     buffered: &[usize],
     lq_buffered: &[usize],
     seek_to: &mut Option<usize>,
@@ -888,7 +920,10 @@ fn seekbar(
     page_nav: &mut i64,
     book_nav: &mut i64,
     toggle_offset: &mut bool,
+    cycle_fit: &mut bool,
+    close_book: &mut bool,
 ) {
+    use egui_phosphor::fill as ph;
     if len <= 1 {
         return;
     }
@@ -984,40 +1019,110 @@ fn seekbar(
                         }
                     }
                 });
-                // One centered row of big touch buttons. The nav arrows are POSITIONAL
-                // (left = leftward in reading); the action flips with direction. Outer
-                // arrows = book, inner = page; ⚙ options, ℹ info, ↔ pairing (spread).
+                // One centered row of big touch icon buttons. The nav arrows are
+                // POSITIONAL (left = leftward in reading); the action flips with
+                // direction. Outer = book (a book glyph with an arrow over it), inner
+                // = page; gear = options, info, ↔ = pairing (spread only), × = close.
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    let bw = 58.0;
-                    let count = if spread { 7 } else { 6 };
+                    let count = if spread { 9 } else { 8 };
                     let sp = ui.spacing().item_spacing.x;
+                    let avail = ui.available_width();
+                    // Fit every button across the available width (shrinking on narrow
+                    // screens), but cap the size so they don't balloon on wide ones.
+                    let bw = (((avail - (count - 1) as f32 * sp) / count as f32).floor())
+                        .clamp(40.0, 58.0);
                     let total = count as f32 * bw + (count - 1) as f32 * sp;
-                    ui.add_space(((ui.available_width() - total) * 0.5).max(0.0));
-                    let big = |ui: &mut egui::Ui, txt: &str| {
-                        ui.add_sized([bw, 46.0], egui::Button::new(egui::RichText::new(txt).size(22.0)))
-                            .clicked()
+                    ui.add_space(((avail - total) * 0.5).max(0.0));
+                    // PerfectViewer-style palette: green nav arrows, an orange book for
+                    // book nav, a red book for close, white utility icons.
+                    let green = egui::Color32::from_rgb(124, 200, 80);
+                    let white = egui::Color32::from_gray(235);
+                    let red = egui::Color32::from_rgb(206, 74, 66);
+                    let orange = egui::Color32::from_rgb(212, 140, 56);
+                    let big = |ui: &mut egui::Ui, txt: &str, color: egui::Color32| {
+                        ui.add_sized(
+                            [bw, 46.0],
+                            egui::Button::new(egui::RichText::new(txt).size(22.0).color(color)),
+                        )
+                        .clicked()
                     };
-                    if big(ui, "⚙") {
+                    // A solid orange book with a glyph poking past its edge — used for
+                    // prev/next-book (a green arrow off the left/right edge) and close (a
+                    // red × off the top-right corner). The book colour is consistent for
+                    // all three; offsetting the glyph past the edge (rather than dead
+                    // centre) keeps both the book and the glyph legible. The glyph's side
+                    // is positional (fixed); the action flips with direction at the call.
+                    let book_overlay = |ui: &mut egui::Ui,
+                                        glyph: &str,
+                                        off: egui::Vec2,
+                                        gsize: f32,
+                                        glyph_color: egui::Color32|
+                     -> bool {
+                        let resp = ui.add_sized([bw, 46.0], egui::Button::new(""));
+                        let c = resp.rect.center();
+                        let p = ui.painter_at(resp.rect);
+                        p.text(
+                            c + egui::vec2(0.0, 1.0),
+                            egui::Align2::CENTER_CENTER,
+                            ph::BOOK,
+                            egui::FontId::proportional(28.0),
+                            orange,
+                        );
+                        p.text(
+                            c + off,
+                            egui::Align2::CENTER_CENTER,
+                            glyph,
+                            egui::FontId::proportional(gsize),
+                            glyph_color,
+                        );
+                        resp.clicked()
+                    };
+                    if big(ui, ph::GEAR, white) {
                         *open_options = true;
                     }
-                    if big(ui, "«") {
+                    // Fit-mode button: when zoomed (in or out of the fit scale), the
+                    // first tap drops the zoom to restore the active fit (icon dimmed
+                    // to show no fit is active); otherwise it cycles fit modes. The icon
+                    // reflects the current fit (1:1 stays as text).
+                    let fit_color = if zoomed {
+                        egui::Color32::from_white_alpha(120)
+                    } else {
+                        white
+                    };
+                    let fit_rich = match fit {
+                        FitMode::Window => egui::RichText::new(ph::ARROWS_OUT).size(22.0),
+                        FitMode::Width => egui::RichText::new(ph::ARROWS_OUT_LINE_HORIZONTAL).size(22.0),
+                        FitMode::Height => egui::RichText::new(ph::ARROWS_OUT_LINE_VERTICAL).size(22.0),
+                        FitMode::Actual => egui::RichText::new("1:1").size(16.0),
+                    }
+                    .color(fit_color);
+                    if ui
+                        .add_sized([bw, 46.0], egui::Button::new(fit_rich))
+                        .clicked()
+                    {
+                        *cycle_fit = true;
+                    }
+                    if book_overlay(ui, ph::ARROW_FAT_LEFT, egui::vec2(-11.0, 1.0), 16.0, green) {
                         *book_nav = if rtl { 1 } else { -1 };
                     }
-                    if big(ui, "‹") {
+                    if big(ui, ph::ARROW_FAT_LEFT, green) {
                         *page_nav = if rtl { 1 } else { -1 };
                     }
-                    if spread && big(ui, "↔") {
+                    if spread && big(ui, ph::ARROWS_LEFT_RIGHT, white) {
                         *toggle_offset = true;
                     }
-                    if big(ui, "›") {
+                    if big(ui, ph::ARROW_FAT_RIGHT, green) {
                         *page_nav = if rtl { -1 } else { 1 };
                     }
-                    if big(ui, "»") {
+                    if book_overlay(ui, ph::ARROW_FAT_RIGHT, egui::vec2(11.0, 1.0), 16.0, green) {
                         *book_nav = if rtl { -1 } else { 1 };
                     }
-                    if big(ui, "ℹ") {
+                    if big(ui, ph::INFO, white) {
                         *open_info = true;
+                    }
+                    if book_overlay(ui, ph::X, egui::vec2(10.0, -8.0), 15.0, red) {
+                        *close_book = true;
                     }
                 });
             });
@@ -1521,6 +1626,7 @@ impl App {
         let cur_layout = self.reader.layout;
         let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
+        let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
         // Snapshot the rows the closure needs (owned), so it borrows no `self`.
         let entries: Vec<(bool, String, PathBuf, Option<egui::TextureHandle>)> = self
@@ -1546,6 +1652,8 @@ impl App {
         let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
         let mut toggle_offset = false;
+        let mut cycle_fit = false;
+        let mut close_book = false;
         let mut page_nav: i64 = 0;
         let mut book_nav: i64 = 0;
         let mut open_info = false;
@@ -1651,6 +1759,8 @@ impl App {
                     len,
                     rtl,
                     cur_layout == Layout::Spread,
+                    cur_fit,
+                    (cur_zoom - 1.0).abs() > 0.001,
                     &buffered,
                     &lq_buffered,
                     &mut seek_to,
@@ -1659,6 +1769,8 @@ impl App {
                     &mut page_nav,
                     &mut book_nav,
                     &mut toggle_offset,
+                    &mut cycle_fit,
+                    &mut close_book,
                 );
                 if hints_visible {
                     zone_hints(ctx, rtl);
@@ -1733,6 +1845,22 @@ impl App {
             self.reader.prefetch();
             self.persist_view();
         }
+        if cycle_fit {
+            if (self.reader.zoom - 1.0).abs() > 0.001 {
+                // Zoomed (in OR out of the fit scale): restore the active fit by
+                // dropping the zoom/pan (reader.fit already holds the fit that was
+                // active before zooming).
+                self.reader.zoom = 1.0;
+                self.reader.pan_x = 0.0;
+                self.reader.pan_y = 0.0;
+            } else {
+                // Already fitted: advance to the next fit mode.
+                self.reader.fit = self.reader.fit.cycle();
+                self.persist_view();
+            }
+            self.reader.prefetch();
+            self.window.request_redraw();
+        }
         if toggle_offset {
             self.reader.spread_offset ^= 1;
             self.reader.index =
@@ -1741,6 +1869,7 @@ impl App {
         }
         reqs.page_nav = page_nav;
         reqs.book_nav = book_nav;
+        reqs.close_book = close_book;
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
         let screen = egui_wgpu::ScreenDescriptor {

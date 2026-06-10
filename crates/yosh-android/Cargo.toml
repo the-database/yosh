@@ -27,6 +27,11 @@ jni = "0.21"
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
 egui-winit = { version = "0.34.3", default-features = false }
+# Phosphor icon font for the seekbar buttons. Pure-Rust (embeds a TTF, no C deps).
+# Use the solid `fill` weight (chunky, PerfectViewer-style) only — not the default
+# thin `regular`. Installed as a Proportional-family fallback (see lib.rs font setup)
+# so icon glyphs render in normal labels/buttons.
+egui-phosphor = { version = "0.12", default-features = false, features = ["fill"] }
 # Natural-order sort for the library (vol 2 before vol 10).
 natord = "1"
 # Resizer for the engine's decode_and_downscale (library cover thumbnails).
