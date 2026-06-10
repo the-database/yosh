@@ -401,6 +401,14 @@ pub struct Reader {
     transition: Option<PageTransition>,
     /// Live interactive page drag (page-flip mode only), if one is in progress.
     drag: Option<PageDrag>,
+    /// Did the last `build_quads` draw a mid-animation frame (transition overlay
+    /// or live drag)? The shells' redraw guards read this instead of re-checking
+    /// the clock: a re-check can land just *after* the animation expired even
+    /// though the frame that was drawn was mid-fade — freezing a half-faded
+    /// ghost of the outgoing page on screen. Deciding once, at draw time,
+    /// guarantees one more frame after any animation frame (which then draws
+    /// clean and clears this).
+    anim_drawn: std::cell::Cell<bool>,
 
     /// Inputs of the last `prefetch()` job-list rebuild. Shells call `prefetch()`
     /// every frame; when neither the view nor the caches changed since the last
@@ -482,6 +490,7 @@ impl Reader {
             transition_enabled: false,
             transition: None,
             drag: None,
+            anim_drawn: std::cell::Cell::new(false),
             last_jobs_key: None,
         }
     }
@@ -850,6 +859,7 @@ impl Reader {
     /// ready spread). Only includes pages present in the cache. When a page-flip
     /// transition is in flight, the outgoing view is appended on top, fading out.
     pub fn build_quads(&self) -> Vec<Quad> {
+        self.anim_drawn.set(false);
         let Some(src) = &self.source else {
             return Vec::new();
         };
@@ -869,6 +879,7 @@ impl Reader {
         if let Some(d) = &self.drag
             && d.live()
         {
+            self.anim_drawn.set(true);
             let raw = d.current_dx();
             let toward = drag_dir(self.direction, raw);
             let incoming = if toward > 0 {
@@ -904,6 +915,7 @@ impl Reader {
         if let Some(t) = &self.transition {
             let p = (t.start.elapsed().as_secs_f32() / (TRANSITION_MS as f32 / 1000.0)).clamp(0.0, 1.0);
             if p < 1.0 {
+                self.anim_drawn.set(true);
                 let eased = 1.0 - (1.0 - p) * (1.0 - p); // ease-out (slide + defocus)
                 // Fade faster than the slide (cubic) so the faint outgoing ghost
                 // clears early. A fade that tracks the slide leaves a dim page
@@ -933,12 +945,14 @@ impl Reader {
         quads
     }
 
-    /// Whether a page-flip animation is currently on screen (drives the shell's
-    /// redraw scheduling so the fade actually plays out).
-    pub fn transition_active(&self) -> bool {
-        self.transition
-            .as_ref()
-            .is_some_and(|t| t.start.elapsed() < Duration::from_millis(TRANSITION_MS))
+    /// Did the most recent `build_quads` draw a mid-animation frame (page-turn
+    /// overlay or interactive drag)? This is what an end-of-frame redraw guard
+    /// must use — a clock-based "is the animation still running?" check there
+    /// would re-sample time *after* the draw, and an animation expiring in that
+    /// gap freezes its last mid-fade frame on screen. Decided at draw time, so
+    /// the frame after any animation frame always renders (clean).
+    pub fn animation_drawn(&self) -> bool {
+        self.anim_drawn.get()
     }
 
     /// Place one view's pages into draw quads — 1 for a single page (or a wide
@@ -1054,6 +1068,9 @@ impl Reader {
 
     /// Build the visible vertical-strip quads (width-fit, stacked top to bottom).
     pub fn build_scroll_quads(&self) -> Vec<Quad> {
+        // No flip animations in scroll mode — clear the draw-time flag so a
+        // mode switch can't leave a stale `animation_drawn` pinning the loop.
+        self.anim_drawn.set(false);
         let Some(src) = &self.source else {
             return Vec::new();
         };
@@ -1755,12 +1772,6 @@ impl Reader {
         {
             d.settle = Some((d.dx, Instant::now()));
         }
-    }
-
-    /// Whether a drag is on screen (tracking the finger, or snapping back) —
-    /// drives the shell's redraw scheduling like `transition_active`.
-    pub fn drag_active(&self) -> bool {
-        self.drag.as_ref().is_some_and(|d| d.live())
     }
 
     pub fn goto(&mut self, index: usize) {

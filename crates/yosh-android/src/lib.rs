@@ -2170,8 +2170,11 @@ impl App {
             || !self.reader.view_is_hq()
             || self.reader.lq_fill_pending()
             || hints_visible
-            || self.reader.transition_active()
-            || self.reader.drag_active() // interactive page drag / its snap-back
+            // Draw-time flag, NOT transition_active()/drag_active(): re-sampling
+            // the clock here can see the animation as just-expired even though
+            // the frame above drew it mid-fade — freezing a half-faded ghost of
+            // the outgoing page on screen (the decision must match the draw).
+            || self.reader.animation_drawn() // page-turn / drag frame was drawn
             || drew_live_anim // a GIF/WebP is playing on screen
             || egui_animating // egui fade/feedback animation mid-flight
         {
