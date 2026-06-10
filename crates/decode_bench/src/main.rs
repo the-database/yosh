@@ -154,7 +154,7 @@ fn main() {
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             p.extension()
-                .map_or(false, |e| e.eq_ignore_ascii_case("png"))
+                .is_some_and(|e| e.eq_ignore_ascii_case("png"))
         })
         .collect();
     files.sort();

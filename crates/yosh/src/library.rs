@@ -98,7 +98,7 @@ pub fn sibling_volumes(of: &Path) -> Vec<PathBuf> {
 }
 
 fn dir_has_image(dir: &Path) -> bool {
-    std::fs::read_dir(dir).map_or(false, |rd| {
+    std::fs::read_dir(dir).is_ok_and(|rd| {
         rd.flatten().any(|e| {
             // Use the entry's cached type to avoid a stat per file (a network
             // round-trip on a share); only follow a symlink with a real check.

@@ -407,14 +407,13 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
     let show_bar = st.show_bar;
     egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
         ui.horizontal(|ui| {
-            if ui.button("Open folder…").clicked() {
-                if let Some(p) = rfd::FileDialog::new().set_title("Open page folder").pick_folder()
-                {
-                    st.pending_open = Some(p);
-                }
+            if ui.button("Open folder…").clicked()
+                && let Some(p) = rfd::FileDialog::new().set_title("Open page folder").pick_folder()
+            {
+                st.pending_open = Some(p);
             }
-            if ui.button("Open file…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
+            if ui.button("Open file…").clicked()
+                && let Some(p) = rfd::FileDialog::new()
                     .set_title("Open comic archive or image")
                     .add_filter(
                         "Comics & images",
@@ -424,17 +423,15 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
                         ],
                     )
                     .pick_file()
-                {
-                    st.pending_open = Some(p);
-                }
+            {
+                st.pending_open = Some(p);
             }
-            if ui.button("Library…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
+            if ui.button("Library…").clicked()
+                && let Some(p) = rfd::FileDialog::new()
                     .set_title("Choose a library folder")
                     .pick_folder()
-                {
-                    st.pending_library = Some(p);
-                }
+            {
+                st.pending_library = Some(p);
             }
             if !lib.volumes.is_empty() && ui.button(if library_view { "Reader" } else { "Grid" }).clicked() {
                 st.req_toggle_library = true;

@@ -30,9 +30,12 @@ fn main() {
         .unwrap_or(0);
 
     let event_loop = EventLoop::new().expect("create event loop");
-    // Poll for now (render every frame). Will switch to Wait + EventLoopProxy wake-ups
-    // once the async decode pipeline lands (M1.3).
-    event_loop.set_control_flow(ControlFlow::Poll);
+    // On-demand rendering: sleep until an event (or the background-poll heartbeat
+    // `about_to_wait` re-arms) instead of free-running. Frames are driven by input
+    // events and by `render()` re-requesting itself while anything is in flight
+    // (decodes pending, animation playing, transition, toast) — so the app costs
+    // ~zero CPU/GPU on a static page but still never misses a decode landing.
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = app::App::new(path, start_index);
     event_loop.run_app(&mut app).expect("run app");

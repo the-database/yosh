@@ -10,6 +10,7 @@
 //!     sRGB → linear luminance, resample, then re-encode through the Dot Gain 20%
 //!     curve so screentones stay inky (see `tone.rs`). Linear-light resampling is
 //!     what suppresses halftone moiré.
+//!
 //! Color decodes that are *visually* grayscale (within a threshold) are detected
 //! and routed through the grayscale path, matching MangaJaNai's behavior.
 
@@ -456,13 +457,11 @@ pub fn decode_and_downscale(
     // Dot Gain profile on a monochrome AVIF) is skipped: it can't be applied to
     // the RGBA buffer (channel mismatch → white), and the gray resize path below
     // handles its tone instead.
-    if !gray_by_channels {
-        if let Some(p) = &profile {
-            if !icc::is_srgb(p) && !icc::is_gray(p) {
+    if !gray_by_channels
+        && let Some(p) = &profile
+            && !icc::is_srgb(p) && !icc::is_gray(p) {
                 icc::to_srgb_rgba(p, &mut full);
             }
-        }
-    }
     // Decoded size = scale to the display height (never upscaling past the source).
     // A page bigger than one GPU texture is rejected (full res is preserved up to
     // the limit; we don't silently downscale a 16k-px image to a blurry one).
@@ -572,7 +571,7 @@ fn frames_to_page(
         // matching browsers (which treat <20ms as 100ms) so a 0ms frame can't pin
         // the loop.
         let (num, den) = frame.delay().numer_denom_ms();
-        let ms = if den == 0 { 0 } else { num / den };
+        let ms = num.checked_div(den).unwrap_or(0);
         let delay = if ms < 20 { 100 } else { ms };
         let buf = frame.into_buffer(); // RgbaImage, full canvas
         let (w, h) = buf.dimensions();
@@ -639,8 +638,8 @@ pub fn decode_page(
     }
     // WebP: frame-decode only when it's actually animated; a static WebP takes the
     // normal still path (with ICC color management) like any other image.
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        if let Ok(dec) = WebPDecoder::new(std::io::Cursor::new(bytes))
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP"
+        && let Ok(dec) = WebPDecoder::new(std::io::Cursor::new(bytes))
             && dec.has_animation()
         {
             let frames = dec
@@ -649,7 +648,6 @@ pub fn decode_page(
                 .map_err(|e| format!("webp frames: {e}"))?;
             return frames_to_page(frames, target_h, resizer);
         }
-    }
     // Stills: the seek hot path. LQ uses the fast gamma-space resize; HQ is the
     // unchanged linear-light pipeline. (Animations/ICO above always decode HQ —
     // rare, and not the seek bottleneck.)
@@ -724,9 +722,9 @@ mod tests {
         b.extend_from_slice(&0u32.to_be_bytes()); // image resources: none
         b.extend_from_slice(&0u32.to_be_bytes()); // layer & mask info: none
         b.extend_from_slice(&0u16.to_be_bytes()); // compression = raw
-        b.extend(std::iter::repeat(255u8).take(16)); // R plane
-        b.extend(std::iter::repeat(0u8).take(16)); // G plane
-        b.extend(std::iter::repeat(0u8).take(16)); // B plane
+        b.extend(std::iter::repeat_n(255u8, 16)); // R plane
+        b.extend(std::iter::repeat_n(0u8, 16)); // G plane
+        b.extend(std::iter::repeat_n(0u8, 16)); // B plane
         b
     }
 

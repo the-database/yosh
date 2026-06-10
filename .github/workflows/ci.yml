@@ -1,0 +1,38 @@
+name: ci
+
+# Tests + lints on every push/PR to main — the release workflow (release.yml)
+# only *builds*, so without this a breaking engine change ships silently.
+# Default features only (pure-Rust, no C toolchain — no dav1d/nasm here);
+# the AVIF feature is exercised by the release build.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # winit/rfd need the desktop dev libs at build time (same set release.yml uses).
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libwayland-dev libx11-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # Workspace is clippy-clean; keep it that way.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace

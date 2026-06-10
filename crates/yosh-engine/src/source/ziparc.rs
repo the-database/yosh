@@ -145,11 +145,7 @@ impl ZipSource {
     fn scan_local(backend: &Backend) -> io::Result<Vec<(String, u64)>> {
         let mut reader = Self::fresh(backend)?;
         let mut entries = Vec::new();
-        loop {
-            let off = match reader.stream_position() {
-                Ok(o) => o,
-                Err(_) => break,
-            };
+        while let Ok(off) = reader.stream_position() {
             match zip::read::read_zipfile_from_stream(&mut reader) {
                 Ok(Some(mut file)) => {
                     let name = file.name().to_string();

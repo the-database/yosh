@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
@@ -73,6 +73,11 @@ const THUMB_BUDGET: usize = 2;
 /// loads don't flash an indicator on every flip — only genuinely slow decodes
 /// (e.g. seeking fast through very high-res pages) cross it.
 const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(150);
+/// How often `about_to_wait` polls the background channels (update check, folder
+/// watch, sibling scan) while the app is otherwise idle. With on-demand rendering
+/// these are no longer drained every frame, so the loop wakes on this heartbeat,
+/// pumps them without rendering, and buys a frame only when something landed.
+const BACKGROUND_POLL: Duration = Duration::from_millis(250);
 /// Fraction of the window width on each side that flips pages on click (and
 /// shows a hover arrow). The middle is reserved for double-click → fullscreen.
 const EDGE_FRAC: f32 = 0.15;
@@ -734,8 +739,10 @@ impl ApplicationHandler for App {
         let budget = Budget::derive(detect_mem_budget_mb(), cpus);
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
 
-        let mut ui = UiState::default();
-        ui.status = format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend);
+        let mut ui = UiState {
+            status: format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend),
+            ..UiState::default()
+        };
         if let Some(p) = self.initial_path.take() {
             ui.pending_open = Some(p);
         }
@@ -847,6 +854,12 @@ impl ApplicationHandler for App {
             return;
         };
         let response = state.egui_state.on_window_event(&state.window, &event);
+        // With `ControlFlow::Wait` the loop no longer free-runs: any input/window
+        // event may have changed reading state, so each one buys a frame (render
+        // then re-requests itself while anything is still in flight). Requesting
+        // from *within* RedrawRequested would loop forever, so that one is exempt —
+        // render's own end-of-frame conditions decide there.
+        let buys_frame = !matches!(event, WindowEvent::RedrawRequested);
 
         match event {
             WindowEvent::CloseRequested => {
@@ -901,15 +914,22 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
-        if response.repaint {
+        if buys_frame || response.repaint {
             state.window.request_redraw();
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.state.as_ref() {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Idle pump: background results (update check, folder watch / live refresh,
+        // sibling scan) are no longer drained per frame, so poll them here; anything
+        // visible that landed buys one frame. The heartbeat re-arms the wake-up so
+        // this keeps running while the app is otherwise asleep.
+        if let Some(state) = self.state.as_mut()
+            && state.poll_background()
+        {
             state.window.request_redraw();
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + BACKGROUND_POLL));
     }
 }
 
@@ -1178,7 +1198,7 @@ impl State {
             // Folder (incl. single-image opens, which open the parent folder):
             // select the current page's file. `name(index)` is a flat file name.
             match self.reader.source.as_ref() {
-                Some(s) if s.len() > 0 => base.join(s.name(self.reader.index)),
+                Some(s) if !s.is_empty() => base.join(s.name(self.reader.index)),
                 _ => base,
             }
         } else {
@@ -1562,7 +1582,8 @@ impl State {
     /// a debounce stamp, kick off a debounced off-thread rebuild of the open volume once
     /// it has settled (or at least every `MAX_WAIT` under a continuous writer), and apply
     /// a finished rebuild to the reader (which preserves position + decoded cache by name).
-    fn poll_folder_watch(&mut self) {
+    /// Returns true when a rebuild was applied (the view changed — worth a frame).
+    fn poll_folder_watch(&mut self) -> bool {
         // Coalesce incoming change events. A bulk copy / streaming archive write fires
         // many — collapse them. `watch_dirty` tracks the latest event (settle delay);
         // `watch_dirty_since` the first of the streak (max-wait cap). Pure access events
@@ -1615,14 +1636,60 @@ impl State {
         }
         // Apply finished rebuilds — newest generation only (a `[`/`]` volume switch
         // bumped `open_gen`, exactly like the `open_rx` guard above).
+        let mut refreshed = false;
         while let Ok((generation, built)) = self.rescan_rx.try_recv() {
             self.rescanning = false;
             if generation == self.open_gen
                 && let Some(source) = built
             {
                 self.reader.apply_refreshed_source(source);
+                refreshed = true;
             }
         }
+        refreshed
+    }
+
+    /// Poll the channels that background threads deliver on — called every frame
+    /// from `render` and, while the app is idle, from the `about_to_wait` heartbeat
+    /// (no frames are flowing then, so this is the only drain). Returns true when
+    /// something user-visible landed and is worth one frame: an update-check result,
+    /// an update-apply failure, or a live-refreshed volume listing.
+    fn poll_background(&mut self) -> bool {
+        let mut changed = false;
+        // Sibling-volume scans only warm the `[`/`]` cache — nothing to show.
+        while let Ok(entry) = self.sib_rx.try_recv() {
+            self.sib_cache = Some(entry);
+        }
+        // Live folder refresh: react to images added/removed in the open folder.
+        changed |= self.poll_folder_watch();
+        // Auto-update: pick up the background check result and any apply result.
+        if let Some(rx) = self.update_rx.take() {
+            match rx.try_recv() {
+                Ok(u) => {
+                    self.update = Some(u);
+                    changed = true; // show the "Update" button
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.update_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some(rx) = self.update_apply_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok(())) => self.relaunch(),
+                Ok(Err(e)) => {
+                    self.updating = false;
+                    self.update_error = Some(e);
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.update_apply_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.updating = false;
+                    self.update_error = Some("update interrupted".into());
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// Scan the current volume's folder for sibling volumes on a background
@@ -1699,7 +1766,7 @@ impl State {
                 };
                 let color = yosh_engine::icc::extract_icc(b)
                     .as_deref()
-                    .and_then(|p| yosh_engine::icc::describe(p))
+                    .and_then(yosh_engine::icc::describe)
                     .unwrap_or_else(|| "—".to_string());
                 (res, detail, human_size(b.len() as u64), color)
             }
@@ -1896,7 +1963,7 @@ impl State {
             self.opening = false;
             self.opening_key = None;
             match built {
-                Ok((source, key, start)) if source.len() > 0 => {
+                Ok((source, key, start)) if !source.is_empty() => {
                     let partial = source.is_partial();
                     let n = source.len();
                     self.set_source(source, &key, start);
@@ -1908,34 +1975,9 @@ impl State {
                 Err(e) => self.ui.status = format!("open failed: {e}"),
             }
         }
-        // Pick up background sibling-volume scans into the `[`/`]` cache.
-        while let Ok(entry) = self.sib_rx.try_recv() {
-            self.sib_cache = Some(entry);
-        }
-        // Live folder refresh: react to images added/removed in the open folder.
-        self.poll_folder_watch();
-        // Auto-update: pick up the background check result and any apply result.
-        if let Some(rx) = self.update_rx.take() {
-            match rx.try_recv() {
-                Ok(u) => self.update = Some(u),
-                Err(std::sync::mpsc::TryRecvError::Empty) => self.update_rx = Some(rx),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
-            }
-        }
-        if let Some(rx) = self.update_apply_rx.take() {
-            match rx.try_recv() {
-                Ok(Ok(())) => self.relaunch(),
-                Ok(Err(e)) => {
-                    self.updating = false;
-                    self.update_error = Some(e);
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => self.update_apply_rx = Some(rx),
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.updating = false;
-                    self.update_error = Some("update interrupted".into());
-                }
-            }
-        }
+        // Background channels (sibling scans, folder watch, update check) — shared
+        // with the idle pump in `about_to_wait`.
+        self.poll_background();
         self.ui.update_version = self.update.as_ref().map(|u| u.version.clone());
         self.ui.updating = self.updating;
         self.ui.update_failed = self.update_error.is_some();
@@ -1984,7 +2026,9 @@ impl State {
         self.ui.resize_path = self.reader.resize_path_label();
         // Drain transient messages the reader queued (boundary hit, zoom level)
         // into the shell's timed toast.
-        if let Some(m) = self.reader.pending_toasts.drain(..).last() {
+        let last_toast = self.reader.pending_toasts.pop();
+        self.reader.pending_toasts.clear();
+        if let Some(m) = last_toast {
             self.toast(m);
         }
         // Persist the read position: the reader owns `index`, the shell owns the
@@ -2087,16 +2131,23 @@ impl State {
         let anim_t = self.anim_origin.elapsed();
         let anim_page = self.playback.page;
         let anim_frame = self.playback.frame;
+        let anim_playing = self.playback.playing;
+        // Did this frame draw an animation that is advancing on its own? If so the
+        // end-of-frame redraw decision keeps the loop running to play it.
+        let mut drew_live_anim = false;
         let page_bgs: Vec<wgpu::BindGroup> = quads
             .iter()
             .filter_map(|q| {
                 self.reader.page_texture(q.page_index).map(|t| {
                     // The animation under user control shows its selected frame;
                     // any other animated page free-runs on the wall clock; stills
-                    // return their sole view. Continuous redraw drives both.
+                    // return their sole view. The redraw-on-demand loop keeps
+                    // frames flowing while one is live (`drew_live_anim`).
                     let view = if Some(q.page_index) == anim_page {
+                        drew_live_anim |= anim_playing && t.frame_count() > 1;
                         t.frame_view(anim_frame)
                     } else {
+                        drew_live_anim |= t.is_animation();
                         t.view_at(anim_t)
                     };
                     self.page_pipeline.prepare_quad(
@@ -2121,9 +2172,14 @@ impl State {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.gpu.reconfigure();
+                // On-demand loop: this frame produced nothing — retry, don't stall.
+                self.window.request_redraw();
                 return;
             }
-            _ => return,
+            _ => {
+                self.window.request_redraw();
+                return;
+            }
         };
         let view = frame
             .texture
@@ -2181,18 +2237,25 @@ impl State {
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
-        // Apply toggle-button requests (take effect next frame).
+        // Apply toggle-button requests (take effect next frame). This frame's quads
+        // were built *before* these land, so anything that fired must buy the next
+        // frame itself (`ui_acted`) — the on-demand loop won't supply one otherwise.
+        let mut ui_acted = false;
         if std::mem::take(&mut self.ui.req_toggle_dir) {
             self.apply_action(Action::ToggleDir);
+            ui_acted = true;
         }
         if std::mem::take(&mut self.ui.req_cycle_fit) {
             self.apply_action(Action::CycleFit);
+            ui_acted = true;
         }
         if std::mem::take(&mut self.ui.req_toggle_layout) {
             self.apply_action(Action::ToggleLayout);
+            ui_acted = true;
         }
         if std::mem::take(&mut self.ui.req_toggle_transition) {
             self.apply_action(Action::TogglePageTransition);
+            ui_acted = true;
         }
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
@@ -2202,32 +2265,39 @@ impl State {
             let page = page.min(src.len().saturating_sub(1));
             if page != self.reader.index {
                 self.reader.goto(page);
+                ui_acted = true;
             }
         }
         // Animation control-panel clicks (drained after the egui frame).
         if std::mem::take(&mut self.ui.anim_req_toggle_play) {
             self.playback_toggle();
+            ui_acted = true;
         }
         let step = std::mem::take(&mut self.ui.anim_req_step);
         if step != 0 {
             self.playback_step(step);
+            ui_acted = true;
         }
         if let Some(f) = self.ui.anim_req_seek.take() {
             self.playback_seek(f);
+            ui_acted = true;
         }
         if std::mem::take(&mut self.ui.anim_req_hide) {
             self.playback.hidden = true;
+            ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_update) && !self.updating {
-            if let Some(u) = self.update.clone() {
-                self.updating = true;
-                self.update_error = None;
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::spawn(move || {
-                    let _ = tx.send(update::apply(&u));
-                });
-                self.update_apply_rx = Some(rx);
-            }
+        if std::mem::take(&mut self.ui.req_update)
+            && !self.updating
+            && let Some(u) = self.update.clone()
+        {
+            self.updating = true;
+            self.update_error = None;
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(update::apply(&u));
+            });
+            self.update_apply_rx = Some(rx);
+            ui_acted = true;
         }
         if let Some(root) = self.ui.pending_library.take() {
             for v in &self.library.volumes {
@@ -2239,11 +2309,11 @@ impl State {
             self.library_view = true;
             self.settings.library_root = Some(root.to_string_lossy().into_owned());
             config::save(&self.settings);
+            ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_toggle_library) {
-            if !self.library.volumes.is_empty() {
-                self.library_view = !self.library_view;
-            }
+        if std::mem::take(&mut self.ui.req_toggle_library) && !self.library.volumes.is_empty() {
+            self.library_view = !self.library_view;
+            ui_acted = true;
         }
         if let Some(i) = self.ui.clicked_volume.take()
             && let Some(v) = self.library.volumes.get(i)
@@ -2251,6 +2321,7 @@ impl State {
             let path = v.path.clone();
             self.library_view = false;
             self.open(&path);
+            ui_acted = true;
         }
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
@@ -2299,6 +2370,30 @@ impl State {
             .queue
             .submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
+
+        // On-demand rendering: request the next frame only while something is
+        // still moving or landing; otherwise the loop sleeps until an input event
+        // (or the `about_to_wait` background heartbeat) wakes it. Mirrors the
+        // Android shell's redraw guard.
+        let egui_animating = full_output
+            .viewport_output
+            .values()
+            .any(|v| v.repaint_delay.is_zero());
+        let thumbs_pending =
+            self.library_view && self.library.volumes.iter().any(|v| !v.thumb_tried);
+        if ui_acted                            // a chrome request landed after quads were built
+            || self.opening                    // background open: spinner over the old page
+            || thumbs_pending                  // library covers still decoding (budgeted/frame)
+            || !self.reader.view_settled       // resize/zoom debounce needs a settle frame
+            || !self.reader.view_is_hq()       // in-view page missing/LQ/stale → wait for decode
+            || self.reader.lq_fill_pending()   // whole-volume LQ tier still filling
+            || self.reader.transition_active() // page-turn animation
+            || drew_live_anim                  // a GIF/WebP is playing
+            || self.toast.is_some()            // timed toast needs frames to expire
+            || egui_animating                  // egui-driven animation (bar reveal, …)
+        {
+            self.window.request_redraw();
+        }
     }
 }
 

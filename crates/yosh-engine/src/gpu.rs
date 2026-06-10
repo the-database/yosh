@@ -1,7 +1,7 @@
 //! Reusable wgpu device/queue context.
 //!
-//! This is the platform-agnostic half of GPU setup: instance + adapter + device
-//! + queue creation, plus the surface-format pick. It holds **no** surface and no
+//! This is the platform-agnostic half of GPU setup: instance + adapter + device +
+//! queue creation, plus the surface-format pick. It holds **no** surface and no
 //! windowing types (`winit`), so a shell creates the surface for its own platform
 //! (a desktop `winit::Window`, an Android `ANativeWindow`, …) and hands a borrow
 //! in for adapter selection. The desktop shell's `Gpu` (in `crates/yosh`) wraps
