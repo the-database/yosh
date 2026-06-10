@@ -2567,7 +2567,11 @@ impl App {
                                     egui::vec2(ui.available_width(), 40.0),
                                     egui::Sense::click(),
                                 );
-                                let chev = if sec.expanded { "▾" } else { "▸" };
+                                let chev = if sec.expanded {
+                                    egui_phosphor::fill::CARET_DOWN
+                                } else {
+                                    egui_phosphor::fill::CARET_RIGHT
+                                };
                                 let strong = ui.visuals().strong_text_color();
                                 let weak = ui.visuals().weak_text_color();
                                 ui.painter().text(
