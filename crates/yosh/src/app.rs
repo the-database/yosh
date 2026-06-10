@@ -858,7 +858,12 @@ impl ApplicationHandler for App {
         // event may have changed reading state, so each one buys a frame (render
         // then re-requests itself while anything is still in flight). Requesting
         // from *within* RedrawRequested would loop forever, so that one is exempt —
-        // render's own end-of-frame conditions decide there.
+        // render's own end-of-frame conditions decide there. (For the same reason
+        // `response.repaint` must NOT be honored here: egui-winit reports
+        // `repaint: true` for RedrawRequested itself — it means "paint now", not
+        // "schedule another frame" — which would re-arm every frame, silently
+        // restoring the continuous loop. egui's real "keep animating" signal is
+        // the `repaint_delay == 0` check on `full_output` at the end of render.)
         let buys_frame = !matches!(event, WindowEvent::RedrawRequested);
 
         match event {
@@ -914,7 +919,7 @@ impl ApplicationHandler for App {
             _ => {}
         }
 
-        if buys_frame || response.repaint {
+        if buys_frame {
             state.window.request_redraw();
         }
     }
