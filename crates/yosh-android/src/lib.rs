@@ -15,7 +15,7 @@
 //! The whole crate is Android-only; the desktop shell is `crates/yosh`.
 #![cfg(target_os = "android")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -80,6 +80,8 @@ fn android_main(app: AndroidApp) {
         view_file,
         touches: HashMap::new(),
         gesture_start: None,
+        page_drag: false,
+        drag_samples: VecDeque::new(),
         pinch: None,
         applied_immersive: None,
         status_bar_px: None,
@@ -112,6 +114,13 @@ struct Shell {
     touches: HashMap<u64, (f64, f64)>,
     /// Single-finger gesture start (for swipe-vs-tap on release).
     gesture_start: Option<(f64, f64)>,
+    /// A single-finger move locked in as an interactive page drag (the page
+    /// follows the finger; the engine renders it via `Reader::drag_update`).
+    /// Locks once the motion is clearly horizontal; cleared on release/pinch.
+    page_drag: bool,
+    /// Recent `(time, x)` samples of the dragging finger (~last 100 ms), for the
+    /// release velocity that decides flick-to-commit.
+    drag_samples: VecDeque<(Instant, f64)>,
     /// Active pinch, captured at its start (see `Pinch`).
     pinch: Option<Pinch>,
     /// Last immersive state pushed to Android, to avoid redundant JNI each frame.
@@ -498,9 +507,19 @@ impl Shell {
                 }
                 if self.touches.len() == 1 {
                     self.gesture_start = Some((x, y));
+                    self.page_drag = false;
+                    self.drag_samples.clear();
                 } else if self.touches.len() == 2 {
-                    // Begin a pinch; cancel the single-finger gesture.
+                    // Begin a pinch; cancel the single-finger gesture — including
+                    // a live page drag, which snaps back.
                     self.gesture_start = None;
+                    if self.page_drag {
+                        self.page_drag = false;
+                        if let Some(app) = self.app.as_mut() {
+                            app.reader.drag_cancel();
+                            app.window.request_redraw();
+                        }
+                    }
                     if let (Some((d, mx, my)), Some(app)) =
                         (self.two_finger_metrics(), self.app.as_ref())
                     {
@@ -568,6 +587,33 @@ impl Shell {
                             app.reader.clamp_pan();
                             app.window.request_redraw();
                         }
+                    } else if !egui_consumed
+                        && let Some((sx, sy)) = self.gesture_start
+                    {
+                        // Single finger, not zoomed → interactive page drag: the
+                        // page follows the finger (Chunky-style), with the neighbor
+                        // view revealed underneath. Locks once the motion is
+                        // clearly horizontal, so taps and the seekbar stay intact.
+                        let (dx, dy) = (x - sx, y - sy);
+                        if !self.page_drag {
+                            let w = self.app.as_ref().map(|a| a.config.width as f64).unwrap_or(1.0);
+                            self.page_drag = dx.abs() > w * 0.015 && dx.abs() > dy.abs();
+                        }
+                        if self.page_drag
+                            && let Some(app) = self.app.as_mut()
+                        {
+                            let now = Instant::now();
+                            self.drag_samples.push_back((now, x));
+                            while self
+                                .drag_samples
+                                .front()
+                                .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
+                            {
+                                self.drag_samples.pop_front();
+                            }
+                            app.reader.drag_update(dx as f32);
+                            app.window.request_redraw();
+                        }
                     }
                 }
             }
@@ -577,10 +623,40 @@ impl Shell {
                     self.pinch = None;
                 }
                 if self.touches.is_empty() {
-                    if let Some((sx, sy)) = self.gesture_start.take() {
-                        if !library && !egui_consumed {
-                            self.handle_gesture(sx, sy, x, y);
+                    let was_drag = std::mem::take(&mut self.page_drag);
+                    let start = self.gesture_start.take();
+                    if was_drag {
+                        // The interactive drag owns this gesture end-to-end; the
+                        // old end-of-gesture swipe must not also fire.
+                        if matches!(phase, TouchPhase::Cancelled) {
+                            if let Some(app) = self.app.as_mut() {
+                                app.reader.drag_cancel();
+                                app.window.request_redraw();
+                            }
+                        } else {
+                            // Release velocity from the ~100 ms sample window —
+                            // decides flick-to-commit on short drags.
+                            let now = Instant::now();
+                            let v = self.drag_samples.front().map_or(0.0, |(t0, x0)| {
+                                let dt = now.duration_since(*t0).as_secs_f64();
+                                if dt > 0.005 { (x - x0) / dt } else { 0.0 }
+                            });
+                            let committed = self
+                                .app
+                                .as_mut()
+                                .is_some_and(|a| a.reader.drag_release(v as f32));
+                            if committed {
+                                self.after_flip();
+                            } else if let Some(app) = self.app.as_mut() {
+                                app.window.request_redraw(); // play the snap-back
+                            }
                         }
+                        self.drag_samples.clear();
+                    } else if let Some((sx, sy)) = start
+                        && !library
+                        && !egui_consumed
+                    {
+                        self.handle_gesture(sx, sy, x, y);
                     }
                 }
             }
@@ -597,37 +673,30 @@ impl Shell {
         Some((dist, (a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
     }
 
-    /// A single-finger gesture ended: a horizontal swipe flips (only when not
-    /// zoomed, where a drag is a pan instead), otherwise it's a tap.
+    /// A single-finger gesture ended without locking into a page drag: a
+    /// near-stationary release is a tap; anything that travelled was a zoomed
+    /// pan (or a vertical scrub) and is not. Unzoomed horizontal motion locks
+    /// into the interactive drag long before reaching here, so flipping is
+    /// handled at `TouchPhase::Ended` by `drag_release`.
     fn handle_gesture(&mut self, sx: f64, sy: f64, ex: f64, ey: f64) {
-        let (w, zoom) = self
-            .app
-            .as_ref()
-            .map(|a| (a.config.width as f64, a.reader.zoom))
-            .unwrap_or((1.0, 1.0));
+        let w = self.app.as_ref().map(|a| a.config.width as f64).unwrap_or(1.0);
         let (dx, dy) = (ex - sx, ey - sy);
-        let is_swipe = dx.abs() > w * 0.08 && dx.abs() > dy.abs() * 1.4;
-        if is_swipe {
-            if zoom <= 1.001 {
-                let rtl = self
-                    .app
-                    .as_ref()
-                    .map(|a| a.reader.direction == Direction::Rtl)
-                    .unwrap_or(false);
-                // Drag metaphor: LTR swipe-left = next; RTL swipe-right = next.
-                let next = if rtl { dx > 0.0 } else { dx < 0.0 };
-                self.flip(if next { 1 } else { -1 });
-            }
-            // else: a drag while zoomed was a pan, not a flip.
-        } else {
+        if dx.abs() < w * 0.015 && dy.abs() < w * 0.015 {
             self.on_tap(sx, sy);
         }
     }
 
-    /// Flip `dir` pages (resetting zoom/pan to fit) and persist the new position.
+    /// Flip `dir` pages and persist the new position.
     fn flip(&mut self, dir: i64) {
+        let Some(app) = self.app.as_mut() else { return };
+        app.reader.step(dir);
+        self.after_flip();
+    }
+
+    /// Post-flip bookkeeping shared by tap flips and committed drags (the step
+    /// already happened): reset the view to fit and persist the position.
+    fn after_flip(&mut self) {
         if let Some(app) = self.app.as_mut() {
-            app.reader.step(dir);
             app.reader.zoom = 1.0;
             app.reader.pan_x = 0.0;
             app.reader.pan_y = 0.0;
@@ -2102,6 +2171,7 @@ impl App {
             || self.reader.lq_fill_pending()
             || hints_visible
             || self.reader.transition_active()
+            || self.reader.drag_active() // interactive page drag / its snap-back
             || drew_live_anim // a GIF/WebP is playing on screen
             || egui_animating // egui fade/feedback animation mid-flight
         {

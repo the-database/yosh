@@ -224,15 +224,93 @@ const TRANSITION_MAX_BLUR: f32 = 0.06;
 /// "sweeping away" in the tapped direction; the blur + fade are the polish.
 const TRANSITION_SLIDE_FRAC: f32 = 0.12;
 
-/// A live page-flip animation: the previous view's pages, fading + smearing out
-/// over [`TRANSITION_MS`] while the new view draws underneath. Only armed in
-/// discrete page-flip mode (not scroll).
+/// A live page-flip animation: the previous view's pages sliding out over
+/// [`TRANSITION_MS`] while the new view draws underneath. Only armed in
+/// discrete page-flip mode (not scroll). Two styles share this struct: a tap
+/// flip slides a short [`TRANSITION_SLIDE_FRAC`] with a fade + motion blur; a
+/// committed interactive drag continues opaque from wherever the finger left
+/// the page (`from_frac`) all the way off-screen (Chunky-style).
 struct PageTransition {
     start: Instant,
     /// The outgoing view's page indices (1 single, 2 spread).
     out_pages: Vec<usize>,
     /// True ⇒ the outgoing page slides off toward +x (screen right).
     exit_right: bool,
+    /// Slide start, as a fraction of the viewport width (0.0 for tap flips).
+    from_frac: f32,
+    /// Slide end (TRANSITION_SLIDE_FRAC for tap flips; DRAG_EXIT_FRAC for drags).
+    to_frac: f32,
+    /// Tap flips fade + blur the outgoing page; drag commits slide it off opaque.
+    fade: bool,
+}
+
+// --- Interactive page drag (Chunky-style: the page tracks the finger) ---
+/// Release commits the flip past this fraction of the viewport width…
+const DRAG_COMMIT_FRAC: f32 = 0.25;
+/// …or on a flick: at least this fast (px/s, same sign as the drag)…
+const DRAG_FLICK_PX_S: f32 = 600.0;
+/// …with at least this much travel (so a stray touch can't flip).
+const DRAG_FLICK_MIN_FRAC: f32 = 0.04;
+/// Damping applied when dragging against the first/last page (rubber-band).
+const DRAG_RUBBER: f32 = 0.35;
+/// Snap-back duration when a drag is released without committing.
+const DRAG_SETTLE_MS: u64 = 150;
+/// Where a committed drag's outgoing page slides to (a hair past the edge).
+const DRAG_EXIT_FRAC: f32 = 1.05;
+
+/// A live one-finger page drag: the current view follows the finger while the
+/// neighbor view it is being dragged toward shows underneath (both views are
+/// normally already prefetched). On release the drag either commits — `step` +
+/// a [`PageTransition`] continuing from the dragged offset — or snap-backs here.
+struct PageDrag {
+    /// Signed horizontal finger displacement, px (+ = finger moved right).
+    dx: f32,
+    /// Released without committing: animate the displacement `.0 → 0` from `.1`.
+    settle: Option<(f32, Instant)>,
+}
+
+impl PageDrag {
+    /// The displacement to draw this frame (raw while tracking; easing toward 0
+    /// during a snap-back).
+    fn current_dx(&self) -> f32 {
+        match self.settle {
+            None => self.dx,
+            Some((from, start)) => {
+                let p = (start.elapsed().as_secs_f32() / (DRAG_SETTLE_MS as f32 / 1000.0))
+                    .clamp(0.0, 1.0);
+                from * (1.0 - p) * (1.0 - p) // ease-out back to rest
+            }
+        }
+    }
+
+    /// Still tracking, or mid snap-back?
+    fn live(&self) -> bool {
+        match self.settle {
+            None => true,
+            Some((_, start)) => start.elapsed() < Duration::from_millis(DRAG_SETTLE_MS),
+        }
+    }
+}
+
+/// Flip direction a horizontal drag is asking for: dragging the page toward the
+/// "previous" edge advances (drag metaphor — LTR swipe-left = next; RTL mirrors).
+/// Matches the shell's historical swipe mapping.
+pub fn drag_dir(direction: Direction, dx: f32) -> i64 {
+    let next = match direction {
+        Direction::Rtl => dx > 0.0,
+        Direction::Ltr => dx < 0.0,
+    };
+    if next { 1 } else { -1 }
+}
+
+/// Should a released drag commit the flip? Far enough, or a deliberate flick
+/// (fast + same direction + non-trivial travel).
+pub fn drag_commits(dx_px: f32, velocity_px_s: f32, viewport_w: f32) -> bool {
+    let frac = dx_px.abs() / viewport_w.max(1.0);
+    frac > DRAG_COMMIT_FRAC
+        || (frac > DRAG_FLICK_MIN_FRAC
+            && velocity_px_s.abs() > DRAG_FLICK_PX_S
+            && velocity_px_s.signum() == dx_px.signum())
 }
 
 /// Default h/w aspect estimate for not-yet-decoded pages in the scroll strip.
@@ -313,6 +391,8 @@ pub struct Reader {
     pub transition_enabled: bool,
     /// The live flip animation, if one is in flight. Cleared once it expires.
     transition: Option<PageTransition>,
+    /// Live interactive page drag (page-flip mode only), if one is in progress.
+    drag: Option<PageDrag>,
 
     /// Inputs of the last `prefetch()` job-list rebuild. Shells call `prefetch()`
     /// every frame; when neither the view nor the caches changed since the last
@@ -393,6 +473,7 @@ impl Reader {
             two_tier,
             transition_enabled: false,
             transition: None,
+            drag: None,
             last_jobs_key: None,
         }
     }
@@ -772,9 +853,46 @@ impl Reader {
         let sh = self.viewport.h.max(1) as f32;
 
         let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+
+        // Live interactive drag: the current view follows the finger; the neighbor
+        // view it's being dragged toward shows underneath (drawn first — pages are
+        // opaque, so quad order is the reveal). Mutually exclusive with the
+        // transition overlay (`drag_update` snaps it; a commit replaces the drag).
+        if let Some(d) = &self.drag
+            && d.live()
+        {
+            let raw = d.current_dx();
+            let toward = drag_dir(self.direction, raw);
+            let incoming = if toward > 0 {
+                layout::next_view(self.layout, self.index, len, self.spread_offset)
+            } else {
+                layout::prev_view(self.layout, self.index, len, self.spread_offset)
+            };
+            let mut quads = Vec::new();
+            let dx = if incoming != self.index {
+                let (ia, ib) = layout::view_pages(self.layout, incoming, len, self.spread_offset);
+                quads = self.place_view(ia, ib, sw, sh, 0, false);
+                raw
+            } else {
+                // First/last page: nothing to reveal — rubber-band the pull.
+                raw * DRAG_RUBBER
+            };
+            // The dragged view draws on top; its fractional offset breaks pixel
+            // snapping only while the drag is live (same accepted transient as
+            // scroll), re-snapping the moment it ends.
+            let base = quads.len().max(2);
+            for mut q in self.place_view(a, b, sw, sh, base, true) {
+                q.offset[0] += 2.0 * dx / sw;
+                quads.push(q);
+            }
+            return quads;
+        }
+
         let mut quads = self.place_view(a, b, sw, sh, 0, true);
 
-        // Page-turn transition: overlay the previous view, fading + smearing out.
+        // Page-turn transition: overlay the previous view sliding out — faded +
+        // motion-blurred for a tap flip, opaque from the dragged offset for a
+        // committed drag.
         if let Some(t) = &self.transition {
             let p = (t.start.elapsed().as_secs_f32() / (TRANSITION_MS as f32 / 1000.0)).clamp(0.0, 1.0);
             if p < 1.0 {
@@ -783,13 +901,18 @@ impl Reader {
                 // clears early. A fade that tracks the slide leaves a dim page
                 // creeping through the back half — that lingering tail is what reads
                 // as "sluggish" even when the slide speed already matches.
-                let fade = 1.0 - p;
-                let alpha = fade * fade * fade;
-                let blur = TRANSITION_MAX_BLUR * eased; // horizontal motion blur, grows as it fades
-                // Slide the outgoing page off toward the exit edge (NDC: full
-                // viewport width = 2.0) so it visibly sweeps away as it fades.
+                let (alpha, blur) = if t.fade {
+                    let fade = 1.0 - p;
+                    (fade * fade * fade, TRANSITION_MAX_BLUR * eased)
+                } else {
+                    (1.0, 0.0) // drag commit: the page visibly slides off, opaque
+                };
+                // Slide the outgoing page toward the exit edge (NDC: full viewport
+                // width = 2.0), from wherever the animation started (0 for taps,
+                // the dragged offset for a committed drag).
                 let exit = if t.exit_right { 1.0 } else { -1.0 };
-                let slide = exit * TRANSITION_SLIDE_FRAC * 2.0 * eased;
+                let slide_frac = t.from_frac + (t.to_frac - t.from_frac) * eased;
+                let slide = exit * slide_frac * 2.0;
                 let oa = t.out_pages[0];
                 let ob = t.out_pages.get(1).copied();
                 // Outgoing quads draw last (on top); slots after the current view's.
@@ -1167,6 +1290,35 @@ impl Reader {
 #[cfg(test)]
 mod tests {
     use super::Budget;
+    use super::{drag_commits, drag_dir, Direction, DRAG_COMMIT_FRAC, DRAG_FLICK_MIN_FRAC};
+
+    // Drag metaphor: pulling the page toward the "previous" edge advances.
+    // LTR: swipe/drag left = next; RTL mirrors. Must match the shell's
+    // historical swipe mapping (lib.rs handle_gesture).
+    #[test]
+    fn drag_dir_matches_swipe_mapping() {
+        assert_eq!(drag_dir(Direction::Ltr, -100.0), 1, "LTR drag left = next");
+        assert_eq!(drag_dir(Direction::Ltr, 100.0), -1, "LTR drag right = prev");
+        assert_eq!(drag_dir(Direction::Rtl, 100.0), 1, "RTL drag right = next");
+        assert_eq!(drag_dir(Direction::Rtl, -100.0), -1, "RTL drag left = prev");
+    }
+
+    #[test]
+    fn drag_commit_thresholds() {
+        let w = 1000.0;
+        // Past the distance threshold commits regardless of velocity.
+        assert!(drag_commits(w * (DRAG_COMMIT_FRAC + 0.01), 0.0, w));
+        assert!(drag_commits(-w * (DRAG_COMMIT_FRAC + 0.01), 0.0, w));
+        // Short of it, a slow release snaps back…
+        assert!(!drag_commits(w * 0.10, 0.0, w));
+        // …but a deliberate flick commits (fast, same sign, non-trivial travel).
+        assert!(drag_commits(w * 0.10, 900.0, w));
+        assert!(drag_commits(-w * 0.10, -900.0, w));
+        // A flick *against* the drag direction must not commit.
+        assert!(!drag_commits(w * 0.10, -900.0, w));
+        // Micro-travel never commits, however fast (stray touches).
+        assert!(!drag_commits(w * (DRAG_FLICK_MIN_FRAC - 0.01), 5000.0, w));
+    }
 
     // Desktop-class inputs reproduce the historical fixed budget exactly.
     #[test]
@@ -1456,6 +1608,13 @@ impl Reader {
     /// a *failed* page (never cached) is allowed past, and a volume larger than the
     /// LQ cap (cache full → its tail can't be thumbnailed) advances freely there.
     pub fn step(&mut self, dir: i64) -> bool {
+        self.step_styled(dir, 0.0, TRANSITION_SLIDE_FRAC, true)
+    }
+
+    /// `step` with an explicit transition style: a tap flip slides 0 →
+    /// `TRANSITION_SLIDE_FRAC` with fade+blur; a committed drag continues opaque
+    /// from the dragged offset (`from_frac`) to `DRAG_EXIT_FRAC` (off-screen).
+    fn step_styled(&mut self, dir: i64, from_frac: f32, to_frac: f32, fade: bool) -> bool {
         let Some(src) = &self.source else { return false };
         let len = src.len();
         if len == 0 {
@@ -1501,6 +1660,9 @@ impl Reader {
                         start: Instant::now(),
                         out_pages,
                         exit_right,
+                        from_frac,
+                        to_frac,
+                        fade,
                     });
                 }
             }
@@ -1512,6 +1674,61 @@ impl Reader {
             self.toast(if dir > 0 { "Last page" } else { "First page" });
             false
         }
+    }
+
+    /// Start or refresh an interactive page drag (the shell feeds the signed
+    /// horizontal finger displacement each move). Page-flip mode only. A new
+    /// drag snaps any in-flight flip animation — same rule as rapid `step`s.
+    pub fn drag_update(&mut self, dx_px: f32) {
+        if self.scroll_mode || self.source.is_none() {
+            return;
+        }
+        self.transition = None;
+        match &mut self.drag {
+            Some(d) if d.settle.is_none() => d.dx = dx_px,
+            _ => self.drag = Some(PageDrag { dx: dx_px, settle: None }),
+        }
+    }
+
+    /// The finger lifted: commit the flip (far enough, or a deliberate flick —
+    /// the outgoing page then continues from the dragged offset off-screen), or
+    /// snap back. Returns whether the flip committed.
+    pub fn drag_release(&mut self, velocity_px_s: f32) -> bool {
+        let Some(d) = &self.drag else { return false };
+        if d.settle.is_some() {
+            return false;
+        }
+        let dx = d.dx;
+        let w = self.viewport.w.max(1) as f32;
+        let committed = drag_commits(dx, velocity_px_s, w) && {
+            let dir = drag_dir(self.direction, dx);
+            let from_frac = (dx.abs() / w).min(1.0);
+            // At the first/last page (or while the step-gate holds) this returns
+            // false and the drag falls through to the snap-back below.
+            self.step_styled(dir, from_frac, DRAG_EXIT_FRAC, false)
+        };
+        if committed {
+            self.drag = None; // the armed transition takes over the animation
+        } else if let Some(d) = &mut self.drag {
+            d.settle = Some((d.dx, Instant::now()));
+        }
+        committed
+    }
+
+    /// Abort a drag without committing (e.g. a second finger landed — the
+    /// gesture became a pinch): snap the page back to rest.
+    pub fn drag_cancel(&mut self) {
+        if let Some(d) = &mut self.drag
+            && d.settle.is_none()
+        {
+            d.settle = Some((d.dx, Instant::now()));
+        }
+    }
+
+    /// Whether a drag is on screen (tracking the finger, or snapping back) —
+    /// drives the shell's redraw scheduling like `transition_active`.
+    pub fn drag_active(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.live())
     }
 
     pub fn goto(&mut self, index: usize) {
