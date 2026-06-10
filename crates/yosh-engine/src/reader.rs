@@ -1253,6 +1253,46 @@ mod tests {
         assert_eq!(super::next_zoom_preset(&ladder, 71.34, true), 80.0);
         assert_eq!(super::next_zoom_preset(&ladder, 71.34, false), 70.0);
     }
+
+    // A name-only stub source: exercises the live-folder-refresh classifier without a
+    // GPU (the real sources read pixels; here only the name list matters).
+    struct NamesSource(Vec<String>);
+    impl crate::source::PageSource for NamesSource {
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn name(&self, i: usize) -> &str {
+            &self.0[i]
+        }
+        fn read_page(&self, _: usize) -> std::io::Result<Vec<u8>> {
+            unreachable!("classifier never reads pixels")
+        }
+    }
+
+    // The classifier separates the cheap index-preserving cases (append / tail-trim)
+    // from a mid-list change that shifts indices and needs a name-based remap.
+    #[test]
+    fn classify_refresh_distinguishes_append_trim_and_reorder() {
+        use super::{classify_refresh, Refresh};
+        let src = |names: &[&str]| NamesSource(names.iter().map(|s| s.to_string()).collect());
+        let base = src(&["1.png", "2.png", "3.png"]);
+        // Identical listing → nothing to do.
+        assert_eq!(classify_refresh(&base, &src(&["1.png", "2.png", "3.png"])), Refresh::Same);
+        // Pages appended at the end → existing indices unchanged.
+        assert_eq!(
+            classify_refresh(&base, &src(&["1.png", "2.png", "3.png", "4.png"])),
+            Refresh::Prefix
+        );
+        // Pages trimmed from the end → still a prefix.
+        assert_eq!(classify_refresh(&base, &src(&["1.png", "2.png"])), Refresh::Prefix);
+        // A file inserted mid-list (natural sort places "1a" between "1" and "2").
+        assert_eq!(
+            classify_refresh(&base, &src(&["1.png", "1a.png", "2.png", "3.png"])),
+            Refresh::Reorder
+        );
+        // A middle file removed → indices after it shift.
+        assert_eq!(classify_refresh(&base, &src(&["1.png", "3.png"])), Refresh::Reorder);
+    }
 }
 
 impl Reader {
@@ -1304,6 +1344,75 @@ impl Reader {
         // The shell persists the read position (it owns the volume key + settings).
         self.prefetch();
     }
+
+    /// Apply a freshly-rescanned listing for the *same* volume (live folder refresh).
+    /// The new source replaces the current one while preserving the read position and
+    /// the decoded caches **by filename**, so files added/removed/reordered on disk
+    /// don't flash the page or jump the reader. Called by the shell when the folder
+    /// watcher's debounced rebuild lands. No-ops if nothing actually changed.
+    pub fn apply_refreshed_source(&mut self, new: Arc<dyn PageSource>) {
+        let Some(old) = self.source.clone() else {
+            self.source = Some(new); // nothing open yet — just adopt it
+            self.prefetch();
+            return;
+        };
+        let (old_len, new_len) = (old.len(), new.len());
+        // A rescan that finds no images (everything deleted) is ignored — keep the last
+        // good listing on screen rather than emptying the reader (and guards `len - 1`).
+        if new_len == 0 {
+            return;
+        }
+        match classify_refresh(old.as_ref(), new.as_ref()) {
+            // Watcher fired on an unrelated touch (mtime/attrs of a file we already
+            // have) — the listing is identical, so there is nothing to do.
+            Refresh::Same => {}
+            // Append or tail-trim: existing indices are unchanged, so keep the cache and
+            // any in-flight decodes and swap the listing in place — no pool rebuild, no
+            // hitch while pages are landing during a live download.
+            Refresh::Prefix => {
+                if new_len < old_len {
+                    self.cache.remap(|i| (i < new_len).then_some(i));
+                    self.lq_cache.remap(|i| (i < new_len).then_some(i));
+                    if self.index >= new_len {
+                        self.index = new_len - 1;
+                    }
+                }
+                if let Some(pool) = &self.pool {
+                    pool.set_source(new.clone());
+                }
+                self.source = Some(new);
+                self.prefetch();
+            }
+            // A file landed/left mid-list, so indices shift. Re-key the read position and
+            // both decoded caches by filename so the same page stays on screen, then
+            // rebuild the pool so stale in-flight `Done{old_index}` results from the old
+            // listing are dropped instead of landing at a now-different index.
+            Refresh::Reorder => {
+                let new_pos: HashMap<&str, usize> =
+                    (0..new_len).map(|i| (new.name(i), i)).collect();
+                let anchor =
+                    layout::view_pages(self.layout, self.index, old_len, self.spread_offset).0;
+                let anchor_name = old.name(anchor).to_string();
+                self.cache.remap(|i| new_pos.get(old.name(i)).copied());
+                self.lq_cache.remap(|i| new_pos.get(old.name(i)).copied());
+                self.index = new_pos
+                    .get(anchor_name.as_str())
+                    .copied()
+                    .unwrap_or_else(|| self.index.min(new_len - 1));
+                self.failed.clear();
+                self.pool = Some(DecodePool::new(
+                    new.clone(),
+                    self.device.clone(),
+                    self.queue.clone(),
+                    self.tex_pool.clone(),
+                    self.workers,
+                ));
+                self.source = Some(new);
+                self.prefetch();
+            }
+        }
+    }
+
     /// Snap zoom to the next ladder stop above/below the current native %. The
     /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
     /// step can land exactly on fit-to-window / fit-to-width.
@@ -1358,5 +1467,34 @@ impl Reader {
             }
         }
         self.prefetch();
+    }
+}
+
+/// How a rescanned listing differs from the one currently open, compared by entry
+/// name. Drives [`Reader::apply_refreshed_source`]'s cheap (index-preserving) vs.
+/// careful (index-remapping) paths.
+#[derive(PartialEq, Eq, Debug)]
+enum Refresh {
+    /// Identical set in the same order — nothing changed.
+    Same,
+    /// One name list is a prefix of the other: pages were only appended at, or
+    /// trimmed from, the end, so existing indices are unchanged.
+    Prefix,
+    /// Names diverge before the shorter length — a file was inserted, removed, or
+    /// renamed mid-list, shifting the indices after it.
+    Reorder,
+}
+
+fn classify_refresh(old: &dyn PageSource, new: &dyn PageSource) -> Refresh {
+    let (o, n) = (old.len(), new.len());
+    for i in 0..o.min(n) {
+        if old.name(i) != new.name(i) {
+            return Refresh::Reorder;
+        }
+    }
+    if o == n {
+        Refresh::Same
+    } else {
+        Refresh::Prefix
     }
 }

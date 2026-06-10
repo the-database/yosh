@@ -60,6 +60,25 @@ impl PageCache {
         }
     }
 
+    /// Re-key every entry through `f` (old index → new index). Entries that map to
+    /// `None` (their file disappeared, or fell out of a shrunken volume) are recycled.
+    /// Used when a folder rescan reorders pages: decoded textures follow their file
+    /// by name instead of flashing or being re-decoded. The map only shrinks or stays
+    /// the same size, so no eviction is needed.
+    pub fn remap(&mut self, f: impl Fn(usize) -> Option<usize>) {
+        let old = std::mem::take(&mut self.map);
+        for (i, page) in old {
+            match f(i) {
+                Some(j) => {
+                    if let Some(prev) = self.map.insert(j, page) {
+                        prev.recycle(&self.pool);
+                    }
+                }
+                None => page.recycle(&self.pool),
+            }
+        }
+    }
+
     /// Insert a page, evicting the entries furthest from `current` if over cap.
     pub fn insert(&mut self, index: usize, page: PageTexture, current: usize) {
         if let Some(old) = self.map.insert(index, page) {
