@@ -132,6 +132,13 @@ struct Shell {
 
 /// How long the next/prev-book boundary prompt stays armed and on screen.
 const BOOK_PROMPT_MS: u64 = 3000;
+
+/// Which screen edge the boundary-prompt card sits on: the edge whose tap zone
+/// triggers `dir` (next = left in RTL / right in LTR; prev mirrors). Shared by
+/// the egui draw and `on_tap`'s fallback hit-rect so they can't disagree.
+fn book_prompt_on_left(dir: i64, rtl: bool) -> bool {
+    (dir > 0) == rtl
+}
 /// Width of the boundary prompt card, egui points.
 const BOOK_PROMPT_W_PT: f32 = 260.0;
 
@@ -813,7 +820,14 @@ impl Shell {
                 let ppp = app.egui_ctx.pixels_per_point() as f64;
                 let half_w = (BOOK_PROMPT_W_PT as f64 / 2.0 + 12.0) * ppp;
                 let half_h = 200.0 * ppp;
-                let inside = (x - w / 2.0).abs() < half_w && (y - h / 2.0).abs() < half_h;
+                // Same edge anchoring as the draw (16pt inset from the side).
+                let rtl = app.reader.direction == Direction::Rtl;
+                let cx = if book_prompt_on_left(p.dir, rtl) {
+                    (16.0 + BOOK_PROMPT_W_PT as f64 / 2.0) * ppp
+                } else {
+                    w - (16.0 + BOOK_PROMPT_W_PT as f64 / 2.0) * ppp
+                };
+                let inside = (x - cx).abs() < half_w && (y - h / 2.0).abs() < half_h;
                 (inside
                     && p.sibling.is_some()
                     && p.at.elapsed().as_millis() < BOOK_PROMPT_MS as u128)
@@ -1470,13 +1484,21 @@ const EDGE_ZONE: f32 = 0.20;
 fn book_prompt_card(
     ctx: &egui::Context,
     dir: i64,
+    rtl: bool,
     title: &str,
     thumb: Option<&egui::TextureHandle>,
     has_sibling: bool,
     book_nav: &mut i64,
 ) {
+    // Anchor to the edge whose tap zone fired it (next = left in RTL, right in
+    // LTR; prev mirrors) so the card appears under the tapping thumb.
+    let anchor = if book_prompt_on_left(dir, rtl) {
+        (egui::Align2::LEFT_CENTER, [16.0, 0.0])
+    } else {
+        (egui::Align2::RIGHT_CENTER, [-16.0, 0.0])
+    };
     egui::Area::new(egui::Id::new("book_prompt"))
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .anchor(anchor.0, anchor.1)
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
@@ -2225,7 +2247,7 @@ impl App {
             // Next/prev-book boundary prompt — over the page, chrome or not.
             // (`prompt_card` is None in the library / empty state.)
             if let Some((dir, title, thumb, has_sibling)) = &prompt_card {
-                book_prompt_card(ctx, *dir, title, thumb.as_ref(), *has_sibling, &mut book_nav);
+                book_prompt_card(ctx, *dir, rtl, title, thumb.as_ref(), *has_sibling, &mut book_nav);
             }
         });
         self.egui_state
