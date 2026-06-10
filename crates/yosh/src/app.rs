@@ -199,9 +199,18 @@ struct State {
     // `rescan_rx`, tagged with the `open_gen` it started under so a volume switch
     // discards a stale result — mirroring the `open_gen` guard on `open_rx`.
     watcher: Option<notify::RecommendedWatcher>,
+    /// When watching a folder, `None` — every change in the watched dir is relevant.
+    /// When watching a growing `.cbz`/`.zip`, we watch its *parent directory* (notify's
+    /// Windows backend is directory-oriented; a lone-file watch is unreliable) and keep
+    /// the archive's path here so sibling-file events in that dir are filtered out.
+    watch_filter: Option<PathBuf>,
     watch_tx: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
     watch_rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
     watch_dirty: Option<Instant>,
+    /// When the current burst of change events began (a folder copy or a streaming
+    /// archive write fires many). `watch_dirty` (last event) drives the settle delay;
+    /// this caps it so a *continuous* writer still refreshes at least every `MAX_WAIT`.
+    watch_dirty_since: Option<Instant>,
     rescanning: bool,
     rescan_tx: std::sync::mpsc::Sender<(u64, Option<Arc<dyn PageSource>>)>,
     rescan_rx: std::sync::mpsc::Receiver<(u64, Option<Arc<dyn PageSource>>)>,
@@ -251,6 +260,20 @@ fn build_source(path: &Path) -> Built {
         }
         _ => Err("unsupported file type (open a folder, image, CBZ, CBR, or 7z)".to_string()),
     }
+}
+
+/// Can this archive grow while open, so live-refresh should watch it? A `.cbz`/`.zip`
+/// being written has no central directory yet, so `ZipSource` opens it via local-header
+/// recovery and a rebuild picks up newly-completed pages. `.cbr`/`.rar`/`.7z` can't be
+/// partially read (they need end-of-file structures), so they aren't watched.
+fn is_growable_archive(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref(),
+        Some("cbz" | "zip")
+    )
 }
 
 /// True if the saved window rect overlaps any currently-connected monitor, so
@@ -807,9 +830,11 @@ impl ApplicationHandler for App {
             sib_tx,
             sib_rx,
             watcher: None,
+            watch_filter: None,
             watch_tx,
             watch_rx,
             watch_dirty: None,
+            watch_dirty_since: None,
             rescanning: false,
             rescan_tx,
             rescan_rx,
@@ -1472,67 +1497,106 @@ impl State {
         self.reader.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
         self.reader.prefetch();
-        // Live folder refresh: watch a folder for added/removed images (archives
-        // can't grow, so this tears the watcher down for them).
+        // Live refresh: watch a folder (added/removed images) or a still-being-written
+        // .cbz/.zip (pages appended on disk). RAR/7z can't be partially read, so this
+        // tears the watcher down for them.
         self.install_folder_watch(path);
         // Warm the sibling-volume list for this folder in the background, so the
         // first `[`/`]` press doesn't pay the parent-dir scan on the main thread.
         self.warm_sib_cache(path);
     }
 
-    /// (Re)install the live-folder-refresh watcher for `path`, or tear it down when
-    /// `path` is not a directory (archives/single files can't grow). `build_source`
-    /// hands `set_source` the *directory* for both folder and single-image opens, so
-    /// a `path.is_dir()` test covers "opened one image, then siblings appear" too.
-    /// A `notify` failure is non-fatal — the feature is simply inactive for that volume.
+    /// (Re)install the live-refresh watcher for `path`, or tear it down for a volume
+    /// that can't grow. We watch a **folder** (`build_source` hands `set_source` the
+    /// *directory* for both folder and single-image opens, so `is_dir()` also covers
+    /// "opened one image, then siblings appear") or a still-being-written **`.cbz`/`.zip`**
+    /// file (recovered via `ZipSource`'s local-header scan). RAR/7z/complete files aren't
+    /// watched. A `notify` failure is non-fatal — the feature is simply inactive for that volume.
     fn install_folder_watch(&mut self, path: &Path) {
         // Reset any pending refresh carried over from the previous volume, and drop
         // the old watch (dropping the watcher unregisters it).
         self.watch_dirty = None;
+        self.watch_dirty_since = None;
         self.rescanning = false;
         self.watcher = None;
-        if !path.is_dir() {
-            return;
-        }
+        self.watch_filter = None;
+        // Pick what to watch: a folder directly, or — for a growing archive — its parent
+        // directory (notify's Windows backend watches directories; a lone-file watch is
+        // unreliable, especially for a writer holding the file open and appending). For the
+        // archive case we keep the file path to filter the dir's events down to it.
+        let (target, filter): (PathBuf, Option<PathBuf>) = if path.is_dir() {
+            (path.to_path_buf(), None)
+        } else if is_growable_archive(path) {
+            // Canonicalize so the parent dir resolves even for a relative/bare-filename
+            // path (whose `parent()` would be ""); fall back to the path as given.
+            let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            match abs.parent() {
+                Some(parent) => (parent.to_path_buf(), Some(abs.clone())),
+                None => return, // no parent dir to watch
+            }
+        } else {
+            return; // RAR/7z/complete file: can't grow, not watched
+        };
         if let Ok(mut w) = notify::recommended_watcher(self.watch_tx.clone())
-            && w.watch(path, notify::RecursiveMode::NonRecursive).is_ok()
+            && w.watch(&target, notify::RecursiveMode::NonRecursive).is_ok()
         {
             self.watcher = Some(w);
+            self.watch_filter = filter;
         }
     }
 
-    /// Drive the live-folder-refresh watcher each frame: coalesce filesystem-change
-    /// events into a debounce stamp, kick off a debounced off-thread `FolderSource`
-    /// rebuild once the folder has been quiet briefly, and apply a finished rebuild to
-    /// the reader (which preserves the read position and decoded cache by filename).
+    /// Drive the live-refresh watcher each frame: coalesce filesystem-change events into
+    /// a debounce stamp, kick off a debounced off-thread rebuild of the open volume once
+    /// it has settled (or at least every `MAX_WAIT` under a continuous writer), and apply
+    /// a finished rebuild to the reader (which preserves position + decoded cache by name).
     fn poll_folder_watch(&mut self) {
-        // Coalesce incoming change events. A bulk copy fires many — collapse them to a
-        // single dirty stamp. Pure access events (reads) don't change the listing.
+        // Coalesce incoming change events. A bulk copy / streaming archive write fires
+        // many — collapse them. `watch_dirty` tracks the latest event (settle delay);
+        // `watch_dirty_since` the first of the streak (max-wait cap). Pure access events
+        // (reads) don't change the listing, so they're ignored.
         while let Ok(ev) = self.watch_rx.try_recv() {
-            if matches!(&ev, Ok(e) if !e.kind.is_access()) {
-                self.watch_dirty = Some(Instant::now());
+            let Ok(e) = ev else { continue };
+            if e.kind.is_access() {
+                continue; // a read, not a listing change
             }
+            // Archive watch: the parent dir is watched, so ignore events for sibling
+            // files (compare by file name — the dir watch is flat, so names are unique).
+            if let Some(target) = &self.watch_filter
+                && !e.paths.iter().any(|p| p.file_name() == target.file_name())
+            {
+                continue;
+            }
+            let now = Instant::now();
+            self.watch_dirty = Some(now);
+            self.watch_dirty_since.get_or_insert(now);
         }
-        // Once the burst has settled, spawn one rescan of the open folder off-thread
-        // (a big `read_dir` shouldn't touch the UI thread). `rescanning` prevents
-        // overlap; the watcher is only present for folders, so this never fires
-        // for archives. Tag the result with the current `open_gen`.
-        const DEBOUNCE: Duration = Duration::from_millis(250);
-        if let Some(since) = self.watch_dirty
-            && since.elapsed() >= DEBOUNCE
+        // Fire once the burst has settled for `QUIET`, OR it's been churning for `MAX_WAIT`
+        // without a gap (a continuously-streamed archive never goes quiet, so the settle
+        // alone would starve). The rebuild runs off-thread (a `read_dir` or a full archive
+        // local-header scan shouldn't touch the UI thread); `rescanning` prevents overlap;
+        // the watcher is only present for watched volumes, so this never fires otherwise.
+        const QUIET: Duration = Duration::from_millis(250);
+        const MAX_WAIT: Duration = Duration::from_millis(1000);
+        let ready = self.watch_dirty.is_some_and(|t| t.elapsed() >= QUIET)
+            || self.watch_dirty_since.is_some_and(|t| t.elapsed() >= MAX_WAIT);
+        if ready
             && !self.rescanning
             && self.watcher.is_some()
-            && let Some(dir) = self.ui.opened.clone()
+            && let Some(path) = self.ui.opened.clone()
         {
             self.watch_dirty = None;
+            self.watch_dirty_since = None;
             self.rescanning = true;
             let generation = self.open_gen;
             let tx = self.rescan_tx.clone();
             std::thread::spawn(move || {
-                let built = FolderSource::new(&dir)
-                    .ok()
-                    .map(|s| Arc::new(s) as Arc<dyn PageSource>);
-                // Always send (even on a transient read error) so `rescanning` clears.
+                // Reuse the open-path dispatcher: a directory rebuilds a `FolderSource`, a
+                // still-growing `.cbz`/`.zip` a `ZipSource` (local-header recovery). On a
+                // transient error (mid-write, no complete pages yet) it sends `None` and
+                // the next debounced refresh retries; `apply_refreshed_source` also no-ops
+                // on an empty listing.
+                let built = build_source(&path).ok().map(|(src, _, _)| src);
+                // Always send (even on error) so `rescanning` clears.
                 let _ = tx.send((generation, built));
             });
         }
