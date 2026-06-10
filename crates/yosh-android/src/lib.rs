@@ -214,6 +214,9 @@ struct App {
     thumb_used: HashMap<PathBuf, u64>,
     /// Monotonic render counter for `thumb_used`.
     frame_no: u64,
+    /// The yosh mascot logo (embedded PNG), shown on the "no comic open" card.
+    /// Decoded lazily on first paint of the empty state.
+    logo: Option<egui::TextureHandle>,
     /// The library's series sections (scanned off-thread; see `spawn_library_scan`).
     series: Vec<Series>,
     series_rx: std::sync::mpsc::Receiver<Vec<Series>>,
@@ -589,6 +592,7 @@ impl ApplicationHandler for Shell {
             queued_covers: std::collections::HashSet::new(),
             thumb_used: HashMap::new(),
             frame_no: 0,
+            logo: None,
             series: Vec::new(),
             series_rx,
             series_tx,
@@ -1701,7 +1705,12 @@ fn seekbar(
 /// Nothing-open helper: with no comic loaded the screen is otherwise just the dark
 /// clear color, so explain how to open one. Centered card with the two ways in —
 /// browse the library or pick a single file — plus the tap-the-top tip.
-fn empty_state(ctx: &egui::Context, open_library: &mut bool, open_picker: &mut bool) {
+fn empty_state(
+    ctx: &egui::Context,
+    logo: Option<&egui::TextureHandle>,
+    open_library: &mut bool,
+    open_picker: &mut bool,
+) {
     egui::Area::new(egui::Id::new("empty_state"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
@@ -1709,7 +1718,17 @@ fn empty_state(ctx: &egui::Context, open_library: &mut bool, open_picker: &mut b
                 ui.set_max_width((ctx.screen_rect().width() * 0.8).min(420.0));
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
-                    ui.label(egui::RichText::new("📖").size(56.0));
+                    // The yosh mascot if it decoded; otherwise a book glyph.
+                    if let Some(tex) = logo {
+                        let [w, h] = tex.size();
+                        let scale = 84.0 / h as f32;
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(
+                            w as f32 * scale,
+                            h as f32 * scale,
+                        )));
+                    } else {
+                        ui.label(egui::RichText::new("📖").size(56.0));
+                    }
                     ui.label(egui::RichText::new("No comic open").strong().size(22.0));
                     ui.label(
                         egui::RichText::new("Open a comic to start reading.")
@@ -2615,7 +2634,16 @@ impl App {
                 });
             } else if len == 0 {
                 // No comic open: show the how-to-open helper instead of a blank screen.
-                empty_state(ctx, &mut reqs.open_library, &mut reqs.open_picker);
+                if self.logo.is_none()
+                    && let Some(img) = decode_logo()
+                {
+                    self.logo = Some(ctx.load_texture(
+                        "yosh_logo",
+                        img,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                empty_state(ctx, self.logo.as_ref(), &mut reqs.open_library, &mut reqs.open_picker);
             } else if controls {
                 seekbar(
                     ctx,
@@ -2952,6 +2980,21 @@ fn decode_cover(path: &Path, resizer: &mut fast_image_resize::Resizer) -> Option
     let decoded = yosh_engine::decode::decode_and_downscale(&bytes, 320, resizer).ok()?;
     let rgba = yosh_engine::decode::to_rgba_image(decoded);
     Some(egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.w as usize, rgba.h as usize],
+        &rgba.pixels,
+    ))
+}
+
+/// Decode the embedded yosh mascot logo for the "no comic open" card. The PNG is
+/// transparent; the engine's decode premultiplies its alpha, so build the egui
+/// image from premultiplied bytes (`from_rgba_unmultiplied` would double-multiply
+/// and darken the anti-aliased edges).
+fn decode_logo() -> Option<egui::ColorImage> {
+    const LOGO: &[u8] = include_bytes!("../../yosh/assets/yosh.png");
+    let mut resizer = fast_image_resize::Resizer::new();
+    let decoded = yosh_engine::decode::decode_and_downscale(LOGO, 256, &mut resizer).ok()?;
+    let rgba = yosh_engine::decode::to_rgba_image(decoded);
+    Some(egui::ColorImage::from_rgba_premultiplied(
         [rgba.w as usize, rgba.h as usize],
         &rgba.pixels,
     ))
