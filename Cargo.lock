@@ -5394,6 +5394,7 @@ version = "0.1.40"
 dependencies = [
  "directories",
  "egui",
+ "egui-phosphor",
  "egui-wgpu",
  "egui-winit",
  "fast_image_resize",

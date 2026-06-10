@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use crate::library::Library;
+use crate::library::{series_status, vol_state, LibCtx, Library, VolState};
 
 #[derive(Default)]
 pub struct UiState {
@@ -29,7 +29,17 @@ pub struct UiState {
     pub req_toggle_layout: bool,
     pub req_toggle_transition: bool,
     pub req_toggle_library: bool,
-    pub clicked_volume: Option<usize>,
+    /// Rescan the current library root (toolbar ⟳). Drained by the app.
+    pub rescan: bool,
+    /// Series whose section the user clicked to expand/collapse this frame
+    /// (its `dir`). Drained by the app, which flips the persisted collapsed set.
+    pub toggle_series: Option<PathBuf>,
+    /// Volume paths of the series sections that were expanded *and* on screen this
+    /// frame — the app decodes only these covers (lazy) and LRU-evicts the rest.
+    pub visible_covers: Vec<PathBuf>,
+    /// A library scan is in flight (off-thread) — show "Scanning library…". Set by
+    /// the app each frame.
+    pub scanning: bool,
     pub help_open: bool,
     /// Whether to draw the top chrome bar (hidden in fullscreen unless the
     /// cursor is at the top edge). Set by the app each frame.
@@ -403,7 +413,13 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
 }
 
 #[allow(deprecated)]
-pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view: bool) {
+pub fn chrome(
+    ctx: &egui::Context,
+    st: &mut UiState,
+    lib: &Library,
+    libctx: &LibCtx,
+    library_view: bool,
+) {
     let show_bar = st.show_bar;
     egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
         ui.horizontal(|ui| {
@@ -433,7 +449,7 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
             {
                 st.pending_library = Some(p);
             }
-            if !lib.volumes.is_empty() && ui.button(if library_view { "Reader" } else { "Grid" }).clicked() {
+            if !lib.is_empty() && ui.button(if library_view { "Reader" } else { "Grid" }).clicked() {
                 st.req_toggle_library = true;
             }
             ui.separator();
@@ -707,41 +723,198 @@ pub fn chrome(ctx: &egui::Context, st: &mut UiState, lib: &Library, library_view
 
     if library_view {
         egui::CentralPanel::default().show(ctx, |ui| {
-            if lib.volumes.is_empty() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("No volumes found — pick a library folder.");
-                });
-                return;
-            }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for (i, v) in lib.volumes.iter().enumerate() {
-                        ui.vertical(|ui| {
-                            ui.set_width(184.0);
-                            let clicked = match v.thumb {
-                                Some(tid) => ui
-                                    .add(egui::ImageButton::new(egui::Image::new(
-                                        egui::load::SizedTexture::new(
-                                            tid,
-                                            egui::vec2(174.0, 246.0),
-                                        ),
-                                    )))
-                                    .clicked(),
-                                None => ui
-                                    .add_sized(
-                                        egui::vec2(174.0, 246.0),
-                                        egui::Button::new("(no preview)"),
-                                    )
-                                    .clicked(),
-                            };
-                            if clicked {
-                                st.clicked_volume = Some(i);
-                            }
-                            ui.label(elide(&v.name, 24));
-                        });
-                    }
-                });
-            });
+            library_sections(ui, st, lib, libctx);
         });
     }
+}
+
+/// Width of a cover cell and its image in the sectioned library row.
+const CELL_W: f32 = 150.0;
+const COVER_H: f32 = 210.0;
+
+/// The Chunky-style library: a vertical list of collapsible series sections, each
+/// a horizontal, scrollbar/drag-scrollable row of cover thumbnails with read-state
+/// visuals (faded "finished" covers, an in-progress bar, the open volume's stroke).
+fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibCtx) {
+    // Solid (non-floating) scrollbars so the horizontal bar under an overflowing row
+    // is clearly visible and the vertical bar reserves a real strip on the right
+    // (the default floating bars reserve 0 width and overlay the rows). Scoped to the
+    // library central panel.
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui.button("⟳ Rescan").on_hover_text("Re-scan the library folder").clicked() {
+            st.rescan = true;
+        }
+        if let Some(root) = &lib.root {
+            ui.label(egui::RichText::new(root.to_string_lossy()).weak());
+        }
+    });
+    ui.separator();
+
+    if lib.is_empty() {
+        ui.add_space(40.0);
+        ui.vertical_centered(|ui| {
+            if st.scanning {
+                ui.add(egui::Spinner::new());
+                ui.label("Scanning library…");
+            } else {
+                ui.label("No comics found here — use “Library…” to pick your comics folder.");
+            }
+        });
+        return;
+    }
+
+    egui::ScrollArea::vertical().show(ui, |ui| {
+        for series in &lib.series {
+            let key = series.dir.to_string_lossy();
+            let expanded = !libctx.collapsed.contains(key.as_ref());
+
+            // Per-volume read state + the series' aggregate status label.
+            let states: Vec<VolState> = series
+                .volumes
+                .iter()
+                .map(|v| {
+                    vol_state(
+                        libctx.progress,
+                        libctx.last_pages,
+                        v.path.to_string_lossy().as_ref(),
+                    )
+                })
+                .collect();
+            let status = series_status(&states);
+
+            // Full-width clickable header: caret + name (left), status (right).
+            // Built with a normal horizontal layout (left label + a right-to-left
+            // sub-layout) so both ends lay out and clip reliably; the row response
+            // is re-interacted for the click.
+            let caret = if expanded {
+                egui_phosphor::fill::CARET_DOWN
+            } else {
+                egui_phosphor::fill::CARET_RIGHT
+            };
+            let full_w = ui.available_width();
+            let header = ui.allocate_ui_with_layout(
+                egui::vec2(full_w, 36.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(format!("{caret}  {}", series.name))
+                            .size(18.0)
+                            .strong(),
+                    );
+                    // Status sits just after the title (a dim "· N unread" / "·
+                    // Reading" / "· Finished"). Kept left-aligned with the title
+                    // rather than pushed to the far right: text near the right edge
+                    // of this nested scroll-area layout doesn't paint reliably.
+                    ui.add_space(10.0);
+                    ui.label(
+                        egui::RichText::new(format!("· {status}"))
+                            .size(13.0)
+                            .weak(),
+                    );
+                },
+            );
+            let rect = header.response.rect;
+            if header.response.interact(egui::Sense::click()).clicked() {
+                st.toggle_series = Some(series.dir.clone());
+            }
+
+            if expanded {
+                // Lazy covers: only sections actually on screen queue decodes.
+                if ui.is_rect_visible(rect) {
+                    st.visible_covers
+                        .extend(series.volumes.iter().map(|v| v.path.clone()));
+                }
+                // Horizontal cover row, full width. The wheel is intentionally NOT a
+                // scroll source here, so a plain wheel over a row falls through to the
+                // outer vertical list (reliable vertical scrolling with the cursor
+                // anywhere). The row scrolls sideways via its scrollbar or by
+                // click-dragging the covers; a quick click still opens a volume.
+                egui::ScrollArea::horizontal()
+                    .id_salt(&series.dir)
+                    .scroll_source(egui::scroll_area::ScrollSource {
+                        scroll_bar: true,
+                        drag: true,
+                        mouse_wheel: false,
+                    })
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for (v, state) in series.volumes.iter().zip(&states) {
+                                let is_current = libctx.current_key
+                                    == Some(v.path.to_string_lossy().as_ref());
+                                volume_cell(ui, st, &v.name, v.path.clone(), v.thumb, *state, is_current);
+                            }
+                        });
+                    });
+            }
+            ui.add_space(10.0);
+        }
+    });
+}
+
+/// One volume in a series row: cover (faded when finished, thin progress bar when
+/// started, highlight stroke when currently open) + truncated name. Clicking sets
+/// `pending_open` so the app opens it next frame.
+#[allow(deprecated)] // egui ImageButton — matches the rest of this module
+fn volume_cell(
+    ui: &mut egui::Ui,
+    st: &mut UiState,
+    name: &str,
+    path: PathBuf,
+    thumb: Option<egui::TextureId>,
+    state: VolState,
+    is_current: bool,
+) {
+    ui.allocate_ui(egui::vec2(CELL_W, COVER_H + 40.0), |ui| {
+        ui.vertical(|ui| {
+            let finished = state == VolState::Finished;
+            let r = match thumb {
+                Some(tid) => {
+                    let mut img = egui::Image::new(egui::load::SizedTexture::new(
+                        tid,
+                        egui::vec2(CELL_W, COVER_H),
+                    ));
+                    if finished {
+                        // Read volumes fade out (Chunky-style).
+                        img = img.tint(egui::Color32::from_white_alpha(72));
+                    }
+                    ui.add(egui::ImageButton::new(img))
+                }
+                None => ui.add_sized(
+                    [CELL_W, COVER_H],
+                    egui::Button::new(egui::RichText::new("…").size(24.0)),
+                ),
+            };
+            let accent = ui.visuals().selection.bg_fill;
+            if is_current {
+                ui.painter().rect_stroke(
+                    r.rect,
+                    3.0,
+                    egui::Stroke::new(2.0, accent),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if let VolState::InProgress(frac) = state {
+                let y = r.rect.bottom() - 2.0;
+                let w = r.rect.width() * frac.clamp(0.02, 1.0);
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(r.rect.left(), y),
+                        egui::pos2(r.rect.left() + w, y),
+                    ],
+                    egui::Stroke::new(3.0, accent),
+                );
+            }
+            let mut label = egui::RichText::new(elide(name, 22)).size(12.0);
+            if finished {
+                label = label.weak();
+            }
+            ui.add_sized([CELL_W, 32.0], egui::Label::new(label).truncate());
+            if r.clicked() {
+                st.pending_open = Some(path);
+            }
+        });
+    });
 }

@@ -14,6 +14,10 @@ wgpu = "29.0.3"
 egui = "0.34.3"
 egui-wgpu = "0.34.3"
 egui-winit = "0.34.3"
+# Phosphor icon font for the library section carets (pure-Rust glyph set — no C
+# toolchain; the same crate the Android shell uses, so the carets render
+# identically and never fall back to tofu boxes).
+egui-phosphor = { version = "0.12", default-features = false, features = ["fill"] }
 rfd = "0.17"
 # The shell still uses a few engine deps directly: `image` for the window icon,
 # the info-overlay format probe, and egui cover thumbnails; `jxl-oxide` only to

@@ -1,7 +1,7 @@
 //! Persisted settings + per-volume last-read page (per-OS config dir via
 //! `directories`, stored as JSON).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,15 @@ pub struct Settings {
     pub library_root: Option<String>,
     /// Volume path (folder or archive) → last-read page index.
     pub last_pages: HashMap<String, usize>,
+    /// Volume path → read-tracking pair `(furthest_page_count, total_pages)`, where
+    /// `furthest_page_count` is the 1-based count of the furthest page ever shown
+    /// (the far page of a spread counts). Drives the library's read-state visuals:
+    /// faded "finished" covers, the in-progress bar, and the per-series status. A
+    /// volume with a `last_pages` entry but no `progress` entry counts as started.
+    pub progress: HashMap<String, (usize, usize)>,
+    /// Series folders (by path string) the user collapsed in the library. Absent ⇒
+    /// expanded, so the default (everything expanded) stores nothing.
+    pub collapsed: HashSet<String>,
     /// Volume path → spread pairing parity offset (0 or 1).
     pub spread_offsets: HashMap<String, u8>,
     /// Whether the keys overlay has been shown once (first-launch onboarding).
@@ -60,6 +69,8 @@ impl Default for Settings {
             gpu: false,
             library_root: None,
             last_pages: HashMap::new(),
+            progress: HashMap::new(),
+            collapsed: HashSet::new(),
             spread_offsets: HashMap::new(),
             help_seen: false,
             seekbar_enabled: true,
@@ -81,6 +92,20 @@ fn config_file() -> Option<PathBuf> {
     }
     directories::ProjectDirs::from("", "the-database", "yosh")
         .map(|d| d.config_dir().join("state.json"))
+}
+
+/// Directory for the cover-thumbnail cache. Portable mode keeps it beside the exe
+/// (so it travels with the app and leaves nothing in the user profile); otherwise
+/// it's the per-OS cache dir. `None` if neither can be resolved.
+pub fn cache_dir() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && dir.join("yosh-portable.txt").exists()
+    {
+        return Some(dir.join("yosh-thumbs"));
+    }
+    directories::ProjectDirs::from("", "the-database", "yosh")
+        .map(|d| d.cache_dir().join("thumbs"))
 }
 
 pub fn load() -> Settings {
