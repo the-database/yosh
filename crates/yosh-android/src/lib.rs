@@ -493,7 +493,25 @@ impl Shell {
                             (self.two_finger_metrics(), self.app.as_mut())
                         {
                             let (sw, sh) = (app.config.width as f32, app.config.height as f32);
-                            app.reader.zoom = p.zoom0 * (d / p.dist0) as f32;
+                            // Raw target from finger spread, then a fit "detent": within
+                            // ONE gesture the zoom can approach the fit scale (zoom == 1.0)
+                            // but not cross it, so a single max zoom-out from above — or
+                            // zoom-in from below — lands exactly on fit. Crossing requires
+                            // releasing and re-pinching (then zoom0 ~= 1.0, so no barrier).
+                            // Barrier side comes from the immutable zoom0; we hard-clamp (no
+                            // dist0 re-baseline) so the barrier holds — at the cost of a
+                            // small dead zone if the user over-pinches past fit and reverses
+                            // mid-gesture.
+                            const FIT: f32 = 1.0;
+                            const EPS: f32 = 0.001; // matches the fit-reset button's "fitted" test
+                            let raw = p.zoom0 * (d / p.dist0) as f32;
+                            app.reader.zoom = if p.zoom0 > FIT + EPS {
+                                raw.max(FIT) // started above fit: can't drop below it this gesture
+                            } else if p.zoom0 < FIT - EPS {
+                                raw.min(FIT) // started below fit: can't rise above it this gesture
+                            } else {
+                                raw // started at fit: free to cross either way (re-pinch path)
+                            };
                             app.reader.clamp_zoom_native();
                             // Actual (post-clamp) scale ratio: keep the content point
                             // under the initial midpoint pinned to the current one.
