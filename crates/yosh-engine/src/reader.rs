@@ -246,6 +246,11 @@ const DRAG_COMMIT_FRAC: f32 = 0.25;
 const DRAG_FLICK_PX_S: f32 = 600.0;
 /// …with at least this much travel (so a stray touch can't flip).
 const DRAG_FLICK_MIN_FRAC: f32 = 0.04;
+/// Releasing while moving back *against* the drag faster than this cancels the
+/// flip regardless of how far the page was pulled — a deliberate reversal means
+/// "changed my mind" (Chunky behavior). Gentler than the flick threshold so a
+/// gentle-but-real backtrack cancels, while sensor jitter doesn't.
+const DRAG_CANCEL_PX_S: f32 = 250.0;
 /// Extra damping when dragging against the first/last page (rubber-band).
 const DRAG_RUBBER: f32 = 0.35;
 /// Snap-back duration when a drag is released without committing.
@@ -302,9 +307,14 @@ pub fn drag_dir(direction: Direction, dx: f32) -> i64 {
 }
 
 /// Should a released drag commit the flip? Far enough, or a deliberate flick
-/// (fast + same direction + non-trivial travel). Measured on raw *finger*
-/// travel, not the resistance-damped page displacement.
+/// (fast + same direction + non-trivial travel) — but a deliberate *reversal*
+/// at release cancels no matter how far the page was pulled. Measured on raw
+/// *finger* travel, not the resistance-damped page displacement.
 pub fn drag_commits(dx_px: f32, velocity_px_s: f32, viewport_w: f32) -> bool {
+    // Moving back against the drag when the finger lifts = "changed my mind".
+    if velocity_px_s.abs() > DRAG_CANCEL_PX_S && velocity_px_s.signum() != dx_px.signum() {
+        return false;
+    }
     let frac = dx_px.abs() / viewport_w.max(1.0);
     frac > DRAG_COMMIT_FRAC
         || (frac > DRAG_FLICK_MIN_FRAC
@@ -1343,6 +1353,15 @@ mod tests {
         assert!(!drag_commits(w * 0.10, -900.0, w));
         // Micro-travel never commits, however fast (stray touches).
         assert!(!drag_commits(w * (DRAG_FLICK_MIN_FRAC - 0.01), 5000.0, w));
+        // A deliberate reversal cancels even PAST the distance threshold —
+        // pulling far right then backtracking left means "changed my mind".
+        assert!(!drag_commits(w * 0.60, -400.0, w));
+        assert!(!drag_commits(-w * 0.60, 400.0, w));
+        // …but sub-threshold opposing jitter at release doesn't kill a real commit.
+        assert!(drag_commits(w * 0.60, -100.0, w));
+        // And a far pull released while still (or coasting forward) commits.
+        assert!(drag_commits(w * 0.60, 0.0, w));
+        assert!(drag_commits(w * 0.60, 300.0, w));
     }
 
     // The resistance curve: ~1:1 tracking at rest (no kink when the drag
