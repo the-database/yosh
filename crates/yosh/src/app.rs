@@ -18,9 +18,8 @@ use fast_image_resize::Resizer;
 use notify::Watcher as _; // brings the `.watch()` method into scope
 
 use crate::config;
-use yosh_engine::decode::decode_and_downscale;
 use crate::gpu::Gpu;
-use crate::library::{cover_bytes, Library};
+use crate::library::{cover_bytes, Library, VolKind};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::DecodePool;
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
@@ -66,9 +65,8 @@ fn total_ram_mb() -> Option<u64> {
 }
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
-/// Library cover thumbnail height, and how many to decode per frame.
+/// Library cover thumbnail height (decoded off-thread; see `pump_covers`).
 const THUMB_H: u32 = 360;
-const THUMB_BUDGET: usize = 2;
 /// Grace period before the centered loading spinner appears, so quick page
 /// loads don't flash an indicator on every flip — only genuinely slow decodes
 /// (e.g. seeking fast through very high-res pages) cross it.
@@ -168,7 +166,26 @@ struct State {
 
     library: Library,
     library_view: bool,
-    thumb_resizer: Resizer,
+    /// Monotonic per-frame counter used to stamp cover recency for LRU eviction
+    /// (the sectioned library only decodes/keeps the covers it has shown).
+    cover_clock: u64,
+    /// Off-thread library scan (recursive dir walk): generation-tagged so a newer
+    /// folder pick / rescan supersedes an in-flight scan; `scanning` drives the
+    /// "Scanning library…" state.
+    scanning: bool,
+    scan_gen: u64,
+    scan_tx: std::sync::mpsc::Sender<(u64, Library)>,
+    scan_rx: std::sync::mpsc::Receiver<(u64, Library)>,
+    /// Off-thread cover decode: workers send back decoded RGBA thumbnails keyed by
+    /// path; the main thread uploads + registers them with egui.
+    cover_tx: std::sync::mpsc::Sender<(PathBuf, yosh_engine::decode::DecodedImage)>,
+    cover_rx: std::sync::mpsc::Receiver<(PathBuf, yosh_engine::decode::DecodedImage)>,
+    /// Cover paths queued or in flight on a worker (dedup; also the "already tried"
+    /// marker, cleared on LRU eviction / library replace so a re-scroll re-queues).
+    queued_covers: std::collections::HashSet<PathBuf>,
+    /// Volume location by path, rebuilt when the library is replaced, so a drained
+    /// cover result maps back to its volume in O(1).
+    cover_loc: std::collections::HashMap<PathBuf, (usize, usize)>,
 
     // Auto-update: a background thread checks the latest public release on
     // launch; the UI offers a one-click in-place update.
@@ -528,10 +545,17 @@ fn probe(b: &[u8]) -> (u32, u32, String) {
     (0, 0, "image".to_string())
 }
 
-/// Best-effort: load a system CJK font so Japanese/Chinese/Korean text (paths,
-/// filenames, library titles) renders in the egui chrome. Appended as a
-/// fallback so Latin keeps the default look; silently skipped if none found.
-fn install_cjk_font(ctx: &egui::Context) {
+/// Install the egui chrome fonts: the Phosphor icon set (for the library section
+/// carets) is added unconditionally, and a best-effort system CJK font is appended
+/// as a fallback so Japanese/Chinese/Korean text (paths, filenames, library
+/// titles) renders. Both are *fallbacks* layered after the default fonts, so Latin
+/// keeps its default look. A single `set_fonts` applies the lot.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    // Phosphor carets etc. — pure-Rust glyph set, always available (matches the
+    // Android shell, so the library headers never fall back to tofu boxes).
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
+
     const CANDIDATES: &[&str] = &[
         r"C:\Windows\Fonts\YuGothR.ttc",
         r"C:\Windows\Fonts\meiryo.ttc",
@@ -541,21 +565,19 @@ fn install_cjk_font(ctx: &egui::Context) {
         "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
         "/Library/Fonts/Hiragino Sans GB.ttc",
     ];
-    let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) else {
-        return;
-    };
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "cjk".to_owned(),
-        // The CJK fallback's glyphs render above the Latin baseline; nudge them
-        // down so mixed JP/EN lines (top bar, info overlay, titles) line up.
-        std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
-            y_offset_factor: 0.18,
-            ..Default::default()
-        })),
-    );
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts.families.entry(family).or_default().push("cjk".to_owned());
+    if let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) {
+        fonts.font_data.insert(
+            "cjk".to_owned(),
+            // The CJK fallback's glyphs render above the Latin baseline; nudge them
+            // down so mixed JP/EN lines (top bar, info overlay, titles) line up.
+            std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
+                y_offset_factor: 0.18,
+                ..Default::default()
+            })),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(family).or_default().push("cjk".to_owned());
+        }
     }
     ctx.set_fonts(fonts);
 }
@@ -717,7 +739,7 @@ impl ApplicationHandler for App {
         let gpu = Gpu::new(window.clone());
 
         let egui_ctx = egui::Context::default();
-        install_cjk_font(&egui_ctx);
+        install_fonts(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -747,12 +769,13 @@ impl ApplicationHandler for App {
             ui.pending_open = Some(p);
         }
 
-        let library = match &settings.library_root {
-            Some(r) => Library::scan(std::path::Path::new(r)),
-            None => Library::empty(),
-        };
-        // Open straight into the grid if nothing was passed to read.
-        let library_view = ui.pending_open.is_none() && !library.volumes.is_empty();
+        // The recursive library scan can be slow on a big tree, so it runs
+        // off-thread (kicked off below, after the channels exist); the grid shows
+        // "Scanning library…" until it lands. Open straight into the grid if nothing
+        // was passed to read and a library root is configured.
+        let library = Library::empty();
+        let has_root = settings.library_root.is_some();
+        let library_view = ui.pending_open.is_none() && has_root;
         // Show the keys overlay once, on the first launch ever, then persist so it
         // never auto-opens again (F1 / "? Help" reopen it on demand).
         if !settings.help_seen {
@@ -776,6 +799,18 @@ impl ApplicationHandler for App {
         // off-thread `FolderSource` rebuilds out.
         let (watch_tx, watch_rx) = std::sync::mpsc::channel();
         let (rescan_tx, rescan_rx) = std::sync::mpsc::channel();
+        // Off-thread library scan + cover decode.
+        let (scan_tx, scan_rx) = std::sync::mpsc::channel();
+        let (cover_tx, cover_rx) = std::sync::mpsc::channel();
+        let mut scan_gen = 0u64;
+        let scanning = has_root;
+        if let Some(root) = settings.library_root.clone() {
+            scan_gen = 1;
+            let tx = scan_tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((1, Library::scan(std::path::Path::new(&root))));
+            });
+        }
         let mut reader = Reader::new(
             gpu.device.clone(),
             gpu.queue.clone(),
@@ -823,7 +858,15 @@ impl ApplicationHandler for App {
             last_title: String::new(),
             library,
             library_view,
-            thumb_resizer: Resizer::new(),
+            cover_clock: 0,
+            scanning,
+            scan_gen,
+            scan_tx,
+            scan_rx,
+            cover_tx,
+            cover_rx,
+            queued_covers: std::collections::HashSet::new(),
+            cover_loc: std::collections::HashMap::new(),
             update_rx: Some(update_rx),
             update: None,
             update_apply_rx: None,
@@ -1444,35 +1487,134 @@ impl State {
 
     /// Decode up to `budget` not-yet-tried library cover thumbnails this frame
     /// and register them with egui.
-    fn decode_thumbnails(&mut self, budget: usize) {
-        let mut done = 0;
-        for i in 0..self.library.volumes.len() {
-            if done >= budget {
-                break;
+    /// Update the open volume's read-tracking entry: the furthest page ever shown
+    /// (1-based count; the far page of a spread counts) and the volume's total.
+    /// Called every rendered frame while reading — cheap map math; the file write
+    /// rides along with the existing `config::save`. Mirrors the Android shell.
+    fn note_progress(&mut self) {
+        let Some(key) = self.volume_key.clone() else {
+            return;
+        };
+        let len = match &self.reader.source {
+            Some(s) => s.len(),
+            None => return,
+        };
+        if len == 0 {
+            return;
+        }
+        let (a, b) = layout::view_pages(
+            self.reader.layout,
+            self.reader.index,
+            len,
+            self.reader.spread_offset,
+        );
+        let seen = b.unwrap_or(a) + 1;
+        let e = self.settings.progress.entry(key).or_insert((0, 0));
+        e.0 = e.0.max(seen);
+        e.1 = len;
+    }
+
+    /// Free every registered library cover texture (before a rescan / new library,
+    /// which then replaces the volumes and their backing `PageTexture`s).
+    fn free_cover_textures(&mut self) {
+        for v in self.library.all_volumes() {
+            if let Some(id) = v.thumb {
+                self.egui_renderer.free_texture(&id);
             }
-            if self.library.volumes[i].thumb_tried {
-                continue;
+        }
+    }
+
+    /// Kick off a recursive library scan off the main thread (generation-tagged so a
+    /// newer pick/rescan wins). The result is applied in `poll_background`.
+    fn start_scan(&mut self, root: PathBuf) {
+        self.scan_gen = self.scan_gen.wrapping_add(1);
+        self.scanning = true;
+        let generation = self.scan_gen;
+        let tx = self.scan_tx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((generation, Library::scan(&root)));
+        });
+        self.window.request_redraw();
+    }
+
+    /// Replace the displayed library: free the old cover textures, reset the cover
+    /// queue, and rebuild the path→volume index used to route decoded covers.
+    fn set_library(&mut self, lib: Library) {
+        self.free_cover_textures();
+        self.queued_covers.clear();
+        self.cover_loc.clear();
+        for (si, s) in lib.series.iter().enumerate() {
+            for (vi, v) in s.volumes.iter().enumerate() {
+                self.cover_loc.insert(v.path.clone(), (si, vi));
             }
-            self.library.volumes[i].thumb_tried = true;
-            done += 1;
-            let Some(bytes) = cover_bytes(&self.library.volumes[i]) else {
-                continue;
-            };
-            let img = match decode_and_downscale(&bytes, THUMB_H, &mut self.thumb_resizer) {
-                Ok(img) => yosh_engine::decode::to_rgba_image(img), // egui samples RGBA
-                Err(_) => continue,
-            };
-            // Library thumbnail (registered with egui, not stored in the page
-            // cache) — its decode-target stamp is unused, so pass 0.
-            let pt =
-                PagePipeline::upload(&self.gpu.device, &self.gpu.queue, &img, &self.reader.tex_pool, 0);
-            let id = self.egui_renderer.register_native_texture(
-                &self.gpu.device,
-                &pt.view,
-                wgpu::FilterMode::Linear,
-            );
-            self.library.volumes[i].thumb = Some(id);
-            self.library.volumes[i].thumb_tex = Some(pt);
+        }
+        self.library = lib;
+    }
+
+    /// Queue the covers the sectioned library reported on screen this frame
+    /// (`ui.visible_covers`) for OFF-THREAD decode, and evict the least-recently-seen
+    /// resident textures past a cap so a deep library can't pin hundreds of MB. The
+    /// heavy read+decode+downscale (and the disk-cache lookup) runs on a worker; the
+    /// main thread only uploads + registers finished thumbnails in `poll_background`.
+    fn pump_covers(&mut self) {
+        let visible = std::mem::take(&mut self.ui.visible_covers);
+        if !visible.is_empty() {
+            self.cover_clock = self.cover_clock.wrapping_add(1);
+            let clock = self.cover_clock;
+            // Stamp recency for visible covers; gather undecoded, not-yet-queued ones.
+            let mut batch: Vec<(PathBuf, VolKind)> = Vec::new();
+            for path in &visible {
+                if let Some(&(si, vi)) = self.cover_loc.get(path) {
+                    let v = &mut self.library.series[si].volumes[vi];
+                    v.last_seen = clock;
+                    if v.thumb.is_none() && self.queued_covers.insert(path.clone()) {
+                        batch.push((path.clone(), v.kind));
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let tx = self.cover_tx.clone();
+                let cache_dir = config::cache_dir();
+                std::thread::spawn(move || {
+                    let mut resizer = Resizer::new();
+                    for (path, kind) in batch {
+                        if let Some(img) = yosh_engine::thumbcache::load_or_decode(
+                            cache_dir.as_deref(),
+                            &path,
+                            THUMB_H,
+                            &mut resizer,
+                            || cover_bytes(&path, kind),
+                        ) && tx.send((path, img)).is_err()
+                        {
+                            break; // receiver gone (app closing)
+                        }
+                    }
+                });
+            }
+        }
+
+        // LRU eviction: keep only the most-recently-seen covers resident.
+        const THUMB_CAP: usize = 192;
+        let live = self.library.all_volumes().filter(|v| v.thumb.is_some()).count();
+        if live > THUMB_CAP {
+            let mut ages: Vec<(u64, usize, usize)> = Vec::new();
+            for (si, s) in self.library.series.iter().enumerate() {
+                for (vi, v) in s.volumes.iter().enumerate() {
+                    if v.thumb.is_some() {
+                        ages.push((v.last_seen, si, vi));
+                    }
+                }
+            }
+            ages.sort_by_key(|&(age, _, _)| age);
+            for (_, si, vi) in ages.into_iter().take(live - THUMB_CAP) {
+                let path = self.library.series[si].volumes[vi].path.clone();
+                let v = &mut self.library.series[si].volumes[vi];
+                if let Some(id) = v.thumb.take() {
+                    self.egui_renderer.free_texture(&id);
+                }
+                v.thumb_tex = None; // dropping the texture frees it
+                self.queued_covers.remove(&path); // allow a re-decode when scrolled back
+            }
         }
     }
 
@@ -1664,6 +1806,39 @@ impl State {
         // Sibling-volume scans only warm the `[`/`]` cache — nothing to show.
         while let Ok(entry) = self.sib_rx.try_recv() {
             self.sib_cache = Some(entry);
+        }
+        // Off-thread library scan: apply the newest result (frees the old cover
+        // textures and rebuilds the path→volume index).
+        while let Ok((generation, lib)) = self.scan_rx.try_recv() {
+            if generation == self.scan_gen {
+                self.set_library(lib);
+                self.scanning = false;
+                changed = true;
+            }
+        }
+        // Off-thread cover decodes: upload + register finished thumbnails (the only
+        // steps that must run on the main thread).
+        while let Ok((path, img)) = self.cover_rx.try_recv() {
+            self.queued_covers.remove(&path);
+            if let Some(&(si, vi)) = self.cover_loc.get(&path) {
+                let pt = PagePipeline::upload(
+                    &self.gpu.device,
+                    &self.gpu.queue,
+                    &img,
+                    &self.reader.tex_pool,
+                    0,
+                );
+                let id = self.egui_renderer.register_native_texture(
+                    &self.gpu.device,
+                    &pt.view,
+                    wgpu::FilterMode::Linear,
+                );
+                let v = &mut self.library.series[si].volumes[vi];
+                v.thumb = Some(id);
+                v.thumb_tex = Some(pt);
+                v.last_seen = self.cover_clock;
+                changed = true;
+            }
         }
         // Live folder refresh: react to images added/removed in the open folder.
         changed |= self.poll_folder_watch();
@@ -2041,6 +2216,8 @@ impl State {
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), self.reader.index);
         }
+        // Advance the read-tracking furthest-page mark for the library's read state.
+        self.note_progress();
         if let Some((_, t)) = &self.toast
             && t.elapsed() >= TOAST_DURATION
         {
@@ -2228,17 +2405,22 @@ impl State {
             }
         }
 
-        // egui chrome.
-        if self.library_view {
-            self.decode_thumbnails(THUMB_BUDGET);
-        }
+        // egui chrome. Covers are decoded *after* the frame (below), driven by the
+        // sections the library view reports visible, so nothing is decoded here.
+        self.ui.scanning = self.scanning;
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let ui_state = &mut self.ui;
         let lib = &self.library;
         let library_view = self.library_view;
+        let libctx = crate::library::LibCtx {
+            progress: &self.settings.progress,
+            last_pages: &self.settings.last_pages,
+            collapsed: &self.settings.collapsed,
+            current_key: self.volume_key.as_deref(),
+        };
         let full_output = self
             .egui_ctx
-            .run(raw_input, |ctx| ui::chrome(ctx, ui_state, lib, library_view));
+            .run(raw_input, |ctx| ui::chrome(ctx, ui_state, lib, &libctx, library_view));
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -2305,29 +2487,37 @@ impl State {
             ui_acted = true;
         }
         if let Some(root) = self.ui.pending_library.take() {
-            for v in &self.library.volumes {
-                if let Some(id) = v.thumb {
-                    self.egui_renderer.free_texture(&id);
-                }
-            }
-            self.library = Library::scan(&root);
+            // Clear the grid to the "Scanning…" state and scan the new root off-thread.
+            self.set_library(Library::empty());
             self.library_view = true;
             self.settings.library_root = Some(root.to_string_lossy().into_owned());
             config::save(&self.settings);
+            self.start_scan(root);
             ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_toggle_library) && !self.library.volumes.is_empty() {
+        if std::mem::take(&mut self.ui.rescan)
+            && let Some(root) = self.library.root.clone()
+        {
+            // Keep the current grid visible until the fresh scan lands (no flicker).
+            self.start_scan(root);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_toggle_library) && !self.library.is_empty() {
             self.library_view = !self.library_view;
             ui_acted = true;
         }
-        if let Some(i) = self.ui.clicked_volume.take()
-            && let Some(v) = self.library.volumes.get(i)
-        {
-            let path = v.path.clone();
-            self.library_view = false;
-            self.open(&path);
+        // Collapse/expand a series section (header click). The collapsed *set* is
+        // persisted, so the default (everything expanded) stores nothing.
+        if let Some(dir) = self.ui.toggle_series.take() {
+            let key = dir.to_string_lossy().into_owned();
+            if !self.settings.collapsed.remove(&key) {
+                self.settings.collapsed.insert(key);
+            }
+            config::save(&self.settings);
             ui_acted = true;
         }
+        // A cover click sets `pending_open` (drained next frame like the top-bar
+        // open buttons), so opening a volume from the grid flows through `open`.
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
         let screen = egui_wgpu::ScreenDescriptor {
@@ -2376,6 +2566,13 @@ impl State {
             .submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         frame.present();
 
+        // Queue/evict library covers *after* presenting, so eviction can never free
+        // a texture this frame just drew. The decode itself runs off-thread; finished
+        // covers are uploaded next frame in `poll_background`.
+        if self.library_view {
+            self.pump_covers();
+        }
+
         // On-demand rendering: request the next frame only while something is
         // still moving or landing; otherwise the loop sleeps until an input event
         // (or the `about_to_wait` background heartbeat) wakes it. Mirrors the
@@ -2384,11 +2581,10 @@ impl State {
             .viewport_output
             .values()
             .any(|v| v.repaint_delay.is_zero());
-        let thumbs_pending =
-            self.library_view && self.library.volumes.iter().any(|v| !v.thumb_tried);
         if ui_acted                            // a chrome request landed after quads were built
             || self.opening                    // background open: spinner over the old page
-            || thumbs_pending                  // library covers still decoding (budgeted/frame)
+            || self.scanning                   // library scan in flight (show "Scanning…")
+            || !self.queued_covers.is_empty()  // covers still decoding off-thread
             || !self.reader.view_settled       // resize/zoom debounce needs a settle frame
             || !self.reader.view_is_hq()       // in-view page missing/LQ/stale → wait for decode
             || self.reader.lq_fill_pending()   // whole-volume LQ tier still filling

@@ -207,6 +207,9 @@ struct App {
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     thumb_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
     thumb_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
+    /// On-disk cover-thumbnail cache dir (app-private `…/thumbs`); covers load from
+    /// here instead of re-decoding the full first page on every open.
+    thumb_cache_dir: Option<PathBuf>,
     /// Covers already queued for decode (lazy, per visible series section).
     queued_covers: std::collections::HashSet<PathBuf>,
     /// Frame stamp a cover was last drawn (LRU for the `thumbs` cap — a big
@@ -589,6 +592,10 @@ impl ApplicationHandler for Shell {
             thumbs: HashMap::new(),
             thumb_rx,
             thumb_tx,
+            thumb_cache_dir: self
+                .android_app
+                .internal_data_path()
+                .map(|p| p.join("thumbs")),
             queued_covers: std::collections::HashSet::new(),
             thumb_used: HashMap::new(),
             frame_no: 0,
@@ -1139,7 +1146,11 @@ impl Shell {
                 // Cover preview: same off-thread pipeline as the library; the
                 // result lands via the per-frame `thumb_rx` drain and the card
                 // picks it up while the prompt is still showing.
-                spawn_cover_decode(vec![p.clone()], app.thumb_tx.clone());
+                spawn_cover_decode(
+                    vec![p.clone()],
+                    app.thumb_cache_dir.clone(),
+                    app.thumb_tx.clone(),
+                );
             }
             app.book_prompt = Some(BookPrompt {
                 dir,
@@ -2765,7 +2776,7 @@ impl App {
             }
         }
         if !to_decode.is_empty() {
-            spawn_cover_decode(to_decode, self.thumb_tx.clone());
+            spawn_cover_decode(to_decode, self.thumb_cache_dir.clone(), self.thumb_tx.clone());
         }
         const THUMB_CAP: usize = 256;
         if self.thumbs.len() > THUMB_CAP {
@@ -2984,15 +2995,17 @@ fn build_source(path: &Path) -> Option<Arc<dyn PageSource>> {
     }
 }
 
-/// Decode a comic's cover (page 0) to a small egui image.
-fn decode_cover(path: &Path, resizer: &mut fast_image_resize::Resizer) -> Option<egui::ColorImage> {
-    let src = build_source(path)?;
-    if src.len() == 0 {
-        return None;
-    }
-    let bytes = src.read_page(0).ok()?;
-    let decoded = yosh_engine::decode::decode_and_downscale(&bytes, 320, resizer).ok()?;
-    let rgba = yosh_engine::decode::to_rgba_image(decoded);
+/// Decode a comic's cover (page 0) to a small egui image, via the on-disk thumbnail
+/// cache (a cache hit reads a tiny PNG instead of decoding the full first page).
+fn decode_cover(
+    path: &Path,
+    cache_dir: Option<&Path>,
+    resizer: &mut fast_image_resize::Resizer,
+) -> Option<egui::ColorImage> {
+    let rgba = yosh_engine::thumbcache::load_or_decode(cache_dir, path, 320, resizer, || {
+        let src = build_source(path)?;
+        (src.len() > 0).then(|| src.read_page(0).ok()).flatten()
+    })?;
     Some(egui::ColorImage::from_rgba_unmultiplied(
         [rgba.w as usize, rgba.h as usize],
         &rgba.pixels,
@@ -3014,15 +3027,20 @@ fn decode_logo() -> Option<egui::ColorImage> {
     ))
 }
 
-/// Spawn a worker that decodes the given comics' covers and streams them back.
-fn spawn_cover_decode(paths: Vec<PathBuf>, tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>) {
+/// Spawn a worker that decodes the given comics' covers and streams them back,
+/// reading/writing the on-disk thumbnail cache as it goes.
+fn spawn_cover_decode(
+    paths: Vec<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
+) {
     std::thread::spawn(move || {
         let mut resizer = fast_image_resize::Resizer::new();
         for path in paths {
-            if let Some(img) = decode_cover(&path, &mut resizer) {
-                if tx.send((path, img)).is_err() {
-                    break;
-                }
+            if let Some(img) = decode_cover(&path, cache_dir.as_deref(), &mut resizer)
+                && tx.send((path, img)).is_err()
+            {
+                break;
             }
         }
     });
