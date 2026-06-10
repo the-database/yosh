@@ -81,6 +81,8 @@ fn android_main(app: AndroidApp) {
         touches: HashMap::new(),
         gesture_start: None,
         pinch: None,
+        applied_immersive: None,
+        status_bar_px: None,
     };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
@@ -112,6 +114,11 @@ struct Shell {
     gesture_start: Option<(f64, f64)>,
     /// Active pinch, captured at its start (see `Pinch`).
     pinch: Option<Pinch>,
+    /// Last immersive state pushed to Android, to avoid redundant JNI each frame.
+    applied_immersive: Option<bool>,
+    /// Status-bar height in px (queried once, lazily); used to inset chrome under
+    /// the bars. `None` until first queried.
+    status_bar_px: Option<i32>,
 }
 
 /// Active two-finger pinch, captured at start so each move can both scale
@@ -426,8 +433,13 @@ impl ApplicationHandler for Shell {
                     }
                 }
                 let has_files = self.has_files;
+                // Status-bar height (queried once; constant). Chrome is inset by it
+                // while the bars are shown so they don't cover the top buttons.
+                let status_px = *self
+                    .status_bar_px
+                    .get_or_insert_with(|| status_bar_height(&self.android_app));
                 let reqs = match self.app.as_mut() {
-                    Some(app) => app.render(has_files),
+                    Some(app) => app.render(has_files, status_px),
                     None => FrameReqs::default(),
                 };
                 if reqs.grant {
@@ -451,6 +463,17 @@ impl ApplicationHandler for Shell {
                 }
                 if reqs.close_book {
                     self.close_comic();
+                }
+                // Reading view with controls hidden → immersive (bars hidden);
+                // otherwise show the bars (controls up, library, or empty screen).
+                let immersive = self.current_key.is_some()
+                    && self
+                        .app
+                        .as_ref()
+                        .is_some_and(|a| !a.controls && !a.library_view);
+                if self.applied_immersive != Some(immersive) {
+                    set_immersive(&self.android_app, immersive);
+                    self.applied_immersive = Some(immersive);
                 }
             }
             _ => {}
@@ -1467,6 +1490,29 @@ fn open_fd(app: &AndroidApp, uri: &str) -> i32 {
     .unwrap_or(-1)
 }
 
+/// Hide (true) / show (false) the Android status + navigation bars. The window
+/// stays edge-to-edge; chrome is inset by `status_bar_height` while bars show.
+fn set_immersive(app: &AndroidApp, immersive: bool) {
+    let _ = with_env(app, |env, activity| {
+        env.call_method(
+            activity,
+            "setImmersive",
+            "(Z)V",
+            &[JValue::Bool(immersive as u8)],
+        )?;
+        Ok(())
+    });
+}
+
+/// Status-bar height in px (0 if unknown) — a platform constant used to inset the
+/// library / empty-state chrome so the bars don't cover it.
+fn status_bar_height(app: &AndroidApp) -> i32 {
+    with_env(app, |env, activity| {
+        Ok(env.call_method(activity, "statusBarHeight", "()I", &[])?.i()?)
+    })
+    .unwrap_or(0)
+}
+
 /// Run a closure with an attached `JNIEnv` and the `YoshActivity` instance,
 /// clearing any pending Java exception afterwards.
 fn with_env<T>(
@@ -1602,7 +1648,7 @@ impl App {
         }
     }
 
-    fn render(&mut self, has_files: bool) -> FrameReqs {
+    fn render(&mut self, has_files: bool, status_bar_px: i32) -> FrameReqs {
         self.reader.viewport = Viewport {
             w: self.config.width,
             h: self.config.height,
@@ -1755,9 +1801,14 @@ impl App {
         let mut open_info = false;
         let mut close_info = false;
         let at_root = self.lib_dir == self.lib_root;
+        // While the bars are shown the window is still full-bleed (NativeActivity
+        // ignores fitSystemWindows), so inset the library's top chrome by the
+        // status-bar height — otherwise the clock/icons cover the top buttons.
+        let top_inset_pt = status_bar_px as f32 / self.egui_ctx.pixels_per_point();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             if library_view {
                 egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add_space(top_inset_pt);
                     if !has_files {
                         ui.add_space(40.0);
                         ui.label("Grant access to your files to browse your comics:");
