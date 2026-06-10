@@ -23,6 +23,9 @@ use std::path::Path;
 /// from it concurrently (folder/zip read in parallel; rar serializes internally).
 pub trait PageSource: Send + Sync {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     /// Entry name for page `index` (file name / archive entry path).
     fn name(&self, index: usize) -> &str;
     /// Read the encoded image bytes for page `index`. May block (rar).
@@ -47,7 +50,7 @@ pub fn fmt_unix(secs: u64) -> String {
     let rem = secs % 86_400;
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as i64; // [0, 146096]
+    let doe = z - era * 146_097; // [0, 146096]
     let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]

@@ -190,6 +190,7 @@ pub struct Quad {
 
 /// Build a [`Quad`] from pixel-space placement — top-left `(x_px, y_px)` and size
 /// `(dw, dh)` within a `(sw, sh)` surface — converting to NDC scale + offset.
+#[allow(clippy::too_many_arguments)]
 pub fn quad_from_px(
     slot: usize,
     page_index: usize,
@@ -312,6 +313,33 @@ pub struct Reader {
     pub transition_enabled: bool,
     /// The live flip animation, if one is in flight. Cleared once it expires.
     transition: Option<PageTransition>,
+
+    /// Inputs of the last `prefetch()` job-list rebuild. Shells call `prefetch()`
+    /// every frame; when neither the view nor the caches changed since the last
+    /// call the desired job list is identical, so it skips the rebuild (which is
+    /// O(volume) while the LQ thumbnail tier is filling).
+    last_jobs_key: Option<JobsKey>,
+}
+
+/// Everything the `prefetch()` job list depends on. Cache/failed contents are
+/// captured via change counters (`PageCache::epoch`) rather than the sets
+/// themselves; `zoom` as bits so the key is `Eq`-comparable.
+#[derive(PartialEq, Clone, Copy)]
+struct JobsKey {
+    index: usize,
+    len: usize,
+    fwd: usize,
+    viewport: (u32, u32),
+    zoom_bits: u32,
+    settled: bool,
+    fit: FitMode,
+    layout: Layout,
+    spread_offset: usize,
+    rotation: u8,
+    scroll_mode: bool,
+    cache_epoch: u64,
+    lq_epoch: u64,
+    failed_len: usize,
 }
 
 impl Reader {
@@ -365,6 +393,7 @@ impl Reader {
             two_tier,
             transition_enabled: false,
             transition: None,
+            last_jobs_key: None,
         }
     }
 
@@ -792,7 +821,7 @@ impl Reader {
     fn place_view(&self, a: usize, b: Option<usize>, sw: f32, sh: f32, slot_base: usize, hold_last: bool) -> Vec<Quad> {
         let ta = self.page_texture(a);
         // Wide (landscape) page is a double-spread image → show it alone.
-        let force_single = ta.map_or(false, |t| t.w > t.h);
+        let force_single = ta.is_some_and(|t| t.w > t.h);
         let b = if force_single { None } else { b };
         let tb = b.and_then(|bi| self.page_texture(bi).map(|t| (bi, t)));
 
@@ -914,12 +943,11 @@ impl Reader {
         let mut slot = 0;
         while i < len && y < sh && slot < MAX_QUADS {
             let dh = self.page_display_h(i, sw);
-            if y + dh > 0.0 {
-                if self.page_texture(i).is_some() {
+            if y + dh > 0.0
+                && self.page_texture(i).is_some() {
                     quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
                     slot += 1;
                 }
-            }
             y += dh;
             i += 1;
         }
@@ -1039,6 +1067,31 @@ impl Reader {
             return;
         };
         let len = src.len();
+        // Shells call this every frame; skip the whole job-list rebuild when none
+        // of its inputs changed since the last call (the queued jobs are still the
+        // right desired set — workers drain them in place). Cache/failed changes
+        // are visible through the epochs / length, so a landing page, a failure,
+        // or a clear always recomputes.
+        let key = JobsKey {
+            index: self.index,
+            len,
+            fwd,
+            viewport: (self.viewport.w, self.viewport.h),
+            zoom_bits: self.zoom.to_bits(),
+            settled,
+            fit: self.fit,
+            layout: self.layout,
+            spread_offset: self.spread_offset,
+            rotation: self.rotation,
+            scroll_mode: self.scroll_mode,
+            cache_epoch: self.cache.epoch(),
+            lq_epoch: self.lq_cache.epoch(),
+            failed_len: self.failed.len(),
+        };
+        if self.last_jobs_key == Some(key) {
+            return;
+        }
+        self.last_jobs_key = Some(key);
         // Two-tier: if the page we're on isn't decoded yet (we've outrun the HQ
         // decode), decode this window with the cheap LQ resize so it appears
         // immediately. Once the anchor is cached the next prefetch wants HQ and

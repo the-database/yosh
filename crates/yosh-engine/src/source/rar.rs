@@ -40,9 +40,9 @@ impl RarSource {
         let mut names: Vec<String> = Vec::new();
         let listing = Archive::new(path)
             .open_for_listing()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         for entry in listing {
-            let entry = entry.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let entry = entry.map_err(|e| io::Error::other(e.to_string()))?;
             let name = entry.filename.to_string_lossy().into_owned();
             if is_image_name(&name) {
                 names.push(name);
@@ -145,7 +145,7 @@ impl PageSource for RarSource {
                     .error
                     .clone()
                     .unwrap_or_else(|| format!("rar: page {index} not found"));
-                return Err(io::Error::new(io::ErrorKind::Other, msg));
+                return Err(io::Error::other(msg));
             }
             guard = self.shared.cv.wait(guard).unwrap();
         }

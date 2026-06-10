@@ -15,7 +15,7 @@ use sevenz_rust2::{ArchiveReader, Password};
 use super::{is_image_name, PageSource};
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e.to_string())
+    io::Error::other(e.to_string())
 }
 
 struct Ready {
@@ -134,7 +134,7 @@ impl PageSource for SevenzSource {
                     .error
                     .clone()
                     .unwrap_or_else(|| format!("7z: page {index} not found"));
-                return Err(io::Error::new(io::ErrorKind::Other, msg));
+                return Err(io::Error::other(msg));
             }
             guard = self.shared.cv.wait(guard).unwrap();
         }

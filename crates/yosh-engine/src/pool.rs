@@ -6,9 +6,9 @@
 //! The job list is rebuilt by the scheduler each navigation (nearest-first), so
 //! workers always pick the highest-priority page relative to the latest position.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use fast_image_resize::Resizer;
@@ -18,6 +18,9 @@ use crate::source::PageSource;
 use crate::page::{PagePipeline, PageTexture};
 use crate::texpool::TexturePool;
 
+// `Done` (a full `PageTexture`) dwarfs `Failed` (a `String`); boxing it would buy
+// nothing — messages are transient and drained every frame.
+#[allow(clippy::large_enum_variant)]
 pub enum Msg {
     /// A finished page. `thumb` distinguishes a whole-volume LQ *thumbnail* (routes
     /// to the reader's `lq_cache`) from a normal window decode (routes to `cache`).
@@ -29,7 +32,7 @@ struct JobState {
     /// Pending decodes as `(page index, exact target height, lq, thumb)` — the target
     /// is the page's on-screen displayed height; `lq` requests the fast (seeking) tier;
     /// `thumb` marks a whole-volume LQ-tier thumbnail (small target, routed separately).
-    jobs: Vec<(usize, u32, bool, bool)>,
+    jobs: VecDeque<(usize, u32, bool, bool)>,
     /// The source workers read from. Lives here (rather than captured per worker) so a
     /// live folder refresh can swap in a grown listing via `set_source` without tearing
     /// down and rebuilding the thread pool. A worker clones it while claiming a job.
@@ -49,6 +52,13 @@ pub struct DecodePool {
     handles: Vec<JoinHandle<()>>,
 }
 
+/// Lock the job state, recovering from poisoning. The critical sections only
+/// touch plain collections (no invariants can be left half-applied by a panic),
+/// so a poisoned lock must not cascade panics across the worker pool.
+fn lock_jobs(m: &Mutex<JobState>) -> MutexGuard<'_, JobState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 impl DecodePool {
     pub fn new(
         source: Arc<dyn PageSource>,
@@ -59,7 +69,7 @@ impl DecodePool {
     ) -> Self {
         let shared = Arc::new((
             Mutex::new(JobState {
-                jobs: Vec::new(),
+                jobs: VecDeque::new(),
                 source,
                 inflight: HashSet::new(),
                 wanted: HashSet::new(),
@@ -84,7 +94,7 @@ impl DecodePool {
                 // latest navigation made useless.
                 let stale = |index: usize| -> bool {
                     let (m, _) = &*shared;
-                    let mut st = m.lock().unwrap();
+                    let mut st = lock_jobs(m);
                     if st.wanted.contains(&index) {
                         false
                     } else {
@@ -94,7 +104,7 @@ impl DecodePool {
                 };
                 let drop_inflight = |index: usize| {
                     let (m, _) = &*shared;
-                    m.lock().unwrap().inflight.remove(&index);
+                    lock_jobs(m).inflight.remove(&index);
                 };
                 loop {
                     // Wait for and claim the highest-priority job (index + its
@@ -103,76 +113,92 @@ impl DecodePool {
                     // picked up on the next claimed job.
                     let (index, th, lq, thumb, source): (usize, u32, bool, bool, Arc<dyn PageSource>) = {
                         let (m, cv) = &*shared;
-                        let mut st = m.lock().unwrap();
+                        let mut st = lock_jobs(m);
                         loop {
                             if !st.running {
                                 return;
                             }
-                            if !st.jobs.is_empty() {
-                                let (i, h, lq, thumb) = st.jobs.remove(0);
+                            if let Some((i, h, lq, thumb)) = st.jobs.pop_front() {
                                 st.inflight.insert(i);
                                 let source = st.source.clone();
                                 break (i, h, lq, thumb, source);
                             }
-                            st = cv.wait(st).unwrap();
+                            st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
                         }
                     };
 
-                    let bytes = match source.read_page(index) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            drop_inflight(index);
-                            if tx
-                                .send(Msg::Failed { index, error: format!("read failed: {e}") })
-                                .is_err()
-                            {
-                                return; // receiver gone
+                    // The whole read → decode → upload body runs under `catch_unwind`:
+                    // a panicking decoder (corrupt file) or GPU upload must not kill the
+                    // worker — and must not leave `index` stuck in `inflight`, which
+                    // would block that page from ever being decoded again (`set_jobs`
+                    // filters in-flight indices). `None` = abandoned as stale.
+                    let body = std::panic::AssertUnwindSafe(|| -> Option<Msg> {
+                        let bytes = match source.read_page(index) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                drop_inflight(index);
+                                return Some(Msg::Failed { index, error: format!("read failed: {e}") });
                             }
-                            continue;
+                        };
+
+                        // Bail before the expensive decode if the jump landed during the read.
+                        if stale(index) {
+                            return None;
                         }
-                    };
 
-                    // Bail before the expensive decode if the jump landed during the read.
-                    if stale(index) {
-                        continue;
-                    }
+                        let decoded = decode_page(&bytes, th, lq, &mut resizer);
 
-                    let decoded = decode_page(&bytes, th, lq, &mut resizer);
-
-                    // Bail before upload if the page left the window during the decode —
-                    // skips the GPU upload, the texpool/cache churn, and a pointless `Done`.
-                    if stale(index) {
-                        continue;
-                    }
-
-                    let page: Result<PageTexture, String> = match decoded {
-                        Ok(DecodedPage::Still(img)) => {
-                            Ok(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
+                        // Bail before upload if the page left the window during the decode —
+                        // skips the GPU upload, the texpool/cache churn, and a pointless `Done`.
+                        if stale(index) {
+                            return None;
                         }
-                        Ok(DecodedPage::Animated(frames)) => Ok(PagePipeline::upload_animated(
-                            &device, &queue, frames, &tex_pool, th, true,
-                        )),
-                        // `.ico` layers: same multi-frame texture, but not an
-                        // auto-playing animation (no delays, manual stepping).
-                        Ok(DecodedPage::Layered(layers)) => Ok(PagePipeline::upload_animated(
-                            &device,
-                            &queue,
-                            layers.into_iter().map(|i| (i, 0u32)).collect(),
-                            &tex_pool,
-                            th,
-                            false,
-                        )),
-                        Err(e) => Err(e),
-                    };
 
-                    drop_inflight(index);
+                        let page: Result<PageTexture, String> = match decoded {
+                            Ok(DecodedPage::Still(img)) => {
+                                Ok(PagePipeline::upload(&device, &queue, &img, &tex_pool, th))
+                            }
+                            Ok(DecodedPage::Animated(frames)) => Ok(PagePipeline::upload_animated(
+                                &device, &queue, frames, &tex_pool, th, true,
+                            )),
+                            // `.ico` layers: same multi-frame texture, but not an
+                            // auto-playing animation (no delays, manual stepping).
+                            Ok(DecodedPage::Layered(layers)) => Ok(PagePipeline::upload_animated(
+                                &device,
+                                &queue,
+                                layers.into_iter().map(|i| (i, 0u32)).collect(),
+                                &tex_pool,
+                                th,
+                                false,
+                            )),
+                            Err(e) => Err(e),
+                        };
 
-                    let msg = match page {
-                        Ok(mut page) => {
-                            page.lq = lq;
-                            Msg::Done { index, page, thumb }
+                        drop_inflight(index);
+
+                        Some(match page {
+                            Ok(mut page) => {
+                                page.lq = lq;
+                                Msg::Done { index, page, thumb }
+                            }
+                            Err(error) => Msg::Failed { index, error },
+                        })
+                    });
+                    let msg = match std::panic::catch_unwind(body) {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => continue, // stale — abandoned mid-pipeline
+                        Err(panic) => {
+                            drop_inflight(index);
+                            // A panic mid-resize can leave the resizer's scratch state
+                            // inconsistent; start fresh.
+                            resizer = Resizer::new();
+                            let what = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic".to_string());
+                            Msg::Failed { index, error: format!("decode panicked: {what}") }
                         }
-                        Err(error) => Msg::Failed { index, error },
                     };
                     if tx.send(msg).is_err() {
                         return; // receiver gone
@@ -192,16 +218,15 @@ impl DecodePool {
     /// skipping pages already in flight. Wakes idle workers.
     pub fn set_jobs(&self, desired: Vec<(usize, u32, bool, bool)>) {
         let (m, cv) = &*self.shared;
-        let mut st = m.lock().unwrap();
+        let mut st = lock_jobs(m);
         // `wanted` captures the full window (including in-flight indices that remain
         // in it) so legitimately-running decodes aren't falsely cancelled; the job
         // queue then drops in-flight pages to avoid re-decoding them.
         st.wanted = desired.iter().map(|(i, _, _, _)| *i).collect();
-        let filtered: Vec<(usize, u32, bool, bool)> = desired
+        st.jobs = desired
             .into_iter()
             .filter(|(i, _, _, _)| !st.inflight.contains(i))
             .collect();
-        st.jobs = filtered;
         drop(st);
         cv.notify_all();
     }
@@ -213,7 +238,7 @@ impl DecodePool {
     /// the pool (in `Reader::apply_refreshed_source`) so stale in-flight results can't land.
     pub fn set_source(&self, source: Arc<dyn PageSource>) {
         let (m, _) = &*self.shared;
-        m.lock().unwrap().source = source;
+        lock_jobs(m).source = source;
     }
 
     /// Drain finished pages (non-blocking).
@@ -230,7 +255,7 @@ impl Drop for DecodePool {
     fn drop(&mut self) {
         {
             let (m, cv) = &*self.shared;
-            m.lock().unwrap().running = false;
+            lock_jobs(m).running = false;
             cv.notify_all();
         }
         for h in self.handles.drain(..) {

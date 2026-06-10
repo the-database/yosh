@@ -22,6 +22,12 @@ pub struct TexturePool {
     max_total: usize,
 }
 
+impl Default for TexturePool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TexturePool {
     pub fn new() -> Self {
         Self::with_max_total(24)

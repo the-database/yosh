@@ -99,7 +99,7 @@ fn load_pages(cfg: &Cfg) -> Vec<Page> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(&cfg.folder)
         .expect("read_dir")
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().map_or(false, |e| e.eq_ignore_ascii_case("png")))
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
         .collect();
     files.sort();
     files.truncate(cfg.count);
@@ -469,11 +469,10 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(sz) => gpu.resize(sz.width, sz.height),
-            WindowEvent::RedrawRequested => {
-                if !gpu.render() {
+            WindowEvent::RedrawRequested
+                if !gpu.render() => {
                     event_loop.exit();
                 }
-            }
             _ => {}
         }
     }

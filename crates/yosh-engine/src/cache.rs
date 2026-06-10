@@ -13,6 +13,9 @@ pub struct PageCache {
     map: HashMap<usize, PageTexture>,
     cap: usize,
     pool: Arc<TexturePool>,
+    /// Bumped on every content change (insert/remap/clear). Lets `Reader::prefetch`
+    /// skip rebuilding the job list when neither the view nor the cache moved.
+    epoch: u64,
 }
 
 impl PageCache {
@@ -21,7 +24,14 @@ impl PageCache {
             map: HashMap::new(),
             cap,
             pool,
+            epoch: 0,
         }
+    }
+
+    /// Content-change counter — differs whenever the set of cached pages (or any
+    /// entry) may have changed since a previous call.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn contains(&self, index: usize) -> bool {
@@ -55,6 +65,7 @@ impl PageCache {
     }
 
     pub fn clear(&mut self) {
+        self.epoch += 1;
         for (_, page) in self.map.drain() {
             page.recycle(&self.pool);
         }
@@ -66,6 +77,7 @@ impl PageCache {
     /// by name instead of flashing or being re-decoded. The map only shrinks or stays
     /// the same size, so no eviction is needed.
     pub fn remap(&mut self, f: impl Fn(usize) -> Option<usize>) {
+        self.epoch += 1;
         let old = std::mem::take(&mut self.map);
         for (i, page) in old {
             match f(i) {
@@ -81,6 +93,7 @@ impl PageCache {
 
     /// Insert a page, evicting the entries furthest from `current` if over cap.
     pub fn insert(&mut self, index: usize, page: PageTexture, current: usize) {
+        self.epoch += 1;
         if let Some(old) = self.map.insert(index, page) {
             old.recycle(&self.pool);
         }
