@@ -57,6 +57,8 @@ struct Uniforms {
     offset: vec2<f32>,
     gray: u32,
     rotation: u32,
+    alpha: f32,
+    blur: f32,
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -93,16 +95,40 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// Motion-blur tap count for the page-turn transition (odd ⇒ one tap is centered).
+// Only used when u.blur != 0; normal page draws take the single-sample branch below
+// and are unaffected.
+const BLUR_TAPS: i32 = 7;
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    let s = textureSample(tex, samp, in.uv);
-    if (u.gray != 0u) {
-        return vec4<f32>(s.r, s.r, s.r, 1.0);
+    var s: vec4<f32>;
+    if (u.blur == 0.0) {
+        // Normal page draw: one 1:1 sample at the texel center, exactly as before.
+        s = textureSample(tex, samp, in.uv);
+    } else {
+        // Fading flip overlay: a horizontal motion blur along the slide axis, so the
+        // outgoing page smears as it sweeps away (and stops clashing as a second
+        // sharp image over the incoming page). u.blur is uniform, so this branch is
+        // uniform control flow (textureSample is legal here).
+        var sum = vec4<f32>(0.0);
+        let half_span = f32(BLUR_TAPS - 1) * 0.5;
+        for (var i: i32 = 0; i < BLUR_TAPS; i = i + 1) {
+            let f = (f32(i) - half_span) / half_span; // -1..1
+            sum = sum + textureSample(tex, samp, vec2<f32>(in.uv.x + f * u.blur, in.uv.y));
+        }
+        s = sum / f32(BLUR_TAPS);
     }
-    // Color pages are stored premultiplied (see decode.rs), so output them as-is
-    // for the pipeline's premultiplied-alpha blend — transparent areas let the
-    // cleared background show through.
-    return s;
+    if (u.gray != 0u) {
+        // Premultiply the fade into the opaque gray page so it composites over the
+        // page underneath (u.alpha == 1.0 ⇒ the original opaque output).
+        let g = s.r;
+        return vec4<f32>(g * u.alpha, g * u.alpha, g * u.alpha, u.alpha);
+    }
+    // Color pages are stored premultiplied (see decode.rs); scaling by alpha keeps
+    // them premultiplied for the pipeline's premultiplied-alpha blend. At alpha==1
+    // this is the original passthrough — transparent areas show the background.
+    return s * u.alpha;
 }
 "#;
 
@@ -113,7 +139,8 @@ struct Uniforms {
     offset: [f32; 2],
     gray: u32,
     rotation: u32, // 0/1/2/3 = 0/90/180/270° CW (UV turn in the vertex shader)
-    _pad: [u32; 2],
+    alpha: f32,    // opacity multiplier (1.0 normally; < 1.0 for a fading flip overlay)
+    blur: f32,     // horizontal motion-blur smear half-width in UV (0.0 normally)
 }
 
 /// One frame of an animated page (GIF/WebP), beyond frame 0. Frame 0 lives in the
@@ -437,6 +464,7 @@ impl PagePipeline {
     /// Write quad `slot`'s uniform (NDC scale + top-left offset) and return its
     /// bind group, ready to bind and `draw(0..6)`. `view` is the texture view to
     /// sample — usually `page.view`, or `page.view_at(t)` for an animated page.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_quad(
         &self,
         device: &wgpu::Device,
@@ -447,13 +475,16 @@ impl PagePipeline {
         scale: [f32; 2],
         offset: [f32; 2],
         rotation: u32,
+        alpha: f32,
+        blur: f32,
     ) -> wgpu::BindGroup {
         let u = Uniforms {
             scale,
             offset,
             gray: page.gray as u32,
             rotation,
-            _pad: [0; 2],
+            alpha,
+            blur,
         };
         queue.write_buffer(&self.ubos[slot], 0, bytemuck::bytes_of(&u));
         device.create_bind_group(&wgpu::BindGroupDescriptor {

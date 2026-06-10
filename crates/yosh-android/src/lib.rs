@@ -61,7 +61,7 @@ fn android_main(app: AndroidApp) {
     let init_view = view_file
         .as_deref()
         .map(load_view)
-        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window));
+        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window, true));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -102,8 +102,9 @@ struct Shell {
     /// The library dir to open the browser at (persisted across launches).
     init_lib_dir: PathBuf,
     lib_dir_file: Option<PathBuf>,
-    /// Persisted viewing options (direction, layout, fit) + where they live.
-    init_view: (Direction, LayoutMode, FitMode),
+    /// Persisted viewing options (direction, layout, fit, page-turn animation) +
+    /// where they live.
+    init_view: (Direction, LayoutMode, FitMode, bool),
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
@@ -324,7 +325,7 @@ impl ApplicationHandler for Shell {
         let budget = Budget::derive(device_mem_budget_mb(), cpus);
         log::info!("budget: {budget:?} ({cpus} cpus)");
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
-        let reader = Reader::new(
+        let mut reader = Reader::new(
             ctx.device.clone(),
             ctx.queue.clone(),
             tex_pool,
@@ -338,6 +339,7 @@ impl ApplicationHandler for Shell {
             0,
             true, // two_tier: LQ while seeking → HQ on settle
         );
+        reader.transition_enabled = self.init_view.3; // page-turn animation (persisted; default on)
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         self.app = Some(App {
             window: window.clone(),
@@ -815,9 +817,11 @@ fn attach_source(
 }
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
-/// Parse persisted viewing options ("dir,layout,fit"); default RTL / single / window.
-fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode) {
-    let (mut dir, mut lay, mut fit) = (Direction::Rtl, LayoutMode::Single, FitMode::Window);
+/// Parse persisted viewing options ("dir,layout,fit,anim"); default RTL / single /
+/// window / animation on.
+fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool) {
+    let (mut dir, mut lay, mut fit, mut anim) =
+        (Direction::Rtl, LayoutMode::Single, FitMode::Window, true);
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -835,12 +839,14 @@ fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode) {
             Some(&"actual") => FitMode::Actual,
             _ => FitMode::Window,
         };
+        // Page-turn animation: 4th slot; absent (older files) ⇒ on.
+        anim = t.get(3) != Some(&"off");
     }
-    (dir, lay, fit)
+    (dir, lay, fit, anim)
 }
 
-/// Persist viewing options as "dir,layout,fit".
-fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode) {
+/// Persist viewing options as "dir,layout,fit,anim".
+fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, anim: bool) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
     let f = match fit {
@@ -849,7 +855,8 @@ fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode) {
         FitMode::Actual => "actual",
         FitMode::Window => "window",
     };
-    let _ = std::fs::write(path, format!("{d},{l},{f}"));
+    let a = if anim { "on" } else { "off" };
+    let _ = std::fs::write(path, format!("{d},{l},{f},{a}"));
 }
 
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
@@ -1261,9 +1268,11 @@ fn options_popup(
     layout: LayoutMode,
     effective_spread: bool,
     fit: FitMode,
+    transition_on: bool,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
+    set_transition: &mut Option<bool>,
     toggle_offset: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
@@ -1336,6 +1345,22 @@ fn options_popup(
                         {
                             *set_fit = Some(f);
                         }
+                    }
+                });
+
+                ui.label(egui::RichText::new("Page-turn animation").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(transition_on, egui::RichText::new("On").size(16.0))
+                        .clicked()
+                    {
+                        *set_transition = Some(true);
+                    }
+                    if ui
+                        .selectable_label(!transition_on, egui::RichText::new("Off").size(16.0))
+                        .clicked()
+                    {
+                        *set_transition = Some(false);
                     }
                 });
             });
@@ -1510,7 +1535,13 @@ impl App {
     /// orientation it happened to resolve to).
     fn persist_view(&self) {
         if let Some(f) = &self.view_file {
-            save_view(f, self.reader.direction, self.layout_mode, self.reader.fit);
+            save_view(
+                f,
+                self.reader.direction,
+                self.layout_mode,
+                self.reader.fit,
+                self.reader.transition_enabled,
+            );
         }
     }
 
@@ -1560,6 +1591,8 @@ impl App {
                         q.scale,
                         q.offset,
                         q.rot,
+                        q.alpha,
+                        q.blur,
                     )
                 })
             })
@@ -1644,6 +1677,7 @@ impl App {
         let cur_layout = self.reader.layout;
         let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
+        let cur_transition = self.reader.transition_enabled;
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
         // Snapshot the rows the closure needs (owned), so it borrows no `self`.
@@ -1669,6 +1703,7 @@ impl App {
         let mut set_dir: Option<Direction> = None;
         let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
+        let mut set_transition: Option<bool> = None;
         let mut toggle_offset = false;
         let mut cycle_fit = false;
         let mut close_book = false;
@@ -1800,9 +1835,11 @@ impl App {
                         cur_layout_mode,
                         cur_layout == Layout::Spread,
                         cur_fit,
+                        cur_transition,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
+                        &mut set_transition,
                         &mut toggle_offset,
                     );
                 }
@@ -1861,6 +1898,10 @@ impl App {
         if let Some(f) = set_fit {
             self.reader.fit = f;
             self.reader.prefetch();
+            self.persist_view();
+        }
+        if let Some(v) = set_transition {
+            self.reader.transition_enabled = v;
             self.persist_view();
         }
         if cycle_fit {
@@ -1947,6 +1988,7 @@ impl App {
             || !self.reader.view_is_hq()
             || self.reader.lq_fill_pending()
             || hints_visible
+            || self.reader.transition_active()
         {
             self.window.request_redraw();
         }

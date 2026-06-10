@@ -179,6 +179,13 @@ pub struct Quad {
     pub scale: [f32; 2],
     pub offset: [f32; 2],
     pub rot: u32, // 0/1/2/3 = 0/90/180/270° CW (single-page draws only; 0 for spreads)
+    /// Opacity multiplier (1.0 = opaque). < 1.0 only for a fading page-turn overlay.
+    pub alpha: f32,
+    /// Horizontal motion-blur smear in UV (0.0 = none; symmetric). Only the
+    /// outgoing page of a page-turn transition sets this — it streaks the page so it
+    /// doesn't clash with the sharp incoming page beneath. The slide carries the
+    /// direction; the smear is along the (horizontal) slide axis.
+    pub blur: f32,
 }
 
 /// Build a [`Quad`] from pixel-space placement — top-left `(x_px, y_px)` and size
@@ -200,7 +207,31 @@ pub fn quad_from_px(
         scale: [2.0 * dw / sw, 2.0 * dh / sh],
         offset: [-1.0 + 2.0 * x_px / sw, 1.0 - 2.0 * y_px / sh],
         rot,
+        alpha: 1.0,
+        blur: 0.0,
     }
+}
+
+/// Duration of the page-flip transition animation (outgoing page blur + fade).
+pub const TRANSITION_MS: u64 = 140;
+/// Peak horizontal motion-blur smear (UV half-width) on the fading outgoing page,
+/// so it streaks along the slide axis instead of clashing as a second sharp image
+/// over the incoming page. 0.0 disables the blur (crisp slide + fade).
+const TRANSITION_MAX_BLUR: f32 = 0.06;
+/// How far the outgoing page slides toward the exit edge by the end of the
+/// transition, as a fraction of the viewport width. The slide is what reads as
+/// "sweeping away" in the tapped direction; the blur + fade are the polish.
+const TRANSITION_SLIDE_FRAC: f32 = 0.12;
+
+/// A live page-flip animation: the previous view's pages, fading + smearing out
+/// over [`TRANSITION_MS`] while the new view draws underneath. Only armed in
+/// discrete page-flip mode (not scroll).
+struct PageTransition {
+    start: Instant,
+    /// The outgoing view's page indices (1 single, 2 spread).
+    out_pages: Vec<usize>,
+    /// True ⇒ the outgoing page slides off toward +x (screen right).
+    exit_right: bool,
 }
 
 /// Default h/w aspect estimate for not-yet-decoded pages in the scroll strip.
@@ -274,6 +305,13 @@ pub struct Reader {
     pub fwd: usize,
     pub fwd_max: usize,
     pub back: usize,
+
+    // --- Page-turn transition (in-book flip animation) ---
+    /// Animate page flips with an outgoing-page blur+fade. Set by the shell from
+    /// settings; off by default (each shell opts in after construction).
+    pub transition_enabled: bool,
+    /// The live flip animation, if one is in flight. Cleared once it expires.
+    transition: Option<PageTransition>,
 }
 
 impl Reader {
@@ -325,6 +363,8 @@ impl Reader {
             fwd_max: budget.fwd_max,
             back: budget.back,
             two_tier,
+            transition_enabled: false,
+            transition: None,
         }
     }
 
@@ -689,7 +729,8 @@ impl Reader {
     }
 
     /// Compute the quads to draw this frame (1 for single/last-held, 2 for a
-    /// ready spread). Only includes pages present in the cache.
+    /// ready spread). Only includes pages present in the cache. When a page-flip
+    /// transition is in flight, the outgoing view is appended on top, fading out.
     pub fn build_quads(&self) -> Vec<Quad> {
         let Some(src) = &self.source else {
             return Vec::new();
@@ -702,6 +743,53 @@ impl Reader {
         let sh = self.viewport.h.max(1) as f32;
 
         let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let mut quads = self.place_view(a, b, sw, sh, 0, true);
+
+        // Page-turn transition: overlay the previous view, fading + smearing out.
+        if let Some(t) = &self.transition {
+            let p = (t.start.elapsed().as_secs_f32() / (TRANSITION_MS as f32 / 1000.0)).clamp(0.0, 1.0);
+            if p < 1.0 {
+                let eased = 1.0 - (1.0 - p) * (1.0 - p); // ease-out (slide + defocus)
+                // Fade faster than the slide (cubic) so the faint outgoing ghost
+                // clears early. A fade that tracks the slide leaves a dim page
+                // creeping through the back half — that lingering tail is what reads
+                // as "sluggish" even when the slide speed already matches.
+                let fade = 1.0 - p;
+                let alpha = fade * fade * fade;
+                let blur = TRANSITION_MAX_BLUR * eased; // horizontal motion blur, grows as it fades
+                // Slide the outgoing page off toward the exit edge (NDC: full
+                // viewport width = 2.0) so it visibly sweeps away as it fades.
+                let exit = if t.exit_right { 1.0 } else { -1.0 };
+                let slide = exit * TRANSITION_SLIDE_FRAC * 2.0 * eased;
+                let oa = t.out_pages[0];
+                let ob = t.out_pages.get(1).copied();
+                // Outgoing quads draw last (on top); slots after the current view's.
+                let base = quads.len().max(2);
+                for mut q in self.place_view(oa, ob, sw, sh, base, false) {
+                    q.alpha = alpha;
+                    q.blur = blur;
+                    q.offset[0] += slide;
+                    quads.push(q);
+                }
+            }
+        }
+        quads
+    }
+
+    /// Whether a page-flip animation is currently on screen (drives the shell's
+    /// redraw scheduling so the fade actually plays out).
+    pub fn transition_active(&self) -> bool {
+        self.transition
+            .as_ref()
+            .is_some_and(|t| t.start.elapsed() < Duration::from_millis(TRANSITION_MS))
+    }
+
+    /// Place one view's pages into draw quads — 1 for a single page (or a wide
+    /// double-spread image shown alone), 2 for a ready facing-page spread.
+    /// `slot_base` is the first GPU quad slot to use. `hold_last` falls back to the
+    /// last-drawn page when the anchor isn't cached yet (current view only; the
+    /// transition overlay passes `false` so a missing outgoing page just snaps).
+    fn place_view(&self, a: usize, b: Option<usize>, sw: f32, sh: f32, slot_base: usize, hold_last: bool) -> Vec<Quad> {
         let ta = self.page_texture(a);
         // Wide (landscape) page is a double-spread image → show it alone.
         let force_single = ta.map_or(false, |t| t.w > t.h);
@@ -738,18 +826,25 @@ impl Reader {
                 let xl = x0.round();
                 let dwl_r = dwl.round();
                 vec![
-                    quad_from_px(0, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
-                    quad_from_px(1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
+                    quad_from_px(slot_base, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
+                    quad_from_px(slot_base + 1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
                 ]
             }
-            (Some(ta), None) => vec![self.single_quad(a, ta, sw, sh)],
+            (Some(ta), None) => {
+                let mut q = self.single_quad(a, ta, sw, sh);
+                q.slot = slot_base;
+                vec![q]
+            }
             _ => {
                 // Anchor has no texture yet (not even a thumbnail): hold the
                 // last-drawn page if it still has one.
-                if let Some(li) = self.last_drawn
+                if hold_last
+                    && let Some(li) = self.last_drawn
                     && let Some(t) = self.page_texture(li)
                 {
-                    return vec![self.single_quad(li, t, sw, sh)];
+                    let mut q = self.single_quad(li, t, sw, sh);
+                    q.slot = slot_base;
+                    return vec![q];
                 }
                 Vec::new()
             }
@@ -1326,6 +1421,36 @@ impl Reader {
             layout::prev_view(self.layout, self.index, len, self.spread_offset)
         };
         if next != self.index {
+            // Arm the page-flip animation: the current view slides+fades out over
+            // the new one. Page-flip mode only (scroll has no discrete flip).
+            if self.transition_enabled && !self.scroll_mode {
+                // Suppress during rapid seeking: if the previous flip was within one
+                // transition-length, snap instead. Overlapping animations look busy,
+                // and a fast flurry of flips shouldn't surface the blur at all.
+                let rapid = self
+                    .nav_times
+                    .back()
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(TRANSITION_MS));
+                if rapid {
+                    self.transition = None; // clear any in-flight one too
+                } else {
+                    let (oa, ob) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+                    let mut out_pages = vec![oa];
+                    if let Some(b) = ob {
+                        out_pages.push(b);
+                    }
+                    // Slide the outgoing page away from the tapped edge. Tapping left
+                    // (or its keyboard equivalent) and tapping right go opposite ways;
+                    // RTL inverts the on-screen sense of "forward", so XOR it in. Net:
+                    // tap-left ⇒ slide right, tap-right ⇒ slide left, both directions.
+                    let exit_right = (dir > 0) == (self.direction == Direction::Rtl);
+                    self.transition = Some(PageTransition {
+                        start: Instant::now(),
+                        out_pages,
+                        exit_right,
+                    });
+                }
+            }
             self.nav_times.push_back(Instant::now());
             self.goto(next);
             true

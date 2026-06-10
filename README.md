@@ -52,12 +52,13 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `E` | show in Explorer (opens the folder and selects the file/archive) |
 | `I` | image info overlay |
 | `B` | bottom seekbar (reveals near the bottom edge; click/drag to jump) |
+| `T` | page-turn transition (slide + soft fade on flip) |
 | `G` | show/hide the animation panel (animated GIF / WebP) |
 | double-click | fullscreen (middle of the page); `F11` also toggles |
 | `Esc` | quit |
 
 Reading position (per volume), reading direction, fit, layout, spread offset, scroll,
-and seekbar visibility are persisted.
+seekbar visibility, and the page-turn transition toggle are persisted.
 
 ## AVIF (optional)
 AVIF decode uses the `image` crate's native (dav1d) backend, gated behind an off-by-default feature so

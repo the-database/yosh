@@ -769,7 +769,7 @@ impl ApplicationHandler for App {
         // off-thread `FolderSource` rebuilds out.
         let (watch_tx, watch_rx) = std::sync::mpsc::channel();
         let (rescan_tx, rescan_rx) = std::sync::mpsc::channel();
-        let reader = Reader::new(
+        let mut reader = Reader::new(
             gpu.device.clone(),
             gpu.queue.clone(),
             tex_pool,
@@ -789,6 +789,7 @@ impl ApplicationHandler for App {
             self.start_index,
             false, // two_tier: desktop keeps the always-HQ pipeline
         );
+        reader.transition_enabled = settings.page_transition_enabled;
         self.state = Some(State {
             window,
             gpu,
@@ -936,6 +937,7 @@ enum Action {
     ToggleSpreadOffset,
     ToggleInfo,
     ToggleSeekbar,
+    TogglePageTransition,
     ToggleAnimBar,
     PrevVolume,
     NextVolume,
@@ -961,6 +963,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyO => return Some(Action::ToggleSpreadOffset),
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
+            KeyCode::KeyT => return Some(Action::TogglePageTransition),
             KeyCode::KeyG => return Some(Action::ToggleAnimBar),
             KeyCode::KeyE => return Some(Action::ShowInExplorer),
             KeyCode::KeyR => return Some(Action::Rotate),
@@ -1106,6 +1109,16 @@ impl State {
                     "Seekbar: on"
                 } else {
                     "Seekbar: off"
+                });
+            }
+            Action::TogglePageTransition => {
+                self.settings.page_transition_enabled = !self.settings.page_transition_enabled;
+                self.reader.transition_enabled = self.settings.page_transition_enabled;
+                config::save(&self.settings);
+                self.toast(if self.settings.page_transition_enabled {
+                    "Page transition: on"
+                } else {
+                    "Page transition: off"
                 });
             }
             Action::ToggleAnimBar => self.playback.hidden = !self.playback.hidden,
@@ -1957,6 +1970,7 @@ impl State {
         } else {
             self.reader.layout.label()
         };
+        self.ui.transition_on = self.settings.page_transition_enabled;
         // Build the Tab info overlay text, reading the source once per page change.
         if self.ui.info_open && !self.library_view && self.info_for != Some(self.reader.index) {
             self.ui.info = self.build_page_info(self.reader.index);
@@ -2094,6 +2108,8 @@ impl State {
                         q.scale,
                         q.offset,
                         q.rot,
+                        q.alpha,
+                        q.blur,
                     )
                 })
             })
@@ -2174,6 +2190,9 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_layout) {
             self.apply_action(Action::ToggleLayout);
+        }
+        if std::mem::take(&mut self.ui.req_toggle_transition) {
+            self.apply_action(Action::TogglePageTransition);
         }
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
