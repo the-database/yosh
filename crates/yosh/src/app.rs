@@ -2392,7 +2392,10 @@ impl State {
             || !self.reader.view_settled       // resize/zoom debounce needs a settle frame
             || !self.reader.view_is_hq()       // in-view page missing/LQ/stale → wait for decode
             || self.reader.lq_fill_pending()   // whole-volume LQ tier still filling
-            || self.reader.transition_active() // page-turn animation
+            // Draw-time flag, not transition_active(): a clock re-check can see
+            // the animation as just-expired even though this frame drew it
+            // mid-fade, freezing a half-faded ghost (decision must match draw).
+            || self.reader.animation_drawn()   // a page-turn frame was drawn
             || drew_live_anim                  // a GIF/WebP is playing
             || self.toast.is_some()            // timed toast needs frames to expire
             || egui_animating                  // egui-driven animation (bar reveal, …)
