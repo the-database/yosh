@@ -35,6 +35,10 @@ use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::DecodePool;
 use yosh_engine::reader::{drag_commits, drag_dir, Budget, Direction, Reader, Viewport};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, SevenzSource, ZipSource};
+// RAR/CBR is gated behind the off-by-default `rar` feature (Linux/CI builds only —
+// see Cargo.toml). The engine only exposes `RarSource` when its `rar` feature is on.
+#[cfg(feature = "rar")]
+use yosh_engine::source::RarSource;
 use yosh_engine::texpool::TexturePool;
 
 /// Entry point android-activity calls on the native-activity thread.
@@ -3280,7 +3284,12 @@ fn ext_lower(p: &Path) -> Option<String> {
 
 /// Is this a comic archive yosh can open on Android (RAR excluded)?
 fn is_comic_archive(p: &Path) -> bool {
-    matches!(ext_lower(p).as_deref(), Some("cbz" | "zip" | "cb7" | "7z"))
+    match ext_lower(p).as_deref() {
+        Some("cbz" | "zip" | "cb7" | "7z") => true,
+        #[cfg(feature = "rar")]
+        Some("cbr" | "rar") => true,
+        _ => false,
+    }
 }
 
 /// Build an engine page source from a comic path (archive or image folder).
@@ -3295,6 +3304,10 @@ fn build_source(path: &Path) -> Option<Arc<dyn PageSource>> {
                 .ok()
                 .map(|s| Arc::new(s) as Arc<dyn PageSource>),
             Some("cb7" | "7z") => SevenzSource::new(path)
+                .ok()
+                .map(|s| Arc::new(s) as Arc<dyn PageSource>),
+            #[cfg(feature = "rar")]
+            Some("cbr" | "rar") => RarSource::new(path)
                 .ok()
                 .map(|s| Arc::new(s) as Arc<dyn PageSource>),
             _ => None,

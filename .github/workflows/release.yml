@@ -156,3 +156,82 @@ jobs:
           files: |
             yosh-windows-x64-portable.zip
             yosh-setup-x64.exe
+
+  # Android APK. Built on Linux on purpose: UnRAR's C++ only cross-compiles to
+  # Android from a Linux host (a Windows host drags in Windows-only sources), so
+  # this is where RAR/CBR support gets baked into the APK — local Windows builds
+  # keep it off. Gradle-free: build-apk.sh drives cargo-ndk + aapt2/zipalign/
+  # apksigner. Independent of the desktop matrix above.
+  android:
+    runs-on: ubuntu-latest
+    env:
+      # Mapped from repo secrets so steps can both use them and test their presence
+      # via the `env` context (secrets can't be referenced directly in `if:`).
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v5
+
+      # A release tag must be release-signed — never publish a debug-signed APK.
+      # Fail fast on a tag if the keystore secret is missing. (A manual
+      # workflow_dispatch without the secret still builds a debug-signed artifact,
+      # which is handy for validating the pipeline before the keystore is set up.)
+      - name: Require signing key on release tags
+        if: ${{ startsWith(github.ref, 'refs/tags/v') && env.ANDROID_KEYSTORE_BASE64 == '' }}
+        run: |
+          echo "::error::ANDROID_KEYSTORE_BASE64 secret is not set — cannot release-sign the APK"
+          exit 1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # versionName from the tag (e.g. v0.1.41 -> 0.1.41); versionCode packed as
+      # major*10000 + minor*100 + patch (monotonic; assumes minor/patch < 100). The
+      # manifest carries no version, so this is what makes released APKs
+      # update-installable (Android rejects a non-increasing versionCode).
+      - name: Compute version
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then vn="${GITHUB_REF_NAME#v}"; else vn="0.0.0"; fi
+          base="${vn%%-*}"
+          IFS=. read -r maj min pat <<< "$base"
+          maj=${maj:-0}; min=${min:-0}; pat=${pat:-0}
+          vc=$(( maj*10000 + min*100 + pat )); [ "$vc" -ge 1 ] || vc=1
+          echo "VERSION_NAME=$vn" >> "$GITHUB_ENV"
+          echo "VERSION_CODE=$vc"  >> "$GITHUB_ENV"
+          echo "APK version $vn (code $vc)"
+
+      - name: Decode signing keystore
+        if: ${{ env.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "KEYSTORE=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+
+      # build-apk.sh reads PROFILE/FEATURES/VERSION_*/KEYSTORE* from env. With no
+      # KEYSTORE it debug-signs; with one it uses the release key. RAR is on (the
+      # script's default FEATURES=rar + -DUNIX_TIME_NS).
+      - name: Build + sign APK
+        run: bash crates/yosh-android/build-apk.sh
+
+      - name: Stage APK asset
+        run: cp crates/yosh-android/out/yosh.apk yosh-android.apk
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: yosh-android-apk
+          path: yosh-android.apk
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: yosh-android.apk
