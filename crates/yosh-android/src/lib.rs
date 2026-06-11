@@ -96,6 +96,7 @@ fn android_main(app: AndroidApp) {
         touches: HashMap::new(),
         gesture_start: None,
         page_drag: false,
+        scroll_drag: false,
         drag_samples: VecDeque::new(),
         pinch: None,
         applied_immersive: None,
@@ -150,6 +151,8 @@ struct Shell {
     /// follows the finger; the engine renders it via `Reader::drag_update`).
     /// Locks once the motion is clearly horizontal; cleared on release/pinch.
     page_drag: bool,
+    /// A single-finger vertical drag locked in as continuous scroll (scroll mode).
+    scroll_drag: bool,
     /// Recent `(time, x)` samples of the dragging finger (~last 100 ms), for the
     /// release velocity that decides flick-to-commit.
     drag_samples: VecDeque<(Instant, f64)>,
@@ -783,6 +786,7 @@ impl Shell {
                 if self.touches.len() == 1 {
                     self.gesture_start = Some((x, y));
                     self.page_drag = false;
+                    self.scroll_drag = false;
                     self.drag_samples.clear();
                 } else if self.touches.len() == 2 {
                     // Begin a pinch; cancel the single-finger gesture — including
@@ -865,29 +869,49 @@ impl Shell {
                     } else if !egui_consumed
                         && let Some((sx, sy)) = self.gesture_start
                     {
-                        // Single finger, not zoomed → interactive page drag: the
-                        // page follows the finger (Chunky-style), with the neighbor
-                        // view revealed underneath. Locks once the motion is
-                        // clearly horizontal, so taps and the seekbar stay intact.
                         let (dx, dy) = (x - sx, y - sy);
-                        if !self.page_drag {
-                            let w = self.app.as_ref().map(|a| a.config.width as f64).unwrap_or(1.0);
-                            self.page_drag = dx.abs() > w * 0.015 && dx.abs() > dy.abs();
-                        }
-                        if self.page_drag
-                            && let Some(app) = self.app.as_mut()
-                        {
-                            let now = Instant::now();
-                            self.drag_samples.push_back((now, x));
-                            while self
-                                .drag_samples
-                                .front()
-                                .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
-                            {
-                                self.drag_samples.pop_front();
+                        let scroll_mode =
+                            self.app.as_ref().map(|a| a.reader.scroll_mode).unwrap_or(false);
+                        if scroll_mode {
+                            // Scroll mode: a vertical drag scrolls the strip
+                            // continuously (incremental, finger-tracking). Locks once
+                            // the motion is clearly vertical so taps/seekbar survive.
+                            if !self.scroll_drag {
+                                let h =
+                                    self.app.as_ref().map(|a| a.config.height as f64).unwrap_or(1.0);
+                                self.scroll_drag = dy.abs() > h * 0.01 && dy.abs() > dx.abs();
                             }
-                            app.reader.drag_update(dx as f32);
-                            app.window.request_redraw();
+                            if self.scroll_drag
+                                && let (Some((_, py)), Some(app)) = (prev, self.app.as_mut())
+                            {
+                                app.reader.top_offset -= (y - py) as f32;
+                                app.reader.normalize();
+                                app.window.request_redraw();
+                            }
+                        } else {
+                            // Page-flip: the page follows the finger (Chunky-style),
+                            // the neighbor revealed underneath. Locks once the motion
+                            // is clearly horizontal, so taps and the seekbar stay intact.
+                            if !self.page_drag {
+                                let w =
+                                    self.app.as_ref().map(|a| a.config.width as f64).unwrap_or(1.0);
+                                self.page_drag = dx.abs() > w * 0.015 && dx.abs() > dy.abs();
+                            }
+                            if self.page_drag
+                                && let Some(app) = self.app.as_mut()
+                            {
+                                let now = Instant::now();
+                                self.drag_samples.push_back((now, x));
+                                while self
+                                    .drag_samples
+                                    .front()
+                                    .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
+                                {
+                                    self.drag_samples.pop_front();
+                                }
+                                app.reader.drag_update(dx as f32);
+                                app.window.request_redraw();
+                            }
                         }
                     }
                 }
@@ -899,6 +923,7 @@ impl Shell {
                 }
                 if self.touches.is_empty() {
                     let was_drag = std::mem::take(&mut self.page_drag);
+                    self.scroll_drag = false;
                     let start = self.gesture_start.take();
                     if was_drag {
                         // The interactive drag owns this gesture end-to-end; the
@@ -1093,10 +1118,13 @@ impl Shell {
             .as_ref()
             .map(|a| a.reader.direction == Direction::Rtl)
             .unwrap_or(false);
-        if x < w * EDGE_ZONE as f64 {
+        // In scroll mode there are no discrete pages to flip, so the side edges fall
+        // through to the center action (toggle the reading chrome).
+        let scroll_mode = self.app.as_ref().map(|a| a.reader.scroll_mode).unwrap_or(false);
+        if !scroll_mode && x < w * EDGE_ZONE as f64 {
             // Left edge: next in RTL, previous in LTR.
             self.flip(if rtl { 1 } else { -1 });
-        } else if x > w * (1.0 - EDGE_ZONE as f64) {
+        } else if !scroll_mode && x > w * (1.0 - EDGE_ZONE as f64) {
             // Right edge: previous in RTL, next in LTR.
             self.flip(if rtl { -1 } else { 1 });
         } else if let Some(app) = self.app.as_mut() {
@@ -2027,11 +2055,13 @@ fn options_popup(
     fit: FitMode,
     transition_on: bool,
     resume_on: bool,
+    scroll_on: bool,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
     set_transition: &mut Option<bool>,
     set_resume: &mut Option<bool>,
+    set_scroll: &mut Option<bool>,
     toggle_offset: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
@@ -2040,6 +2070,22 @@ fn options_popup(
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
+
+                ui.label(egui::RichText::new("Reading mode").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(!scroll_on, egui::RichText::new("Page-flip").size(16.0))
+                        .clicked()
+                    {
+                        *set_scroll = Some(false);
+                    }
+                    if ui
+                        .selectable_label(scroll_on, egui::RichText::new("Scroll").size(16.0))
+                        .clicked()
+                    {
+                        *set_scroll = Some(true);
+                    }
+                });
 
                 ui.label(egui::RichText::new("Reading direction").strong());
                 ui.horizontal(|ui| {
@@ -2363,9 +2409,18 @@ impl App {
         // thumbnails → lq_cache) and record failures.
         self.reader.drain_pool();
         self.reader.update_decode_view();
+        // Scroll mode: keep the (anchor, top_offset) valid as page heights resolve,
+        // before prefetch reads the visible window.
+        if self.reader.scroll_mode {
+            self.reader.normalize();
+        }
         self.reader.prefetch();
 
-        let quads = self.reader.build_quads();
+        let quads = if self.reader.scroll_mode {
+            self.reader.build_scroll_quads()
+        } else {
+            self.reader.build_quads()
+        };
         let anim_t = self.anim_origin.elapsed();
         // Did this frame draw a free-running animation (GIF/WebP)? The end-of-frame
         // redraw guard keeps the loop alive while one is on screen — without this,
@@ -2477,6 +2532,7 @@ impl App {
         let cur_fit = self.reader.fit;
         let cur_transition = self.reader.transition_enabled;
         let cur_resume = self.resume_on_startup;
+        let cur_scroll = self.reader.scroll_mode;
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
         let lib_root_str = self.lib_root.display().to_string();
@@ -2596,6 +2652,7 @@ impl App {
         let mut set_fit: Option<FitMode> = None;
         let mut set_transition: Option<bool> = None;
         let mut set_resume: Option<bool> = None;
+        let mut set_scroll: Option<bool> = None;
         let mut toggle_offset = false;
         let mut cycle_fit = false;
         let mut to_library = false;
@@ -2823,11 +2880,13 @@ impl App {
                         cur_fit,
                         cur_transition,
                         cur_resume,
+                        cur_scroll,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
                         &mut set_transition,
                         &mut set_resume,
+                        &mut set_scroll,
                         &mut toggle_offset,
                     );
                 }
@@ -2946,6 +3005,12 @@ impl App {
         }
         if let Some(v) = set_resume {
             self.resume_on_startup = v;
+            self.persist_view();
+        }
+        if let Some(v) = set_scroll {
+            self.reader.scroll_mode = v;
+            self.reader.top_offset = 0.0;
+            self.reader.prefetch();
             self.persist_view();
         }
         if cycle_fit {
