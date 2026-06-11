@@ -9,14 +9,20 @@
 
     <!-- Browse a comic library folder directly (like Perfect Viewer / the desktop).
          A "special" permission the user grants once in Settings; fine for a
-         sideloaded personal app. -->
+         sideloaded personal app. Android 11+ only. -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- Android 10 and below have no MANAGE_EXTERNAL_STORAGE: use the legacy
+         storage model + runtime READ instead (paired with requestLegacyExternalStorage
+         below). maxSdkVersion=29 so 11+ devices keep using MANAGE only. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
 
     <application
         android:label="yosh"
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="true"
-        android:extractNativeLibs="true">
+        android:extractNativeLibs="true"
+        android:requestLegacyExternalStorage="true">
         <activity
             android:name="com.thedatabase.yosh.YoshActivity"
             android:exported="true"

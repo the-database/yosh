@@ -48,6 +48,17 @@ fn android_main(app: AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
     log::info!("yosh-android starting");
+    // winit allows exactly one EventLoop per process. android-activity re-invokes
+    // android_main when the activity is recreated in a still-cached process (e.g.
+    // Back destroys the activity, then the user reopens) — building a second
+    // EventLoop there panics. Defensively bail on re-entry so Android relaunches us
+    // fresh instead. (The process::exit at the end normally prevents re-entry from
+    // happening at all; this guards the timing edge where a reopen races the exit.)
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        log::warn!("android_main re-entered in a live process; exiting for a clean restart");
+        std::process::exit(0);
+    }
     // A reader should keep the screen awake while a page is up.
     app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
     // Per-comic reading positions persist in the app's private dir.
@@ -107,7 +118,15 @@ fn android_main(app: AndroidApp) {
         applied_immersive: None,
         status_bar_px: None,
     };
-    event_loop.run_app(&mut shell).expect("run event loop");
+    if let Err(e) = event_loop.run_app(&mut shell) {
+        log::error!("event loop exited with error: {e}");
+    }
+    // run_app returns only when the activity is destroyed (not on background — that
+    // delivers Suspended and keeps running). Exit the process so the next launch is a
+    // fresh process with a fresh EventLoop, instead of leaving a cached process that
+    // would re-enter android_main and hit the one-EventLoop-per-process limit.
+    log::info!("yosh-android event loop ended; exiting process");
+    std::process::exit(0);
 }
 
 /// Cap on the most-recently-read list (`recents.txt`); the head is the resume target.
