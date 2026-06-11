@@ -8,6 +8,15 @@ name = "yosh_android"
 # Android loads the app as a shared library; android-activity calls `android_main`.
 crate-type = ["cdylib"]
 
+[features]
+# RAR/CBR support, OFF by default. UnRAR's bundled C++ only cross-compiles to
+# Android from a *Linux* host: on Windows its build.rs pulls in Windows-only
+# sources (isnt.cpp), and it needs `-DUNIX_TIME_NS` to avoid `lutimes` (absent
+# from Bionic). So local/Windows builds omit it and the CI ubuntu job turns it on
+# (see crates/yosh-android/build-apk.sh + .github/workflows/release.yml).
+# Forwarded to the engine's own `rar` feature.
+rar = ["yosh-engine/rar"]
+
 # The shell is Android-only (the desktop shell is `crates/yosh`). Keeping the deps
 # under a target gate means a host `cargo build` over the workspace compiles this
 # crate to an empty cdylib instantly, with no winit/wgpu/engine pulled in.
