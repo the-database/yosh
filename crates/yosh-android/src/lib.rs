@@ -458,8 +458,8 @@ struct FrameReqs {
     page_nav: i64,
     /// Seekbar book button: open the prev/next sibling comic in the folder (-1/+1).
     book_nav: i64,
-    /// Seekbar close button: close the current comic, back to the empty state.
-    close_book: bool,
+    /// Seekbar bookshelf button: return to the library, leaving the book warm.
+    to_library: bool,
 }
 
 impl ApplicationHandler for Shell {
@@ -723,8 +723,8 @@ impl ApplicationHandler for Shell {
                 if reqs.book_nav != 0 {
                     self.open_sibling_book(reqs.book_nav);
                 }
-                if reqs.close_book {
-                    self.close_comic();
+                if reqs.to_library {
+                    self.open_library();
                 }
                 // Reading view with controls hidden → immersive (bars hidden);
                 // otherwise show the bars (controls up, library, or empty screen).
@@ -1208,30 +1208,6 @@ impl Shell {
         self.save_positions();
     }
 
-    /// Close the current comic: persist its position, tear down the page source
-    /// (the inverse of `attach_source`), and fall back to the empty "no comic open"
-    /// state (`len == 0` renders `empty_state`).
-    fn close_comic(&mut self) {
-        if let (Some(k), Some(app)) = (self.current_key.clone(), self.app.as_ref()) {
-            self.positions.insert(k, app.reader.index);
-        }
-        self.save_positions();
-        self.current_key = None;
-        if let Some(app) = self.app.as_mut() {
-            app.reader.pool = None;
-            app.reader.source = None;
-            app.reader.cache.clear();
-            app.reader.lq_cache.clear();
-            app.reader.failed.clear();
-            app.book_title.clear();
-            app.book_prompt = None;
-            app.controls = false;
-            app.show_options = false;
-            app.show_info = false;
-            app.window.request_redraw();
-        }
-    }
-
     fn save_positions(&self) {
         let Some(path) = &self.pos_path else { return };
         let mut out = String::new();
@@ -1485,7 +1461,7 @@ fn seekbar(
     book_nav: &mut i64,
     toggle_offset: &mut bool,
     cycle_fit: &mut bool,
-    close_book: &mut bool,
+    to_library: &mut bool,
 ) {
     use egui_phosphor::fill as ph;
     if len <= 1 {
@@ -1632,12 +1608,16 @@ fn seekbar(
                         .clamp(40.0, 58.0);
                     let total = count as f32 * bw + (count - 1) as f32 * sp;
                     ui.add_space(((avail - total) * 0.5).max(0.0));
-                    // PerfectViewer-style palette: green nav arrows, an orange book for
-                    // book nav, a red book for close, white utility icons.
+                    // PerfectViewer-style palette: every button gets its own vivid hue
+                    // (no plain white). Green page arrows + orange book stay; each utility
+                    // icon takes a distinct colour so they read apart at a glance.
                     let green = egui::Color32::from_rgb(124, 200, 80);
-                    let white = egui::Color32::from_gray(235);
-                    let red = egui::Color32::from_rgb(206, 74, 66);
                     let orange = egui::Color32::from_rgb(212, 140, 56);
+                    let amber = egui::Color32::from_rgb(224, 176, 74); // gear / options
+                    let cyan = egui::Color32::from_rgb(96, 196, 200); // fit
+                    let violet = egui::Color32::from_rgb(176, 138, 232); // spread toggle
+                    let azure = egui::Color32::from_rgb(104, 170, 236); // info
+                    let rose = egui::Color32::from_rgb(232, 128, 150); // return to library
                     let big = |ui: &mut egui::Ui, txt: &str, color: egui::Color32| {
                         ui.add_sized(
                             [bw, 46.0],
@@ -1646,11 +1626,10 @@ fn seekbar(
                         .clicked()
                     };
                     // A solid orange book with a glyph poking past its edge — used for
-                    // prev/next-book (a green arrow off the left/right edge) and close (a
-                    // red × off the top-right corner). The book colour is consistent for
-                    // all three; offsetting the glyph past the edge (rather than dead
-                    // centre) keeps both the book and the glyph legible. The glyph's side
-                    // is positional (fixed); the action flips with direction at the call.
+                    // prev/next-book (a green arrow off the left/right edge). Offsetting
+                    // the glyph past the edge (rather than dead centre) keeps both the
+                    // book and the glyph legible; the glyph's side is positional (fixed),
+                    // and the action flips with direction at the call.
                     let book_overlay = |ui: &mut egui::Ui,
                                         glyph: &str,
                                         off: egui::Vec2,
@@ -1676,7 +1655,7 @@ fn seekbar(
                         );
                         resp.clicked()
                     };
-                    if big(ui, ph::GEAR, white) {
+                    if big(ui, ph::GEAR, amber) {
                         *open_options = true;
                     }
                     // Fit-mode button: when zoomed (in or out of the fit scale), the
@@ -1684,9 +1663,9 @@ fn seekbar(
                     // to show no fit is active); otherwise it cycles fit modes. The icon
                     // reflects the current fit (1:1 stays as text).
                     let fit_color = if zoomed {
-                        egui::Color32::from_white_alpha(120)
+                        cyan.gamma_multiply(0.5)
                     } else {
-                        white
+                        cyan
                     };
                     let fit_rich = match fit {
                         FitMode::Window => egui::RichText::new(ph::ARROWS_OUT).size(22.0),
@@ -1707,7 +1686,7 @@ fn seekbar(
                     if big(ui, ph::ARROW_FAT_LEFT, green) {
                         *page_nav = if rtl { 1 } else { -1 };
                     }
-                    if spread && big(ui, ph::ARROWS_LEFT_RIGHT, white) {
+                    if spread && big(ui, ph::ARROWS_LEFT_RIGHT, violet) {
                         *toggle_offset = true;
                     }
                     if big(ui, ph::ARROW_FAT_RIGHT, green) {
@@ -1716,11 +1695,13 @@ fn seekbar(
                     if book_overlay(ui, ph::ARROW_FAT_RIGHT, egui::vec2(11.0, 1.0), 16.0, green) {
                         *book_nav = if rtl { -1 } else { 1 };
                     }
-                    if big(ui, ph::INFO, white) {
+                    if big(ui, ph::INFO, azure) {
                         *open_info = true;
                     }
-                    if book_overlay(ui, ph::X, egui::vec2(10.0, -8.0), 15.0, red) {
-                        *close_book = true;
+                    // Return to the bookshelf, leaving the book warm (instant resume).
+                    // Redundant with the top-strip tap, but a visible, discoverable button.
+                    if big(ui, ph::BOOKS, rose) {
+                        *to_library = true;
                     }
                 });
             });
@@ -2509,7 +2490,7 @@ impl App {
         let mut set_transition: Option<bool> = None;
         let mut toggle_offset = false;
         let mut cycle_fit = false;
-        let mut close_book = false;
+        let mut to_library = false;
         let mut page_nav: i64 = 0;
         let mut book_nav: i64 = 0;
         let mut open_info = false;
@@ -2517,6 +2498,16 @@ impl App {
         // Browse mode may climb anywhere (picking a new root); only the
         // filesystem root has no Up.
         let at_root = self.lib_dir.parent().is_none();
+        // Library header "Resume <book>" button — drawn only when a book is open (the
+        // library is the home; there's nothing to return to otherwise). It names the
+        // book so it hints the destination; clip the title (by char count, since titles
+        // are often CJK) so a long name can't push the other header buttons off-screen.
+        let resume_label = (len > 0).then(|| {
+            let total = self.book_title.chars().count();
+            let t: String = self.book_title.chars().take(14).collect();
+            let t = if total > 14 { format!("{t}…") } else { t };
+            format!("{}  Resume {t}", egui_phosphor::fill::BOOK_OPEN)
+        });
         // While the bars are shown the window is still full-bleed (NativeActivity
         // ignores fitSystemWindows), so inset the library's top chrome by the
         // status-bar height — otherwise the clock/icons cover the top buttons.
@@ -2575,7 +2566,9 @@ impl App {
                         // cover row per series (Chunky-style).
                         ui.horizontal(|ui| {
                             ui.spacing_mut().button_padding = egui::vec2(14.0, 10.0);
-                            if ui.button(egui::RichText::new("× Close").size(18.0)).clicked() {
+                            if let Some(label) = &resume_label
+                                && ui.button(egui::RichText::new(label).size(18.0)).clicked()
+                            {
                                 close_lib = true;
                             }
                             if ui
@@ -2688,7 +2681,7 @@ impl App {
                     &mut book_nav,
                     &mut toggle_offset,
                     &mut cycle_fit,
-                    &mut close_book,
+                    &mut to_library,
                 );
                 if hints_visible {
                     zone_hints(ctx, rtl);
@@ -2845,7 +2838,7 @@ impl App {
         }
         reqs.page_nav = page_nav;
         reqs.book_nav = book_nav;
-        reqs.close_book = close_book;
+        reqs.to_library = to_library;
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
         let screen = egui_wgpu::ScreenDescriptor {

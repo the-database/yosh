@@ -22,12 +22,21 @@ pub struct UiState {
     pub layout_label: &'static str,
     /// Whether the page-turn transition is on (for the "Turn:" button label).
     pub transition_on: bool,
+    /// Whether resume-last-book-on-startup is on (for the "Resume:" button label).
+    pub resume_on_startup: bool,
+    /// Whether a volume is currently loaded. Distinguishes the onboarding panel
+    /// (nothing open) from the library grid; set by the app each frame.
+    pub reader_open: bool,
+    /// Whether a library root is configured (a grid is reachable). Drives the
+    /// onboarding card's primary CTA; set by the app each frame.
+    pub has_library_root: bool,
 
     // Requests raised by clicks, consumed by the app after the frame.
     pub req_toggle_dir: bool,
     pub req_cycle_fit: bool,
     pub req_toggle_layout: bool,
     pub req_toggle_transition: bool,
+    pub req_toggle_resume: bool,
     pub req_toggle_library: bool,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
     pub rescan: bool,
@@ -112,6 +121,10 @@ pub struct UiState {
     pub anim_req_seek: Option<usize>,
     /// Set when the user hides the panel via its close button.
     pub anim_req_hide: bool,
+
+    /// The yosh mascot logo (embedded PNG), lazily decoded the first time the
+    /// onboarding panel renders and cached for the rest of the session.
+    pub logo: Option<egui::TextureHandle>,
 }
 
 /// Which seekbar to draw. Only `Bar` is implemented today; the variant exists so
@@ -449,7 +462,8 @@ pub fn chrome(
             {
                 st.pending_library = Some(p);
             }
-            if !lib.is_empty() && ui.button(if library_view { "Reader" } else { "Grid" }).clicked() {
+            // Grid↔Reader flip only makes sense with a warm book to flip to/from.
+            if st.reader_open && ui.button(if library_view { "Reader" } else { "Grid" }).clicked() {
                 st.req_toggle_library = true;
             }
             ui.separator();
@@ -468,6 +482,13 @@ pub fn chrome(
                 .clicked()
             {
                 st.req_toggle_transition = true;
+            }
+            if ui
+                .button(format!("Resume: {}", if st.resume_on_startup { "on" } else { "off" }))
+                .on_hover_text("Reopen the last book you were reading when yosh starts")
+                .clicked()
+            {
+                st.req_toggle_resume = true;
             }
             if ui.button("? Help").clicked() {
                 st.help_open = !st.help_open;
@@ -728,6 +749,101 @@ pub fn chrome(
     }
 }
 
+/// First-run onboarding, rendered *inside* the library view when no library folder
+/// is configured yet (the library is the home screen, so there's no separate "no
+/// comic open" page). Centered mascot + the two ways to get going: pick a library
+/// folder, or open a one-off file/folder. Once a library is set, the library shows
+/// its grid / scanning / empty states instead (see `library_sections`).
+fn onboarding(ui: &mut egui::Ui, st: &mut UiState) {
+    // Lazily decode the mascot once, then reuse the texture for the session.
+    if st.logo.is_none()
+        && let Some(img) = decode_logo()
+    {
+        st.logo = Some(ui.ctx().load_texture("yosh_logo", img, egui::TextureOptions::LINEAR));
+    }
+    ui.add_space(ui.available_height() * 0.16);
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+        // The yosh mascot if it decoded; otherwise a book glyph.
+        if let Some(tex) = &st.logo {
+            let [w, h] = tex.size();
+            let scale = 120.0 / h as f32;
+            ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(
+                w as f32 * scale,
+                h as f32 * scale,
+            )));
+        } else {
+            ui.label(egui::RichText::new("📖").size(56.0));
+        }
+        ui.label(egui::RichText::new("No comic open").strong().size(22.0));
+        ui.label(
+            egui::RichText::new("Set up your library, or open a file to start reading.")
+                .size(14.0)
+                .color(egui::Color32::from_white_alpha(160)),
+        );
+        ui.add_space(4.0);
+        ui.spacing_mut().button_padding = egui::vec2(18.0, 10.0);
+        if ui
+            .add(egui::Button::new(
+                egui::RichText::new("📚 Pick your comics folder…").size(18.0),
+            ))
+            .on_hover_text("Choose a folder of comics to browse as a library")
+            .clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .set_title("Choose a library folder")
+                .pick_folder()
+        {
+            st.pending_library = Some(p);
+        }
+        if ui
+            .add(egui::Button::new(egui::RichText::new("Open file…").size(18.0)))
+            .clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .set_title("Open comic archive or image")
+                .add_filter(
+                    "Comics & images",
+                    &[
+                        "cbz", "cbr", "zip", "rar", "7z", "cb7", "png", "jpg", "jpeg", "webp",
+                        "gif", "bmp", "avif", "jxl", "psd", "ico",
+                    ],
+                )
+                .pick_file()
+        {
+            st.pending_open = Some(p);
+        }
+        if ui
+            .add(egui::Button::new(egui::RichText::new("Open folder…").size(18.0)))
+            .clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .set_title("Open page folder")
+                .pick_folder()
+        {
+            st.pending_open = Some(p);
+        }
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new("Press F1 for keys.")
+                .size(12.0)
+                .color(egui::Color32::from_white_alpha(140)),
+        );
+    });
+}
+
+/// Decode the embedded yosh mascot logo for the onboarding card. The PNG is
+/// transparent; the engine's decode premultiplies its alpha, so build the egui
+/// image from premultiplied bytes (`from_rgba_unmultiplied` would double-multiply
+/// and darken the anti-aliased edges).
+fn decode_logo() -> Option<egui::ColorImage> {
+    const LOGO: &[u8] = include_bytes!("../assets/yosh.png");
+    let mut resizer = fast_image_resize::Resizer::new();
+    let decoded = yosh_engine::decode::decode_and_downscale(LOGO, 256, &mut resizer).ok()?;
+    let rgba = yosh_engine::decode::to_rgba_image(decoded);
+    Some(egui::ColorImage::from_rgba_premultiplied(
+        [rgba.w as usize, rgba.h as usize],
+        &rgba.pixels,
+    ))
+}
+
 /// Width of a cover cell and its image in the sectioned library row.
 const CELL_W: f32 = 150.0;
 const COVER_H: f32 = 210.0;
@@ -736,6 +852,13 @@ const COVER_H: f32 = 210.0;
 /// a horizontal, scrollbar/drag-scrollable row of cover thumbnails with read-state
 /// visuals (faded "finished" covers, an in-progress bar, the open volume's stroke).
 fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibCtx) {
+    // No library folder configured yet → this home view IS the first-run onboarding
+    // (no Rescan header, nothing to scan). Use the mirrored flag, not `lib.root`,
+    // which is None mid-first-scan right after a folder is picked.
+    if !st.has_library_root {
+        onboarding(ui, st);
+        return;
+    }
     // Solid (non-floating) scrollbars so the horizontal bar under an overflowing row
     // is clearly visible and the vertical bar reserves a real strip on the right
     // (the default floating bars reserve 0 width and overlay the rows). Scoped to the
