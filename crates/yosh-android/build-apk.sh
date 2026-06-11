@@ -38,11 +38,16 @@ JDK="${JAVA_HOME:?JAVA_HOME must be set}"
 BT="$(ls -d "$SDK"/build-tools/*/ 2>/dev/null | sort -V | tail -1)"; BT="${BT%/}"
 [ -n "$BT" ] || { echo "no build-tools found under $SDK/build-tools"; exit 1; }
 
-# NDK: prefer the runner's pinned latest, else newest under $SDK/ndk.
-NDK="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-}}}"
+# NDK: prefer the runner's stable default (ANDROID_NDK_ROOT) over LATEST — the
+# latter can be a canary (e.g. r29) that triggers a cargo-ndk version-mismatch
+# warning; r27 matches the local toolchain. Else newest under $SDK/ndk.
+NDK="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}}"
 if [ -z "$NDK" ]; then NDK="$(ls -d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -1)"; NDK="${NDK%/}"; fi
-[ -n "$NDK" ] || { echo "no NDK found (set ANDROID_NDK_LATEST_HOME or install one under $SDK/ndk)"; exit 1; }
+[ -n "$NDK" ] || { echo "no NDK found (set ANDROID_NDK_ROOT or install one under $SDK/ndk)"; exit 1; }
+# Set ANDROID_NDK_HOME to match so cargo-ndk doesn't warn about a ROOT/HOME mismatch.
 export ANDROID_NDK_HOME="$NDK"
+TOOLBIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+SYSROOT="$NDK/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
 
 # Platform android.jar to compile/link against: prefer android-34 (our targetSdk),
 # else the newest available.
@@ -53,7 +58,7 @@ else
 fi
 [ -n "$JAR" ] || { echo "no platform android.jar found under $SDK/platforms"; exit 1; }
 
-STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+STRIP="$TOOLBIN/llvm-strip"
 
 echo "SDK=$SDK"
 echo "NDK=$NDK"
@@ -62,6 +67,20 @@ echo "platform jar=$JAR"
 echo "profile=$PROFILE  features=$FEATURES  versionName=$VERSION_NAME  versionCode=$VERSION_CODE"
 
 abis=("arm64-v8a:aarch64-linux-android" "x86_64:x86_64-linux-android")
+
+# unrar_sys (and some other crates) emit `cargo:rustc-link-lib=pthread` for every
+# non-Windows target, but Android folds pthread/rt into libc and NDK r23+ ships no
+# stub archive — so linking the .so fails with "unable to find library -lpthread".
+# Drop empty stub archives into each ABI's sysroot lib dir (alongside libc.a, which
+# is on the linker's default search path); the linker then resolves -lpthread/-lrt
+# while the real symbols come from libc. Only needed for the rar build.
+for entry in "${abis[@]}"; do
+  triple="${entry##*:}"
+  libdir="$SYSROOT/usr/lib/$triple"
+  for stub in libpthread.a librt.a; do
+    [ -e "$libdir/$stub" ] || "$TOOLBIN/llvm-ar" rcs "$libdir/$stub"
+  done
+done
 
 # RAR's UnRAR C++ needs UNIX_TIME_NS so it uses utimensat (Bionic has no lutimes).
 # Harmless when the rar feature is off. Applies to whichever ABIs we build.
