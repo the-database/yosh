@@ -55,6 +55,9 @@ fn android_main(app: AndroidApp) {
     // Series the user collapsed in the library (default expanded).
     let collapsed_path = app.internal_data_path().map(|p| p.join("collapsed.txt"));
     let collapsed = collapsed_path.as_deref().map(load_collapsed).unwrap_or_default();
+    // Most-recently-read volume keys (MRU, newest first): resume target + shelf.
+    let recents_path = app.internal_data_path().map(|p| p.join("recents.txt"));
+    let recents = recents_path.as_deref().map(load_recents).unwrap_or_default();
     let lib_dir_file = app.internal_data_path().map(|p| p.join("libroot.txt"));
     let init_lib_dir = lib_dir_file
         .as_deref()
@@ -67,7 +70,7 @@ fn android_main(app: AndroidApp) {
     let init_view = view_file
         .as_deref()
         .map(load_view)
-        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window, true));
+        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window, true, false, true));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -82,6 +85,8 @@ fn android_main(app: AndroidApp) {
         progress_path,
         collapsed,
         collapsed_path,
+        recents,
+        recents_path,
         current_key: None,
         has_files: false,
         init_lib_dir,
@@ -98,6 +103,9 @@ fn android_main(app: AndroidApp) {
     };
     event_loop.run_app(&mut shell).expect("run event loop");
 }
+
+/// Cap on the most-recently-read list (`recents.txt`); the head is the resume target.
+const RECENTS_CAP: usize = 32;
 
 struct Shell {
     app: Option<App>,
@@ -119,6 +127,10 @@ struct Shell {
     /// expanded the default for anything new).
     collapsed: std::collections::HashSet<PathBuf>,
     collapsed_path: Option<PathBuf>,
+    /// Most-recently-read volume keys (newest first): resume-on-launch picks the
+    /// first reopenable one; the library's "Recently read" row renders them.
+    recents: Vec<String>,
+    recents_path: Option<PathBuf>,
     /// Identity of the currently-open comic, for saving its position.
     current_key: Option<String>,
     /// Cached all-files-access state (refreshed on resume + library toggle).
@@ -128,7 +140,7 @@ struct Shell {
     lib_dir_file: Option<PathBuf>,
     /// Persisted viewing options (direction, layout, fit, page-turn animation) +
     /// where they live.
-    init_view: (Direction, LayoutMode, FitMode, bool),
+    init_view: (Direction, LayoutMode, FitMode, bool, bool, bool),
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
@@ -249,6 +261,8 @@ struct App {
     /// this resolves to (orientation-dependent for `Auto`); this is the source of
     /// truth that persists. See `apply_resolved_layout`.
     layout_mode: LayoutMode,
+    /// Reopen the last book on launch (persisted in view.txt; toggled in options).
+    resume_on_startup: bool,
     /// Where viewing options persist (mirrors Shell.view_file).
     view_file: Option<PathBuf>,
 }
@@ -380,6 +394,8 @@ struct LibCtx<'a> {
     positions: &'a HashMap<String, usize>,
     collapsed: &'a std::collections::HashSet<PathBuf>,
     current_key: Option<&'a str>,
+    /// Most-recently-read keys (newest first) for the "Recently read" row.
+    recents: &'a [String],
 }
 
 /// Per-frame owned snapshot of one series section for the egui closure.
@@ -566,7 +582,7 @@ impl ApplicationHandler for Shell {
             // Concrete layout, resolved from the saved mode against the initial
             // window size (so an `Auto` launch already matches the orientation).
             self.init_view.1.resolve(config.width, config.height),
-            false, // scroll_mode: page-flip
+            self.init_view.4, // scroll mode (persisted)
             self.init_view.0, // direction (default RTL)
             0,
             true, // two_tier: LQ while seeking → HQ on settle
@@ -612,12 +628,21 @@ impl ApplicationHandler for Shell {
             show_options: false,
             show_info: false,
             layout_mode: self.init_view.1,
+            resume_on_startup: self.init_view.5,
             view_file: self.view_file.clone(),
         });
-        // Nothing is open on first launch — the empty-state helper (see `render`)
-        // explains how to open a comic. Restore the last comic? No: positions are
-        // per-comic, and we don't persist which one was last open, so we land on the
-        // empty state and let the user pick from the library / file picker.
+        // Pick up where we left off: with resume on, reopen the most-recent
+        // reopenable book (at its saved page); else, if a library is configured, open
+        // it as the home; else fall through to the empty-state card (onboarding). SAF
+        // content:// one-offs can't be silently rebuilt, so resume skips them.
+        let lib_configured = self.init_lib_dir != PathBuf::from("/storage/emulated/0");
+        if self.init_view.5
+            && let Some(key) = self.recents.iter().find(|k| is_reopenable_fs(k)).cloned()
+        {
+            self.open_path(PathBuf::from(key));
+        } else if lib_configured {
+            self.open_library();
+        }
         window.request_redraw();
     }
 
@@ -627,6 +652,7 @@ impl ApplicationHandler for Shell {
             self.positions.insert(k, app.reader.index);
         }
         self.save_positions();
+        self.save_recents();
         if let (Some(f), Some(app)) = (self.lib_dir_file.clone(), self.app.as_ref()) {
             let _ = std::fs::write(f, app.lib_root.to_string_lossy().as_bytes());
         }
@@ -688,6 +714,7 @@ impl ApplicationHandler for Shell {
                             positions: &self.positions,
                             collapsed: &self.collapsed,
                             current_key: self.current_key.as_deref(),
+                            recents: &self.recents,
                         },
                     ),
                     None => FrameReqs::default(),
@@ -1204,6 +1231,11 @@ impl Shell {
             app.window.request_redraw();
         }
         self.current_key = Some(key.clone());
+        // Bump to the front of the recently-read list (MRU, deduped, capped).
+        self.recents.retain(|k| k != &key);
+        self.recents.insert(0, key.clone());
+        self.recents.truncate(RECENTS_CAP);
+        self.save_recents();
         self.positions.insert(key, start);
         self.save_positions();
     }
@@ -1236,6 +1268,11 @@ impl Shell {
             out.push_str(&format!("{}\n", p.display()));
         }
         let _ = std::fs::write(path, out);
+    }
+
+    fn save_recents(&self) {
+        let Some(path) = &self.recents_path else { return };
+        let _ = std::fs::write(path, self.recents.join("\n"));
     }
 
     /// Update the in-memory read-tracking entry for the open comic: the furthest
@@ -1311,9 +1348,9 @@ fn attach_source(
 /// Load the persisted per-comic positions (one `index\tkey` line each).
 /// Parse persisted viewing options ("dir,layout,fit,anim"); default RTL / single /
 /// window / animation on.
-fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool) {
-    let (mut dir, mut lay, mut fit, mut anim) =
-        (Direction::Rtl, LayoutMode::Single, FitMode::Window, true);
+fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool) {
+    let (mut dir, mut lay, mut fit, mut anim, mut scroll, mut resume) =
+        (Direction::Rtl, LayoutMode::Single, FitMode::Window, true, false, true);
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -1333,12 +1370,24 @@ fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool) {
         };
         // Page-turn animation: 4th slot; absent (older files) ⇒ on.
         anim = t.get(3) != Some(&"off");
+        // 5th slot: scroll mode; absent ⇒ page-flip.
+        scroll = t.get(4) == Some(&"scroll");
+        // 6th slot: resume-on-launch; absent ⇒ on.
+        resume = t.get(5) != Some(&"noresume");
     }
-    (dir, lay, fit, anim)
+    (dir, lay, fit, anim, scroll, resume)
 }
 
-/// Persist viewing options as "dir,layout,fit,anim".
-fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, anim: bool) {
+/// Persist viewing options as "dir,layout,fit,anim,scroll,resume".
+fn save_view(
+    path: &Path,
+    dir: Direction,
+    lay: LayoutMode,
+    fit: FitMode,
+    anim: bool,
+    scroll: bool,
+    resume: bool,
+) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
     let f = match fit {
@@ -1348,7 +1397,9 @@ fn save_view(path: &Path, dir: Direction, lay: LayoutMode, fit: FitMode, anim: b
         FitMode::Window => "window",
     };
     let a = if anim { "on" } else { "off" };
-    let _ = std::fs::write(path, format!("{d},{l},{f},{a}"));
+    let s = if scroll { "scroll" } else { "flip" };
+    let r = if resume { "resume" } else { "noresume" };
+    let _ = std::fs::write(path, format!("{d},{l},{f},{a},{s},{r}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -1371,6 +1422,19 @@ fn load_collapsed(path: &std::path::Path) -> std::collections::HashSet<PathBuf> 
     std::fs::read_to_string(path)
         .map(|s| s.lines().filter(|l| !l.is_empty()).map(PathBuf::from).collect())
         .unwrap_or_default()
+}
+
+/// Load the most-recently-read list (one volume key per line, newest first).
+fn load_recents(path: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+/// True if `key` is a filesystem path we can silently rebuild a source from on
+/// launch (not a SAF `content://` URI, and still present on disk).
+fn is_reopenable_fs(key: &str) -> bool {
+    !key.starts_with("content://") && std::path::Path::new(key).exists()
 }
 
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
@@ -1962,10 +2026,12 @@ fn options_popup(
     effective_spread: bool,
     fit: FitMode,
     transition_on: bool,
+    resume_on: bool,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
     set_transition: &mut Option<bool>,
+    set_resume: &mut Option<bool>,
     toggle_offset: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
@@ -2054,6 +2120,22 @@ fn options_popup(
                         .clicked()
                     {
                         *set_transition = Some(false);
+                    }
+                });
+
+                ui.label(egui::RichText::new("Resume on startup").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(resume_on, egui::RichText::new("On").size(16.0))
+                        .clicked()
+                    {
+                        *set_resume = Some(true);
+                    }
+                    if ui
+                        .selectable_label(!resume_on, egui::RichText::new("Off").size(16.0))
+                        .clicked()
+                    {
+                        *set_resume = Some(false);
                     }
                 });
             });
@@ -2246,6 +2328,8 @@ impl App {
                 self.layout_mode,
                 self.reader.fit,
                 self.reader.transition_enabled,
+                self.reader.scroll_mode,
+                self.resume_on_startup,
             );
         }
     }
@@ -2392,6 +2476,7 @@ impl App {
         let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
         let cur_transition = self.reader.transition_enabled;
+        let cur_resume = self.resume_on_startup;
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
         let lib_root_str = self.lib_root.display().to_string();
@@ -2450,6 +2535,28 @@ impl App {
         } else {
             Vec::new()
         };
+        // "Recently read" cells (newest first), built like `sections` so the egui
+        // closure borrows no `self`. Filtered to reopenable filesystem entries — the
+        // only ones with a cover + a working tap-to-open (SAF one-offs are skipped).
+        let recents_cells: Vec<VolCell> = if library_view && !browse {
+            lib.recents
+                .iter()
+                .filter(|k| is_reopenable_fs(k))
+                .take(12)
+                .map(|k| {
+                    let path = PathBuf::from(k);
+                    VolCell {
+                        label: name_of(&path),
+                        thumb: self.thumbs.get(&path).cloned(),
+                        state: vol_state(lib.progress, lib.positions, k.as_str()),
+                        is_current: lib.current_key == Some(k.as_str()),
+                        path,
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         // Boundary prompt: lazily clear once its window lapses; visibility is
         // sampled ONCE here and reused for both the draw and the redraw guard
         // (the draw-time-consistency rule — see `Reader::animation_drawn`).
@@ -2488,6 +2595,7 @@ impl App {
         let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
         let mut set_transition: Option<bool> = None;
+        let mut set_resume: Option<bool> = None;
         let mut toggle_offset = false;
         let mut cycle_fit = false;
         let mut to_library = false;
@@ -2597,6 +2705,26 @@ impl App {
                             });
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
+                            // "Recently read" row above the series (most-recent first).
+                            if !recents_cells.is_empty() {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new("Recently read").size(18.0).strong(),
+                                );
+                                visible_covers
+                                    .extend(recents_cells.iter().map(|v| v.path.clone()));
+                                egui::ScrollArea::horizontal()
+                                    .id_salt("recents_row")
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for v in &recents_cells {
+                                                volume_cell(ui, v, &mut reqs, &mut close_lib);
+                                            }
+                                        });
+                                    });
+                                ui.add_space(8.0);
+                                ui.separator();
+                            }
                             for sec in &sections {
                                 // Full-width tappable header: chevron + name
                                 // left, status label right.
@@ -2694,10 +2822,12 @@ impl App {
                         cur_layout == Layout::Spread,
                         cur_fit,
                         cur_transition,
+                        cur_resume,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
                         &mut set_transition,
+                        &mut set_resume,
                         &mut toggle_offset,
                     );
                 }
@@ -2812,6 +2942,10 @@ impl App {
         }
         if let Some(v) = set_transition {
             self.reader.transition_enabled = v;
+            self.persist_view();
+        }
+        if let Some(v) = set_resume {
+            self.resume_on_startup = v;
             self.persist_view();
         }
         if cycle_fit {
