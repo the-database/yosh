@@ -261,6 +261,12 @@ const DRAG_SETTLE_MS: u64 = 150;
 /// animation takes over from wherever the page actually sits.
 const DRAG_MAX_FRAC: f32 = 0.33;
 
+/// Inertial scroll (fling) physics for continuous scroll mode. Velocity decays
+/// exponentially (`v *= exp(-FRICTION*dt)`), so a flick's total glide ≈ `v0/FRICTION`.
+const SCROLL_FLING_FRICTION: f32 = 1.5; // per second; lower = longer glide
+const SCROLL_FLING_MIN_V: f32 = 50.0; // px/s; below this the fling stops
+const SCROLL_FLING_MAX_V: f32 = 60000.0; // px/s; cap on release velocity (hard flick)
+
 /// A live one-finger page drag: the current view follows the finger while the
 /// neighbor view it is being dragged toward shows underneath (both views are
 /// normally already prefetched). On release the drag either commits — `step` +
@@ -381,6 +387,9 @@ pub struct Reader {
     pub nav_times: VecDeque<Instant>,
     pub scroll_mode: bool,
     pub top_offset: f32, // px the anchor page is scrolled above the viewport top
+    /// Inertial scroll velocity (px/sec applied to `top_offset`; +ve scrolls the
+    /// strip forward). 0 when not flinging; driven by `fling_tick`.
+    pub scroll_velocity: f32,
     pub est_aspect: f32, // h/w estimate for undecoded pages in the strip
 
     // --- Surface + decode-view debounce ---
@@ -419,6 +428,10 @@ pub struct Reader {
     /// guarantees one more frame after any animation frame (which then draws
     /// clean and clears this).
     anim_drawn: std::cell::Cell<bool>,
+    /// During a page-flip drag, the leading-edge seam for the shell's drop shadow:
+    /// `(seam_fraction 0..1, signed_intensity)` — sign = which side the revealed page
+    /// is on. `None` when no drag is live. Set by `build_quads`, read via `drag_seam`.
+    drag_seam: std::cell::Cell<Option<(f32, f32)>>,
 
     /// Inputs of the last `prefetch()` job-list rebuild. Shells call `prefetch()`
     /// every frame; when neither the view nor the caches changed since the last
@@ -486,6 +499,7 @@ impl Reader {
             nav_times: VecDeque::new(),
             scroll_mode,
             top_offset: 0.0,
+            scroll_velocity: 0.0,
             est_aspect: DEFAULT_ASPECT,
             viewport: Viewport::default(),
             pending_view: (0, 0, 1.0),
@@ -501,6 +515,7 @@ impl Reader {
             transition: None,
             drag: None,
             anim_drawn: std::cell::Cell::new(false),
+            drag_seam: std::cell::Cell::new(None),
             last_jobs_key: None,
         }
     }
@@ -870,6 +885,7 @@ impl Reader {
     /// transition is in flight, the outgoing view is appended on top, fading out.
     pub fn build_quads(&self) -> Vec<Quad> {
         self.anim_drawn.set(false);
+        self.drag_seam.set(None);
         let Some(src) = &self.source else {
             return Vec::new();
         };
@@ -911,6 +927,13 @@ impl Reader {
             // fractional offset breaks pixel snapping only while the drag is
             // live (same accepted transient as scroll), re-snapping on rest.
             let dx = drag_resist(finger, sw);
+            // Drop-shadow seam for the shell — only when a neighbor is actually
+            // revealed (no shadow on a first/last-page rubber-band).
+            if incoming != self.index && dx.abs() > 0.5 {
+                let seam_x = if dx > 0.0 { dx } else { sw + dx };
+                let si = (dx.abs() / 220.0).clamp(0.0, 1.0) * dx.signum();
+                self.drag_seam.set(Some((seam_x / sw, si)));
+            }
             let base = quads.len().max(2);
             for mut q in self.place_view(a, b, sw, sh, base, true) {
                 q.offset[0] += 2.0 * dx / sw;
@@ -963,6 +986,12 @@ impl Reader {
     /// the frame after any animation frame always renders (clean).
     pub fn animation_drawn(&self) -> bool {
         self.anim_drawn.get()
+    }
+
+    /// During a live page-flip drag, `(seam_fraction 0..1, signed_intensity)` for the
+    /// shell's edge drop shadow; `None` otherwise. See the `drag_seam` field.
+    pub fn drag_seam(&self) -> Option<(f32, f32)> {
+        self.drag_seam.get()
     }
 
     /// Place one view's pages into draw quads — 1 for a single page (or a wide
@@ -1942,6 +1971,45 @@ impl Reader {
             }
         }
         self.prefetch();
+    }
+
+    /// Begin an inertial scroll glide at `velocity` px/sec (clamped). Driven by
+    /// `fling_tick` each frame until it decays below `SCROLL_FLING_MIN_V` or hits an end.
+    pub fn start_fling(&mut self, velocity: f32) {
+        self.scroll_velocity = velocity.clamp(-SCROLL_FLING_MAX_V, SCROLL_FLING_MAX_V);
+    }
+
+    /// Stop any in-flight scroll glide (e.g. a finger touched down to catch it).
+    pub fn stop_fling(&mut self) {
+        self.scroll_velocity = 0.0;
+    }
+
+    /// Whether a scroll glide is currently active.
+    pub fn flinging(&self) -> bool {
+        self.scroll_velocity.abs() >= SCROLL_FLING_MIN_V
+    }
+
+    /// Advance the inertial scroll by `dt` seconds: move the strip, decay the
+    /// velocity, and stop at the volume's ends. Returns whether the glide continues
+    /// (so the shell knows to schedule another frame). No prefetch/toast here — the
+    /// shell's per-frame render prefetches, and a per-frame toast would spam.
+    pub fn fling_tick(&mut self, dt: f32) -> bool {
+        if self.scroll_velocity.abs() < SCROLL_FLING_MIN_V {
+            self.scroll_velocity = 0.0;
+            return false;
+        }
+        let before = self.index;
+        let before_off = self.top_offset;
+        let dy = self.scroll_velocity * dt;
+        self.top_offset += dy;
+        self.normalize();
+        self.scroll_velocity *= (-SCROLL_FLING_FRICTION * dt).exp();
+        // Clamped at an end (the strip didn't move despite a push) → stop dead.
+        if self.index == before && dy.abs() > 0.5 && (self.top_offset - before_off).abs() < 0.5 {
+            self.scroll_velocity = 0.0;
+            return false;
+        }
+        self.scroll_velocity.abs() >= SCROLL_FLING_MIN_V
     }
 }
 

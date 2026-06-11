@@ -97,6 +97,7 @@ fn android_main(app: AndroidApp) {
         gesture_start: None,
         page_drag: false,
         scroll_drag: false,
+        last_fling_tick: Instant::now(),
         drag_samples: VecDeque::new(),
         pinch: None,
         applied_immersive: None,
@@ -153,8 +154,10 @@ struct Shell {
     page_drag: bool,
     /// A single-finger vertical drag locked in as continuous scroll (scroll mode).
     scroll_drag: bool,
-    /// Recent `(time, x)` samples of the dragging finger (~last 100 ms), for the
-    /// release velocity that decides flick-to-commit.
+    /// Last `fling_tick` time, for the per-frame dt of the inertial scroll glide.
+    last_fling_tick: Instant,
+    /// Recent `(time, x|y)` samples of the dragging finger (~last 100 ms): x for the
+    /// page-flip flick-to-commit, y for the scroll-release fling velocity.
     drag_samples: VecDeque<(Instant, f64)>,
     /// Active pinch, captured at its start (see `Pinch`).
     pinch: Option<Pinch>,
@@ -702,6 +705,8 @@ impl ApplicationHandler for Shell {
                         self.open_picked(&uri);
                     }
                 }
+                // Advance an inertial scroll glide (if any) before drawing this frame.
+                self.tick_scroll_fling();
                 let has_files = self.has_files;
                 // Status-bar height (queried once; constant). Chrome is inset by it
                 // while the bars are shown so they don't cover the top buttons.
@@ -787,6 +792,10 @@ impl Shell {
                     self.gesture_start = Some((x, y));
                     self.page_drag = false;
                     self.scroll_drag = false;
+                    // A finger down catches any in-flight scroll glide.
+                    if let Some(app) = self.app.as_mut() {
+                        app.reader.stop_fling();
+                    }
                     self.drag_samples.clear();
                 } else if self.touches.len() == 2 {
                     // Begin a pinch; cancel the single-finger gesture — including
@@ -881,12 +890,24 @@ impl Shell {
                                     self.app.as_ref().map(|a| a.config.height as f64).unwrap_or(1.0);
                                 self.scroll_drag = dy.abs() > h * 0.01 && dy.abs() > dx.abs();
                             }
-                            if self.scroll_drag
-                                && let (Some((_, py)), Some(app)) = (prev, self.app.as_mut())
-                            {
-                                app.reader.top_offset -= (y - py) as f32;
-                                app.reader.normalize();
-                                app.window.request_redraw();
+                            if self.scroll_drag {
+                                // Sample (time, y) for the release fling velocity
+                                // (reuses drag_samples; page-flip uses it for x, but
+                                // the two modes are mutually exclusive per gesture).
+                                let now = Instant::now();
+                                self.drag_samples.push_back((now, y));
+                                while self
+                                    .drag_samples
+                                    .front()
+                                    .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
+                                {
+                                    self.drag_samples.pop_front();
+                                }
+                                if let (Some((_, py)), Some(app)) = (prev, self.app.as_mut()) {
+                                    app.reader.top_offset -= (y - py) as f32;
+                                    app.reader.normalize();
+                                    app.window.request_redraw();
+                                }
                             }
                         } else {
                             // Page-flip: the page follows the finger (Chunky-style),
@@ -923,9 +944,24 @@ impl Shell {
                 }
                 if self.touches.is_empty() {
                     let was_drag = std::mem::take(&mut self.page_drag);
-                    self.scroll_drag = false;
+                    let was_scroll = std::mem::take(&mut self.scroll_drag);
                     let start = self.gesture_start.take();
-                    if was_drag {
+                    if was_scroll {
+                        // Scroll release → inertial fling from the recent y-velocity.
+                        if !matches!(phase, TouchPhase::Cancelled) {
+                            let now = Instant::now();
+                            let vy = self.drag_samples.front().map_or(0.0, |(t0, y0)| {
+                                let dt = now.duration_since(*t0).as_secs_f64();
+                                if dt > 0.005 { (y - y0) / dt } else { 0.0 }
+                            });
+                            self.last_fling_tick = now;
+                            if let Some(app) = self.app.as_mut() {
+                                // strip velocity = −finger velocity (flick up → forward)
+                                app.reader.start_fling(-vy as f32);
+                                app.window.request_redraw();
+                            }
+                        }
+                    } else if was_drag {
                         // The interactive drag owns this gesture end-to-end; the
                         // old end-of-gesture swipe must not also fire.
                         if matches!(phase, TouchPhase::Cancelled) {
@@ -1032,6 +1068,23 @@ impl Shell {
 
     /// Open the library browser at the configured root, refreshing all-files
     /// access first (the browser shows the grant prompt if it's missing). Shared by
+    /// Advance the inertial scroll glide one frame (a no-op unless flinging): apply
+    /// the velocity to the strip, decay it, and schedule the next frame while it lasts.
+    fn tick_scroll_fling(&mut self) {
+        let flinging = self.app.as_ref().map(|a| a.reader.flinging()).unwrap_or(false);
+        if !flinging {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_fling_tick).as_secs_f32().clamp(0.0, 0.05);
+        self.last_fling_tick = now;
+        if let Some(app) = self.app.as_mut()
+            && app.reader.fling_tick(dt)
+        {
+            app.window.request_redraw();
+        }
+    }
+
     /// the top-strip tap and the empty-state "Browse library" button.
     fn open_library(&mut self) {
         self.has_files = has_all_files(&self.android_app);
@@ -1507,7 +1560,7 @@ fn info_popup(ctx: &egui::Context, lines: &[(String, String)], close: &mut bool)
     egui::Area::new(egui::Id::new("info_popup"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            translucent_popup(ui.style()).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
                 ui.label(egui::RichText::new("Info").strong().size(18.0));
                 egui::Grid::new("info_grid")
@@ -1564,9 +1617,7 @@ fn seekbar(
     let sw = ctx.screen_rect().width();
     // Translucent panel so the page shows through behind the controls. Keep the
     // popup's color/stroke/rounding, just drop the fill's alpha.
-    let frame = egui::Frame::popup(&ctx.style());
-    let f = frame.fill;
-    let frame = frame.fill(egui::Color32::from_rgba_unmultiplied(f.r(), f.g(), f.b(), 200));
+    let frame = translucent_popup(&ctx.style());
     egui::Area::new(egui::Id::new("seekbar"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
         .show(ctx, |ui| {
@@ -1989,29 +2040,69 @@ fn book_prompt_card(
         });
 }
 
+/// A popup frame with the fill alpha dropped so the page shows through (matches the
+/// seekbar). Shared by the seekbar + the options/info popups.
+fn translucent_popup(style: &egui::Style) -> egui::Frame {
+    let frame = egui::Frame::popup(style);
+    let f = frame.fill;
+    frame.fill(egui::Color32::from_rgba_unmultiplied(f.r(), f.g(), f.b(), 200))
+}
+
+/// A soft drop shadow riding the dragged page's leading edge (page-flip swipe), cast
+/// onto the revealed page beneath. `frac` is the seam x (0..1 of width); `si`'s sign
+/// is the revealed side, magnitude the intensity. Painted on the background layer so
+/// it sits over the page but under the chrome.
+fn drag_shadow(ctx: &egui::Context, frac: f32, si: f32) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new("drag_shadow"),
+    ));
+    let rect = ctx.screen_rect();
+    let seam_x = rect.left() + frac * rect.width();
+    let w = 22.0;
+    let far_x = if si > 0.0 { seam_x - w } else { seam_x + w };
+    let dark = egui::Color32::from_black_alpha((si.abs() * 120.0).clamp(0.0, 255.0) as u8);
+    let clear = egui::Color32::TRANSPARENT;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(egui::pos2(seam_x, rect.top()), dark);
+    mesh.colored_vertex(egui::pos2(seam_x, rect.bottom()), dark);
+    mesh.colored_vertex(egui::pos2(far_x, rect.top()), clear);
+    mesh.colored_vertex(egui::pos2(far_x, rect.bottom()), clear);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    painter.add(mesh);
+}
+
 /// Faint labels + outlines over the tap zones (shown briefly with the controls) so
 /// the layout is discoverable. Painted, NOT laid out as widgets: an egui Area
 /// registers under the pointer and makes the tap report "consumed", blocking the
 /// edge/top zones. A background-layer painter does no hit-testing, so taps fall
 /// through to nav.
-fn zone_hints(ctx: &egui::Context, rtl: bool) {
+fn zone_hints(ctx: &egui::Context, rtl: bool, scroll: bool) {
     let painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Background,
         egui::Id::new("zone_hints"),
     ));
     let rect = ctx.screen_rect();
-    // Outline the tap zones (top strip + side edges). Two-tone — a dark stroke under
-    // a lighter one — so the lines read on both white and dark manga pages.
+    // Outline the tap zones. Two-tone — a dark stroke under a lighter one — so the
+    // lines read on both white and dark manga pages.
     let dark = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(120));
     let light = egui::Stroke::new(1.5, egui::Color32::from_white_alpha(200));
     let ty = rect.top() + rect.height() * TOP_ZONE;
-    let lx = rect.left() + rect.width() * EDGE_ZONE;
-    let rx = rect.right() - rect.width() * EDGE_ZONE;
-    let yr = egui::Rangef::new(ty, rect.bottom());
+    // Top strip (library) — both modes.
     for s in [dark, light] {
         painter.hline(rect.x_range(), ty, s);
-        painter.vline(lx, yr, s);
-        painter.vline(rx, yr, s);
+    }
+    // Side flip zones only in page-flip; scroll mode has no side flips (any tap
+    // below the top strip toggles the controls).
+    if !scroll {
+        let lx = rect.left() + rect.width() * EDGE_ZONE;
+        let rx = rect.right() - rect.width() * EDGE_ZONE;
+        let yr = egui::Rangef::new(ty, rect.bottom());
+        for s in [dark, light] {
+            painter.vline(lx, yr, s);
+            painter.vline(rx, yr, s);
+        }
     }
     let font = egui::FontId::proportional(18.0);
     let draw = |pos: egui::Pos2, anchor: egui::Align2, text: &str| {
@@ -2031,17 +2122,20 @@ fn zone_hints(ctx: &egui::Context, rtl: bool) {
         egui::Align2::CENTER_CENTER,
         "📚 Library",
     );
-    let (left, right) = if rtl { ("Next ›", "‹ Prev") } else { ("‹ Prev", "Next ›") };
-    draw(
-        egui::pos2(rect.left() + 40.0, rect.center().y),
-        egui::Align2::LEFT_CENTER,
-        left,
-    );
-    draw(
-        egui::pos2(rect.right() - 40.0, rect.center().y),
-        egui::Align2::RIGHT_CENTER,
-        right,
-    );
+    // Side flip labels only in page-flip.
+    if !scroll {
+        let (left, right) = if rtl { ("Next ›", "‹ Prev") } else { ("‹ Prev", "Next ›") };
+        draw(
+            egui::pos2(rect.left() + 40.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            left,
+        );
+        draw(
+            egui::pos2(rect.right() - 40.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            right,
+        );
+    }
 }
 
 /// Viewing-options popup (from the seekbar gear): reading direction, page layout,
@@ -2067,7 +2161,7 @@ fn options_popup(
     egui::Area::new(egui::Id::new("view_options"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            translucent_popup(ui.style()).show(ui, |ui| {
                 ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
 
@@ -2533,6 +2627,7 @@ impl App {
         let cur_transition = self.reader.transition_enabled;
         let cur_resume = self.resume_on_startup;
         let cur_scroll = self.reader.scroll_mode;
+        let drag_seam = self.reader.drag_seam();
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
         let lib_root_str = self.lib_root.display().to_string();
@@ -2869,7 +2964,7 @@ impl App {
                     &mut to_library,
                 );
                 if hints_visible {
-                    zone_hints(ctx, rtl);
+                    zone_hints(ctx, rtl, cur_scroll);
                 }
                 if show_options {
                     options_popup(
@@ -2898,6 +2993,12 @@ impl App {
             // (`prompt_card` is None in the library / empty state.)
             if let Some((dir, title, thumb, has_sibling)) = &prompt_card {
                 book_prompt_card(ctx, *dir, rtl, title, thumb.as_ref(), *has_sibling, &mut book_nav);
+            }
+            // Page-flip drag drop shadow — over the page, chrome or not.
+            if !library_view
+                && let Some((frac, si)) = drag_seam
+            {
+                drag_shadow(ctx, frac, si);
             }
         });
         self.egui_state
