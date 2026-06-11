@@ -1888,7 +1888,11 @@ fn empty_state(
                     ui.spacing_mut().button_padding = egui::vec2(18.0, 12.0);
                     if ui
                         .add(egui::Button::new(
-                            egui::RichText::new("📚 Browse library").size(18.0),
+                            egui::RichText::new(format!(
+                                "{}  Browse library",
+                                egui_phosphor::fill::BOOKS
+                            ))
+                            .size(18.0),
                         ))
                         .clicked()
                     {
@@ -2120,7 +2124,7 @@ fn zone_hints(ctx: &egui::Context, rtl: bool, scroll: bool) {
     draw(
         egui::pos2(rect.center().x, rect.top() + 56.0),
         egui::Align2::CENTER_CENTER,
-        "📚 Library",
+        &format!("{}  Library", egui_phosphor::fill::BOOKS),
     );
     // Side flip labels only in page-flip.
     if !scroll {
