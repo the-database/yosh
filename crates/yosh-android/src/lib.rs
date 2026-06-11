@@ -85,7 +85,15 @@ fn android_main(app: AndroidApp) {
     let init_view = view_file
         .as_deref()
         .map(load_view)
-        .unwrap_or((Direction::Rtl, LayoutMode::Single, FitMode::Window, true, false, true));
+        .unwrap_or((
+            Direction::Rtl,
+            LayoutMode::Single,
+            FitMode::Window,
+            true,
+            false,
+            true,
+            ThemePref::System,
+        ));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
         .build()
@@ -165,7 +173,7 @@ struct Shell {
     lib_dir_file: Option<PathBuf>,
     /// Persisted viewing options (direction, layout, fit, page-turn animation) +
     /// where they live.
-    init_view: (Direction, LayoutMode, FitMode, bool, bool, bool),
+    init_view: (Direction, LayoutMode, FitMode, bool, bool, bool, ThemePref),
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
@@ -292,6 +300,10 @@ struct App {
     layout_mode: LayoutMode,
     /// Reopen the last book on launch (persisted in view.txt; toggled in options).
     resume_on_startup: bool,
+    /// Chrome theme preference (persisted in view.txt; toggled in options).
+    theme: ThemePref,
+    /// Cached OS night-mode flag (re-read on resume); resolves `ThemePref::System`.
+    system_dark: bool,
     /// Where viewing options persist (mirrors Shell.view_file).
     view_file: Option<PathBuf>,
 }
@@ -485,6 +497,43 @@ impl LayoutMode {
     }
 }
 
+/// Chrome theme preference. `System` follows the OS day/night setting (read via
+/// JNI on Android — winit doesn't surface it); `Light`/`Dark` force it. Light is
+/// the e-ink-friendly mode (white background, dark text, opaque popups); the dark
+/// default is unusable on a reflective e-ink panel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ThemePref {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePref {
+    /// Resolve to dark-vs-light, consulting the cached system night-mode flag for `System`.
+    fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            ThemePref::System => system_dark,
+            ThemePref::Light => false,
+            ThemePref::Dark => true,
+        }
+    }
+    /// Persistence token (view.txt slot 7).
+    fn label(self) -> &'static str {
+        match self {
+            ThemePref::System => "system",
+            ThemePref::Light => "light",
+            ThemePref::Dark => "dark",
+        }
+    }
+    fn parse(tok: Option<&&str>) -> Self {
+        match tok {
+            Some(&"light") => ThemePref::Light,
+            Some(&"dark") => ThemePref::Dark,
+            _ => ThemePref::System,
+        }
+    }
+}
+
 /// Cross-shell actions an egui frame requests (handled after the egui run, since
 /// they need `Shell` state the reader/render path doesn't own).
 #[derive(Default)]
@@ -523,6 +572,7 @@ impl ApplicationHandler for Shell {
         // Resume from background (incl. returning from the picker): rebuild only
         // the surface against the existing device + reader — no re-decode.
         if self.app.is_some() {
+            let sys_dark = system_dark(&self.android_app);
             {
                 let app = self.app.as_mut().unwrap();
                 app.surface = app
@@ -532,6 +582,7 @@ impl ApplicationHandler for Shell {
                     .expect("recreate surface");
                 app.surface.configure(&app.ctx.device, &app.config);
                 app.window = window.clone();
+                app.system_dark = sys_dark; // OS theme may have changed while backgrounded
                 app.window.request_redraw();
             }
             // Returning from the picker: Android delivers onActivityResult before
@@ -658,6 +709,8 @@ impl ApplicationHandler for Shell {
             show_info: false,
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
+            theme: self.init_view.6,
+            system_dark: system_dark(&self.android_app),
             view_file: self.view_file.clone(),
         });
         // Pick up where we left off: with resume on, reopen the most-recent
@@ -1452,9 +1505,16 @@ fn attach_source(
 /// Load the persisted per-comic positions (one `index\tkey` line each).
 /// Parse persisted viewing options ("dir,layout,fit,anim"); default RTL / single /
 /// window / animation on.
-fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool) {
-    let (mut dir, mut lay, mut fit, mut anim, mut scroll, mut resume) =
-        (Direction::Rtl, LayoutMode::Single, FitMode::Window, true, false, true);
+fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool, ThemePref) {
+    let (mut dir, mut lay, mut fit, mut anim, mut scroll, mut resume, mut theme) = (
+        Direction::Rtl,
+        LayoutMode::Single,
+        FitMode::Window,
+        true,
+        false,
+        true,
+        ThemePref::System,
+    );
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -1478,11 +1538,13 @@ fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool) 
         scroll = t.get(4) == Some(&"scroll");
         // 6th slot: resume-on-launch; absent ⇒ on.
         resume = t.get(5) != Some(&"noresume");
+        // 7th slot: chrome theme; absent (older files) ⇒ follow the system.
+        theme = ThemePref::parse(t.get(6));
     }
-    (dir, lay, fit, anim, scroll, resume)
+    (dir, lay, fit, anim, scroll, resume, theme)
 }
 
-/// Persist viewing options as "dir,layout,fit,anim,scroll,resume".
+/// Persist viewing options as "dir,layout,fit,anim,scroll,resume,theme".
 fn save_view(
     path: &Path,
     dir: Direction,
@@ -1491,6 +1553,7 @@ fn save_view(
     anim: bool,
     scroll: bool,
     resume: bool,
+    theme: ThemePref,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -1503,7 +1566,8 @@ fn save_view(
     let a = if anim { "on" } else { "off" };
     let s = if scroll { "scroll" } else { "flip" };
     let r = if resume { "resume" } else { "noresume" };
-    let _ = std::fs::write(path, format!("{d},{l},{f},{a},{s},{r}"));
+    let t = theme.label();
+    let _ = std::fs::write(path, format!("{d},{l},{f},{a},{s},{r},{t}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -1638,6 +1702,9 @@ fn seekbar(
     // A floating pill lifted off the bottom edge (the very edge collides with the
     // system gesture bar + is awkward to grab), fattened for touch.
     let sw = ctx.screen_rect().width();
+    // The seekbar hand-paints the slider/buttons (egui can't style them per-widget
+    // here), so pick high-contrast tones for light/e-ink off the active theme.
+    let light = !ctx.style().visuals.dark_mode;
     // Translucent panel so the page shows through behind the controls. Keep the
     // popup's color/stroke/rounding, just drop the fill's alpha.
     let frame = translucent_popup(&ctx.style());
@@ -1697,9 +1764,21 @@ fn seekbar(
                     // clearly not-there. (In LTR the trailing side is the read side, so the
                     // track reads inverted there — we optimise for RTL; the handle stays
                     // correctly blue.) A white ring keeps the handle legible against blue.
-                    let seeked = egui::Color32::from_rgb(96, 185, 255); // bright blue: handle + seeked rail
-                    let unseeked = egui::Color32::from_rgb(120, 124, 130); // neutral grey: unseeked track
-                    let ring = egui::Stroke::new(2.0, egui::Color32::WHITE);
+                    let (seeked, unseeked, ring_col) = if light {
+                        // On white: dark handle/rail, light-grey track, dark ring.
+                        (
+                            egui::Color32::from_rgb(70, 70, 70),
+                            egui::Color32::from_rgb(200, 200, 200),
+                            egui::Color32::from_rgb(30, 30, 30),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(96, 185, 255), // bright blue: handle + seeked rail
+                            egui::Color32::from_rgb(120, 124, 130), // neutral grey: unseeked track
+                            egui::Color32::WHITE,
+                        )
+                    };
+                    let ring = egui::Stroke::new(2.0, ring_col);
                     let v = ui.visuals_mut();
                     v.selection.bg_fill = unseeked;
                     v.widgets.inactive.bg_fill = seeked;
@@ -1736,8 +1815,18 @@ fn seekbar(
                         let half = (span / last * 0.5).max(0.75); // half a page-step wide
                         let yb = track.bottom() - 1.0;
                         let yt = yb - 2.0;
-                        let lq_tick = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 55);
-                        let hq_tick = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
+                        let (lq_tick, hq_tick) = if light {
+                            // Darker green so the cache wash reads on white.
+                            (
+                                egui::Color32::from_rgba_unmultiplied(70, 130, 90, 90),
+                                egui::Color32::from_rgba_unmultiplied(50, 110, 70, 180),
+                            )
+                        } else {
+                            (
+                                egui::Color32::from_rgba_unmultiplied(120, 165, 140, 55),
+                                egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150),
+                            )
+                        };
                         let p = ui.painter();
                         // LQ wash first, then HQ on top. Mirror the slider's own RTL
                         // value transform so ticks line up with where the handle sits.
@@ -1776,14 +1865,23 @@ fn seekbar(
                     ui.add_space(((avail - total) * 0.5).max(0.0));
                     // PerfectViewer-style palette: every button gets its own vivid hue
                     // (no plain white). Green page arrows + orange book stay; each utility
-                    // icon takes a distinct colour so they read apart at a glance.
-                    let green = egui::Color32::from_rgb(124, 200, 80);
-                    let orange = egui::Color32::from_rgb(212, 140, 56);
-                    let amber = egui::Color32::from_rgb(224, 176, 74); // gear / options
-                    let cyan = egui::Color32::from_rgb(96, 196, 200); // fit
-                    let violet = egui::Color32::from_rgb(176, 138, 232); // spread toggle
-                    let azure = egui::Color32::from_rgb(104, 170, 236); // info
-                    let rose = egui::Color32::from_rgb(232, 128, 150); // return to library
+                    // icon takes a distinct colour so they read apart at a glance. On
+                    // light/e-ink the hues wash out to mid-grey, so use one near-black for
+                    // every glyph (max contrast — colour-coding is lost on grayscale anyway).
+                    let (green, orange, amber, cyan, violet, azure, rose) = if light {
+                        let k = egui::Color32::from_rgb(40, 40, 40);
+                        (k, k, k, k, k, k, k)
+                    } else {
+                        (
+                            egui::Color32::from_rgb(124, 200, 80),
+                            egui::Color32::from_rgb(212, 140, 56),
+                            egui::Color32::from_rgb(224, 176, 74), // gear / options
+                            egui::Color32::from_rgb(96, 196, 200), // fit
+                            egui::Color32::from_rgb(176, 138, 232), // spread toggle
+                            egui::Color32::from_rgb(104, 170, 236), // info
+                            egui::Color32::from_rgb(232, 128, 150), // return to library
+                        )
+                    };
                     let big = |ui: &mut egui::Ui, txt: &str, color: egui::Color32| {
                         ui.add_sized(
                             [bw, 46.0],
@@ -1890,6 +1988,9 @@ fn empty_state(
                 ui.set_max_width((ctx.screen_rect().width() * 0.8).min(420.0));
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
+                    // Secondary text color from the active theme (was a hardcoded
+                    // white alpha — invisible on the light card).
+                    let weak = ui.visuals().weak_text_color();
                     // The yosh mascot if it decoded; otherwise a book glyph.
                     if let Some(tex) = logo {
                         let [w, h] = tex.size();
@@ -1905,7 +2006,7 @@ fn empty_state(
                     ui.label(
                         egui::RichText::new("Open a comic to start reading.")
                             .size(15.0)
-                            .color(egui::Color32::from_white_alpha(180)),
+                            .color(weak),
                     );
                     ui.add_space(4.0);
                     ui.spacing_mut().button_padding = egui::vec2(18.0, 12.0);
@@ -1931,7 +2032,7 @@ fn empty_state(
                     ui.label(
                         egui::RichText::new("Tip: tap the top of the screen any time to open your library.")
                             .size(12.0)
-                            .color(egui::Color32::from_white_alpha(140)),
+                            .color(weak),
                     );
                 });
             });
@@ -2071,6 +2172,11 @@ fn book_prompt_card(
 /// seekbar). Shared by the seekbar + the options/info popups.
 fn translucent_popup(style: &egui::Style) -> egui::Frame {
     let frame = egui::Frame::popup(style);
+    // Light / e-ink mode: keep it fully opaque (translucency over the page looks
+    // muddy on a reflective panel). Only the dark theme lets the page show through.
+    if !style.visuals.dark_mode {
+        return frame;
+    }
     let f = frame.fill;
     frame.fill(egui::Color32::from_rgba_unmultiplied(f.r(), f.g(), f.b(), 200))
 }
@@ -2177,12 +2283,14 @@ fn options_popup(
     transition_on: bool,
     resume_on: bool,
     scroll_on: bool,
+    theme: ThemePref,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
     set_transition: &mut Option<bool>,
     set_resume: &mut Option<bool>,
     set_scroll: &mut Option<bool>,
+    set_theme: &mut Option<ThemePref>,
     toggle_offset: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
@@ -2305,6 +2413,22 @@ fn options_popup(
                         *set_resume = Some(false);
                     }
                 });
+
+                ui.label(egui::RichText::new("Theme").strong());
+                ui.horizontal(|ui| {
+                    for (t, text) in [
+                        (ThemePref::System, "System"),
+                        (ThemePref::Light, "Light"),
+                        (ThemePref::Dark, "Dark"),
+                    ] {
+                        if ui
+                            .selectable_label(theme == t, egui::RichText::new(text).size(16.0))
+                            .clicked()
+                        {
+                            *set_theme = Some(t);
+                        }
+                    }
+                });
             });
         });
 }
@@ -2328,6 +2452,16 @@ fn has_all_files(app: &AndroidApp) -> bool {
         Ok(env.call_method(activity, "hasAllFiles", "()Z", &[])?.z()?)
     })
     .unwrap_or(false)
+}
+
+/// True if the OS is in night (dark) mode — resolves the `System` theme. winit
+/// doesn't surface the system theme on Android, so read the uiMode night flag via
+/// JNI (available since API 29). Defaults to dark on failure (the historical look).
+fn system_dark(app: &AndroidApp) -> bool {
+    with_env(app, |env, activity| {
+        Ok(env.call_method(activity, "isSystemDark", "()Z", &[])?.z()?)
+    })
+    .unwrap_or(true)
 }
 
 /// Open Settings so the user can grant all-files access.
@@ -2497,6 +2631,7 @@ impl App {
                 self.reader.transition_enabled,
                 self.reader.scroll_mode,
                 self.resume_on_startup,
+                self.theme,
             );
         }
     }
@@ -2518,6 +2653,10 @@ impl App {
 
     fn render(&mut self, has_files: bool, status_bar_px: i32, lib: LibCtx<'_>) -> FrameReqs {
         self.frame_no += 1;
+        // Resolved chrome theme this frame: drives the page-letterbox clear color
+        // (below) and egui's visuals (set at the top of the egui run). The seekbar's
+        // hardcoded colors read it back off `ui.visuals().dark_mode`.
+        let light = !self.theme.is_dark(self.system_dark);
         self.reader.viewport = Viewport {
             w: self.config.width,
             h: self.config.height,
@@ -2596,11 +2735,17 @@ impl App {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 32.0 / 255.0,
-                            g: 32.0 / 255.0,
-                            b: 32.0 / 255.0,
-                            a: 1.0,
+                        // Letterbox behind pages: white in light/e-ink mode (a big dark
+                        // fill is unusable on a reflective panel), else the dark #202020.
+                        load: wgpu::LoadOp::Clear(if light {
+                            wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }
+                        } else {
+                            wgpu::Color {
+                                r: 32.0 / 255.0,
+                                g: 32.0 / 255.0,
+                                b: 32.0 / 255.0,
+                                a: 1.0,
+                            }
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -2654,6 +2799,7 @@ impl App {
         let cur_transition = self.reader.transition_enabled;
         let cur_resume = self.resume_on_startup;
         let cur_scroll = self.reader.scroll_mode;
+        let cur_theme = self.theme;
         let drag_seam = self.reader.drag_seam();
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
@@ -2775,6 +2921,7 @@ impl App {
         let mut set_transition: Option<bool> = None;
         let mut set_resume: Option<bool> = None;
         let mut set_scroll: Option<bool> = None;
+        let mut set_theme: Option<ThemePref> = None;
         let mut toggle_offset = false;
         let mut cycle_fit = false;
         let mut to_library = false;
@@ -2800,6 +2947,14 @@ impl App {
         // status-bar height — otherwise the clock/icons cover the top buttons.
         let top_inset_pt = status_bar_px as f32 / self.egui_ctx.pixels_per_point();
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            // Theme the whole frame up front: standard widgets (library grid, popups,
+            // empty-state card, series headers) follow this; the hand-painted chrome
+            // (seekbar, letterbox) reads `dark_mode` back off the visuals.
+            ctx.set_visuals(if light {
+                egui::Visuals::light()
+            } else {
+                egui::Visuals::dark()
+            });
             if library_view {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(top_inset_pt);
@@ -3013,12 +3168,14 @@ impl App {
                         cur_transition,
                         cur_resume,
                         cur_scroll,
+                        cur_theme,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
                         &mut set_transition,
                         &mut set_resume,
                         &mut set_scroll,
+                        &mut set_theme,
                         &mut toggle_offset,
                     );
                 }
@@ -3150,6 +3307,11 @@ impl App {
             self.reader.top_offset = 0.0;
             self.reader.prefetch();
             self.persist_view();
+        }
+        if let Some(t) = set_theme {
+            self.theme = t;
+            self.persist_view();
+            self.window.request_redraw(); // re-paint the chrome under the new theme
         }
         if cycle_fit {
             if (self.reader.zoom - 1.0).abs() > 0.001 {
