@@ -864,6 +864,10 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
     // (the default floating bars reserve 0 width and overlay the rows). Scoped to the
     // library central panel.
     ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+    // egui paints a fade-out gradient at scroll edges (default strength 0.5); on the
+    // cover grid it dims the thumbnails at the screen bottom, reading as a stray drop
+    // shadow anchored to the scrolling content. Turn it off. (Matches the Android fix.)
+    ui.spacing_mut().scroll.fade.strength = 0.0;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         if ui.button("⟳ Rescan").on_hover_text("Re-scan the library folder").clicked() {
