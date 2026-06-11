@@ -4,6 +4,7 @@ import android.Manifest;
 import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -70,6 +71,14 @@ public class YoshActivity extends NativeActivity {
             runOnUiThread(() -> requestPermissions(
                 new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, READ_REQUEST));
         }
+    }
+
+    /** True if the OS is in night (dark) mode. Resolves the "System" theme on the
+     *  native side (winit doesn't surface the system theme on Android). The uiMode
+     *  night mask exists since API 29. */
+    public boolean isSystemDark() {
+        int mode = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
+        return mode == Configuration.UI_MODE_NIGHT_YES;
     }
 
     /** Launch the SAF document picker. Called from native via JNI. */
