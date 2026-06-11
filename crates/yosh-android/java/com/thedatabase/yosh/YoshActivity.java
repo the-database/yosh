@@ -1,7 +1,9 @@
 package com.thedatabase.yosh;
 
+import android.Manifest;
 import android.app.NativeActivity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -22,6 +24,7 @@ import android.view.WindowInsetsController;
 // from NativeActivity), so android_main runs exactly as before.
 public class YoshActivity extends NativeActivity {
     private static final int PICK_REQUEST = 1001;
+    private static final int READ_REQUEST = 1002;
 
     /** Set by onActivityResult; read + cleared by the native side via takePickedUri. */
     public static volatile String pickedUri = null;
@@ -35,25 +38,38 @@ public class YoshActivity extends NativeActivity {
         return u;
     }
 
-    /** True if the app has all-files access (so it can browse the library by path). */
+    /** True if the app can read the shared storage to browse the library by path.
+     *  Android 11+ uses all-files access (MANAGE_EXTERNAL_STORAGE); Android 10 and
+     *  below use the legacy storage model gated on runtime READ_EXTERNAL_STORAGE
+     *  (which, unlike pre-30 before, we must actually check — the blanket `true`
+     *  let the UI think it had access while every std::fs read silently failed). */
     public boolean hasAllFiles() {
         if (Build.VERSION.SDK_INT >= 30) {
             return Environment.isExternalStorageManager();
         }
-        return true; // pre-Android-11 uses the legacy storage model
+        return checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                == PackageManager.PERMISSION_GRANTED;
     }
 
-    /** Open Settings so the user can grant all-files access. Called from native. */
+    /** Ask the user for storage access. Called from native. Android 11+ opens the
+     *  all-files Settings page; Android 10 and below show the runtime READ permission
+     *  dialog. After granting, the native side re-polls hasAllFiles() on resume. */
     public void requestAllFiles() {
-        runOnUiThread(() -> {
-            try {
-                Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
-                intent.setData(Uri.parse("package:" + getPackageName()));
-                startActivity(intent);
-            } catch (Exception e) {
-                startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
-            }
-        });
+        if (Build.VERSION.SDK_INT >= 30) {
+            runOnUiThread(() -> {
+                try {
+                    Intent intent =
+                        new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    intent.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(intent);
+                } catch (Exception e) {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                }
+            });
+        } else {
+            runOnUiThread(() -> requestPermissions(
+                new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, READ_REQUEST));
+        }
     }
 
     /** Launch the SAF document picker. Called from native via JNI. */
