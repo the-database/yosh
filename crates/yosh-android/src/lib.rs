@@ -569,42 +569,44 @@ impl ApplicationHandler for Shell {
             self.has_files,
             window.scale_factor()
         );
-        // Resume from background (incl. returning from the picker): rebuild only
-        // the surface against the existing device + reader — no re-decode.
+        // What to restore after a resume-rebuild (all None/false on a true first launch).
+        let mut rebuild_book: Option<String> = None;
+        let mut resume_active = false; // this resumed() is a forced rebuild (app was live)
+        let mut resume_library = false; // the library overlay was up when we rebuilt
+        // Resume from background: unconditionally rebuild the GPU. Reusing the cached
+        // adapter against the post-background surface works on most devices, but some
+        // e-ink GPUs reject it ("Surface does not support the adapter's queue family") via
+        // an async validation error that no synchronous check (is_surface_supported, an
+        // error scope / uncaptured-error handler, get_current_texture's status, or a poll)
+        // catches before it lands — so tear the context down and rebuild from scratch (a
+        // fresh adapter is always compatible with its fresh surface, like cold start).
+        // Resume isn't the zero-hitch reading hot-path, so re-decoding the current page
+        // from its saved position is an acceptable cost for never crashing.
         if self.app.is_some() {
-            let sys_dark = system_dark(&self.android_app);
-            {
-                let app = self.app.as_mut().unwrap();
-                app.surface = app
-                    .ctx
-                    .instance
-                    .create_surface(window.clone())
-                    .expect("recreate surface");
-                app.surface.configure(&app.ctx.device, &app.config);
-                app.window = window.clone();
-                app.system_dark = sys_dark; // OS theme may have changed while backgrounded
-                app.window.request_redraw();
+            resume_active = true;
+            resume_library = self.app.as_ref().unwrap().library_view;
+            // Save the open book's page and clear current_key so the reopen below restores
+            // that saved page (not the fresh reader's index 0).
+            if let (Some(k), Some(app)) = (self.current_key.take(), self.app.as_ref()) {
+                self.positions.insert(k.clone(), app.reader.index);
+                self.save_positions();
+                rebuild_book = Some(k);
             }
-            // Returning from the picker: Android delivers onActivityResult before
-            // onResume, so the URI is ready by now. (RedrawRequested polls too, as
-            // a backup in case the redraw loop isn't continuous.)
-            if self.picker_pending {
-                log::info!("resumed with picker_pending; polling");
-                match take_picked_uri(&self.android_app) {
-                    Some(uri) => {
-                        self.picker_pending = false;
-                        self.open_picked(&uri);
-                    }
-                    None => log::info!("resumed: no picked uri yet"),
-                }
-            }
-            return;
+            self.app = None; // drops the old GPU context, Reader, decode pool + textures
+            // fall through to the full build below.
         }
 
-        // First launch: full build.
+        // First launch (or a forced rebuild): full build.
         let instance = GpuContext::create_instance();
         let surface = instance.create_surface(window.clone()).expect("create surface");
         let ctx = GpuContext::create(instance, Some(&surface));
+        // Make wgpu errors non-fatal: the default handler panics, which is how a stray
+        // validation error (notably surface.configure rejecting a post-background surface
+        // on some e-ink GPUs) takes the app down. Log instead; the resume path detects the
+        // bad surface via get_current_texture's status and rebuilds the GPU.
+        ctx.device.on_uncaptured_error(Arc::new(|e: wgpu::Error| {
+            log::error!("wgpu error (non-fatal): {e}");
+        }));
         let size = window.inner_size();
         let caps = surface.get_capabilities(&ctx.adapter);
         let config = wgpu::SurfaceConfiguration {
@@ -718,7 +720,22 @@ impl ApplicationHandler for Shell {
         // it as the home; else fall through to the empty-state card (onboarding). SAF
         // content:// one-offs can't be silently rebuilt, so resume skips them.
         let lib_configured = self.init_lib_dir != PathBuf::from("/storage/emulated/0");
-        if self.init_view.5
+        // Reopen after the (re)build. Priority: a SAF picker return opens the picked file;
+        // a resume-rebuild restores what was showing (the open book at its page, else the
+        // library if it was up / is the home, else the empty-state card); a true first
+        // launch resumes the most-recent book, else the configured library, else the card.
+        if self.picker_pending
+            && let Some(uri) = take_picked_uri(&self.android_app)
+        {
+            self.picker_pending = false;
+            self.open_picked(&uri);
+        } else if let Some(key) = rebuild_book.filter(|k| is_reopenable_fs(k)) {
+            self.open_path(PathBuf::from(key));
+        } else if resume_active {
+            if resume_library || lib_configured {
+                self.open_library();
+            }
+        } else if self.init_view.5
             && let Some(key) = self.recents.iter().find(|k| is_reopenable_fs(k)).cloned()
         {
             self.open_path(PathBuf::from(key));
