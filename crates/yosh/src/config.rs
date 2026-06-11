@@ -6,6 +6,10 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// Cap on the most-recently-read list (`Settings::recents`). Bounds the persisted
+/// JSON and the future recents shelf; the head is the resume target.
+pub const RECENTS_CAP: usize = 32;
+
 /// Persisted window geometry so size/position/maximized survive a restart.
 /// Coordinates are physical pixels: `x`/`y` are the window's outer top-left
 /// (incl. decorations), `w`/`h` are the inner (client-area) size. When
@@ -32,6 +36,14 @@ pub struct Settings {
     pub gpu: bool,
     /// Last library root folder (browse grid).
     pub library_root: Option<String>,
+    /// Most-recently-read volume paths, newest first, deduped, capped at
+    /// `RECENTS_CAP`. `recents[0]` is the resume target on a no-arg launch (the
+    /// first entry that still exists on disk); the same list backs the future
+    /// "recently read" shelf. Same key form as `last_pages`.
+    pub recents: Vec<String>,
+    /// Resume the most recent volume on a no-arg launch (default on). Toggled from
+    /// the top bar.
+    pub resume_on_startup: bool,
     /// Volume path (folder or archive) → last-read page index.
     pub last_pages: HashMap<String, usize>,
     /// Volume path → read-tracking pair `(furthest_page_count, total_pages)`, where
@@ -68,6 +80,8 @@ impl Default for Settings {
             scroll: false,
             gpu: false,
             library_root: None,
+            recents: Vec::new(),
+            resume_on_startup: true,
             last_pages: HashMap::new(),
             progress: HashMap::new(),
             collapsed: HashSet::new(),

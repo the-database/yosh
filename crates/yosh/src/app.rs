@@ -242,6 +242,15 @@ struct State {
 /// start index)`, or an error message. Built off-thread by `build_source`.
 type Built = Result<(Arc<dyn PageSource>, PathBuf, Option<usize>), String>;
 
+/// Bump `key` to the front of the most-recently-read list (newest first), drop any
+/// older duplicate, and cap the length. Generic over the key string so the resume
+/// path and the future recents shelf share one definition.
+fn push_recent(settings: &mut config::Settings, key: &str) {
+    settings.recents.retain(|p| p != key);
+    settings.recents.insert(0, key.to_string());
+    settings.recents.truncate(config::RECENTS_CAP);
+}
+
 /// Construct a page source for `path` (folder / archive / single image). Pure
 /// I/O, touches no app state, so it runs on a background thread — a slow
 /// (e.g. network-share) open never blocks the UI. The result is handed back to
@@ -767,15 +776,27 @@ impl ApplicationHandler for App {
         };
         if let Some(p) = self.initial_path.take() {
             ui.pending_open = Some(p);
+        } else if settings.resume_on_startup {
+            // Resume the last book on a no-arg launch: open the most recent volume
+            // that still exists on disk (a stale head is skipped so the list stays
+            // useful). `set_source` resumes its saved page automatically.
+            if let Some(p) = settings
+                .recents
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            {
+                ui.pending_open = Some(PathBuf::from(p));
+            }
         }
 
         // The recursive library scan can be slow on a big tree, so it runs
         // off-thread (kicked off below, after the channels exist); the grid shows
-        // "Scanning library…" until it lands. Open straight into the grid if nothing
-        // was passed to read and a library root is configured.
+        // "Scanning library…" until it lands. The library is the home screen: with
+        // nothing to open (no CLI arg, no resume) we land in the library view — which
+        // shows the configured grid, or the onboarding when no library is set yet.
         let library = Library::empty();
         let has_root = settings.library_root.is_some();
-        let library_view = ui.pending_open.is_none() && has_root;
+        let library_view = ui.pending_open.is_none();
         // Show the keys overlay once, on the first launch ever, then persist so it
         // never auto-opens again (F1 / "? Help" reopen it on demand).
         if !settings.help_seen {
@@ -1672,6 +1693,7 @@ impl State {
         self.reader.nav_times.clear();
         self.reader.rotation = 0; // each volume opens upright
         self.reader.index = idx.min(source.len() - 1);
+        push_recent(&mut self.settings, &key);
         self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
         self.reader.source = Some(source);
@@ -2193,6 +2215,11 @@ impl State {
             self.reader.layout.label()
         };
         self.ui.transition_on = self.settings.page_transition_enabled;
+        self.ui.resume_on_startup = self.settings.resume_on_startup;
+        // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
+        // library grid; `ui.opened` is sticky once set, so it can't.
+        self.ui.reader_open = self.reader.source.is_some();
+        self.ui.has_library_root = self.settings.library_root.is_some();
         // Build the Tab info overlay text, reading the source once per page change.
         if self.ui.info_open && !self.library_view && self.info_for != Some(self.reader.index) {
             self.ui.info = self.build_page_info(self.reader.index);
@@ -2444,6 +2471,11 @@ impl State {
             self.apply_action(Action::TogglePageTransition);
             ui_acted = true;
         }
+        if std::mem::take(&mut self.ui.req_toggle_resume) {
+            self.settings.resume_on_startup = !self.settings.resume_on_startup;
+            config::save(&self.settings);
+            ui_acted = true;
+        }
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
         if let Some(page) = self.ui.seek_request.take()
@@ -2502,8 +2534,12 @@ impl State {
             self.start_scan(root);
             ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_toggle_library) && !self.library.is_empty() {
+        if std::mem::take(&mut self.ui.req_toggle_library) {
             self.library_view = !self.library_view;
+            // The library is the home screen — never flip to a bookless reader.
+            if self.reader.source.is_none() {
+                self.library_view = true;
+            }
             ui_acted = true;
         }
         // Collapse/expand a series section (header click). The collapsed *set* is
