@@ -2061,7 +2061,7 @@ fn drag_shadow(ctx: &egui::Context, frac: f32, si: f32) {
     let seam_x = rect.left() + frac * rect.width();
     let w = 22.0;
     let far_x = if si > 0.0 { seam_x - w } else { seam_x + w };
-    let dark = egui::Color32::from_black_alpha((si.abs() * 120.0).clamp(0.0, 255.0) as u8);
+    let dark = egui::Color32::from_black_alpha((si.abs() * 60.0).clamp(0.0, 255.0) as u8);
     let clear = egui::Color32::TRANSPARENT;
     let mut mesh = egui::Mesh::default();
     mesh.colored_vertex(egui::pos2(seam_x, rect.top()), dark);
@@ -2776,6 +2776,10 @@ impl App {
             if library_view {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(top_inset_pt);
+                    // egui paints a fade-out gradient at scroll edges (default
+                    // strength 0.5); on the cover grid it dims the thumbnails at the
+                    // screen bottom, reading as a stray drop shadow. Turn it off.
+                    ui.spacing_mut().scroll.fade.strength = 0.0;
                     if !has_files {
                         ui.add_space(40.0);
                         ui.label("Grant access to your files to browse your comics:");
@@ -2867,6 +2871,9 @@ impl App {
                                     .extend(recents_cells.iter().map(|v| v.path.clone()));
                                 egui::ScrollArea::horizontal()
                                     .id_salt("recents_row")
+                                    .scroll_bar_visibility(
+                                        egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                    )
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             for v in &recents_cells {
@@ -2917,6 +2924,9 @@ impl App {
                                     }
                                     egui::ScrollArea::horizontal()
                                         .id_salt(&sec.dir)
+                                        .scroll_bar_visibility(
+                                            egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                                        )
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
                                                 for v in &sec.volumes {
