@@ -23,6 +23,46 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
+/// Chrome theme preference. `System` follows the OS day/night setting (read via
+/// `winit::window::Theme`); `Light`/`Dark` force it. `Light` is the e-ink-friendly
+/// mode — a white page letterbox + egui's light visuals; the dark default suits a
+/// backlit monitor. The Android shell carries the same three-way choice.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemePref {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemePref {
+    /// Resolve to dark-vs-light, consulting the cached OS night-mode flag for `System`.
+    pub fn is_dark(self, system_dark: bool) -> bool {
+        match self {
+            ThemePref::System => system_dark,
+            ThemePref::Light => false,
+            ThemePref::Dark => true,
+        }
+    }
+    /// Short label for the top-bar "Theme:" button.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemePref::System => "system",
+            ThemePref::Light => "light",
+            ThemePref::Dark => "dark",
+        }
+    }
+    /// Next preference for the cycling top-bar button (system → light → dark → …).
+    pub fn cycle(self) -> Self {
+        match self {
+            ThemePref::System => ThemePref::Light,
+            ThemePref::Light => ThemePref::Dark,
+            ThemePref::Dark => ThemePref::System,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -67,6 +107,8 @@ pub struct Settings {
     /// fast sweep across a large monitor is more fatiguing than on a phone (Android
     /// enables it unconditionally in its own shell).
     pub page_transition_enabled: bool,
+    /// Chrome theme: System (follow OS) / Light (e-ink) / Dark. Cycled from the top bar.
+    pub theme: ThemePref,
     /// Last window geometry (size/position/maximized). None until first saved.
     pub window: Option<WindowState>,
 }
@@ -89,6 +131,7 @@ impl Default for Settings {
             help_seen: false,
             seekbar_enabled: true,
             page_transition_enabled: false, // desktop default off; Android shell forces on
+            theme: ThemePref::System,
             window: None,
         }
     }
