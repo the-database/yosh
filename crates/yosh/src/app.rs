@@ -2018,7 +2018,13 @@ impl State {
         };
         self.ui.transition_on = self.settings.page_transition_enabled;
         self.ui.resume_on_startup = self.settings.resume_on_startup;
-        self.ui.theme_label = self.settings.theme.label();
+        // Current view state for the Settings panel's active-value highlighting.
+        self.ui.scroll_on = self.reader.scroll_mode;
+        self.ui.dir_rtl = self.reader.direction == Direction::Rtl;
+        self.ui.layout_spread = !self.reader.scroll_mode && self.reader.layout == Layout::Spread;
+        self.ui.fit_mode = fit_to_u8(self.reader.fit);
+        self.ui.rotation = self.reader.rotation;
+        self.ui.theme = self.settings.theme;
         // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
         // library grid; `ui.opened` is sticky once set, so it can't.
         self.ui.reader_open = self.reader.source.is_some();
@@ -2290,8 +2296,31 @@ impl State {
             config::save(&self.settings);
             ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_cycle_theme) {
-            self.settings.theme = self.settings.theme.cycle();
+        // Settings-panel requests (mirror Android's options popup).
+        if std::mem::take(&mut self.ui.req_toggle_scroll) {
+            self.apply_action(Action::ToggleScroll);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_toggle_pairing) {
+            self.apply_action(Action::ToggleSpreadOffset);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_rotate) {
+            self.apply_action(Action::Rotate);
+            ui_acted = true;
+        }
+        if let Some(v) = self.ui.req_set_fit.take() {
+            // Direct fit set (panel radio), mirroring Action::CycleFit's reset.
+            self.reader.fit = fit_from_u8(v);
+            self.reader.zoom = 1.0;
+            self.reader.pan_x = 0.0;
+            self.reader.pan_y = 0.0;
+            self.settings.fit = v;
+            config::save(&self.settings);
+            ui_acted = true;
+        }
+        if let Some(t) = self.ui.req_set_theme.take() {
+            self.settings.theme = t;
             config::save(&self.settings);
             self.window.request_redraw(); // repaint chrome + letterbox under the new theme
             ui_acted = true;

@@ -22,10 +22,17 @@ pub struct UiState {
     pub layout_label: &'static str,
     /// Whether the page-turn transition is on (for the "Turn:" button label).
     pub transition_on: bool,
-    /// Whether resume-last-book-on-startup is on (for the "Resume:" button label).
+    /// Whether resume-last-book-on-startup is on. Set each frame; drives the
+    /// Settings panel's Resume toggle.
     pub resume_on_startup: bool,
-    /// Current chrome theme name (for the "Theme:" button label); set each frame.
-    pub theme_label: &'static str,
+    // Current view state, set by the app each frame so the Settings panel can
+    // highlight the active value in each control group.
+    pub scroll_on: bool,
+    pub dir_rtl: bool,
+    pub layout_spread: bool,
+    pub fit_mode: u8,
+    pub rotation: u8,
+    pub theme: crate::config::ThemePref,
     /// Whether a volume is currently loaded. Distinguishes the onboarding panel
     /// (nothing open) from the library grid; set by the app each frame.
     pub reader_open: bool,
@@ -39,9 +46,17 @@ pub struct UiState {
     pub req_toggle_layout: bool,
     pub req_toggle_transition: bool,
     pub req_toggle_resume: bool,
-    /// Cycle the chrome theme (system → light → dark). Drained by the app.
-    pub req_cycle_theme: bool,
     pub req_toggle_library: bool,
+    /// Whether the Settings panel window is open (toggled by the top-bar gear).
+    pub settings_open: bool,
+    // Settings-panel requests, drained by the app after the frame.
+    pub req_toggle_scroll: bool,
+    pub req_toggle_pairing: bool,
+    pub req_rotate: bool,
+    /// Direct fit selection (0..3) from the panel's radio group.
+    pub req_set_fit: Option<u8>,
+    /// Direct theme selection from the panel's radio group.
+    pub req_set_theme: Option<crate::config::ThemePref>,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
     pub rescan: bool,
     /// Series whose section the user clicked to expand/collapse this frame
@@ -459,18 +474,15 @@ pub fn chrome(
             {
                 st.pending_open = Some(p);
             }
-            if ui.button("Library…").clicked()
-                && let Some(p) = rfd::FileDialog::new()
-                    .set_title("Choose a library folder")
-                    .pick_folder()
-            {
-                st.pending_library = Some(p);
-            }
-            // Grid↔Reader flip only makes sense with a warm book to flip to/from.
-            if st.reader_open && ui.button(if library_view { "Reader" } else { "Grid" }).clicked() {
+            // Library↔Reader flip only makes sense with a warm book to flip to/from.
+            // (Setting the library lives in the library view's "Change library…", not
+            // here — it's rare; mirrors the Android shell.)
+            if st.reader_open && ui.button(if library_view { "Reader" } else { "Library" }).clicked() {
                 st.req_toggle_library = true;
             }
             ui.separator();
+            // Frequently-changed, per-book view controls keep quick top-bar buttons;
+            // set-and-forget options (theme / resume / page-turn / …) live behind ⚙ Settings.
             if ui.button(format!("Dir: {}", st.dir_label)).clicked() {
                 st.req_toggle_dir = true;
             }
@@ -481,25 +493,11 @@ pub fn chrome(
                 st.req_toggle_layout = true;
             }
             if ui
-                .button(format!("Turn: {}", if st.transition_on { "on" } else { "off" }))
-                .on_hover_text("Page-turn transition (slide + fade on flip) — key T")
+                .button("⚙ Settings")
+                .on_hover_text("Reading mode, direction, layout, fit, rotation, page-turn, resume, theme")
                 .clicked()
             {
-                st.req_toggle_transition = true;
-            }
-            if ui
-                .button(format!("Resume: {}", if st.resume_on_startup { "on" } else { "off" }))
-                .on_hover_text("Reopen the last book you were reading when yosh starts")
-                .clicked()
-            {
-                st.req_toggle_resume = true;
-            }
-            if ui
-                .button(format!("Theme: {}", st.theme_label))
-                .on_hover_text("Chrome theme: system / light (e-ink) / dark")
-                .clicked()
-            {
-                st.req_cycle_theme = true;
+                st.settings_open = !st.settings_open;
             }
             if ui.button("? Help").clicked() {
                 st.help_open = !st.help_open;
@@ -584,11 +582,13 @@ pub fn chrome(
                 ui.separator();
                 ui.heading("Files");
                 ui.label("E   show in Explorer (open the folder & select the file)");
-                ui.label("Open folder / Open file / Library;  Grid ↔ Reader");
+                ui.label("Open folder / Open file;  Library ↔ Reader;  ⚙ Settings");
                 ui.label("drag a folder, archive, or image onto the window");
                 ui.label("F1   toggle this help");
             });
     }
+
+    settings_window(ctx, st);
 
     if st.info_open && !library_view && !st.info.is_empty() {
         egui::Area::new(egui::Id::new("info_overlay"))
@@ -760,6 +760,118 @@ pub fn chrome(
     }
 }
 
+/// The Settings panel (top-bar ⚙ button): a full mirror of the Android view-options
+/// popup (`yosh-android` `options_popup`). Frequently-changed view controls
+/// (direction/layout/fit) also have quick top-bar buttons; the set-and-forget ones
+/// (page-turn / resume / theme) live only here. Each control sets a `req_*` flag that
+/// the app drains after the frame. `.open` takes a local copy so the body can still
+/// borrow `st` for the controls.
+fn settings_window(ctx: &egui::Context, st: &mut UiState) {
+    if !st.settings_open {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("⚙ Settings")
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+
+            ui.label(egui::RichText::new("Reading mode").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!st.scroll_on, "Page-flip").clicked() && st.scroll_on {
+                    st.req_toggle_scroll = true;
+                }
+                if ui.selectable_label(st.scroll_on, "Scroll").clicked() && !st.scroll_on {
+                    st.req_toggle_scroll = true;
+                }
+            });
+
+            ui.label(egui::RichText::new("Reading direction").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!st.dir_rtl, "→ LTR").clicked() && st.dir_rtl {
+                    st.req_toggle_dir = true;
+                }
+                if ui.selectable_label(st.dir_rtl, "← RTL").clicked() && !st.dir_rtl {
+                    st.req_toggle_dir = true;
+                }
+            });
+
+            ui.label(egui::RichText::new("Page layout").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(!st.layout_spread, "Single").clicked() && st.layout_spread {
+                    st.req_toggle_layout = true;
+                }
+                if ui.selectable_label(st.layout_spread, "Two-page").clicked() && !st.layout_spread {
+                    st.req_toggle_layout = true;
+                }
+            });
+            // Pairing parity only matters in a spread.
+            if st.layout_spread
+                && ui
+                    .button("Shift page pairing")
+                    .on_hover_text("Fix a mis-paired spread (key O)")
+                    .clicked()
+            {
+                st.req_toggle_pairing = true;
+            }
+
+            ui.label(egui::RichText::new("Fit").strong());
+            ui.horizontal(|ui| {
+                for (i, text) in ["Window", "Width", "Height", "1:1"].iter().enumerate() {
+                    if ui.selectable_label(st.fit_mode == i as u8, *text).clicked() {
+                        st.req_set_fit = Some(i as u8);
+                    }
+                }
+            });
+
+            ui.label(egui::RichText::new("Rotation").strong());
+            if ui
+                .button(format!("Rotate 90° ⟳  ·  now {}°", st.rotation as u32 * 90))
+                .clicked()
+            {
+                st.req_rotate = true;
+            }
+
+            ui.separator();
+
+            ui.label(egui::RichText::new("Page-turn animation").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(st.transition_on, "On").clicked() && !st.transition_on {
+                    st.req_toggle_transition = true;
+                }
+                if ui.selectable_label(!st.transition_on, "Off").clicked() && st.transition_on {
+                    st.req_toggle_transition = true;
+                }
+            });
+
+            ui.label(egui::RichText::new("Resume on startup").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(st.resume_on_startup, "On").clicked() && !st.resume_on_startup {
+                    st.req_toggle_resume = true;
+                }
+                if ui.selectable_label(!st.resume_on_startup, "Off").clicked() && st.resume_on_startup {
+                    st.req_toggle_resume = true;
+                }
+            });
+
+            ui.label(egui::RichText::new("Theme").strong());
+            ui.horizontal(|ui| {
+                for (t, text) in [
+                    (crate::config::ThemePref::System, "System"),
+                    (crate::config::ThemePref::Light, "Light"),
+                    (crate::config::ThemePref::Dark, "Dark"),
+                ] {
+                    if ui.selectable_label(st.theme == t, text).clicked() {
+                        st.req_set_theme = Some(t);
+                    }
+                }
+            });
+        });
+    st.settings_open = open;
+}
+
 /// First-run onboarding, rendered *inside* the library view when no library folder
 /// is configured yet (the library is the home screen, so there's no separate "no
 /// comic open" page). Centered mascot + the two ways to get going: pick a library
@@ -886,6 +998,15 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
     ui.horizontal(|ui| {
         if ui.button("⟳ Rescan").on_hover_text("Re-scan the library folder").clicked() {
             st.rescan = true;
+        }
+        // Set/change the library root lives here (rare action), not in the top bar —
+        // mirrors the Android library's "Change library…".
+        if ui.button("📂 Change library…").on_hover_text("Pick a different comics folder").clicked()
+            && let Some(p) = rfd::FileDialog::new()
+                .set_title("Choose a library folder")
+                .pick_folder()
+        {
+            st.pending_library = Some(p);
         }
         if let Some(root) = &lib.root {
             ui.label(egui::RichText::new(root.to_string_lossy()).weak());
