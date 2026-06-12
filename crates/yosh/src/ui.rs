@@ -474,23 +474,27 @@ pub fn chrome(
             {
                 st.pending_open = Some(p);
             }
-            // Library↔Reader flip only makes sense with a warm book to flip to/from.
-            // (Setting the library lives in the library view's "Change library…", not
-            // here — it's rare; mirrors the Android shell.)
-            if st.reader_open && ui.button(if library_view { "Reader" } else { "Library" }).clicked() {
+            // Going *to* the library only makes sense with a warm book; the way *back*
+            // is the descriptive "Resume <book>" button on the right (added below),
+            // mirroring the Android shell. (Setting the library lives in the library
+            // view's "Change library…", not here — it's rare.)
+            if st.reader_open && !library_view && ui.button("Library").clicked() {
                 st.req_toggle_library = true;
             }
             ui.separator();
             // Frequently-changed, per-book view controls keep quick top-bar buttons;
             // set-and-forget options (theme / resume / page-turn / …) live behind ⚙ Settings.
-            if ui.button(format!("Dir: {}", st.dir_label)).clicked() {
-                st.req_toggle_dir = true;
-            }
-            if ui.button(format!("Fit: {}", st.fit_label)).clicked() {
-                st.req_cycle_fit = true;
-            }
-            if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
-                st.req_toggle_layout = true;
+            // They act on the open book, so they're hidden on the library grid.
+            if !library_view {
+                if ui.button(format!("Dir: {}", st.dir_label)).clicked() {
+                    st.req_toggle_dir = true;
+                }
+                if ui.button(format!("Fit: {}", st.fit_label)).clicked() {
+                    st.req_cycle_fit = true;
+                }
+                if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
+                    st.req_toggle_layout = true;
+                }
             }
             if ui
                 .button("⚙ Settings")
@@ -526,20 +530,47 @@ pub fn chrome(
                 }
             }
             ui.separator();
-            if !st.status.is_empty() {
-                ui.label(&st.status);
-                ui.separator();
-            }
-            match &st.opened {
-                Some(p) => {
-                    let short = p
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_else(|| p.to_str().unwrap_or(""));
-                    ui.label(short)
+            if library_view {
+                // The page indicator / volume name describe the open book, not the grid,
+                // so on the library they're replaced by a one-click "Resume <book>" back
+                // to the reader (shown only with a warm book — the library is the home,
+                // so there's nothing to return to otherwise). Mirrors the Android shell.
+                if st.reader_open {
+                    let label = match &st.opened {
+                        Some(p) => {
+                            let name = p
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or_else(|| p.to_str().unwrap_or(""));
+                            // Clip by char count (titles are often CJK) so a long name
+                            // can't push the other header buttons off-screen.
+                            let total = name.chars().count();
+                            let clip: String = name.chars().take(24).collect();
+                            let clip = if total > 24 { format!("{clip}…") } else { clip };
+                            format!("{}  Resume {clip}", egui_phosphor::fill::BOOK_OPEN)
+                        }
+                        None => format!("{}  Resume", egui_phosphor::fill::BOOK_OPEN),
+                    };
+                    if ui.button(label).clicked() {
+                        st.req_toggle_library = true;
+                    }
                 }
-                None => ui.label("no volume open"),
-            };
+            } else {
+                if !st.status.is_empty() {
+                    ui.label(&st.status);
+                    ui.separator();
+                }
+                match &st.opened {
+                    Some(p) => {
+                        let short = p
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_else(|| p.to_str().unwrap_or(""));
+                        ui.label(short)
+                    }
+                    None => ui.label("no volume open"),
+                };
+            }
         });
     });
 

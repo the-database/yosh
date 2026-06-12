@@ -1,5 +1,5 @@
 //! Image metadata probing for the info overlay: a header-only `probe` (dimensions
-//! + format string, no full decode) and a human-readable byte-size formatter.
+//! and a format string, no full decode) plus a human-readable byte-size formatter.
 //! Shared by the desktop and Android shells so both info overlays read identically.
 
 /// Human-readable byte size for the info overlay.
