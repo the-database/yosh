@@ -14,6 +14,7 @@ pub mod decode;
 pub mod gpu;
 pub mod icc;
 pub mod layout;
+pub mod meta;
 pub mod page;
 pub mod pool;
 pub mod prefetch;

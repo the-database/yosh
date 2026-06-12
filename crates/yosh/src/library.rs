@@ -153,6 +153,9 @@ pub struct LibCtx<'a> {
     pub last_pages: &'a HashMap<String, usize>,
     pub collapsed: &'a HashSet<String>,
     pub current_key: Option<&'a str>,
+    /// Most-recently-read volume paths, newest first — backs the "Recently read"
+    /// shelf at the top of the library view.
+    pub recents: &'a [String],
 }
 
 /// A volume's read state, derived from the shell's progress/last-page maps.

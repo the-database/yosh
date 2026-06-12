@@ -294,6 +294,13 @@ struct App {
     book_prompt: Option<BookPrompt>,
     show_options: bool,
     show_info: bool,
+    /// Page index the heavy info-overlay metadata (Format/Color/Size/Modified) was
+    /// last built for, so the page bytes are re-read only on a page change while the
+    /// info popup is open — not every frame. `None` ⇒ rebuild on next render.
+    info_for: Option<usize>,
+    /// Cached (label, value) metadata lines for `info_for`'s page. Spliced into
+    /// `build_info`'s per-frame lines so the byte read stays gated.
+    info_meta: Vec<(String, String)>,
     /// The user's layout choice. `reader.layout` is the concrete `Single`/`Spread`
     /// this resolves to (orientation-dependent for `Auto`); this is the source of
     /// truth that persists. See `apply_resolved_layout`.
@@ -709,6 +716,8 @@ impl ApplicationHandler for Shell {
             book_prompt: None,
             show_options: false,
             show_info: false,
+            info_for: None,
+            info_meta: Vec::new(),
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
             theme: self.init_view.6,
@@ -1514,6 +1523,7 @@ fn attach_source(
     reader.cache.clear();
     reader.lq_cache.clear();
     reader.failed.clear();
+    reader.rotation = 0; // each comic opens upright (mirrors the desktop shell)
     reader.index = start;
     reader.source = Some(src);
     reader.prefetch();
@@ -2301,6 +2311,7 @@ fn options_popup(
     resume_on: bool,
     scroll_on: bool,
     theme: ThemePref,
+    rotation: u8,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
@@ -2309,6 +2320,7 @@ fn options_popup(
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
     toggle_offset: &mut bool,
+    rotate: &mut bool,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
@@ -2398,6 +2410,17 @@ fn options_popup(
                         }
                     }
                 });
+
+                // Manual page rotation (single-page draws only — the engine ignores
+                // it for spreads). Per-comic and transient: not persisted, reset to
+                // upright on the next open, exactly like the desktop `R` key.
+                ui.label(egui::RichText::new("Rotation").strong());
+                if ui
+                    .button(egui::RichText::new(format!("Rotate 90° ⟳  ·  now {}°", rotation as u32 * 90)).size(16.0))
+                    .clicked()
+                {
+                    *rotate = true;
+                }
 
                 ui.label(egui::RichText::new("Page-turn animation").strong());
                 ui.horizontal(|ui| {
@@ -2567,8 +2590,45 @@ impl App {
         self.window.request_redraw();
     }
 
+    /// Re-read the displayed page's bytes once to compute the heavy info-overlay
+    /// metadata (Format / Color / Size / Modified), caching it under `info_for`. A
+    /// no-op unless the page changed since the last build, so the byte read stays
+    /// off the per-frame path. Mirrors the desktop `build_page_info`/`info_for`.
+    fn refresh_info_meta(&mut self) {
+        let Some(src) = &self.reader.source else {
+            self.info_for = None;
+            self.info_meta.clear();
+            return;
+        };
+        let len = src.len();
+        let idx = view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
+        if self.info_for == Some(idx) {
+            return;
+        }
+        let modified = src.modified(idx).unwrap_or_else(|| "—".to_string());
+        let (size, fmt, color) = match src.read_page(idx).ok() {
+            Some(b) => {
+                let detail = yosh_engine::meta::probe(&b).2;
+                let color = yosh_engine::icc::extract_icc(&b)
+                    .as_deref()
+                    .and_then(yosh_engine::icc::describe)
+                    .unwrap_or_else(|| "—".to_string());
+                (yosh_engine::meta::human_size(b.len() as u64), detail, color)
+            }
+            None => ("—".to_string(), "—".to_string(), "—".to_string()),
+        };
+        self.info_meta = vec![
+            ("Format".to_string(), fmt),
+            ("Color".to_string(), color),
+            ("Size".to_string(), size),
+            ("Modified".to_string(), modified),
+        ];
+        self.info_for = Some(idx);
+    }
+
     /// Build the image-info overlay lines from the current page + reader state
-    /// (the Android take on the desktop's "I" overlay).
+    /// (the Android take on the desktop's "I" overlay). The heavy metadata
+    /// (`info_meta`) is refreshed separately via `refresh_info_meta` (gated).
     fn build_info(&self) -> Vec<(String, String)> {
         let Some(src) = &self.reader.source else {
             return Vec::new();
@@ -2584,6 +2644,9 @@ impl App {
                 format!("{} × {}", self.config.width, self.config.height),
             ),
         ];
+        // Format / Color / Size / Modified — read from the page bytes, refreshed
+        // only on a page change (see `refresh_info_meta`) so this stays per-frame cheap.
+        lines.extend(self.info_meta.iter().cloned());
         if let Some(p) = self.reader.cache.get(idx) {
             lines.push(("Source".to_string(), format!("{} × {}", p.src_w, p.src_h)));
             lines.push(("Decoded".to_string(), format!("{} × {}", p.w, p.h)));
@@ -2805,6 +2868,11 @@ impl App {
         let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
         let show_options = self.show_options;
         let show_info = self.show_info;
+        if show_info {
+            self.refresh_info_meta(); // gated byte read → Format/Color/Size/Modified
+        } else {
+            self.info_for = None; // rebuild the metadata when the popup is next opened
+        }
         let info_lines = if show_info { self.build_info() } else { Vec::new() };
         let rtl = self.reader.direction == Direction::Rtl;
         let cur_dir = self.reader.direction;
@@ -2817,6 +2885,7 @@ impl App {
         let cur_resume = self.resume_on_startup;
         let cur_scroll = self.reader.scroll_mode;
         let cur_theme = self.theme;
+        let cur_rotation = self.reader.rotation;
         let drag_seam = self.reader.drag_seam();
         let cur_zoom = self.reader.zoom;
         let lib_dir_str = self.lib_dir.display().to_string();
@@ -2940,6 +3009,7 @@ impl App {
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
         let mut toggle_offset = false;
+        let mut rotate = false;
         let mut cycle_fit = false;
         let mut to_library = false;
         let mut page_nav: i64 = 0;
@@ -3186,6 +3256,7 @@ impl App {
                         cur_resume,
                         cur_scroll,
                         cur_theme,
+                        cur_rotation,
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
@@ -3194,6 +3265,7 @@ impl App {
                         &mut set_scroll,
                         &mut set_theme,
                         &mut toggle_offset,
+                        &mut rotate,
                     );
                 }
                 if show_info {
@@ -3351,6 +3423,14 @@ impl App {
             self.reader.index =
                 view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
             self.reader.prefetch();
+        }
+        if rotate {
+            self.reader.rotation = (self.reader.rotation + 1) % 4;
+            // The rotated box has new bounds, so any prior pan is now out of range.
+            self.reader.pan_x = 0.0;
+            self.reader.pan_y = 0.0;
+            self.reader.prefetch(); // re-decode at the rotation-aware 1:1 target
+            self.window.request_redraw();
         }
         reqs.page_nav = page_nav;
         reqs.book_nav = book_nav;

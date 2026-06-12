@@ -24,6 +24,8 @@ pub struct UiState {
     pub transition_on: bool,
     /// Whether resume-last-book-on-startup is on (for the "Resume:" button label).
     pub resume_on_startup: bool,
+    /// Current chrome theme name (for the "Theme:" button label); set each frame.
+    pub theme_label: &'static str,
     /// Whether a volume is currently loaded. Distinguishes the onboarding panel
     /// (nothing open) from the library grid; set by the app each frame.
     pub reader_open: bool,
@@ -37,6 +39,8 @@ pub struct UiState {
     pub req_toggle_layout: bool,
     pub req_toggle_transition: bool,
     pub req_toggle_resume: bool,
+    /// Cycle the chrome theme (system → light → dark). Drained by the app.
+    pub req_cycle_theme: bool,
     pub req_toggle_library: bool,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
     pub rescan: bool,
@@ -490,6 +494,13 @@ pub fn chrome(
             {
                 st.req_toggle_resume = true;
             }
+            if ui
+                .button(format!("Theme: {}", st.theme_label))
+                .on_hover_text("Chrome theme: system / light (e-ink) / dark")
+                .clicked()
+            {
+                st.req_cycle_theme = true;
+            }
             if ui.button("? Help").clicked() {
                 st.help_open = !st.help_open;
             }
@@ -848,6 +859,9 @@ fn decode_logo() -> Option<egui::ColorImage> {
 const CELL_W: f32 = 150.0;
 const COVER_H: f32 = 210.0;
 
+/// How many covers the "Recently read" shelf shows at most (newest first).
+const RECENTS_SHELF: usize = 12;
+
 /// The Chunky-style library: a vertical list of collapsible series sections, each
 /// a horizontal, scrollbar/drag-scrollable row of cover thumbnails with read-state
 /// visuals (faded "finished" covers, an in-progress bar, the open volume's stroke).
@@ -893,6 +907,7 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {
+        recents_row(ui, st, lib, libctx);
         for series in &lib.series {
             let key = series.dir.to_string_lossy();
             let expanded = !libctx.collapsed.contains(key.as_ref());
@@ -979,6 +994,59 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
             ui.add_space(10.0);
         }
     });
+}
+
+/// The "Recently read" shelf at the top of the library: the most-recently opened
+/// volumes (newest first) that still exist in the current library, drawn with the
+/// same cover cells as the series rows. Mirrors the Android library's recents row.
+/// No-op when there are no resolvable recents (e.g. a fresh library, or recents that
+/// all point outside the current root).
+fn recents_row(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibCtx) {
+    if libctx.recents.is_empty() {
+        return;
+    }
+    // Index volumes by their string key (matching how recents/last_pages are keyed:
+    // `path.to_string_lossy()`) so a recent resolves to its cover/name/state.
+    let mut by_key: std::collections::HashMap<String, &crate::library::Volume> =
+        std::collections::HashMap::new();
+    for series in &lib.series {
+        for v in &series.volumes {
+            by_key.insert(v.path.to_string_lossy().into_owned(), v);
+        }
+    }
+    let recents: Vec<&crate::library::Volume> = libctx
+        .recents
+        .iter()
+        .filter_map(|p| by_key.get(p).copied())
+        .take(RECENTS_SHELF)
+        .collect();
+    if recents.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Recently read").size(18.0).strong());
+    egui::ScrollArea::horizontal()
+        .id_salt("recents_row")
+        .scroll_source(egui::scroll_area::ScrollSource {
+            scroll_bar: true,
+            drag: true,
+            mouse_wheel: false,
+        })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for v in &recents {
+                    let key = v.path.to_string_lossy();
+                    let state = vol_state(libctx.progress, libctx.last_pages, key.as_ref());
+                    let is_current = libctx.current_key == Some(key.as_ref());
+                    // Recents may belong to a collapsed or off-screen series; queue
+                    // their covers so the shelf isn't left blank.
+                    st.visible_covers.push(v.path.clone());
+                    volume_cell(ui, st, &v.name, v.path.clone(), v.thumb, state, is_current);
+                }
+            });
+        });
+    ui.add_space(10.0);
+    ui.separator();
 }
 
 /// One volume in a series row: cover (faded when finished, thin progress bar when
