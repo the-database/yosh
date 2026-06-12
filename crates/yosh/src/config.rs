@@ -38,27 +38,12 @@ pub enum ThemePref {
 
 impl ThemePref {
     /// Resolve to dark-vs-light, consulting the cached OS night-mode flag for `System`.
+    /// The Settings panel selects a variant directly, so no label/cycle helpers needed.
     pub fn is_dark(self, system_dark: bool) -> bool {
         match self {
             ThemePref::System => system_dark,
             ThemePref::Light => false,
             ThemePref::Dark => true,
-        }
-    }
-    /// Short label for the top-bar "Theme:" button.
-    pub fn label(self) -> &'static str {
-        match self {
-            ThemePref::System => "system",
-            ThemePref::Light => "light",
-            ThemePref::Dark => "dark",
-        }
-    }
-    /// Next preference for the cycling top-bar button (system → light → dark → …).
-    pub fn cycle(self) -> Self {
-        match self {
-            ThemePref::System => ThemePref::Light,
-            ThemePref::Light => ThemePref::Dark,
-            ThemePref::Dark => ThemePref::System,
         }
     }
 }
@@ -131,7 +116,9 @@ impl Default for Settings {
             help_seen: false,
             seekbar_enabled: true,
             page_transition_enabled: false, // desktop default off; Android shell forces on
-            theme: ThemePref::System,
+            // Dark by default on desktop (a backlit monitor); intentionally unlike the
+            // Android shell, which defaults to System so e-ink panels get Light.
+            theme: ThemePref::Dark,
             window: None,
         }
     }
