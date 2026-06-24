@@ -599,16 +599,59 @@ impl Reader {
         (sw - dw) / 2.0 + self.pan_x.clamp(-maxp, maxp)
     }
 
-    /// Displayed height of the current page under the active fit + zoom.
-    pub fn current_display_h(&self) -> f32 {
+    /// Displayed dimensions `(width, height)` of the current page/spread under the
+    /// active fit + zoom. Computes the exact on-screen size (accounting for spreads
+    /// and 1:1 scale) so pan bounds and edge detection perfectly match the rendered quad.
+    pub fn display_dims(&self) -> Option<(f32, f32)> {
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
-        match self.cache.get(self.index) {
-            Some(t) => {
-                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
-            }
-            None => sh,
+        if self.scroll_mode {
+            let cw = sw * self.zoom;
+            let dh = self.page_display_h(self.index, sw);
+            return Some((cw, dh));
         }
+        let len = self.source.as_ref()?.len();
+        if len == 0 {
+            return None;
+        }
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let ta = self.cache.get(a)?;
+        let force_single = ta.w > ta.h;
+        let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
+
+        match tb {
+            Some(tb) => {
+                let h_ref = ta.h.max(tb.h) as f32;
+                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
+                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
+                let combined_w = wa + wb;
+                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref) * self.zoom;
+                Some((combined_w * s, h_ref * s))
+            }
+            None => {
+                if self.fit == FitMode::Actual {
+                    let (nw, nh) = if self.rotation % 2 == 1 {
+                        (ta.src_h as f32, ta.src_w as f32)
+                    } else {
+                        (ta.src_w as f32, ta.src_h as f32)
+                    };
+                    Some((nw * self.zoom, nh * self.zoom))
+                } else {
+                    let (ew, eh) = if self.rotation % 2 == 1 {
+                        (ta.h as f32, ta.w as f32)
+                    } else {
+                        (ta.w as f32, ta.h as f32)
+                    };
+                    let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+                    Some((ew * s, eh * s))
+                }
+            }
+        }
+    }
+
+    /// Displayed height of the current page under the active fit + zoom.
+    pub fn current_display_h(&self) -> f32 {
+        self.display_dims().map_or(self.viewport.h.max(1) as f32, |(_, dh)| dh)
     }
 
     /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h)` — the inputs
@@ -821,18 +864,9 @@ impl Reader {
             self.pan_x = self.pan_x.clamp(-mx, mx);
             return;
         }
-        if let Some(t) = self.cache.get(self.index) {
-            // Match single_quad's rotated bounding box so pan clamps to the
-            // displayed (possibly turned) page, not the source orientation.
-            let single = self.layout == Layout::Single || t.w > t.h;
-            let (ew, eh) = if single && self.rotation % 2 == 1 {
-                (t.h as f32, t.w as f32)
-            } else {
-                (t.w as f32, t.h as f32)
-            };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
-            let mx = ((ew * s - sw) / 2.0).max(0.0);
-            let my = ((eh * s - sh) / 2.0).max(0.0);
+        if let Some((dw, dh)) = self.display_dims() {
+            let mx = ((dw - sw) / 2.0).max(0.0);
+            let my = ((dh - sh) / 2.0).max(0.0);
             self.pan_x = self.pan_x.clamp(-mx, mx);
             self.pan_y = self.pan_y.clamp(-my, my);
         }
