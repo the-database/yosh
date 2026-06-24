@@ -603,7 +603,7 @@ pub fn chrome(
                 ui.label("O   shift spread pairing (fix wrong pairing)");
                 ui.separator();
                 ui.heading("View");
-                ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
+                ui.label("+ / −   zoom;   Ctrl+wheel — zoom at cursor;   drag — pan");
                 ui.label("R   rotate 90° (clockwise)");
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");

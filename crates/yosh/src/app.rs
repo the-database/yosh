@@ -132,6 +132,7 @@ struct State {
     page_pipeline: PagePipeline,
     cursor_x: f64,
     cursor_y: f64,
+    ctrl_held: bool,
     mouse_down: bool,
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     cursor_in_window: bool, // gates the edge-hover navigation arrows
@@ -660,6 +661,7 @@ impl ApplicationHandler for App {
             page_pipeline,
             cursor_x: 0.0,
             cursor_y: 0.0,
+            ctrl_held: false,
             mouse_down: false,
             drag_dist: 0.0,
             cursor_in_window: false,
@@ -781,6 +783,9 @@ impl ApplicationHandler for App {
             // on screen. A later CursorMoved / CursorEntered re-arms the flag.
             WindowEvent::Focused(false) | WindowEvent::Occluded(true) => {
                 state.cursor_in_window = false
+            }
+            WindowEvent::ModifiersChanged(m) => {
+                state.ctrl_held = m.state().control_key();
             }
             _ => {}
         }
@@ -1175,8 +1180,20 @@ impl State {
     }
 
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
-    /// the page already fits.
+    /// the page already fits. Ctrl+wheel = focal-point zoom at the cursor.
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        // Ctrl+wheel: zoom at the cursor position (focal-point zoom).
+        if self.ctrl_held {
+            let dy = match delta {
+                MouseScrollDelta::LineDelta(_, y) => y,
+                MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 50.0,
+            };
+            if dy == 0.0 {
+                return;
+            }
+            self.zoom_at_cursor(dy);
+            return;
+        }
         if self.reader.scroll_mode {
             let dy_px = match delta {
                 MouseScrollDelta::LineDelta(_, y) => y * SCROLL_WHEEL_PX,
@@ -1244,6 +1261,40 @@ impl State {
             self.reader.pan_y = next;
             self.reader.pan_edge_at = None; // panning within the page
         }
+    }
+
+    /// Focal-point zoom: scale the view so the content under the cursor stays
+    /// fixed. `dy > 0` zooms in, `dy < 0` zooms out. Same math as the Android
+    /// pinch-to-zoom focal point (lib.rs lines 958–966).
+    fn zoom_at_cursor(&mut self, dy: f32) {
+        let sw = self.reader.viewport.w.max(1) as f32;
+        let sh = self.reader.viewport.h.max(1) as f32;
+        let old_zoom = self.reader.zoom;
+        // Smooth factor: each notch scales by ~25%.
+        let factor = (1.25_f32).powf(dy);
+        self.reader.zoom *= factor;
+        self.reader.clamp_zoom_native();
+        let k = self.reader.zoom / old_zoom;
+        // Cursor offset from the viewport center (the page's anchor point).
+        let cx = self.cursor_x as f32 - sw / 2.0;
+        let cy = self.cursor_y as f32 - sh / 2.0;
+        // Glide factor: as we zoom in (dy > 0), smoothly pull the focus point towards
+        // the center of the screen (0, 0). 0.75 means it moves 25% closer per notch.
+        let glide = (0.75_f32).powf(dy);
+        let target_cx = cx * glide;
+        let target_cy = cy * glide;
+
+        // Adjust pan so the content point under the cursor glides to the target offset:
+        // new_pan = target_offset - k * (cursor_offset - old_pan)
+        if self.reader.scroll_mode {
+            self.reader.pan_x = target_cx - k * (cx - self.reader.pan_x);
+        } else {
+            self.reader.pan_x = target_cx - k * (cx - self.reader.pan_x);
+            self.reader.pan_y = target_cy - k * (cy - self.reader.pan_y);
+        }
+        self.reader.clamp_pan();
+        let pct = self.reader.effective_zoom_pct();
+        self.toast(format!("Zoom {pct:.0}%"));
     }
 
     /// A clean click: the left/right edge strips flip pages; the wide middle
