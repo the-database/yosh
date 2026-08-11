@@ -147,6 +147,10 @@ struct State {
     /// settings so a session spent entirely maximized still persists the prior
     /// restored rect; updated on move/resize; written back on exit.
     win_geom: Option<(i32, i32, u32, u32)>,
+    /// Whether the window was maximized, sampled alongside `win_geom` while not
+    /// fullscreen. Persisted instead of a live `is_maximized()` so quitting from
+    /// fullscreen still restores the maximized state underneath it.
+    win_maximized: bool,
     volume_key: Option<String>,
     /// Visible page(s) the Tab info overlay text was built for, as
     /// `Reader::visible_pages` reports them (None = rebuild needed).
@@ -666,6 +670,7 @@ impl ApplicationHandler for App {
             cursor_in_window: false,
             last_mid_click: None,
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
+            win_maximized: settings.window.is_some_and(|w| w.maximized),
             settings,
             system_dark,
             volume_key: None,
@@ -739,9 +744,10 @@ impl ApplicationHandler for App {
                 // input event between renders sees the new size (as it did when
                 // these reads came straight from `gpu.config`).
                 state.reader.viewport = state.content_viewport();
-                state.record_window_geometry();
             }
-            WindowEvent::Moved(_) => state.record_window_geometry(),
+            // Geometry is sampled in `render`, not here — see
+            // `record_window_geometry` for why the event-time state is unreliable.
+            WindowEvent::Moved(_) => {}
             // OS switched day/night: refresh the cached flag so a `System` theme
             // follows it (buys_frame below repaints the chrome).
             WindowEvent::ThemeChanged(theme) => {
@@ -1121,14 +1127,28 @@ impl State {
         }
     }
 
-    /// Persist the current position + settings (called on close).
-    /// Snapshot the window's restored (non-maximized, non-fullscreen) geometry.
-    /// Maximizing/fullscreen reports the filled-screen rect, which we don't want
-    /// as the restore target, so those states are skipped — `win_geom` keeps the
-    /// last normal rect, which is exactly what we persist.
+    /// Snapshot the window's restored (non-maximized, non-fullscreen) geometry and
+    /// whether it is maximized. `win_geom` keeps the last *normal* rect, which is
+    /// what an un-maximize should return to, and what we persist.
+    ///
+    /// **Called once per frame from `render`, never from the event handlers.** On
+    /// Windows a maximize delivers `WM_MOVE` before `WM_SIZE`, and winit only sets
+    /// its `MAXIMIZED` flag while handling `WM_SIZE` — so a `Moved` handler sees
+    /// `is_maximized() == false` alongside the already-maximized rect and records
+    /// the filled-screen rect as the restore target. (That poisoned the saved
+    /// geometry: the window reopened correctly maximized, but un-maximizing landed
+    /// on a near-fullscreen rect, and exiting from fullscreen reopened *windowed*
+    /// at that size.) By render time both messages have been processed, so the
+    /// maximized flag and the rect agree.
     fn record_window_geometry(&mut self) {
-        if self.window.is_maximized() || self.window.fullscreen().is_some() {
+        // Fullscreen reports the filled-screen rect and hides the underlying
+        // maximized state, so leave both snapshots alone and keep what we had.
+        if self.window.fullscreen().is_some() {
             return;
+        }
+        self.win_maximized = self.window.is_maximized();
+        if self.win_maximized {
+            return; // maximized rect isn't the restore target
         }
         let Ok(pos) = self.window.outer_position() else {
             return;
@@ -1143,16 +1163,18 @@ impl State {
         if let Some(k) = &self.volume_key {
             self.settings.last_pages.insert(k.clone(), self.reader.index);
         }
-        // Save geometry + the current maximized flag. `win_geom` already holds the
-        // restored rect (it's only updated while normal), so an un-maximize after
-        // restart returns to the right size/position.
+        // Save geometry + the maximized flag. Both come from the per-frame snapshot:
+        // `win_geom` holds the last *normal* rect (so an un-maximize after restart
+        // returns to the right size/position) and `win_maximized` is the last state
+        // seen outside fullscreen (so quitting from fullscreen still reopens
+        // maximized rather than windowed at the filled-screen size).
         if let Some((x, y, w, h)) = self.win_geom {
             self.settings.window = Some(config::WindowState {
                 x,
                 y,
                 w,
                 h,
-                maximized: self.window.is_maximized(),
+                maximized: self.win_maximized,
             });
         }
         config::save(&self.settings);
@@ -1987,6 +2009,8 @@ impl State {
         // reading math reads instead of `gpu.config`), less the top-bar inset so
         // the chrome never covers the page.
         self.reader.viewport = self.content_viewport();
+        // Sample window geometry here, where a move/resize has fully settled.
+        self.record_window_geometry();
         if let Some(p) = self.ui.pending_open.take() {
             self.open(&p);
         }
