@@ -642,6 +642,34 @@ impl Reader {
         Some((sw, sh, fit_w, fit_h, dec_h, ta.src_h.max(1) as f32))
     }
 
+    /// The page(s) actually on screen right now, as `(anchor, facing?)`.
+    ///
+    /// [`layout::view_pages`] gives the *pairing* for an index, but two reader-side
+    /// rules decide what's really drawn, and shells must not re-derive them: a wide
+    /// (landscape) page is a pre-joined double-spread and shows alone, and continuous
+    /// scroll has no pairing at all. Both mirror `place_view`.
+    ///
+    /// This also normalizes the anchor: `goto` sets `index` directly, so after a
+    /// seekbar jump `index` can be the *second* page of a pair — callers that use it
+    /// raw end up describing a different page than the title does.
+    ///
+    /// Deliberately independent of decode state, so the answer doesn't flicker while
+    /// the facing page is still decoding. Don't read `build_quads()` for this: during
+    /// a page-turn transition or a live drag it also carries the outgoing view.
+    pub fn visible_pages(&self) -> (usize, Option<usize>) {
+        let len = self.source.as_ref().map_or(0, |s| s.len());
+        if len == 0 {
+            return (self.index, None);
+        }
+        if self.scroll_mode {
+            return (self.index.min(len - 1), None);
+        }
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        // Wide (landscape) anchor is a double-page image → it shows alone.
+        let wide = self.cache.get(a).is_some_and(|t| t.w > t.h);
+        (a, if wide { None } else { b })
+    }
+
     /// device-px-per-native-px of the in-view anchor page, matching exactly what
     /// `build_quads` draws (single vs. facing-pair dims). `None` while the anchor
     /// isn't decoded yet.

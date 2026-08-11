@@ -148,8 +148,9 @@ struct State {
     /// restored rect; updated on move/resize; written back on exit.
     win_geom: Option<(i32, i32, u32, u32)>,
     volume_key: Option<String>,
-    /// Page index the Tab info overlay text was built for (None = rebuild needed).
-    info_for: Option<usize>,
+    /// Visible page(s) the Tab info overlay text was built for, as
+    /// `Reader::visible_pages` reports them (None = rebuild needed).
+    info_for: Option<(usize, Option<usize>)>,
     /// The anchor page currently waiting to decode and when that wait began,
     /// used to delay the loading spinner *per page* (so a fast page reached at
     /// the end of a slow-seek streak still gets its own grace period). None as
@@ -737,10 +738,7 @@ impl ApplicationHandler for App {
                 // Keep the reading viewport in lock-step with the surface so an
                 // input event between renders sees the new size (as it did when
                 // these reads came straight from `gpu.config`).
-                state.reader.viewport = Viewport {
-                    w: state.gpu.config.width,
-                    h: state.gpu.config.height,
-                };
+                state.reader.viewport = state.content_viewport();
                 state.record_window_geometry();
             }
             WindowEvent::Moved(_) => state.record_window_geometry(),
@@ -1914,43 +1912,81 @@ impl State {
         if len == 0 {
             return "yosh".to_string();
         }
-        // The page actually shown (anchor): `index` in single/scroll, the first
-        // page of the pair in a two-page spread.
-        let anchor = if self.reader.scroll_mode {
-            self.reader.index
-        } else {
-            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
-        }
-        .min(len - 1);
-        let name = src.name(anchor);
+        // The page(s) actually shown — both halves of a two-page spread, not just
+        // the anchor (issue #12).
+        let (anchor, facing) = self.reader.visible_pages();
+        let anchor = anchor.min(len - 1);
+        let facing = facing.filter(|b| *b < len);
         // Just the basename — archive entries can carry a subfolder path.
-        let file = std::path::Path::new(name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(name);
-        // Native resolution of the shown page, Firefox-tab style. Pulled from the
-        // decoded texture (`src_w`/`src_h` are pre-downscale source dims), so it
-        // appears once the page lands and is empty while it's still decoding.
-        let res = match self.reader.cache.get(anchor) {
+        let base = |i: usize| {
+            let name = src.name(i);
+            std::path::Path::new(name)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(name)
+                .to_string()
+        };
+        // Native resolution, Firefox-tab style. Pulled from the decoded texture
+        // (`src_w`/`src_h` are pre-downscale source dims), so it appears once the
+        // page lands and is empty while it's still decoding.
+        let res = |i: usize| match self.reader.cache.get(i) {
             Some(t) if t.src_w > 0 && t.src_h > 0 => format!(" ({} × {})", t.src_w, t.src_h),
             _ => String::new(),
         };
-        let pos = format!("[ {} / {} ] - yosh", anchor + 1, len);
+        let (file, pos) = match facing {
+            // Reading order, so the pair reads the way it's drawn.
+            Some(b) if self.reader.direction == Direction::Rtl => (
+                format!("{}{} | {}{}", base(b), res(b), base(anchor), res(anchor)),
+                format!("[ {}-{} / {} ] - yosh", anchor + 1, b + 1, len),
+            ),
+            Some(b) => (
+                format!("{}{} | {}{}", base(anchor), res(anchor), base(b), res(b)),
+                format!("[ {}-{} / {} ] - yosh", anchor + 1, b + 1, len),
+            ),
+            None => (
+                format!("{}{}", base(anchor), res(anchor)),
+                format!("[ {} / {} ] - yosh", anchor + 1, len),
+            ),
+        };
         match self.ui.opened.as_ref().and_then(|p| p.file_name()).and_then(|n| n.to_str()) {
-            Some(book) => format!("{book} > {file}{res} {pos}"),
-            None => format!("{file}{res} {pos}"),
+            Some(book) => format!("{book} > {file} {pos}"),
+            None => format!("{file} {pos}"),
+        }
+    }
+
+    /// Physical pixels of surface reserved at the top for the chrome bar.
+    ///
+    /// The page is drawn by wgpu straight onto the surface, while the top bar is an
+    /// egui `TopBottomPanel` painted over it afterwards — so unless we inset the
+    /// page ourselves, an opaque bar simply covers its top (issue #10).
+    ///
+    /// Only the *pinned* (windowed) bar reserves space. In fullscreen the bar is a
+    /// hover-reveal overlay whose height egui **animates**, and the viewport feeds
+    /// `page_target_h` → `JobsKey`, so insetting by an animating height would churn
+    /// the decode target every frame of the reveal. Treating it as a pure overlay
+    /// keeps the height constant except across a real windowed/fullscreen change.
+    fn top_inset_px(&self) -> f32 {
+        if self.window.fullscreen().is_some() {
+            0.0
+        } else {
+            self.ui.bar_px.max(0.0).min(self.gpu.config.height as f32 * 0.5)
+        }
+    }
+
+    /// The reading viewport: the surface minus the space reserved for the top bar.
+    fn content_viewport(&self) -> Viewport {
+        Viewport {
+            w: self.gpu.config.width,
+            h: (self.gpu.config.height as f32 - self.top_inset_px()).max(1.0) as u32,
         }
     }
 
     #[allow(deprecated)]
     fn render(&mut self) {
         // Mirror the live surface size into the reading viewport (the value the
-        // reading math reads instead of `gpu.config`). Equal to `gpu.config` by
-        // construction, so this is a no-op for behavior.
-        self.reader.viewport = Viewport {
-            w: self.gpu.config.width,
-            h: self.gpu.config.height,
-        };
+        // reading math reads instead of `gpu.config`), less the top-bar inset so
+        // the chrome never covers the page.
+        self.reader.viewport = self.content_viewport();
         if let Some(p) = self.ui.pending_open.take() {
             self.open(&p);
         }
@@ -2030,9 +2066,19 @@ impl State {
         self.ui.reader_open = self.reader.source.is_some();
         self.ui.has_library_root = self.settings.library_root.is_some();
         // Build the Tab info overlay text, reading the source once per page change.
-        if self.ui.info_open && !self.library_view && self.info_for != Some(self.reader.index) {
-            self.ui.info = self.build_page_info(self.reader.index);
-            self.info_for = Some(self.reader.index);
+        // Keyed on the *visible* pages, not the raw index: `goto` doesn't normalize
+        // to the pair anchor, so a seekbar jump could land `index` on the second
+        // page and describe a different page than the title (issue #12).
+        let visible = self.reader.visible_pages();
+        if self.ui.info_open && !self.library_view && self.info_for != Some(visible) {
+            let (a, b) = visible;
+            self.ui.info = self.build_page_info(a);
+            // Both halves of a spread get described, separated by a blank row.
+            if let Some(b) = b {
+                self.ui.info.push((String::new(), String::new()));
+                self.ui.info.extend(self.build_page_info(b));
+            }
+            self.info_for = Some(visible);
         }
         // Live view state for the overlays: current zoom % (shown in the info
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
@@ -2081,11 +2127,7 @@ impl State {
         self.ui.seek_hovered = false;
         if let Some(src) = &self.reader.source {
             let len = src.len();
-            let anchor = if self.reader.scroll_mode {
-                self.reader.index
-            } else {
-                layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
-            };
+            let (anchor, facing) = self.reader.visible_pages();
             let in_cache = self.reader.cache.contains(anchor);
             // A page whose decode errored is in `failed`; treat it as not-loading so
             // we show a failure notice (file name + reason) instead of spinning.
@@ -2096,9 +2138,15 @@ impl State {
             if in_cache {
                 self.reader.last_drawn = Some(anchor);
             }
+            // Count from the visible anchor (and span the pair), so the status line
+            // agrees with the window title instead of drifting by one in spread mode.
+            let shown = match facing {
+                Some(b) => format!("{}-{}", anchor + 1, b + 1),
+                None => format!("{}", anchor + 1),
+            };
             self.ui.status = format!(
                 "{}/{}{}",
-                self.reader.index + 1,
+                shown,
                 len,
                 if failed {
                     "  [failed]"
@@ -2135,7 +2183,10 @@ impl State {
             self.ui.seek_buffered.extend(self.reader.cache.buffered_indices());
             self.ui.seek_lq_buffered.clear();
             self.ui.seek_lq_buffered.extend(self.reader.lq_cache.buffered_indices());
-            let win_h = self.reader.viewport.h.max(1) as f32;
+            // Window-relative, so measure against the *surface* height, not the
+            // page viewport (which is inset by the top bar) — otherwise the reveal
+            // zone would sit a bar's height too high.
+            let win_h = self.gpu.config.height.max(1) as f32;
             let near_bottom =
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
             self.ui.seek_show =
@@ -2236,6 +2287,22 @@ impl State {
                 multiview_mask: None,
             });
             if !page_bgs.is_empty() {
+                // Draw into the region below the top bar. The quads were built in NDC
+                // against `reader.viewport`, which is already the inset height, so this
+                // maps them onto exactly that sub-rect — no engine-side origin needed.
+                // `LoadOp::Clear` above still covers the whole surface, so the strip
+                // behind the bar keeps the background color.
+                let inset = self.top_inset_px();
+                if inset > 0.0 {
+                    pass.set_viewport(
+                        0.0,
+                        inset,
+                        self.gpu.config.width as f32,
+                        (self.gpu.config.height as f32 - inset).max(1.0),
+                        0.0,
+                        1.0,
+                    );
+                }
                 pass.set_pipeline(&self.page_pipeline.pipeline);
                 for bg in &page_bgs {
                     pass.set_bind_group(0, bg, &[]);

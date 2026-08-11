@@ -76,7 +76,7 @@ cargo test  -p yosh spread                             # run a subset of tests b
     column 50/50 — a horizontal smear that beats against halftones. So `single_quad`/`build_quads` **round the
     page's screen position and size to integers** in the page-flip path. (Scroll keeps sub-pixel placement so
     motion stays smooth — its transient softness is acceptable.)
-  - **How the invariant is enforced — exact per-page decode targets.** `app.rs::page_target_h(i)` computes
+  - **How the invariant is enforced — exact per-page decode targets.** `reader.rs::page_target_h(i)` computes
     each page's *exact* on-screen displayed pixel height (from its source aspect + the active fit/zoom/layout,
     pairing-aware for spreads, width-based for scroll), and `prefetch` passes it per page to the pool as
     `(index, target_h)` jobs — so the CPU resize lands the texture at its drawn size and the GPU samples 1:1.
@@ -92,12 +92,23 @@ cargo test  -p yosh spread                             # run a subset of tests b
     and a second GPU downscale is exactly what the invariant forbids. (An old dormant `Downscaler` blit was
     removed; recover it from git history if a *high-quality* GPU resize is ever attempted.) The only GPU
     resampling is the page-draw sampler, which is a no-op at the 1:1 sizes the exact targets produce — see
-    the `decode_target_matches_drawn_size{,_rotated,_actual_zoomed_out}` tests in `app.rs`, which prove the
+    the `decode_target_matches_drawn_size{,_rotated,_actual_zoomed_out}` tests in `reader.rs`, which prove the
     decode target equals the drawn size (GPU samples 1:1) across fits, 90° rotation, and 1:1 zoom-out.
 
+> **Where the reading math lives.** `page_target_h`, `single_quad`/`build_quads`, `Viewport`, and the
+> invariant tests are in `crates/yosh-engine/src/reader.rs`; `FitMode`/`fit_scale` are in
+> `yosh-engine/src/page.rs`. `crates/yosh/src/app.rs` is the *shell* — window, input, egui chrome — and
+> feeds the engine a `Viewport` each frame. (These moved out of `app.rs` in the engine extraction.)
+
 ### Central state and the frame loop
-- **`app.rs` (~1.7k lines) — `State`** is the winit `ApplicationHandler` and owns everything: gpu, egui,
-  the `PageSource`, the `DecodePool`, the `PageCache`, nav/layout/zoom/pan/scroll state, and persisted settings.
+- **`app.rs` — `State`** is the winit `ApplicationHandler` and owns the shell: gpu, egui, the `Reader`
+  (which itself holds the `PageSource`, `DecodePool`, `PageCache`, and nav/layout/zoom/pan/scroll state),
+  and persisted settings.
+  - The page is drawn by wgpu directly onto the surface and the egui chrome is painted *over* it
+    afterwards, so the top bar would cover the page unless the shell reserves space: `top_inset_px()` /
+    `content_viewport()` shrink `reader.viewport` and `set_viewport` on the page pass draws below the bar.
+    Only the *pinned* (windowed) bar insets — the fullscreen hover-reveal bar animates its height, and the
+    viewport feeds `page_target_h` → `JobsKey`, so insetting by it would churn the decode target.
   - **`render()`** is the per-frame heart: drain the pool, recompute+debounce the decode view
     (`update_decode_view`), build draw quads, draw pages, then the egui chrome. Re-read this before touching
     frame behavior.

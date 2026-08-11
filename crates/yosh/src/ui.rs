@@ -72,6 +72,11 @@ pub struct UiState {
     /// Whether to draw the top chrome bar (hidden in fullscreen unless the
     /// cursor is at the top edge). Set by the app each frame.
     pub show_bar: bool,
+    /// Measured height of the top bar in *physical* pixels, reported back by
+    /// `chrome` each frame (0 when the bar isn't drawn). The app reserves this
+    /// much space above the page so an opaque bar never covers it — the page is
+    /// drawn by wgpu, not egui, so the panel's layout doesn't inset it on its own.
+    pub bar_px: f32,
     /// Tab info overlay: whether it's shown, and its (label, value) lines (built
     /// by the app for the current page).
     pub info_open: bool,
@@ -178,7 +183,7 @@ fn nav_arrow(ctx: &egui::Context, id: &str, align: egui::Align2, offset: egui::V
             let p = ui.painter();
             let c = rect.center();
             p.circle_filled(c, 27.0, egui::Color32::from_black_alpha(96));
-            let stroke = egui::Stroke::new(5.0, egui::Color32::from_white_alpha(205));
+            let stroke = egui::Stroke::new(5.0_f32, egui::Color32::from_white_alpha(205));
             let (dx, dy) = (10.0, 18.0);
             let (tip, back) = if left { (-dx, dx) } else { (dx, -dx) };
             p.line_segment([c + egui::vec2(back, -dy), c + egui::vec2(tip, 0.0)], stroke);
@@ -235,7 +240,7 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     let p = ui.painter();
                     p.line_segment(
                         [egui::pos2(x0, cy), egui::pos2(x1, cy)],
-                        egui::Stroke::new(8.0, egui::Color32::from_white_alpha(60)),
+                        egui::Stroke::new(8.0_f32, egui::Color32::from_white_alpha(60)),
                     );
                     // mpv-style cache bar: a thin strip just under the track marking
                     // which pages are buffered (the decode-ahead ready set). The
@@ -282,13 +287,13 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     let start_x = if rtl { x1 } else { x0 };
                     p.line_segment(
                         [egui::pos2(start_x, cy), egui::pos2(handle_x, cy)],
-                        egui::Stroke::new(8.0, egui::Color32::from_white_alpha(190)),
+                        egui::Stroke::new(8.0_f32, egui::Color32::from_white_alpha(190)),
                     );
                     p.circle_filled(egui::pos2(handle_x, cy), r, egui::Color32::WHITE);
                     p.circle_stroke(
                         egui::pos2(handle_x, cy),
                         r,
-                        egui::Stroke::new(2.0, egui::Color32::from_black_alpha(120)),
+                        egui::Stroke::new(2.0_f32, egui::Color32::from_black_alpha(120)),
                     );
 
                     // Click or drag (live scrub) jumps to the page under the pointer.
@@ -421,11 +426,11 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
                             let p = ui.painter();
                             p.line_segment(
                                 [egui::pos2(x0, cy), egui::pos2(x1, cy)],
-                                egui::Stroke::new(5.0, egui::Color32::from_white_alpha(55)),
+                                egui::Stroke::new(5.0_f32, egui::Color32::from_white_alpha(55)),
                             );
                             p.line_segment(
                                 [egui::pos2(x0, cy), egui::pos2(hx, cy)],
-                                egui::Stroke::new(5.0, egui::Color32::from_white_alpha(200)),
+                                egui::Stroke::new(5.0_f32, egui::Color32::from_white_alpha(200)),
                             );
                             p.circle_filled(egui::pos2(hx, cy), 5.0, egui::Color32::WHITE);
                         }
@@ -453,7 +458,7 @@ pub fn chrome(
     library_view: bool,
 ) {
     let show_bar = st.show_bar;
-    egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
+    let bar = egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
         ui.horizontal(|ui| {
             if ui.button("Open folder…").clicked()
                 && let Some(p) = rfd::FileDialog::new().set_title("Open page folder").pick_folder()
@@ -573,6 +578,12 @@ pub fn chrome(
             }
         });
     });
+    // Report the bar's measured height back to the app, which reserves that much
+    // space above the page. `show_animated` returns None while the panel is fully
+    // collapsed, and animates the height while it opens/closes — the app only
+    // *uses* this when the bar is pinned (windowed), so the animating value never
+    // reaches the decode target. Physical px: the reader's viewport is physical.
+    st.bar_px = bar.map_or(0.0, |b| b.response.rect.height() * ctx.pixels_per_point());
 
     if st.help_open {
         egui::Window::new("yosh — keys")
@@ -622,8 +633,12 @@ pub fn chrome(
     settings_window(ctx, st);
 
     if st.info_open && !library_view && !st.info.is_empty() {
+        // Sit just under the bar, whatever height it actually is (it was a
+        // hardcoded 44.0, which drifts with theme/DPI/font changes). `bar_px` is
+        // physical; egui positions in points.
+        let below_bar = st.bar_px / ctx.pixels_per_point() + 4.0;
         egui::Area::new(egui::Id::new("info_overlay"))
-            .fixed_pos(egui::pos2(12.0, 44.0))
+            .fixed_pos(egui::pos2(12.0, below_bar))
             .interactable(false)
             .show(ctx, |ui| {
                 egui::Frame::new()
@@ -636,6 +651,14 @@ pub fn chrome(
                             .spacing([14.0, 3.0])
                             .show(ui, |ui| {
                                 for (k, v) in &st.info {
+                                    // An empty pair separates the two halves of a
+                                    // spread — draw a rule rather than a blank row.
+                                    if k.is_empty() && v.is_empty() {
+                                        ui.separator();
+                                        ui.separator();
+                                        ui.end_row();
+                                        continue;
+                                    }
                                     ui.label(
                                         egui::RichText::new(k).color(egui::Color32::from_gray(150)),
                                     );
@@ -1239,7 +1262,7 @@ fn volume_cell(
                 ui.painter().rect_stroke(
                     r.rect,
                     3.0,
-                    egui::Stroke::new(2.0, accent),
+                    egui::Stroke::new(2.0_f32, accent),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -1251,7 +1274,7 @@ fn volume_cell(
                         egui::pos2(r.rect.left(), y),
                         egui::pos2(r.rect.left() + w, y),
                     ],
-                    egui::Stroke::new(3.0, accent),
+                    egui::Stroke::new(3.0_f32, accent),
                 );
             }
             let mut label = egui::RichText::new(elide(name, 22)).size(12.0);
