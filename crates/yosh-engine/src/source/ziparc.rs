@@ -4,6 +4,10 @@
 //! instead of re-opening + re-parsing the archive on every read — that repeated
 //! open + central-directory scan is a real cost over a network share.
 //!
+//! Pages are addressed by *archive index*, not by name — `zip`'s name lookup cannot
+//! round-trip an entry whose name isn't ASCII/UTF-8 (see `ZipSource::list_central`),
+//! and legacy (Shift-JIS/GBK) entry names are decoded by us for display and sorting.
+//!
 //! The archive can be backed by an on-disk path *or* an in-memory byte buffer
 //! (e.g. bytes the shell read from an Android `content://` file descriptor, where
 //! there is no path to reopen). The `Reader` enum unifies the two so the read +
@@ -16,12 +20,17 @@ use std::sync::{Arc, Mutex};
 
 use zip::ZipArchive;
 
-use super::{is_image_name, PageSource};
+use super::{decode_entry_name, detect_legacy_encoding, is_image_name, PageSource};
 
 /// Idle parsed-archive handles kept for reuse. Bounded to roughly the decode
 /// worker count — only idle handles are capped, so a drift from that just costs a
 /// few extra short-lived opens, never correctness.
 const POOL_CAP: usize = 8;
+
+/// Ceiling on the read buffer we pre-allocate from an entry's *declared* uncompressed
+/// size. A corrupt or hostile header can claim a huge size, and `with_capacity` would
+/// commit that much before a single byte is read; past this we just let the vec grow.
+const MAX_PREALLOC: usize = 256 << 20; // 256 MiB
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::other(e.to_string())
@@ -65,7 +74,9 @@ impl Seek for Reader {
 /// directory is recovered by scanning local file headers from the front, recording
 /// each surviving entry's header offset for direct seek+read.
 enum Index {
-    Central,
+    /// Archive entry index per page, parallel to `names`. Pages are addressed
+    /// positionally, never by name — see `list_central`.
+    Central(Vec<usize>),
     /// Local-file-header byte offset per entry, parallel to `names`.
     Local(Vec<u64>),
 }
@@ -95,21 +106,12 @@ impl ZipSource {
 
     fn build(backend: Backend) -> io::Result<Self> {
         match ZipArchive::new(Self::fresh(&backend)?) {
-            // Normal archive: `file_names()` reads straight from the in-memory central
-            // directory `ZipArchive::new` already parsed — no per-entry seek. A dir
-            // entry's name ends in `/`, so `is_image_name` rejects it; the explicit
-            // `/` guard is belt-and-suspenders for an oddly-named dir.
-            Ok(zip) => {
-                let mut names: Vec<String> = zip
-                    .file_names()
-                    .filter(|n| !n.ends_with('/') && is_image_name(n))
-                    .map(|n| n.to_string())
-                    .collect();
-                names.sort_by(|a, b| natord::compare(a, b));
+            Ok(mut zip) => {
+                let (names, idx) = Self::list_central(&mut zip);
                 Ok(Self {
                     backend,
                     names,
-                    index: Index::Central,
+                    index: Index::Central(idx),
                     partial: false,
                     pool: Mutex::new(Vec::new()),
                 })
@@ -134,6 +136,76 @@ impl ZipSource {
                 })
             }
         }
+    }
+
+    /// List a parsed archive's image entries as `(display name, archive index)`,
+    /// naturally sorted by name.
+    ///
+    /// **Pages are addressed by index, never by name.** `zip` keys its entry map by the
+    /// *raw* header bytes but `file_names()` hands back a decoded string, and `by_name`
+    /// re-encodes that string as UTF-8 to look it up. When general-purpose bit 11 (the
+    /// UTF-8 flag) is clear and the bytes aren't ASCII, the decoded name is a CP437
+    /// transliteration whose UTF-8 form never matches the raw key — e.g. Shift-JIS
+    /// `81 45` renders as `üE`, which re-encodes to `c3 bc 45`. So the round-trip
+    /// `by_name(file_names()[i])` fails for *every* entry of a legacy-encoded archive
+    /// ("specified file not found in archive"), which is exactly how a Japanese CBZ used
+    /// to open with a full page list and then fail on every single page. `by_index`
+    /// sidesteps the name map entirely.
+    ///
+    /// A dir entry's name ends in `/`, so `is_image_name` rejects it; the explicit `/`
+    /// guard is belt-and-suspenders for an oddly-named dir.
+    ///
+    /// For the *display* name we want the real characters, not the transliteration. That
+    /// same keyed-by-raw-bytes map gives us an exact, allocation-free test for which
+    /// names need help: `index_for_name(n)` hashes `n`'s UTF-8 bytes against the raw
+    /// keys, so a name that maps back to its own entry is already byte-exact (ASCII, or
+    /// a properly UTF-8-flagged name) and is kept as-is. Only a name that *fails* that
+    /// round-trip is a CP437 transliteration, and only for those do we re-read the raw
+    /// header bytes and decode them ourselves — so Shift-JIS/GBK pages display and sort
+    /// correctly. Both `file_names()` and the round-trip test read from the already-parsed
+    /// in-memory central directory, so ASCII and UTF-8-flagged archives (the overwhelming
+    /// majority, including Japanese ones written by modern zippers) pay nothing at all;
+    /// only a genuinely legacy-encoded archive pays a local-header seek per entry
+    /// (~1.5 ms for 500 entries).
+    fn list_central(zip: &mut ZipArchive<Reader>) -> (Vec<String>, Vec<usize>) {
+        let decoded: Vec<String> = zip.file_names().map(str::to_string).collect();
+        // Compare against `Some(i)`, not just `is_some()`: a pathological archive holding
+        // both the raw and the transliterated spelling of one name would otherwise let an
+        // entry validate against its neighbour.
+        let exact: Vec<bool> = decoded
+            .iter()
+            .enumerate()
+            .map(|(i, n)| zip.index_for_name(n) == Some(i))
+            .collect();
+        // Image filtering can run on the transliterated name: CP437 maps ASCII to itself,
+        // and no legacy trail byte is `.` (Shift-JIS trail bytes start at 0x40), so the
+        // extension survives transliteration intact. Filtering first also keeps the raw
+        // re-read below down to the pages we actually intend to show.
+        let keep: Vec<usize> = (0..decoded.len())
+            .filter(|&i| !decoded[i].ends_with('/') && is_image_name(&decoded[i]))
+            .collect();
+
+        // Only names that failed the round-trip need their raw bytes re-read. A raw read
+        // that fails just leaves that entry on the crate's own decoding — one bad entry
+        // shouldn't cost us the rest of the archive.
+        let (idxs, raws): (Vec<usize>, Vec<Vec<u8>>) = keep
+            .iter()
+            .copied()
+            .filter(|&i| !exact[i])
+            .filter_map(|i| zip.by_index_raw(i).ok().map(|e| (i, e.name_raw().to_vec())))
+            .unzip();
+        let enc = detect_legacy_encoding(&raws);
+        let mut legacy: Vec<Option<String>> = vec![None; decoded.len()];
+        for (i, raw) in idxs.into_iter().zip(&raws) {
+            legacy[i] = Some(decode_entry_name(raw, enc));
+        }
+
+        let mut entries: Vec<(String, usize)> = keep
+            .into_iter()
+            .map(|i| (legacy[i].take().unwrap_or_else(|| decoded[i].clone()), i))
+            .collect();
+        entries.sort_by(|a, b| natord::compare(&a.0, &b.0));
+        entries.into_iter().unzip()
     }
 
     /// Recover an archive with no central directory by reading local file headers
@@ -174,7 +246,7 @@ impl ZipSource {
         reader.seek(SeekFrom::Start(offset))?;
         match zip::read::read_zipfile_from_stream(&mut reader).map_err(to_io)? {
             Some(mut entry) => {
-                let mut buf = Vec::with_capacity(entry.size() as usize);
+                let mut buf = Vec::with_capacity((entry.size() as usize).min(MAX_PREALLOC));
                 entry.read_to_end(&mut buf)?;
                 Ok(buf)
             }
@@ -225,17 +297,17 @@ impl PageSource for ZipSource {
 
     fn read_page(&self, index: usize) -> io::Result<Vec<u8>> {
         // Recovered archive: read directly from the entry's local-header offset.
-        if let Index::Local(offsets) = &self.index {
-            return self.read_local(offsets[index]);
-        }
-        let name = &self.names[index];
+        let entry_idx = match &self.index {
+            Index::Local(offsets) => return self.read_local(offsets[index]),
+            Index::Central(idx) => idx[index],
+        };
         let mut zip = self.checkout()?;
         // Confine the `ZipFile` borrow to this block: `read_to_end` fully drains
         // the bytes into an owned Vec, then `entry` drops — only then is `zip`
         // free to move back into the pool.
         let result = (|| -> io::Result<Vec<u8>> {
-            let mut entry = zip.by_name(name).map_err(to_io)?;
-            let mut buf = Vec::with_capacity(entry.size() as usize);
+            let mut entry = zip.by_index(entry_idx).map_err(to_io)?;
+            let mut buf = Vec::with_capacity((entry.size() as usize).min(MAX_PREALLOC));
             entry.read_to_end(&mut buf)?;
             Ok(buf)
         })();
@@ -250,12 +322,12 @@ impl PageSource for ZipSource {
     fn modified(&self, index: usize) -> Option<String> {
         // Lazy: only the Tab info overlay asks, and it already reads the full page
         // there, so a one-off open for the timestamp is cheap. Both paths surface
-        // last-modified via a `ZipFile`: by name through the central directory, or —
-        // for a recovered archive — by seeking to the entry's local header.
+        // last-modified via a `ZipFile`: by archive index through the central directory,
+        // or — for a recovered archive — by seeking to the entry's local header.
         let dt = match &self.index {
-            Index::Central => {
+            Index::Central(idx) => {
                 let mut zip = ZipArchive::new(Self::fresh(&self.backend).ok()?).ok()?;
-                zip.by_name(self.names.get(index)?).ok()?.last_modified()
+                zip.by_index(*idx.get(index)?).ok()?.last_modified()
             }
             Index::Local(offsets) => {
                 let mut reader = Self::fresh(&self.backend).ok()?;
@@ -305,6 +377,133 @@ mod tests {
         }
         w.finish().unwrap();
         path
+    }
+
+    /// Hand-build a stored-entry zip with **raw** name bytes and general-purpose flag
+    /// 0 (no UTF-8 bit). `ZipWriter` only accepts `&str` names, so a legacy-codepage
+    /// archive — the exact shape that used to break every page read — can't be produced
+    /// with it; we emit the local headers, central directory and EOCD directly.
+    fn raw_name_zip(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        let mut central: Vec<u8> = Vec::new();
+        for (name, data) in entries {
+            let offset = out.len() as u32;
+            let crc = crc32fast::hash(data);
+            let (n, sz) = (name.len() as u16, data.len() as u32);
+            // Local file header: stored, no extra field, sizes known up front.
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0]); // version, flags=0, method=0 (stored)
+            out.extend_from_slice(&[0, 0, 0x21, 0]); // mod time / date
+            out.extend_from_slice(&crc.to_le_bytes());
+            out.extend_from_slice(&sz.to_le_bytes()); // compressed
+            out.extend_from_slice(&sz.to_le_bytes()); // uncompressed
+            out.extend_from_slice(&n.to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes()); // extra len
+            out.extend_from_slice(name);
+            out.extend_from_slice(data);
+
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0]); // made-by, needed, flags=0, method=0
+            central.extend_from_slice(&[0, 0, 0x21, 0]);
+            central.extend_from_slice(&crc.to_le_bytes());
+            central.extend_from_slice(&sz.to_le_bytes());
+            central.extend_from_slice(&sz.to_le_bytes());
+            central.extend_from_slice(&n.to_le_bytes());
+            central.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // extra, comment, disk
+            central.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // internal + external attrs
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name);
+        }
+        let (cd_off, cd_len) = (out.len() as u32, central.len() as u32);
+        let count = entries.len() as u16;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]); // disk numbers
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&cd_len.to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        out
+    }
+
+    /// Regression: a Shift-JIS-named archive (UTF-8 flag clear) must open *and* read.
+    ///
+    /// `zip` keys entries by raw name bytes but returns a CP437 transliteration, so the
+    /// old `by_name(file_names()[i])` round-trip failed on every page with "specified
+    /// file not found in archive" — the archive listed all its pages and then rendered
+    /// none of them. Reading by index fixes it, and the raw bytes are decoded for display.
+    #[test]
+    fn reads_shift_jis_named_entries() {
+        // "週刊/001.jpg" in CP932: 8f 54 8a a7 = 週刊
+        let name: &[u8] = &[
+            0x8f, 0x54, 0x8a, 0xa7, b'/', b'0', b'0', b'1', b'.', b'j', b'p', b'g',
+        ];
+        let bytes = raw_name_zip(&[(name, b"SJIS-PAGE-ONE")]);
+        let src = ZipSource::from_bytes(bytes).unwrap();
+
+        assert_eq!(src.len(), 1, "the .jpg entry must survive filtering");
+        assert_eq!(
+            src.read_page(0).unwrap(),
+            b"SJIS-PAGE-ONE",
+            "reading a legacy-encoded entry must not fail"
+        );
+        assert_eq!(
+            src.name(0),
+            "週刊/001.jpg",
+            "legacy name decoded for display, not CP437 mojibake"
+        );
+    }
+
+    /// Reading is encoding-*agnostic*: pages are addressed by index, so an archive whose
+    /// names don't round-trip must still read no matter what codepage produced them.
+    /// Display names are best-effort detection on top of that — this pins the encodings
+    /// that resolve correctly, and `reads` is the part that must never regress.
+    #[test]
+    fn reads_and_names_legacy_encodings() {
+        let cases: &[(&'static encoding_rs::Encoding, &str)] = &[
+            (encoding_rs::SHIFT_JIS, "週刊少年ジャンプ 2026年37・38号/001.jpg"),
+            (encoding_rs::EUC_JP, "週刊少年ジャンプ/001.jpg"),
+            (encoding_rs::GBK, "海贼王 第100话/001.jpg"),
+            (encoding_rs::BIG5, "海賊王 第100話/001.jpg"),
+            (encoding_rs::EUC_KR, "원피스 100화/001.jpg"),
+            (encoding_rs::WINDOWS_1251, "Наруто том 5/001.jpg"),
+            (encoding_rs::WINDOWS_1252, "café résumé/001.jpg"),
+        ];
+        for (enc, want) in cases {
+            let raw = enc.encode(want).0.into_owned();
+            let src = ZipSource::from_bytes(raw_name_zip(&[(&raw, b"PAGE")])).unwrap();
+            assert_eq!(src.len(), 1, "{}: entry must survive filtering", enc.name());
+            assert_eq!(
+                src.read_page(0).unwrap(),
+                b"PAGE",
+                "{}: reads must not depend on the name encoding",
+                enc.name()
+            );
+            assert_eq!(src.name(0), *want, "{}: name decoded", enc.name());
+        }
+    }
+
+    /// A properly UTF-8-flagged non-ASCII archive is already byte-exact, so it must be
+    /// passed through untouched — never re-sniffed (which could mangle e.g. `café.jpg`).
+    #[test]
+    fn flagged_utf8_names_pass_through_unchanged() {
+        let path = write_zip("utf8flag", &[("第01話/café.png", b"FLAGGED")], &[]);
+        let src = ZipSource::new(&path).unwrap();
+        assert_eq!(src.len(), 1);
+        assert_eq!(src.name(0), "第01話/café.png");
+        assert_eq!(src.read_page(0).unwrap(), b"FLAGGED");
+    }
+
+    /// A UTF-8 name stored *without* the UTF-8 flag (very common) round-trips as UTF-8
+    /// rather than being mis-sniffed as some legacy codepage.
+    #[test]
+    fn reads_unflagged_utf8_names() {
+        let bytes = raw_name_zip(&[("表紙.png".as_bytes(), b"COVER")]);
+        let src = ZipSource::from_bytes(bytes).unwrap();
+        assert_eq!(src.len(), 1);
+        assert_eq!(src.name(0), "表紙.png");
+        assert_eq!(src.read_page(0).unwrap(), b"COVER");
     }
 
     #[test]

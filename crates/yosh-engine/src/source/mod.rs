@@ -19,6 +19,9 @@ pub use ziparc::ZipSource;
 use std::io;
 use std::path::Path;
 
+use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
+use encoding_rs::Encoding;
+
 /// A source of comic pages. Must be `Send + Sync` so decode workers can pull
 /// from it concurrently (folder/zip read in parallel; rar serializes internally).
 pub trait PageSource: Send + Sync {
@@ -89,4 +92,38 @@ pub fn is_image_ext(p: &Path) -> bool {
 /// Is this archive entry name an image? (Handles `/`-separated archive paths.)
 pub fn is_image_name(name: &str) -> bool {
     is_image_ext(Path::new(name))
+}
+
+/// Pick the codepage for one archive's legacy entry names.
+///
+/// Zip stores names as raw bytes and only flags UTF-8 via general-purpose bit 11; plenty
+/// of Japanese/Chinese archives are written by tools that leave that flag clear and store
+/// legacy codepage bytes (Shift-JIS, GBK, Big5, EUC-KR, …) instead.
+///
+/// Detection is done **once for the whole archive**, not per name. Filenames are far too
+/// short to sniff individually — `第01話` is 6 bytes of CP932, which a detector will read
+/// as Cyrillic about as readily as Japanese — but every entry in an archive was written by
+/// one tool in one encoding, so pooling all of them turns a hopeless 6-byte sample into a
+/// decisive one. Feeding names in archive order also keeps the verdict deterministic.
+pub fn detect_legacy_encoding(raws: &[Vec<u8>]) -> &'static Encoding {
+    // ISO-2022-JP is denied: it is stateful and effectively never used for filenames,
+    // and allowing it lets stray escape bytes swing the guess.
+    let mut det = EncodingDetector::new(Iso2022JpDetection::Deny);
+    for raw in raws {
+        det.feed(raw, false);
+    }
+    det.feed(&[], true);
+    det.guess(None, Utf8Detection::Allow)
+}
+
+/// Decode one raw archive-entry name using the archive's detected codepage.
+///
+/// Valid UTF-8 always wins over `enc`: it covers correctly-flagged names and the very
+/// common "UTF-8 bytes, flag never set" case, and UTF-8 is self-validating enough that a
+/// name which parses cleanly is not a legacy-codepage name that happens to look like one.
+pub fn decode_entry_name(raw: &[u8], enc: &'static Encoding) -> String {
+    match std::str::from_utf8(raw) {
+        Ok(s) => s.to_string(),
+        Err(_) => enc.decode(raw).0.into_owned(),
+    }
 }
