@@ -168,6 +168,16 @@ fn decode_png(bytes: &[u8]) -> Result<Decoded, String> {
 fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, String> {
     use jpeg_decoder::PixelFormat;
     let mut d = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    // Peek at the headers before decoding: a 4-component JPEG (CMYK, or Adobe's
+    // YCCK) goes to the `image` crate instead. Its JPEG backend is zune-jpeg, which
+    // converts *both* Adobe transforms to RGB during decode; `jpeg-decoder` only
+    // hands back raw CMYK32 that we'd have to convert (and ink-profile) ourselves.
+    // Reading the info first and then decoding on the same decoder is supported —
+    // the decode resumes from the already-parsed frame rather than re-parsing.
+    d.read_info().map_err(|e| format!("jpeg read_info: {e}"))?;
+    if d.info().map(|i| i.pixel_format) == Some(PixelFormat::CMYK32) {
+        return decode_other(bytes);
+    }
     let pixels = d.decode().map_err(|e| format!("jpeg decode: {e}"))?;
     let info = d.info().ok_or("jpeg: no info")?;
     let (w, h) = (info.width as u32, info.height as u32);
@@ -456,10 +466,13 @@ pub fn decode_and_downscale(
     // are untouched, so seek throughput is unaffected. A *grayscale* ICC (e.g. a
     // Dot Gain profile on a monochrome AVIF) is skipped: it can't be applied to
     // the RGBA buffer (channel mismatch → white), and the gray resize path below
-    // handles its tone instead.
+    // handles its tone instead. A *CMYK* ICC (a print-sourced JPEG/TIFF) is
+    // skipped for the same reason — see `icc::is_cmyk`, which fails silently
+    // rather than loudly — and because the decoder already converted those pixels
+    // to RGB, so the profile no longer describes the buffer.
     if !gray_by_channels
         && let Some(p) = &profile
-            && !icc::is_srgb(p) && !icc::is_gray(p) {
+            && !icc::is_srgb(p) && !icc::is_gray(p) && !icc::is_cmyk(p) {
                 icc::to_srgb_rgba(p, &mut full);
             }
     // Decoded size = scale to the display height (never upscaling past the source).
@@ -679,6 +692,83 @@ mod tests {
     fn frame(rgba: [u8; 4]) -> Frame {
         let img = RgbaImage::from_pixel(4, 4, Rgba(rgba));
         Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(100, 1))
+    }
+
+    /// Encode a solid-color 4-component JPEG. `ink` is **ink-coverage** CMYK
+    /// (0 = no ink), the convention `jpeg-encoder` takes and `jpeg-decoder` hands
+    /// back — the encoder applies the Adobe inversion itself. `color_type` selects
+    /// which Adobe APP14 transform is written: `Cmyk` → 0, `CmykAsYcck` → 2.
+    fn encode_cmyk_jpeg(ink: [u8; 4], color_type: jpeg_encoder::ColorType) -> Vec<u8> {
+        let (w, h) = (32u16, 32u16);
+        let data: Vec<u8> = ink.iter().copied().cycle().take(w as usize * h as usize * 4).collect();
+        let mut buf = Vec::new();
+        jpeg_encoder::Encoder::new(&mut buf, 98)
+            .encode(&data, w, h, color_type)
+            .unwrap();
+        buf
+    }
+
+    fn assert_solid_rgb(img: &DecodedImage, want: [u8; 3], what: &str) {
+        assert!(!img.gray, "{what}: a CMYK page must decode as RGBA8");
+        assert_eq!(img.pixels.len(), (img.w * img.h * 4) as usize, "{what}: RGBA8 length");
+        // Sample the middle so JPEG block edges don't skew it.
+        let i = (((img.h / 2) * img.w + img.w / 2) * 4) as usize;
+        let got = [img.pixels[i], img.pixels[i + 1], img.pixels[i + 2]];
+        let ok = got.iter().zip(&want).all(|(g, w)| (*g as i32 - *w as i32).abs() <= 24);
+        assert!(ok, "{what}: expected ~{want:?}, got {got:?}");
+        assert_eq!(img.pixels[i + 3], 255, "{what}: opaque");
+    }
+
+    /// Issue #14: a CMYK JPEG used to fail outright with
+    /// "jpeg: unsupported pixel format CMYK32". Both Adobe transforms must decode —
+    /// plain CMYK (APP14 transform 0) and YCCK (transform 2), which is what
+    /// Photoshop and ImageMagick actually emit.
+    #[test]
+    fn cmyk_and_ycck_jpegs_decode() {
+        // Pure cyan ink → red channel fully absorbed, green/blue pass through.
+        let cases = [
+            (jpeg_encoder::ColorType::Cmyk, "CMYK (APP14 transform 0)"),
+            (jpeg_encoder::ColorType::CmykAsYcck, "YCCK (APP14 transform 2)"),
+        ];
+        for (ct, what) in cases {
+            let bytes = encode_cmyk_jpeg([255, 0, 0, 0], ct);
+            let mut resizer = Resizer::new();
+            match decode_page(&bytes, 32, false, &mut resizer).unwrap() {
+                DecodedPage::Still(img) => assert_solid_rgb(&img, [0, 255, 255], what),
+                _ => panic!("{what}: a jpeg is a still"),
+            }
+        }
+    }
+
+    /// The K channel must darken rather than invert — a sign error here would show
+    /// as a near-white page instead of a near-black one.
+    #[test]
+    fn cmyk_black_ink_decodes_dark() {
+        let bytes = encode_cmyk_jpeg([0, 0, 0, 255], jpeg_encoder::ColorType::Cmyk);
+        let mut resizer = Resizer::new();
+        match decode_page(&bytes, 32, false, &mut resizer).unwrap() {
+            DecodedPage::Still(img) => assert_solid_rgb(&img, [0, 0, 0], "full K ink"),
+            _ => panic!("a jpeg is a still"),
+        }
+    }
+
+    /// A CMYK ICC profile must be recognized so `decode_and_downscale` skips color
+    /// management. It cannot be applied to the already-RGB pixels, and qcms does
+    /// *not* reject the mismatch — it silently maps white to blue.
+    #[test]
+    fn cmyk_icc_profile_is_detected() {
+        let mut prof = vec![0u8; 132];
+        prof[16..20].copy_from_slice(b"CMYK");
+        assert!(icc::is_cmyk(&prof));
+        assert!(!icc::is_gray(&prof));
+
+        let mut gray = vec![0u8; 132];
+        gray[16..20].copy_from_slice(b"GRAY");
+        assert!(!icc::is_cmyk(&gray), "GRAY must not read as CMYK");
+
+        let mut rgb = vec![0u8; 132];
+        rgb[16..20].copy_from_slice(b"RGB ");
+        assert!(!icc::is_cmyk(&rgb), "RGB must not read as CMYK");
     }
 
     #[test]

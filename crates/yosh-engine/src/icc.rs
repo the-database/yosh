@@ -39,6 +39,20 @@ pub fn is_gray(profile: &[u8]) -> bool {
     profile.get(16..20) == Some(b"GRAY")
 }
 
+/// True if the profile's data colour space is CMYK (at ICC header offset 16) —
+/// e.g. the SWOP/FOGRA profile a print-sourced CMYK JPEG or TIFF carries.
+///
+/// Like [`is_gray`], such a profile must NOT reach `to_srgb_rgba`, and this one
+/// fails *silently*: qcms accepts an `(RGBA8, RGBA8)` transform, so it does not
+/// reject the mismatch — it runs the 4-channel CMYK source through a 3-channel
+/// `Clut4x3`, leaving the LUT partly unfilled and rendering garbage/near-black.
+/// The pixels have already been converted to RGB by the decoder (zune-jpeg for
+/// CMYK JPEGs, the `image` crate for CMYK TIFFs), so the profile no longer
+/// describes them and the right move is to skip color management here.
+pub fn is_cmyk(profile: &[u8]) -> bool {
+    profile.get(16..20) == Some(b"CMYK")
+}
+
 /// Human-readable profile name (e.g. "Display P3") from the ICC `desc` tag.
 /// Handles the v2 `textDescriptionType` (ASCII) and v4 `mluc`
 /// (multiLocalizedUnicodeType, UTF-16BE) encodings.

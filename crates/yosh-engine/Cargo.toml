@@ -53,3 +53,4 @@ encoding_rs = "0.8"
 # Hand-building zips with raw (non-UTF-8) entry names in tests needs real CRCs;
 # `zip`'s writer only accepts `&str` names, so it can't produce those archives.
 crc32fast = "1"
+jpeg-encoder = "0.7.1"
