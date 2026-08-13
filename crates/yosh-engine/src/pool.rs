@@ -9,7 +9,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 
 use fast_image_resize::Resizer;
 
@@ -49,7 +48,6 @@ struct JobState {
 pub struct DecodePool {
     shared: Arc<(Mutex<JobState>, Condvar)>,
     results: Receiver<Msg>,
-    handles: Vec<JoinHandle<()>>,
 }
 
 /// Lock the job state, recovering from poisoning. The critical sections only
@@ -78,7 +76,6 @@ impl DecodePool {
             Condvar::new(),
         ));
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
-        let mut handles = Vec::new();
 
         for _ in 0..workers {
             let shared = shared.clone();
@@ -86,7 +83,11 @@ impl DecodePool {
             let queue = queue.clone();
             let tex_pool = tex_pool.clone();
             let tx = tx.clone();
-            handles.push(std::thread::spawn(move || {
+            // Workers are spawned **detached** — no `JoinHandle` is kept. Teardown
+            // must never wait out a slow read/decode in flight (see `Drop`), and each
+            // worker owns `Arc` clones of everything it touches (device, queue,
+            // texture pool, source), so a straggler outliving the pool is safe.
+            std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
                 // Has `index` fallen out of the wanted window? If so, drop it from
                 // `inflight` (so it can be re-queued later) and report stale. Called
@@ -204,14 +205,10 @@ impl DecodePool {
                         return; // receiver gone
                     }
                 }
-            }));
+            });
         }
 
-        Self {
-            shared,
-            results: rx,
-            handles,
-        }
+        Self { shared, results: rx }
     }
 
     /// Replace the work list with `desired` (`(index, target_h)`, nearest-first),
@@ -251,15 +248,25 @@ impl DecodePool {
     }
 }
 
+/// Teardown is **signal-only: it never joins a worker.** A join would wait out
+/// whatever I/O is in flight — an HDD spin-up, a network share, a RAR entry not yet
+/// decompressed — which used to stall app close *and* every volume switch (a switch
+/// rebuilds the pool). Instead we tell the workers to stop and walk away: clearing
+/// `wanted` makes their existing `stale()` checks abandon the current page at the
+/// next yield boundary, and `running = false` retires them at the next job claim.
+///
+/// Safe because a straggler can't leak results into a new pool: it holds `Arc`
+/// clones of everything it touches, and the results `Receiver` drops with the pool,
+/// so its `tx.send` fails and it exits. The channel — never the join — was always
+/// the guarantee.
 impl Drop for DecodePool {
     fn drop(&mut self) {
-        {
-            let (m, cv) = &*self.shared;
-            lock_jobs(m).running = false;
-            cv.notify_all();
-        }
-        for h in self.handles.drain(..) {
-            let _ = h.join();
-        }
+        let (m, cv) = &*self.shared;
+        let mut st = lock_jobs(m);
+        st.running = false;
+        st.jobs.clear();
+        st.wanted.clear();
+        drop(st);
+        cv.notify_all();
     }
 }

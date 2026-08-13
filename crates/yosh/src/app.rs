@@ -155,6 +155,12 @@ struct State {
     /// Visible page(s) the Tab info overlay text was built for, as
     /// `Reader::visible_pages` reports them (None = rebuild needed).
     info_for: Option<(usize, Option<usize>)>,
+    /// The full info-overlay rows are gathered off-thread: they need `read_page` +
+    /// `modified`, which block on a spun-down disk (and, on a RAR still
+    /// decompressing, until that entry is extracted). The overlay shows no-I/O
+    /// placeholder rows meanwhile, replaced when a result lands in `poll_background`.
+    info_tx: std::sync::mpsc::Sender<InfoRows>,
+    info_rx: std::sync::mpsc::Receiver<InfoRows>,
     /// The anchor page currently waiting to decode and when that wait began,
     /// used to delay the loading spinner *per page* (so a fast page reached at
     /// the end of a slow-seek streak still gets its own grace period). None as
@@ -215,11 +221,22 @@ struct State {
     opening_key: Option<PathBuf>,
     open_tx: std::sync::mpsc::Sender<(u64, Built)>,
     open_rx: std::sync::mpsc::Receiver<(u64, Built)>,
+    /// Startup resume scan: which recent still exists on disk is decided on a
+    /// background thread (a stale network share or a spun-down HDD can make
+    /// `Path::exists` take seconds, and this runs before the first frame). Some
+    /// while the scan is in flight — the window is already up, showing the spinner
+    /// — then None once the answer has been applied (or something else opened first).
+    resume_rx: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
     /// Cached parent-dir scan for `[`/`]` — (parent dir, want_folder, natural-sort
     /// paths). Warmed in the background on open so the first jump doesn't pay it.
     sib_cache: Option<(PathBuf, bool, Vec<PathBuf>)>,
     sib_tx: std::sync::mpsc::Sender<(PathBuf, bool, Vec<PathBuf>)>,
     sib_rx: std::sync::mpsc::Receiver<(PathBuf, bool, Vec<PathBuf>)>,
+    /// A `[`/`]` press that arrived while `sib_cache` was cold, held until the
+    /// background scan lands (then replayed in `poll_background`). Presses
+    /// accumulate, so mashing `]` three times before the scan finishes jumps three
+    /// volumes rather than one.
+    pending_sib_jump: Option<i64>,
 
     // Live folder refresh: an OS filesystem watch on the open folder, so images
     // added/removed on disk appear without reopening. `watcher` holds the notify
@@ -250,6 +267,12 @@ struct State {
 /// Result of constructing a page source: `(source, volume-key path, explicit
 /// start index)`, or an error message. Built off-thread by `build_source`.
 type Built = Result<(Arc<dyn PageSource>, PathBuf, Option<usize>), String>;
+
+/// One off-thread info-overlay result: the open generation, the visible-pages key
+/// it was gathered for, and one `(page index, rows)` block per visible page. The
+/// two tags let the main thread drop a result it has already moved past — a volume
+/// switch bumps the generation, a page turn changes the key.
+type InfoRows = (u64, (usize, Option<usize>), Vec<(usize, Vec<(String, String)>)>);
 
 /// Bump `key` to the front of the most-recently-read list (newest first), drop any
 /// older duplicate, and cap the length. Generic over the key string so the resume
@@ -569,19 +592,26 @@ impl ApplicationHandler for App {
             status: format!("{} ({:?})", gpu.adapter_info.name, gpu.adapter_info.backend),
             ..UiState::default()
         };
+        // Resume the last book on a no-arg launch: open the most recent volume that
+        // still exists on disk (a stale head is skipped so the list stays useful).
+        // `set_source` resumes its saved page automatically. The `exists()` probes run
+        // off-thread — they hit the filesystem, and a dead network share or sleeping
+        // HDD would otherwise delay the *window itself* by seconds. The answer is
+        // picked up in `poll_background`.
+        let mut resume_rx = None;
         if let Some(p) = self.initial_path.take() {
             ui.pending_open = Some(p);
-        } else if settings.resume_on_startup {
-            // Resume the last book on a no-arg launch: open the most recent volume
-            // that still exists on disk (a stale head is skipped so the list stays
-            // useful). `set_source` resumes its saved page automatically.
-            if let Some(p) = settings
-                .recents
-                .iter()
-                .find(|p| std::path::Path::new(p).exists())
-            {
-                ui.pending_open = Some(PathBuf::from(p));
-            }
+        } else if settings.resume_on_startup && !settings.recents.is_empty() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let recents = settings.recents.clone();
+            std::thread::spawn(move || {
+                let found = recents
+                    .into_iter()
+                    .find(|p| std::path::Path::new(p).exists())
+                    .map(PathBuf::from);
+                let _ = tx.send(found);
+            });
+            resume_rx = Some(rx);
         }
 
         // The recursive library scan can be slow on a big tree, so it runs
@@ -591,7 +621,10 @@ impl ApplicationHandler for App {
         // shows the configured grid, or the onboarding when no library is set yet.
         let library = Library::empty();
         let has_root = settings.library_root.is_some();
-        let library_view = ui.pending_open.is_none();
+        // A pending resume scan counts as "something is opening": start on the reader
+        // background (with the spinner, via `opening` below) rather than flashing the
+        // library grid for the frames the scan takes.
+        let library_view = ui.pending_open.is_none() && resume_rx.is_none();
         // Show the keys overlay once, on the first launch ever, then persist so it
         // never auto-opens again (F1 / "? Help" reopen it on demand).
         if !settings.help_seen {
@@ -608,9 +641,11 @@ impl ApplicationHandler for App {
                 let _ = update_tx.send(u);
             }
         });
-        // Channels for background archive opens and sibling-volume prescans.
+        // Channels for background archive opens, sibling-volume prescans, and the
+        // off-thread Tab info overlay.
         let (open_tx, open_rx) = std::sync::mpsc::channel();
         let (sib_tx, sib_rx) = std::sync::mpsc::channel();
+        let (info_tx, info_rx) = std::sync::mpsc::channel();
         // Channels for the live-folder-refresh watcher: raw notify events in, and
         // off-thread `FolderSource` rebuilds out.
         let (watch_tx, watch_rx) = std::sync::mpsc::channel();
@@ -675,6 +710,8 @@ impl ApplicationHandler for App {
             system_dark,
             volume_key: None,
             info_for: None,
+            info_tx,
+            info_rx,
             loading_pending: None,
             toast: None,
             anim_origin: Instant::now(),
@@ -697,13 +734,15 @@ impl ApplicationHandler for App {
             updating: false,
             update_error: None,
             open_gen: 0,
-            opening: false,
+            opening: resume_rx.is_some(), // spinner while the resume scan runs
             opening_key: None,
             open_tx,
             open_rx,
+            resume_rx,
             sib_cache: None,
             sib_tx,
             sib_rx,
+            pending_sib_jump: None,
             watcher: None,
             watch_filter: None,
             watch_tx,
@@ -716,7 +755,7 @@ impl ApplicationHandler for App {
         });
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -734,9 +773,16 @@ impl ApplicationHandler for App {
         let buys_frame = !matches!(event, WindowEvent::RedrawRequested);
 
         match event {
+            // Quit by process exit rather than `event_loop.exit()`: the orderly path
+            // runs every destructor on the way out (wgpu/driver teardown, the notify
+            // watcher, threads still finishing a slow read), which can hang the window
+            // on screen for seconds. `persist()` has already flushed everything durable
+            // — the config JSON — and the thumb cache writes temp-file + rename, so a
+            // killed write can at worst strand a stray temp file. Same pattern as
+            // `relaunch()`.
             WindowEvent::CloseRequested => {
                 state.persist();
-                event_loop.exit();
+                std::process::exit(0);
             }
             WindowEvent::Resized(size) => {
                 state.gpu.resize(size.width, size.height);
@@ -758,8 +804,10 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(action) = action_from(&event) && !response.consumed {
                     if matches!(action, Action::Quit) {
+                        // Immediate exit, skipping destructor teardown — see
+                        // `CloseRequested` above.
                         state.persist();
-                        event_loop.exit();
+                        std::process::exit(0);
                     } else {
                         state.apply_action(action);
                     }
@@ -892,6 +940,49 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
         }
     }
     None
+}
+
+/// Gather display info for page `index` (Tab overlay): reads the page bytes once
+/// and probes the header for resolution + format. A free function over the bare
+/// source, because it runs on a **background** thread — `read_page` and `modified`
+/// are disk I/O, and on a RAR still decompressing `read_page` blocks until that
+/// entry lands, which would freeze the UI for as long as the extraction takes.
+/// The cache-derived "LQ tier" row needs no I/O and is appended by the main
+/// thread when this result is applied.
+fn page_info(src: &dyn PageSource, index: usize) -> Vec<(String, String)> {
+    let name = src.name(index).to_string();
+    let bytes = src.read_page(index).ok();
+    let (res, fmt, size, color) = match &bytes {
+        Some(b) => {
+            let (w, h, detail) = yosh_engine::meta::probe(b);
+            let res = if w == 0 || h == 0 {
+                "—".to_string()
+            } else {
+                format!("{w} × {h}")
+            };
+            let color = yosh_engine::icc::extract_icc(b)
+                .as_deref()
+                .and_then(yosh_engine::icc::describe)
+                .unwrap_or_else(|| "—".to_string());
+            (res, detail, yosh_engine::meta::human_size(b.len() as u64), color)
+        }
+        None => (
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+        ),
+    };
+    let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
+    vec![
+        ("File".to_string(), name),
+        ("Page".to_string(), format!("{} / {}", index + 1, src.len())),
+        ("Size".to_string(), size),
+        ("Modified".to_string(), modified),
+        ("Resolution".to_string(), res),
+        ("Format".to_string(), fmt),
+        ("Color".to_string(), color),
+    ]
 }
 
 impl State {
@@ -1103,12 +1194,16 @@ impl State {
             return;
         };
         let want_folder = cur.is_dir();
-        // Use the background-warmed cache when it matches this folder; otherwise
-        // scan synchronously this once (cold cache, e.g. a very first `[`/`]`).
+        // Use the background-warmed cache when it matches this folder. On a miss
+        // (cold cache, e.g. a `[`/`]` in the first moments after launch) don't scan
+        // here — a parent-dir `read_dir` + per-entry stat on a network share would
+        // freeze the UI. Park the jump, warm the cache off-thread, and replay it in
+        // `poll_background` once the listing lands.
         let hit = matches!(&self.sib_cache, Some((p, wf, _)) if *p == parent && *wf == want_folder);
         if !hit {
-            let vols = crate::library::sibling_volumes(&cur);
-            self.sib_cache = Some((parent, want_folder, vols));
+            self.pending_sib_jump = Some(self.pending_sib_jump.take().unwrap_or(0) + delta);
+            self.warm_sib_cache(&cur);
+            return;
         }
         let sibs = &self.sib_cache.as_ref().unwrap().2;
         let cur_name = cur.file_name();
@@ -1647,9 +1742,47 @@ impl State {
     /// an update-apply failure, or a live-refreshed volume listing.
     fn poll_background(&mut self) -> bool {
         let mut changed = false;
+        // Startup resume scan: the first recent that still exists on disk (or None).
+        // Apply it only if nothing has been opened in the meantime — a dropped file,
+        // a library pick or a `[`/`]` during the scan wins over the stale resume.
+        if let Some(rx) = self.resume_rx.take() {
+            match rx.try_recv() {
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.resume_rx = Some(rx),
+                // A `Disconnected` scan thread answered nothing and never will, so
+                // fold it into the "nothing to resume" case — the spinner must not stick.
+                res => {
+                    changed = true;
+                    if self.open_gen == 0
+                        && self.ui.pending_open.is_none()
+                        && self.reader.source.is_none()
+                    {
+                        match res.ok().flatten() {
+                            Some(p) => self.ui.pending_open = Some(p),
+                            // Nothing resumable left: drop the spinner and land on the
+                            // library grid (the no-arg home screen).
+                            None => {
+                                self.opening = false;
+                                self.library_view = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Sibling-volume scans only warm the `[`/`]` cache — nothing to show.
+        let mut sibs_landed = false;
         while let Ok(entry) = self.sib_rx.try_recv() {
             self.sib_cache = Some(entry);
+            sibs_landed = true;
+        }
+        // …unless a `[`/`]` was parked waiting for exactly that listing: replay it now
+        // that the cache is warm. If the volume moved folders meanwhile this re-warms
+        // and re-parks instead — still terminating, since each pass needs a fresh scan.
+        if sibs_landed
+            && let Some(d) = self.pending_sib_jump.take()
+        {
+            self.jump_volume(d);
+            changed = true;
         }
         // Off-thread library scan: apply the newest result (frees the old cover
         // textures and rebuilds the path→volume index).
@@ -1683,6 +1816,39 @@ impl State {
                 v.last_seen = self.cover_clock;
                 changed = true;
             }
+        }
+        // Off-thread Tab info overlay: replace the placeholder rows with the full
+        // ones. Both tags must still match — a result for a volume that has since
+        // been switched (generation) or for pages already turned past (key) would
+        // describe something other than what's on screen, so it's dropped.
+        while let Ok((generation, key, blocks)) = self.info_rx.try_recv() {
+            if generation != self.open_gen || self.info_for != Some(key) {
+                continue;
+            }
+            let len = self.reader.source.as_ref().map_or(0, |s| s.len());
+            let mut rows = Vec::new();
+            for (n, (index, block)) in blocks.into_iter().enumerate() {
+                if n > 0 {
+                    rows.push((String::new(), String::new())); // spread separator
+                }
+                rows.extend(block);
+                // LQ preview tier: fill progress + what's on screen for this page
+                // (HQ full-res, the soft LQ thumbnail, or neither yet). Cache reads,
+                // no I/O — which is why this row is added here and not off-thread.
+                let showing = if self.reader.cache.contains(index) {
+                    "HQ"
+                } else if self.reader.lq_cache.contains(index) {
+                    "LQ preview"
+                } else {
+                    "—"
+                };
+                rows.push((
+                    "LQ tier".to_string(),
+                    format!("{}/{} · {}", self.reader.lq_cache.len(), len, showing),
+                ));
+            }
+            self.ui.info = rows;
+            changed = true;
         }
         // Live folder refresh: react to images added/removed in the open folder.
         changed |= self.poll_folder_watch();
@@ -1769,62 +1935,6 @@ impl State {
             format!("{f} (single)")
         };
         self.toast(view_label);
-    }
-
-    /// Gather display info for page `index` (Tab overlay): reads the page bytes
-    /// once and probes the header for resolution + format. Only called on a page
-    /// change while the overlay is open, so the extra read is cheap.
-    fn build_page_info(&self, index: usize) -> Vec<(String, String)> {
-        let Some(src) = &self.reader.source else {
-            return Vec::new();
-        };
-        let name = src.name(index).to_string();
-        let bytes = src.read_page(index).ok();
-        let (res, fmt, size, color) = match &bytes {
-            Some(b) => {
-                let (w, h, detail) = yosh_engine::meta::probe(b);
-                let res = if w == 0 || h == 0 {
-                    "—".to_string()
-                } else {
-                    format!("{w} × {h}")
-                };
-                let color = yosh_engine::icc::extract_icc(b)
-                    .as_deref()
-                    .and_then(yosh_engine::icc::describe)
-                    .unwrap_or_else(|| "—".to_string());
-                (res, detail, yosh_engine::meta::human_size(b.len() as u64), color)
-            }
-            None => (
-                "—".to_string(),
-                "—".to_string(),
-                "—".to_string(),
-                "—".to_string(),
-            ),
-        };
-        let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
-        let mut lines = vec![
-            ("File".to_string(), name),
-            ("Page".to_string(), format!("{} / {}", index + 1, src.len())),
-            ("Size".to_string(), size),
-            ("Modified".to_string(), modified),
-            ("Resolution".to_string(), res),
-            ("Format".to_string(), fmt),
-            ("Color".to_string(), color),
-        ];
-        // LQ preview tier: fill progress + what's on screen for this page (HQ
-        // full-res, the soft LQ thumbnail, or neither yet).
-        let showing = if self.reader.cache.contains(index) {
-            "HQ"
-        } else if self.reader.lq_cache.contains(index) {
-            "LQ preview"
-        } else {
-            "—"
-        };
-        lines.push((
-            "LQ tier".to_string(),
-            format!("{}/{} · {}", self.reader.lq_cache.len(), src.len(), showing),
-        ));
-        lines
     }
 
     /// The in-view anchor page if it is an animated (GIF/WebP) page with its texture
@@ -2096,13 +2206,39 @@ impl State {
         let visible = self.reader.visible_pages();
         if self.ui.info_open && !self.library_view && self.info_for != Some(visible) {
             let (a, b) = visible;
-            self.ui.info = self.build_page_info(a);
-            // Both halves of a spread get described, separated by a blank row.
-            if let Some(b) = b {
-                self.ui.info.push((String::new(), String::new()));
-                self.ui.info.extend(self.build_page_info(b));
-            }
             self.info_for = Some(visible);
+            match self.reader.source.clone() {
+                Some(src) => {
+                    // Fill the overlay *this* frame with what costs nothing — the
+                    // name and page number the source already knows. Everything
+                    // else (size, modified, resolution, format, color) needs the
+                    // page bytes, so `page_info` gathers it off-thread and
+                    // `poll_background` swaps the full rows in when they land.
+                    let head = |i: usize| {
+                        vec![
+                            ("File".to_string(), src.name(i).to_string()),
+                            ("Page".to_string(), format!("{} / {}", i + 1, src.len())),
+                        ]
+                    };
+                    let mut rows = head(a);
+                    // Both halves of a spread get described, separated by a blank row.
+                    if let Some(b) = b {
+                        rows.push((String::new(), String::new()));
+                        rows.extend(head(b));
+                    }
+                    self.ui.info = rows;
+                    let tx = self.info_tx.clone();
+                    let generation = self.open_gen;
+                    std::thread::spawn(move || {
+                        let mut blocks = vec![(a, page_info(src.as_ref(), a))];
+                        if let Some(b) = b {
+                            blocks.push((b, page_info(src.as_ref(), b)));
+                        }
+                        let _ = tx.send((generation, visible, blocks));
+                    });
+                }
+                None => self.ui.info = Vec::new(),
+            }
         }
         // Live view state for the overlays: current zoom % (shown in the info
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
