@@ -816,9 +816,11 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 state.on_cursor_moved(position.x, position.y)
             }
-            // The seekbar isn't scrollable, so don't let hovering it swallow the
-            // wheel — keep routing it to the reader (clicks/drags still seek).
-            WindowEvent::MouseWheel { delta, .. } if !response.consumed || state.ui.seek_hovered => {
+            // Non-scrollable chrome (seekbar, anim panel) isn't allowed to swallow
+            // the wheel — keep routing it to the reader (clicks/drags still work).
+            WindowEvent::MouseWheel { delta, .. }
+                if !response.consumed || state.wheel_passthrough() =>
+            {
                 state.on_wheel(delta)
             }
             WindowEvent::MouseInput {
@@ -1287,6 +1289,28 @@ impl State {
             let _ = cmd.spawn();
         }
         std::process::exit(0);
+    }
+
+    /// Foreground chrome with nothing scrollable in it: hovering these must not
+    /// swallow the wheel — the reader keeps navigating (clicks/drags on the
+    /// widget still work normally).
+    const WHEEL_PASSTHROUGH: [&'static str; 2] = ["seekbar", "anim_panel"];
+
+    /// Is the pointer over one of those layers?
+    ///
+    /// Hit-tested against the *layer* rect via `layer_id_at` — which is exactly
+    /// what `egui_wants_pointer_input()` (the `consumed` flag this cancels) uses,
+    /// read from the same completed frame. A per-widget `contains_pointer()` used
+    /// to stand in for this and covered a smaller rect than the layer, leaving a
+    /// dead strip over the seekbar frame's margin — painted as part of the pill,
+    /// but outside the widget — where neither side of the guard fired.
+    fn wheel_passthrough(&self) -> bool {
+        let Some(pos) = self.egui_ctx.input(|i| i.pointer.interact_pos()) else {
+            return false;
+        };
+        self.egui_ctx
+            .layer_id_at(pos)
+            .is_some_and(|l| Self::WHEEL_PASSTHROUGH.iter().any(|&id| l.id == egui::Id::new(id)))
     }
 
     /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
@@ -2284,7 +2308,6 @@ impl State {
         // bottom edge (a touch taller than the floating pill so a drag stays in
         // the reveal zone). Cleared here so it vanishes when no volume is open.
         self.ui.seek_show = false;
-        self.ui.seek_hovered = false;
         if let Some(src) = &self.reader.source {
             let len = src.len();
             let (anchor, facing) = self.reader.visible_pages();

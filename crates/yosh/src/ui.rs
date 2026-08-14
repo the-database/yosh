@@ -122,10 +122,6 @@ pub struct UiState {
     /// Page indices with an LQ preview thumbnail (the whole volume once warm),
     /// painted as a fainter wash beneath the HQ cache bar. Refilled each frame.
     pub seek_lq_buffered: Vec<usize>,
-    /// Pointer is over the seekbar this frame. Lets the app keep routing the
-    /// mouse wheel to the reader (the bar isn't scrollable) while egui still
-    /// gets clicks/drags for seeking.
-    pub seek_hovered: bool,
 
     /// Animation control panel (bottom-left), shown for animated GIF/WebP pages.
     /// Display fields set by the app each frame; the `anim_req_*` fields are
@@ -219,8 +215,6 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     // height is the vertical click target — keep it generous.
                     let (rect, resp) = ui
                         .allocate_exact_size(egui::vec2(bar_w, 30.0), egui::Sense::click_and_drag());
-                    // Let the wheel keep scrolling the reader while over the bar.
-                    st.seek_hovered = resp.contains_pointer();
 
                     let r = 11.0_f32; // handle radius
                     let x0 = rect.left() + r; // handle-center span, inset by the radius
