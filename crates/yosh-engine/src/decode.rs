@@ -294,6 +294,58 @@ fn is_jxl(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xFF, 0x0A]) || bytes.starts_with(&JXL_BOX)
 }
 
+/// The smallest `jpeg-decoder` IDCT scale (in eighths: 1, 2, 4 or 8) whose output
+/// height still **covers** `target_h`. The decoder can run a reduced-size inverse
+/// DCT — 1/8, 1/4, 1/2 or full — which costs a fraction of the full IDCT and skips
+/// the corresponding share of the upsample/color-convert work. Choosing the
+/// smallest covering scale means the CPU resize still does a real (never an
+/// upscaling) reduction to the exact target, so the LQ tier's output size is
+/// unchanged — only the work to get there shrinks (≈4–16× less IDCT on a thumbnail).
+fn idct_eighths(src_h: u32, target_h: u32) -> u32 {
+    [1u32, 2, 4]
+        .into_iter()
+        .find(|&s| src_h.saturating_mul(s).div_ceil(8) >= target_h)
+        .unwrap_or(8)
+}
+
+/// JPEG decode for the **LQ tier only**, asking the decoder for an IDCT-reduced
+/// image when the target is far below native. Returns the usual [`Decoded`] (whose
+/// `w`/`h` are the *reduced* buffer's) plus the file's true source dimensions,
+/// which the caller must restore onto the [`DecodedImage`] — `src_w`/`src_h` drive
+/// the zoom readout and the 1:1 decode target, and must always describe the file,
+/// not the buffer.
+fn decode_jpeg_scaled(bytes: &[u8], target_h: u32) -> Result<(Decoded, (u32, u32)), String> {
+    use jpeg_decoder::PixelFormat;
+    let mut d = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
+    d.read_info().map_err(|e| format!("jpeg read_info: {e}"))?;
+    let info = d.info().ok_or("jpeg: no info")?;
+    // 4-component (CMYK / YCCK) JPEGs go to the `image` crate, as in `decode_jpeg`.
+    if info.pixel_format == PixelFormat::CMYK32 {
+        let d = decode_other(bytes)?;
+        let src = (d.0, d.1);
+        return Ok((d, src));
+    }
+    let (src_w, src_h) = (info.width as u32, info.height as u32);
+    let s = idct_eighths(src_h, target_h);
+    if s < 8 {
+        // Request the reduced size explicitly rather than passing the caller's
+        // target: `choose_idct_size` matches on *either* axis, so an aspect-correct
+        // request is what makes it land on the scale computed above.
+        let req = |v: u32| v.saturating_mul(s).div_ceil(8).clamp(1, u16::MAX as u32) as u16;
+        d.scale(req(src_w), req(src_h)).map_err(|e| format!("jpeg scale: {e}"))?;
+    }
+    let pixels = d.decode().map_err(|e| format!("jpeg decode: {e}"))?;
+    let info = d.info().ok_or("jpeg: no info")?; // output size (post-scale)
+    let (w, h) = (info.width as u32, info.height as u32);
+    let icc = d.icc_profile();
+    let decoded = match info.pixel_format {
+        PixelFormat::L8 => (w, h, true, pixels, icc),
+        PixelFormat::RGB24 => (w, h, false, rgb_to_rgba(&pixels, w, h), icc),
+        other => return Err(format!("jpeg: unsupported pixel format {other:?}")),
+    };
+    Ok((decoded, (src_w, src_h)))
+}
+
 /// Decode to full resolution (no resize), normalized to gray (1ch) or RGBA8.
 fn decode_raw(bytes: &[u8]) -> Result<Decoded, String> {
     if bytes.starts_with(&PNG_SIG) {
@@ -515,22 +567,39 @@ pub fn decode_and_downscale(
 /// resize, skipping ICC color management, the visually-grayscale detection, and
 /// the linear-light path. The fast tier shown while seeking; a native-sized page
 /// (no downscale) returns the same pixels HQ would, so nothing is lost there.
+///
+/// JPEGs additionally decode through a reduced-size IDCT (see `idct_eighths`) —
+/// the biggest single win for the whole-volume thumbnail fill, which used to
+/// full-res-decode every page of a volume just to shrink it to 540 px. **The HQ
+/// path never does this**: its output must be the one exact resample of the full
+/// source data.
 fn decode_and_downscale_lq(
     bytes: &[u8],
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
-    let (w, h, gray_by_channels, full, _profile) = decode_raw(bytes)?;
+    let ((w, h, gray_by_channels, full, _profile), (src_w, src_h)) =
+        if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+            decode_jpeg_scaled(bytes, target_h)?
+        } else {
+            let d = decode_raw(bytes)?;
+            let src = (d.0, d.1);
+            (d, src)
+        };
     let (tw, th) = target_dims(w, h, target_h);
     check_fits(tw, th)?;
-    if tw == w && th == h {
-        return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, path: ResizePath::None, pixels: full });
-    }
-    if gray_by_channels {
-        downscale_gray_fast(&full, w, h, tw, th, resizer)
+    let mut img = if tw == w && th == h {
+        DecodedImage { w, h, src_w: w, src_h: h, gray: gray_by_channels, path: ResizePath::None, pixels: full }
+    } else if gray_by_channels {
+        downscale_gray_fast(&full, w, h, tw, th, resizer)?
     } else {
-        downscale_color_fast(&full, w, h, tw, th, resizer)
-    }
+        downscale_color_fast(&full, w, h, tw, th, resizer)?
+    };
+    // The IDCT hint means the decoded buffer may be smaller than the file, so the
+    // source dims have to come from the header, not from what we decoded.
+    img.src_w = src_w;
+    img.src_h = src_h;
+    Ok(img)
 }
 
 /// A decoded page: a single still image (the common case), an animation as an
@@ -769,6 +838,66 @@ mod tests {
         let mut rgb = vec![0u8; 132];
         rgb[16..20].copy_from_slice(b"RGB ");
         assert!(!icc::is_cmyk(&rgb), "RGB must not read as CMYK");
+    }
+
+    /// The IDCT-scale chooser must never pick a reduction that lands *below* the
+    /// requested height — the CPU resize is a downscale-only path, so undershooting
+    /// would mean upscaling a thumbnail (blurry) instead of reducing it. It must
+    /// also actually reduce when there is headroom, which is the entire win.
+    #[test]
+    fn idct_scale_covers_the_target_and_still_reduces() {
+        for src_h in [540u32, 1024, 1600, 2048, 4096, 5207] {
+            for target in [90u32, 180, 360, 540, 1080, 2160] {
+                let s = idct_eighths(src_h, target);
+                assert!((1..=8).contains(&s), "src {src_h} → {target}: scale {s}");
+                let out = src_h.saturating_mul(s).div_ceil(8);
+                assert!(
+                    out >= target.min(src_h),
+                    "src {src_h} → {target}: reduced to {out}, below the target"
+                );
+                // And it is the *smallest* such scale (no wasted IDCT work).
+                if s > 1 {
+                    let smaller = src_h.saturating_mul(s / 2).div_ceil(8);
+                    assert!(smaller < target, "src {src_h} → {target}: {s}/8 is bigger than needed");
+                }
+            }
+        }
+        // A page already at or below the target decodes at full scale.
+        assert_eq!(idct_eighths(400, 540), 8);
+        // A 540px thumb of a 4096px page: 1/8 (512) is short, 2/8 (1024) covers it.
+        assert_eq!(idct_eighths(4096, 540), 2);
+        // A huge page for a tiny thumb takes the cheapest IDCT there is.
+        assert_eq!(idct_eighths(5207, 90), 1);
+        // `u32::MAX` (the uncached 1:1 target) can't overflow into a bogus scale.
+        assert_eq!(idct_eighths(5207, u32::MAX), 8);
+    }
+
+    /// End-to-end LQ JPEG decode: the output still lands at the exact requested
+    /// height (the IDCT reduction is invisible in the result), and `src_w`/`src_h`
+    /// keep describing the *file* — they drive the zoom readout and the 1:1 decode
+    /// target, so reporting the reduced buffer's size there would misreport zoom and
+    /// re-decode loops. The HQ path is unaffected, which the same page proves.
+    #[test]
+    fn lq_jpeg_decodes_scaled_but_reports_true_source_dims() {
+        let (w, h) = (600u16, 1200u16);
+        let rgb: Vec<u8> = (0..(w as usize * h as usize))
+            .flat_map(|i| [(i % 251) as u8, (i % 253) as u8, (i % 257) as u8])
+            .collect();
+        let mut bytes = Vec::new();
+        jpeg_encoder::Encoder::new(&mut bytes, 90)
+            .encode(&rgb, w, h, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+
+        let mut resizer = Resizer::new();
+        for lq in [true, false] {
+            match decode_page(&bytes, 150, lq, &mut resizer).unwrap() {
+                DecodedPage::Still(img) => {
+                    assert_eq!(img.h, 150, "lq={lq}: decoded to the exact target height");
+                    assert_eq!((img.src_w, img.src_h), (600, 1200), "lq={lq}: true source dims");
+                }
+                _ => panic!("a jpeg is a still"),
+            }
+        }
     }
 
     #[test]

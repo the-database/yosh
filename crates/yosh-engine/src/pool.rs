@@ -41,6 +41,11 @@ pub type Waker = Arc<dyn Fn() + Send + Sync>;
 /// all of it: the *priority* half of the throttle is the claim order (window
 /// first), this is the *concurrency* half, which keeps a burst of full-res thumb
 /// decodes from occupying every worker on a slow device.
+///
+/// A flat constant on purpose: worker 0 is a *reserved* non-thumb lane (see
+/// [`DecodePool::new`]), so on any multi-worker pool — even the 3-worker Low
+/// device tier — at least one thread is always free for the HQ window, and this
+/// cap never has to be scaled per tier.
 const LQ_CONCURRENCY: usize = 2;
 
 struct JobState {
@@ -118,6 +123,14 @@ impl JobState {
     ///    whose page is already being thumbed, are skipped *and dropped* (a later
     ///    tail rebuild re-adds them if the page still has no preview).
     ///
+    /// `allow_thumbs = false` is the **reserved non-thumb lane**: worker 0 of a
+    /// multi-worker pool never claims step 2, so a page flip's HQ decode can never
+    /// queue behind a full-res thumbnail decode — the case that matters on the
+    /// 3-worker Low tier, where `LQ_CONCURRENCY` alone would leave a single spare
+    /// thread. Such a worker simply re-waits when only tail work exists; condvars
+    /// can't target a subset, so a tail-only notify may wake it pointlessly (one
+    /// cheap re-wait, never a lost job).
+    ///
     /// **`None` is exactly the worker's wait condition**, and every state change
     /// that can turn a `None` into a `Some` must notify the condvar:
     /// `set_jobs` (window jobs appear), `set_lq_tail` (tail entries appear), and
@@ -126,12 +139,12 @@ impl JobState {
     /// every other worker parked on a full-slot `None`, nothing but that release
     /// can restart the tail — a missing notify there strands it until the next
     /// navigation.
-    fn claim(&mut self) -> Option<(usize, u32, bool, bool)> {
+    fn claim(&mut self, allow_thumbs: bool) -> Option<(usize, u32, bool, bool)> {
         if let Some((i, h, lq, thumb)) = self.jobs.pop_front() {
             self.inflight.insert(i);
             return Some((i, h, lq, thumb));
         }
-        if self.thumbs_inflight.len() >= LQ_CONCURRENCY {
+        if !allow_thumbs || self.thumbs_inflight.len() >= LQ_CONCURRENCY {
             return None;
         }
         while let Some((i, h)) = self.lq_tail.pop_front() {
@@ -171,7 +184,12 @@ impl DecodePool {
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         let wake_pending = Arc::new(AtomicBool::new(false));
 
-        for _ in 0..workers {
+        for w in 0..workers {
+            // Reserved non-thumb lane: worker 0 of a multi-worker pool only ever
+            // claims HQ window jobs, so the page a flip is waiting on never queues
+            // behind the whole-volume thumbnail fill. A single-worker pool can't
+            // afford to reserve its only thread (nothing would fill the tail).
+            let allow_thumbs = !(w == 0 && workers > 1);
             let shared = shared.clone();
             let device = device.clone();
             let queue = queue.clone();
@@ -239,7 +257,7 @@ impl DecodePool {
                             if !st.running {
                                 return;
                             }
-                            if let Some((i, h, lq, thumb)) = st.claim() {
+                            if let Some((i, h, lq, thumb)) = st.claim(allow_thumbs) {
                                 let source = st.source.clone();
                                 break (i, h, lq, thumb, source);
                             }
@@ -536,14 +554,37 @@ mod tests {
         st.jobs = VecDeque::from(vec![(5, 900, false, false), (6, 900, false, false)]);
         st.lq_tail = VecDeque::from(vec![(40, 540), (41, 540)]);
 
-        assert_eq!(st.claim(), Some((5, 900, false, false)));
-        assert_eq!(st.claim(), Some((6, 900, false, false)));
+        assert_eq!(st.claim(true), Some((5, 900, false, false)));
+        assert_eq!(st.claim(true), Some((6, 900, false, false)));
         assert!(st.lq_tail.len() == 2, "tail untouched while the window had work");
         // Window empty → the tail is finally eligible, as a thumb job.
-        assert_eq!(st.claim(), Some((40, 540, true, true)));
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
         // A window job arriving mid-fill jumps ahead of the rest of the tail again.
         st.jobs.push_back((7, 900, false, false));
-        assert_eq!(st.claim(), Some((7, 900, false, false)));
+        assert_eq!(st.claim(true), Some((7, 900, false, false)));
+    }
+
+    /// The reserved non-thumb lane (worker 0 of a multi-worker pool): it takes HQ
+    /// window jobs like any other worker, but a queued thumbnail is invisible to
+    /// it — it parks instead, keeping one thread permanently available for the next
+    /// page flip. Nothing it declines is consumed, so a thumb-claiming worker still
+    /// finds the tail intact.
+    #[test]
+    fn a_reserved_worker_never_claims_from_the_tail() {
+        let mut st = job_state();
+        st.lq_tail = VecDeque::from(vec![(40, 540), (41, 540)]);
+
+        assert_eq!(st.claim(false), None, "reserved lane must ignore the tail");
+        assert_eq!(st.lq_tail.len(), 2, "a declined claim must not consume the tail");
+        assert!(st.thumbs_inflight.is_empty(), "and must not take a thumb slot");
+
+        // The HQ window is still its job, and it takes it ahead of any tail entry.
+        st.jobs.push_back((5, 900, false, false));
+        assert_eq!(st.claim(false), Some((5, 900, false, false)));
+        assert_eq!(st.claim(false), None);
+
+        // Every other worker still drains the tail normally.
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
     }
 
     /// `cancel_lq` (a page landed a real texture) must stop the queued thumbnail
@@ -555,9 +596,9 @@ mod tests {
         st.lq_tail = VecDeque::from(vec![(40, 540), (41, 540), (42, 540)]);
         st.lq_cancel.insert(41);
 
-        assert_eq!(st.claim(), Some((40, 540, true, true)));
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
         // 41 is skipped *and* consumed, so the next claim is 42, not 41.
-        assert_eq!(st.claim(), Some((42, 540, true, true)));
+        assert_eq!(st.claim(true), Some((42, 540, true, true)));
         assert!(st.lq_tail.is_empty());
         assert!(st.lq_cancel.is_empty(), "a consumed cancel is dropped with its entry");
 
@@ -566,7 +607,7 @@ mod tests {
         let mut st = job_state();
         st.lq_tail = VecDeque::from(vec![(7, 540), (8, 540)]);
         st.lq_cancel.extend([7, 8]);
-        assert_eq!(st.claim(), None);
+        assert_eq!(st.claim(true), None);
         assert!(st.lq_tail.is_empty());
     }
 
@@ -583,24 +624,24 @@ mod tests {
         let mut claimed = Vec::new();
         for _ in 0..8 {
             // Eight idle workers all try to claim.
-            if let Some((i, _, _, thumb)) = st.claim() {
+            if let Some((i, _, _, thumb)) = st.claim(true) {
                 assert!(thumb);
                 claimed.push(i);
             }
         }
         assert_eq!(claimed, vec![0, 1], "at most {LQ_CONCURRENCY} thumbs in flight");
-        assert_eq!(st.claim(), None, "slots full → the worker must wait");
+        assert_eq!(st.claim(true), None, "slots full → the worker must wait");
         assert_eq!(st.lq_tail.len(), 8, "a blocked claim must not consume the tail");
 
         // A thumb finishes (worker: `drop_inflight` → remove + notify_one).
         st.thumbs_inflight.remove(&0);
-        assert_eq!(st.claim(), Some((2, 540, true, true)));
-        assert_eq!(st.claim(), None);
+        assert_eq!(st.claim(true), Some((2, 540, true, true)));
+        assert_eq!(st.claim(true), None);
 
         // A window job is *not* subject to the thumb cap — the HQ path never waits
         // on the background tier.
         st.jobs.push_back((99, 1200, false, false));
-        assert_eq!(st.claim(), Some((99, 1200, false, false)));
+        assert_eq!(st.claim(true), Some((99, 1200, false, false)));
     }
 
     /// Thumbs stay out of `inflight`, which is the set `set_jobs` filters the HQ
@@ -612,7 +653,7 @@ mod tests {
     fn thumbs_do_not_block_the_hq_decode_of_the_same_page() {
         let mut st = job_state();
         st.lq_tail = VecDeque::from(vec![(40, 540)]);
-        assert_eq!(st.claim(), Some((40, 540, true, true)));
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
         assert!(!st.inflight.contains(&40), "a thumb must not claim the inflight slot");
         assert!(st.thumbs_inflight.contains(&40));
 
@@ -620,7 +661,7 @@ mod tests {
         // filter and is claimed normally.
         assert!(!st.inflight.contains(&40));
         st.jobs.push_back((40, 1600, false, false));
-        assert_eq!(st.claim(), Some((40, 1600, false, false)));
+        assert_eq!(st.claim(true), Some((40, 1600, false, false)));
         assert!(st.inflight.contains(&40));
 
         // …and the thumb finishing must not clear the HQ decode's marker.
@@ -635,8 +676,8 @@ mod tests {
     fn a_page_is_never_thumbed_twice_concurrently() {
         let mut st = job_state();
         st.lq_tail = VecDeque::from(vec![(40, 540), (40, 540), (41, 540)]);
-        assert_eq!(st.claim(), Some((40, 540, true, true)));
-        assert_eq!(st.claim(), Some((41, 540, true, true)), "duplicate 40 skipped");
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
+        assert_eq!(st.claim(true), Some((41, 540, true, true)), "duplicate 40 skipped");
         assert_eq!(st.thumbs_inflight.len(), 2);
     }
 

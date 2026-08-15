@@ -33,7 +33,9 @@ use yosh_engine::gpu::GpuContext;
 use yosh_engine::layout::{view_pages, view_start, Layout};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
-use yosh_engine::reader::{drag_commits, drag_dir, Budget, Direction, Reader, Viewport};
+use yosh_engine::reader::{
+    drag_commits, drag_dir, Budget, DeviceTier, Direction, Reader, Viewport,
+};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, SevenzSource, ZipSource};
 // RAR/CBR is gated behind the off-by-default `rar` feature (Linux/CI builds only —
 // see Cargo.toml). The engine only exposes `RarSource` when its `rar` feature is on.
@@ -93,6 +95,7 @@ fn android_main(app: AndroidApp) {
             false,
             true,
             ThemePref::System,
+            PerfPref::Auto,
         ));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
@@ -180,7 +183,7 @@ struct Shell {
     lib_dir_file: Option<PathBuf>,
     /// Persisted viewing options (direction, layout, fit, page-turn animation) +
     /// where they live.
-    init_view: (Direction, LayoutMode, FitMode, bool, bool, bool, ThemePref),
+    init_view: InitView,
     view_file: Option<PathBuf>,
     /// Active touch points by finger id, for swipe / pinch-zoom / pan.
     touches: HashMap<u64, (f64, f64)>,
@@ -327,6 +330,16 @@ struct App {
     resume_on_startup: bool,
     /// Chrome theme preference (persisted in view.txt; toggled in options).
     theme: ThemePref,
+    /// Performance profile (persisted in view.txt; toggled in options). Applied
+    /// live by `apply_perf` — no book reopen.
+    perf: PerfPref,
+    /// The tier the hardware probe chose, used whenever `perf` is `Auto`. Probed
+    /// once per GPU build (a resume re-probes, which is free and correct).
+    auto_tier: DeviceTier,
+    /// The `Budget::for_tier` inputs, kept so the performance setting can recompute
+    /// a budget at runtime without re-reading `/proc`.
+    mem_budget_mb: u64,
+    cpus: usize,
     /// Cached OS night-mode flag (re-read on resume); resolves `ThemePref::System`.
     system_dark: bool,
     /// Light/dark actually pushed into the egui context (`ctx.set_visuals` is
@@ -568,6 +581,50 @@ impl ThemePref {
     }
 }
 
+/// Performance profile: how hard the reader is allowed to work this device.
+/// A single picker rather than individual knobs — the `Budget` fields are
+/// interdependent (a wider prefetch window with a small cache just evicts itself),
+/// so exposing them separately would only let a user build a worse configuration.
+/// `Auto` (the default) uses the probed [`DeviceTier`]; the rest pin a tier, which
+/// is how a flagship keeps today's aggressive behavior (`Performance` = the tier
+/// that applies no ceilings) and a device the heuristic misjudged can be corrected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PerfPref {
+    Auto,
+    Low,
+    Mid,
+    High,
+}
+
+impl PerfPref {
+    /// The tier this pins, or `None` for `Auto` (use the probed one).
+    fn tier(self) -> Option<DeviceTier> {
+        match self {
+            PerfPref::Auto => None,
+            PerfPref::Low => Some(DeviceTier::Low),
+            PerfPref::Mid => Some(DeviceTier::Mid),
+            PerfPref::High => Some(DeviceTier::High),
+        }
+    }
+    /// Persistence token (view.txt slot 8).
+    fn label(self) -> &'static str {
+        match self {
+            PerfPref::Auto => "auto",
+            PerfPref::Low => "low",
+            PerfPref::Mid => "mid",
+            PerfPref::High => "high",
+        }
+    }
+    fn parse(tok: Option<&&str>) -> Self {
+        match tok {
+            Some(&"low") => PerfPref::Low,
+            Some(&"mid") => PerfPref::Mid,
+            Some(&"high") => PerfPref::High,
+            _ => PerfPref::Auto,
+        }
+    }
+}
+
 /// Cross-shell actions an egui frame requests (handled after the egui run, since
 /// they need `Shell` state the reader/render path doesn't own).
 #[derive(Default)]
@@ -598,6 +655,14 @@ impl ApplicationHandler for Shell {
                 .expect("create window"),
         );
         self.has_files = has_all_files(&self.android_app);
+        // Every options toggle writes view.txt immediately, but `init_view` is the
+        // snapshot this process *launched* with — and a resume rebuilds the whole
+        // App from it. Re-read the file so options changed since launch (theme,
+        // fit, performance profile, …) survive a background/foreground cycle
+        // instead of silently reverting.
+        if let Some(f) = &self.view_file {
+            self.init_view = load_view(f);
+        }
         // On-demand rendering: the loop sleeps until an event arrives, and every
         // off-thread producer wakes it through `frame_waker` when it has something
         // to show. `Wait` is winit's default, but the whole redraw guard below is
@@ -700,8 +765,21 @@ impl ApplicationHandler for Shell {
             egui_wgpu::RendererOptions::default(),
         );
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let budget = Budget::derive(device_mem_budget_mb(), cpus);
-        log::info!("budget: {budget:?} ({cpus} cpus)");
+        let (mem_budget_mb, total_mb) = device_mem();
+        let max_khz = max_cpu_khz();
+        let auto_tier = device_tier(total_mb, max_khz);
+        let perf = self.init_view.7;
+        let tier = perf.tier().unwrap_or(auto_tier);
+        let budget = Budget::for_tier(tier, mem_budget_mb, cpus);
+        // One line with everything the tier decision rests on: a field report of a
+        // device behaving badly should be diagnosable from logcat alone.
+        log::info!(
+            "device: {total_mb} MB RAM, {cpus} cpus, max {} MHz, gpu \"{}\" → auto tier {auto_tier:?}, perf {} → {tier:?}",
+            max_khz.map_or(0, |k| k / 1000),
+            ctx.adapter_info.name,
+            perf.label(),
+        );
+        log::info!("budget: {budget:?} (mem slice {mem_budget_mb} MB)");
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
         let mut reader = Reader::new(
             ctx.device.clone(),
@@ -768,6 +846,10 @@ impl ApplicationHandler for Shell {
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
             theme: self.init_view.6,
+            perf,
+            auto_tier,
+            mem_budget_mb,
+            cpus,
             system_dark: system_dark(&self.android_app),
             applied_light: None,
             view_file: self.view_file.clone(),
@@ -1593,11 +1675,16 @@ fn attach_source(
     reader.prefetch();
 }
 
+/// The persisted viewing options, in `view.txt`'s positional order: direction,
+/// layout mode, fit, page-turn animation, scroll mode, resume-on-startup, chrome
+/// theme, performance profile.
+type InitView = (Direction, LayoutMode, FitMode, bool, bool, bool, ThemePref, PerfPref);
+
 /// Load the persisted per-comic positions (one `index\tkey` line each).
 /// Parse persisted viewing options ("dir,layout,fit,anim"); default RTL / single /
 /// window / animation on.
-fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool, ThemePref) {
-    let (mut dir, mut lay, mut fit, mut anim, mut scroll, mut resume, mut theme) = (
+fn load_view(path: &Path) -> InitView {
+    let (mut dir, mut lay, mut fit, mut anim, mut scroll, mut resume, mut theme, mut perf) = (
         Direction::Rtl,
         LayoutMode::Single,
         FitMode::Window,
@@ -1605,6 +1692,7 @@ fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool, 
         false,
         true,
         ThemePref::System,
+        PerfPref::Auto,
     );
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
@@ -1631,11 +1719,14 @@ fn load_view(path: &Path) -> (Direction, LayoutMode, FitMode, bool, bool, bool, 
         resume = t.get(5) != Some(&"noresume");
         // 7th slot: chrome theme; absent (older files) ⇒ follow the system.
         theme = ThemePref::parse(t.get(6));
+        // 8th slot: performance profile; absent (older files) ⇒ auto (the probed tier).
+        perf = PerfPref::parse(t.get(7));
     }
-    (dir, lay, fit, anim, scroll, resume, theme)
+    (dir, lay, fit, anim, scroll, resume, theme, perf)
 }
 
-/// Persist viewing options as "dir,layout,fit,anim,scroll,resume,theme".
+/// Persist viewing options as "dir,layout,fit,anim,scroll,resume,theme,perf".
+#[allow(clippy::too_many_arguments)]
 fn save_view(
     path: &Path,
     dir: Direction,
@@ -1645,6 +1736,7 @@ fn save_view(
     scroll: bool,
     resume: bool,
     theme: ThemePref,
+    perf: PerfPref,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -1658,7 +1750,8 @@ fn save_view(
     let s = if scroll { "scroll" } else { "flip" };
     let r = if resume { "resume" } else { "noresume" };
     let t = theme.label();
-    let _ = std::fs::write(path, format!("{d},{l},{f},{a},{s},{r},{t}"));
+    let p = perf.label();
+    let _ = std::fs::write(path, format!("{d},{l},{f},{a},{s},{r},{t},{p}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -1710,24 +1803,80 @@ fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
     map
 }
 
-/// Memory (MB) the reader may use for its page cache + GPU textures, from
-/// `/proc/meminfo`. Decoded pages and GPU textures are *native* allocations, not
-/// bounded by the (small) Java heap, so a healthy slice of device RAM is fine —
-/// more cache + a wider prefetch window means fewer stalls seeking heavy pages.
-fn device_mem_budget_mb() -> u64 {
-    let total = std::fs::read_to_string("/proc/meminfo")
+/// Read one `/proc/meminfo` field in MB (the values are in kB).
+fn meminfo_mb(text: &str, field: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.strip_prefix(field))?
+        .split_whitespace()
+        .next()?
+        .parse::<u64>()
         .ok()
-        .and_then(|s| {
-            s.lines()
-                .find_map(|l| l.strip_prefix("MemTotal:"))?
-                .split_whitespace()
-                .next()?
-                .parse::<u64>()
-                .ok()
-        })
         .map(|kb| kb / 1024)
-        .unwrap_or(4096);
-    (total / 8).max(256)
+}
+
+/// `(budget_mb, total_mb)` — the memory the reader may use for its page cache +
+/// GPU textures, and the device's raw RAM (which the tier heuristic reads).
+///
+/// Decoded pages and GPU textures are *native* allocations, not bounded by the
+/// (small) Java heap, so a healthy slice of device RAM is fine. But **MemTotal
+/// alone is a lie about what's available**: the old `MemTotal/8` made every ≥3 GB
+/// phone — a cheap one included — saturate every `Budget::derive` clamp at the
+/// desktop maxima, which is the main reason yosh ran badly on slow devices. Take
+/// the smaller of a total-RAM slice and a third of what's actually free right now,
+/// then clamp into a range that keeps a small device conservative and a big one
+/// from claiming more than the reader can usefully hold.
+fn device_mem() -> (u64, u64) {
+    let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let total = meminfo_mb(&info, "MemTotal:").unwrap_or(4096);
+    // Older kernels lack MemAvailable; fall back to the total-only estimate.
+    let avail = meminfo_mb(&info, "MemAvailable:").unwrap_or(total / 2);
+    let budget = (total / 8).min(avail / 3).clamp(192, 1024);
+    (budget, total)
+}
+
+/// Highest CPU clock (kHz) the SoC advertises, across all cores. This is the
+/// big.LITTLE discriminator the tier heuristic needs: all-little budget SoCs top
+/// out around 1.8–2.0 GHz while a flagship prime core is 2.8 GHz+, and core *count*
+/// can't tell them apart (both are 8). `None` when sysfs isn't readable (some
+/// devices restrict it) — the caller then tiers on RAM alone.
+fn max_cpu_khz() -> Option<u64> {
+    let dir = std::fs::read_dir("/sys/devices/system/cpu").ok()?;
+    let mut best: Option<u64> = None;
+    for e in dir.flatten() {
+        let p = e.path().join("cpufreq/cpuinfo_max_freq");
+        if let Ok(s) = std::fs::read_to_string(&p)
+            && let Ok(khz) = s.trim().parse::<u64>()
+        {
+            best = Some(best.map_or(khz, |b: u64| b.max(khz)));
+        }
+    }
+    best
+}
+
+/// Classify the device from RAM + peak CPU clock. Deliberately conservative in the
+/// middle: only a clearly-flagship device (≥ 8 GB **and** ≥ 2.5 GHz) gets `High`,
+/// which is the tier that applies no ceilings at all. Never tier on GPU name —
+/// the same GPU string ships across wildly different thermal envelopes.
+///
+/// (Pixel 9 Pro XL → High; Snapdragon 695 / 6 GB → Mid; Helio G85 / 4 GB → Low.)
+fn device_tier(total_mb: u64, max_khz: Option<u64>) -> DeviceTier {
+    let gb = total_mb as f64 / 1024.0;
+    match max_khz {
+        Some(khz) if khz < 2_100_000 => DeviceTier::Low,
+        Some(khz) => {
+            if gb < 4.0 {
+                DeviceTier::Low
+            } else if gb >= 8.0 && khz >= 2_500_000 {
+                DeviceTier::High
+            } else {
+                DeviceTier::Mid
+            }
+        }
+        // Clock unreadable: RAM-only fallback.
+        None if gb < 4.0 => DeviceTier::Low,
+        None if gb >= 8.0 => DeviceTier::High,
+        None => DeviceTier::Mid,
+    }
 }
 
 /// Bottom seekbar: "page / total" + a draggable slider that requests a jump.
@@ -2375,6 +2524,7 @@ fn options_popup(
     resume_on: bool,
     scroll_on: bool,
     theme: ThemePref,
+    perf: PerfPref,
     rotation: u8,
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
@@ -2383,6 +2533,7 @@ fn options_popup(
     set_resume: &mut Option<bool>,
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
+    set_perf: &mut Option<PerfPref>,
     toggle_offset: &mut bool,
     rotate: &mut bool,
 ) {
@@ -2533,6 +2684,33 @@ fn options_popup(
                         }
                     }
                 });
+
+                // One profile, not individual knobs: the budget's fields are
+                // interdependent. Auto = the hardware probe; the rest pin a tier
+                // (Performance = no ceilings, i.e. the desktop configuration).
+                ui.label(egui::RichText::new("Performance").strong());
+                ui.horizontal(|ui| {
+                    for (p, text) in [
+                        (PerfPref::Auto, "Auto"),
+                        (PerfPref::Low, "Battery saver"),
+                        (PerfPref::Mid, "Balanced"),
+                        (PerfPref::High, "Performance"),
+                    ] {
+                        if ui
+                            .selectable_label(perf == p, egui::RichText::new(text).size(16.0))
+                            .clicked()
+                        {
+                            *set_perf = Some(p);
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(
+                        "Auto matches your device. Lower settings decode fewer pages ahead and use less memory and battery.",
+                    )
+                    .size(12.0)
+                    .color(egui::Color32::from_white_alpha(150)),
+                );
             });
         });
 }
@@ -2780,8 +2958,54 @@ impl App {
                 self.reader.scroll_mode,
                 self.resume_on_startup,
                 self.theme,
+                self.perf,
             );
         }
+    }
+
+    /// Apply the performance profile to the live reader — **no book reopen**. The
+    /// budget's fields are all runtime-settable: the window sizes are plain fields,
+    /// both caches and the texture pool can be re-capped in place (evicting down
+    /// keeps the pages nearest the read position, so nothing on screen flashes),
+    /// and the worker count is the one thing that needs a new pool. Rebuilding the
+    /// pool is cheap and hitch-free because teardown is signal-only and the caches
+    /// are deliberately **kept** — the current page stays decoded and on screen
+    /// while the new pool refills around it.
+    fn apply_perf(&mut self) {
+        let tier = self.perf.tier().unwrap_or(self.auto_tier);
+        let b = Budget::for_tier(tier, self.mem_budget_mb, self.cpus);
+        log::info!("perf {} → tier {tier:?}, budget: {b:?}", self.perf.label());
+        let current = self.reader.index;
+        self.reader.workers = b.workers;
+        self.reader.fwd = b.fwd;
+        self.reader.fwd_max = b.fwd_max;
+        self.reader.back = b.back;
+        self.reader.actual_cap_vh = b.actual_cap_vh;
+        self.reader.lq_thumb_h = b.lq_thumb_h;
+        self.reader.lq_tier = b.lq_tier;
+        self.reader.cache.set_cap(b.cache_cap, current);
+        self.reader.lq_cache.set_cap(b.lq_cap, current);
+        self.reader.tex_pool.set_max_total(b.texpool_max);
+        // Nothing open (library view): the fields above are enough — the pool is
+        // built with `reader.workers` when the next book opens.
+        let Some(src) = self.reader.source.clone() else {
+            return;
+        };
+        let pool = DecodePool::new(
+            src,
+            self.ctx.device.clone(),
+            self.ctx.queue.clone(),
+            self.reader.tex_pool.clone(),
+            b.workers,
+        );
+        // A fresh pool starts wakerless and with empty queues: re-install the wake
+        // callback, then force a full rebuild of both the job list and the
+        // thumbnail tail (`JobsKey` doesn't capture budget fields, so without this
+        // the memoized key would suppress the very prefetch that refills the pool).
+        pool.set_waker(self.reader.waker.clone());
+        self.reader.pool = Some(pool);
+        self.reader.invalidate_jobs();
+        self.reader.prefetch();
     }
 
     /// Resolve the layout mode against the current viewport and, if it differs from
@@ -2968,6 +3192,7 @@ impl App {
         let cur_resume = self.resume_on_startup;
         let cur_scroll = self.reader.scroll_mode;
         let cur_theme = self.theme;
+        let cur_perf = self.perf;
         let cur_rotation = self.reader.rotation;
         let drag_seam = self.reader.drag_seam();
         let cur_zoom = self.reader.zoom;
@@ -3099,6 +3324,7 @@ impl App {
         let mut set_resume: Option<bool> = None;
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
+        let mut set_perf: Option<PerfPref> = None;
         let mut toggle_offset = false;
         let mut rotate = false;
         let mut cycle_fit = false;
@@ -3354,6 +3580,7 @@ impl App {
                         cur_resume,
                         cur_scroll,
                         cur_theme,
+                        cur_perf,
                         cur_rotation,
                         &mut set_dir,
                         &mut set_layout,
@@ -3362,6 +3589,7 @@ impl App {
                         &mut set_resume,
                         &mut set_scroll,
                         &mut set_theme,
+                        &mut set_perf,
                         &mut toggle_offset,
                         &mut rotate,
                     );
@@ -3504,6 +3732,12 @@ impl App {
             self.theme = t;
             self.persist_view();
             self.window.request_redraw(); // re-paint the chrome under the new theme
+        }
+        if let Some(p) = set_perf {
+            self.perf = p;
+            self.apply_perf(); // live: no reopen, current page stays on screen
+            self.persist_view();
+            self.window.request_redraw();
         }
         if cycle_fit {
             if (self.reader.zoom - 1.0).abs() > 0.001 {
