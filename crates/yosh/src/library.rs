@@ -281,7 +281,7 @@ fn archive_kind(p: &Path) -> Option<VolKind> {
 /// avoid spinning up a full sequential extractor for a thumbnail. Takes
 /// `(path, kind)` rather than `&Volume` so an off-thread cover-decode worker can
 /// call it without holding a borrow of the library.
-pub fn cover_bytes(path: &Path, kind: VolKind) -> Option<Vec<u8>> {
+pub fn cover_bytes(path: &Path, kind: VolKind) -> Option<std::sync::Arc<Vec<u8>>> {
     match kind {
         VolKind::Folder => {
             let s = FolderSource::new(path).ok()?;

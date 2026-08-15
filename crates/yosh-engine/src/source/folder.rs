@@ -61,8 +61,8 @@ impl PageSource for FolderSource {
         &self.names[index]
     }
 
-    fn read_page(&self, index: usize) -> io::Result<Vec<u8>> {
-        std::fs::read(&self.paths[index])
+    fn read_page(&self, index: usize) -> io::Result<std::sync::Arc<Vec<u8>>> {
+        std::fs::read(&self.paths[index]).map(std::sync::Arc::new)
     }
 
     fn modified(&self, index: usize) -> Option<String> {
@@ -98,8 +98,8 @@ mod tests {
         assert_eq!(src.len(), 2, "dir + non-image excluded");
         assert_eq!(src.name(0), "01.png"); // natural-sorted
         assert_eq!(src.name(1), "02.jpg");
-        assert_eq!(src.read_page(0).unwrap(), b"PNGDATA-ONE");
-        assert_eq!(src.read_page(1).unwrap(), b"JPGDATA-TWO");
+        assert_eq!(*src.read_page(0).unwrap(), b"PNGDATA-ONE");
+        assert_eq!(*src.read_page(1).unwrap(), b"JPGDATA-TWO");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

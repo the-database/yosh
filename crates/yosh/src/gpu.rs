@@ -31,7 +31,13 @@ impl Gpu {
         let surface = instance
             .create_surface(window.clone())
             .expect("create surface");
-        let ctx = GpuContext::create(instance, Some(&surface));
+        // Desktop keeps the historical preference: on a laptop with switchable
+        // graphics this picks the discrete GPU.
+        let ctx = GpuContext::create(
+            instance,
+            Some(&surface),
+            wgpu::PowerPreference::HighPerformance,
+        );
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&ctx.adapter);
