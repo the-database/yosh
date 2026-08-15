@@ -24,7 +24,7 @@ use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
 use winit::application::ApplicationHandler;
 use winit::event::{Touch, TouchPhase, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::platform::android::activity::{AndroidApp, WindowManagerFlags};
 use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 use yosh_engine::gpu::GpuContext;
 use yosh_engine::layout::{view_pages, view_start, Layout};
 use yosh_engine::page::{FitMode, PagePipeline};
-use yosh_engine::pool::DecodePool;
+use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::reader::{drag_commits, drag_dir, Budget, Direction, Reader, Viewport};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, SevenzSource, ZipSource};
 // RAR/CBR is gated behind the off-by-default `rar` feature (Linux/CI builds only —
@@ -101,6 +101,7 @@ fn android_main(app: AndroidApp) {
     let mut shell = Shell {
         app: None,
         android_app: app,
+        frame_waker: None,
         picker_pending: false,
         positions,
         pos_path,
@@ -144,6 +145,12 @@ struct Shell {
     app: Option<App>,
     /// Kept for JNI into the `YoshActivity` Java bridge (vm + activity pointers).
     android_app: AndroidApp,
+    /// "Something new to draw" callback for off-thread producers: it just calls
+    /// `Window::request_redraw`, which is thread-safe (it flags the window and
+    /// wakes the ALooper). Handed to the decode pool via `Reader::set_waker` and to
+    /// the library producers, so the frame loop can genuinely idle between results
+    /// instead of polling for them. Re-made per window in `resumed`.
+    frame_waker: Option<Waker>,
     /// A document-picker launch is awaiting its result.
     picker_pending: bool,
     /// Per-comic last-read page, keyed by comic identity (content:// URI or path).
@@ -254,12 +261,24 @@ struct App {
     lib_entries: Vec<Entry>,
     /// Decoded cover thumbnails by comic path (egui textures), filled off-thread.
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
-    thumb_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
+    /// One message per *requested* cover — `None` when the decode failed, so the
+    /// in-flight count below can't leak on an unreadable archive.
+    thumb_rx: std::sync::mpsc::Receiver<(PathBuf, Option<egui::ColorImage>)>,
     /// Queue into the persistent cover-decode worker (see [`spawn_cover_worker`]):
     /// batches of comic paths in, decoded covers back out through `thumb_rx`.
     cover_tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
     /// Covers already queued for decode (lazy, per visible series section).
     queued_covers: std::collections::HashSet<PathBuf>,
+    /// Covers sent to the worker whose result hasn't been drained yet. Unlike
+    /// `queued_covers` (which remembers every request, so a decoded — or
+    /// undecodable — cover is never re-queued) this drops back to zero, which is
+    /// what the redraw guard needs: "results are still coming", not "results ever
+    /// came".
+    covers_inflight: usize,
+    /// The shell's frame waker (see [`Shell::frame_waker`]), carried here so the
+    /// App's own off-thread producers — the series scan — can wake the loop when
+    /// their results land.
+    frame_waker: Option<Waker>,
     /// Frame stamp a cover was last drawn (LRU for the `thumbs` cap — a big
     /// library would otherwise pin hundreds of MB of egui textures).
     thumb_used: HashMap<PathBuf, u64>,
@@ -383,7 +402,7 @@ const SERIES_MAX_DEPTH: usize = 5;
 /// Walk `root` off-thread and group its comics into [`Series`] — every folder
 /// that directly holds at least one volume. Sent back whole (drained in render
 /// like the cover decodes), so a deep tree or slow storage never hitches the UI.
-fn spawn_library_scan(root: PathBuf, tx: std::sync::mpsc::Sender<Vec<Series>>) {
+fn spawn_library_scan(root: PathBuf, tx: std::sync::mpsc::Sender<Vec<Series>>, waker: Option<Waker>) {
     std::thread::spawn(move || {
         let mut out = Vec::new();
         if walk_series(&root, 0, &mut out) {
@@ -401,7 +420,12 @@ fn spawn_library_scan(root: PathBuf, tx: std::sync::mpsc::Sender<Vec<Series>>) {
                 &b.dir.to_string_lossy().to_lowercase(),
             )
         });
+        // Send, then wake: the loop is idle while the scan runs, so the result only
+        // reaches the screen if this schedules the frame that drains `series_rx`.
         let _ = tx.send(out);
+        if let Some(w) = &waker {
+            w();
+        }
     });
 }
 
@@ -574,6 +598,17 @@ impl ApplicationHandler for Shell {
                 .expect("create window"),
         );
         self.has_files = has_all_files(&self.android_app);
+        // On-demand rendering: the loop sleeps until an event arrives, and every
+        // off-thread producer wakes it through `frame_waker` when it has something
+        // to show. `Wait` is winit's default, but the whole redraw guard below is
+        // built on it, so pin it explicitly rather than inherit it.
+        event_loop.set_control_flow(ControlFlow::Wait);
+        // A fresh window means a fresh waker (the old one holds the old window and
+        // dies with the App it belonged to).
+        self.frame_waker = Some({
+            let w = window.clone();
+            Arc::new(move || w.request_redraw())
+        });
         log::info!(
             "all-files access: {} | scale {}",
             self.has_files,
@@ -683,13 +718,16 @@ impl ApplicationHandler for Shell {
             true, // two_tier: LQ while seeking → HQ on settle
         );
         reader.transition_enabled = self.init_view.3; // page-turn animation (persisted; default on)
+        // Landing decodes schedule their own frame from the worker thread; every
+        // pool this reader builds inherits the callback.
+        reader.set_waker(self.frame_waker.clone());
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (series_tx, series_rx) = std::sync::mpsc::channel();
         // On-disk cover-thumbnail cache dir (app-private `…/thumbs`): covers load
         // from here instead of re-decoding the full first page on every open. It's
         // owned by the cover worker, the only thing that touches it.
         let thumb_cache_dir = self.android_app.internal_data_path().map(|p| p.join("thumbs"));
-        let cover_tx = spawn_cover_worker(thumb_cache_dir, thumb_tx);
+        let cover_tx = spawn_cover_worker(thumb_cache_dir, thumb_tx, self.frame_waker.clone());
         self.app = Some(App {
             window: window.clone(),
             ctx,
@@ -709,6 +747,8 @@ impl ApplicationHandler for Shell {
             thumb_rx,
             cover_tx,
             queued_covers: std::collections::HashSet::new(),
+            covers_inflight: 0,
+            frame_waker: self.frame_waker.clone(),
             thumb_used: HashMap::new(),
             frame_no: 0,
             logo: None,
@@ -1362,9 +1402,11 @@ impl Shell {
                 && !app.thumbs.contains_key(p)
             {
                 // Cover preview: same off-thread pipeline as the library; the
-                // result lands via the per-frame `thumb_rx` drain and the card
-                // picks it up while the prompt is still showing.
-                let _ = app.cover_tx.send(vec![p.clone()]);
+                // result lands via the per-frame `thumb_rx` drain (woken by the
+                // worker) and the card picks it up while the prompt is showing.
+                if app.cover_tx.send(vec![p.clone()]).is_ok() {
+                    app.covers_inflight += 1;
+                }
             }
             app.book_prompt = Some(BookPrompt {
                 dir,
@@ -1527,13 +1569,17 @@ fn attach_source(
     src: Arc<dyn PageSource>,
     start: usize,
 ) {
-    reader.pool = Some(DecodePool::new(
+    let pool = DecodePool::new(
         src.clone(),
         device.clone(),
         queue.clone(),
         reader.tex_pool.clone(),
         reader.workers,
-    ));
+    );
+    // A new pool starts wakerless: re-install the shell's callback or this book's
+    // decodes would land without ever scheduling the frame that draws them.
+    pool.set_waker(reader.waker.clone());
+    reader.pool = Some(pool);
     reader.cache.clear();
     reader.lq_cache.clear();
     reader.failed.clear();
@@ -2600,7 +2646,11 @@ impl App {
     /// `series_rx` in render).
     fn kick_series_scan(&mut self) {
         self.series_pending = true;
-        spawn_library_scan(self.lib_root.clone(), self.series_tx.clone());
+        spawn_library_scan(
+            self.lib_root.clone(),
+            self.series_tx.clone(),
+            self.frame_waker.clone(),
+        );
         self.window.request_redraw();
     }
 
@@ -2859,6 +2909,11 @@ impl App {
         }
         // Drain decoded covers into egui textures, and any finished series scan.
         while let Ok((path, img)) = self.thumb_rx.try_recv() {
+            self.covers_inflight = self.covers_inflight.saturating_sub(1);
+            // A cover that wouldn't decode (unreadable or empty archive) stays in
+            // `queued_covers`, so it isn't retried every frame — it just never
+            // gets a thumbnail.
+            let Some(img) = img else { continue };
             let handle =
                 self.egui_ctx
                     .load_texture(path.to_string_lossy(), img, egui::TextureOptions::default());
@@ -3381,7 +3436,12 @@ impl App {
             }
         }
         if !to_decode.is_empty() {
-            let _ = self.cover_tx.send(to_decode);
+            // Count them as in flight only once the worker has them: a dead worker
+            // (App torn down) would otherwise leave the redraw guard armed forever.
+            let queued = to_decode.len();
+            if self.cover_tx.send(to_decode).is_ok() {
+                self.covers_inflight += queued;
+            }
         }
         const THUMB_CAP: usize = 256;
         if self.thumbs.len() > THUMB_CAP {
@@ -3520,18 +3580,19 @@ impl App {
             .submit(user_cmds.into_iter().chain(std::iter::once(enc.finish())));
         self.window.pre_present_notify();
         frame.present();
-        // On-demand redraw: idle on a settled, decoded reading page. Keep going
-        // while the library is open (covers stream in / scrolling), the decode view
-        // hasn't settled (resize/zoom re-decode), or the current page is still
-        // decoding (not yet cached and not failed). Nav/zoom/pan and egui repaints
-        // wake the loop via request_redraw in the event handler.
-        // Keep drawing while the library is open, the view hasn't settled, or the
-        // current page isn't HQ yet (missing, or only the LQ seek-tier — so it
-        // sharpens to HQ once seeking stops).
-        if self.library_view
+        // On-demand redraw: idle on a settled, decoded reading page. Pending work
+        // no longer needs a leg here — everything that produces a result off-thread
+        // (the decode pool, the cover worker, the series scan) sends and then calls
+        // the frame waker, which is `request_redraw`, so the frame that drains it
+        // is scheduled by the landing itself. What's left are the things the loop
+        // can only learn about by drawing again: an unsettled decode view (one
+        // confirmation frame, self-limiting), timed chrome, and animations.
+        // The library still gets a leg while results are outstanding — a cheap
+        // belt-and-braces for the *first* frame after a scan/cover is queued, since
+        // that producer may finish before we even reach the guard.
+        // Nav/zoom/pan and egui repaints wake the loop from the event handler.
+        if (self.library_view && (self.series_pending || self.covers_inflight > 0))
             || !self.reader.view_settled
-            || !self.reader.view_is_hq()
-            || self.reader.lq_fill_pending()
             || hints_visible
             // Draw-time flag, NOT transition_active()/drag_active(): re-sampling
             // the clock here can see the animation as just-expired even though
@@ -3646,7 +3707,10 @@ fn decode_logo() -> Option<egui::ColorImage> {
 
 /// Spawn the single, persistent cover-decode worker: batches of comic paths in
 /// (`Sender<Vec<PathBuf>>`), decoded covers streamed back out through `tx`,
-/// reading/writing the on-disk thumbnail cache as it goes.
+/// reading/writing the on-disk thumbnail cache as it goes. Each cover is sent
+/// then followed by a `waker` call, so a library sitting idle draws the covers as
+/// they arrive without the frame loop polling for them; a path that fails to
+/// decode still sends (`None`) so the shell's in-flight count always drains.
 ///
 /// One thread for the App's whole lifetime, reusing one `Resizer`, instead of a
 /// thread per batch — scrolling a library used to mint a fresh thread (and a
@@ -3656,17 +3720,20 @@ fn decode_logo() -> Option<egui::ColorImage> {
 /// progress finishes first, then the `tx` send fails and it returns anyway).
 fn spawn_cover_worker(
     cache_dir: Option<PathBuf>,
-    tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
+    tx: std::sync::mpsc::Sender<(PathBuf, Option<egui::ColorImage>)>,
+    waker: Option<Waker>,
 ) -> std::sync::mpsc::Sender<Vec<PathBuf>> {
     let (job_tx, job_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
     std::thread::spawn(move || {
         let mut resizer = fast_image_resize::Resizer::new();
         while let Ok(paths) = job_rx.recv() {
             for path in paths {
-                if let Some(img) = decode_cover(&path, cache_dir.as_deref(), &mut resizer)
-                    && tx.send((path, img)).is_err()
-                {
+                let img = decode_cover(&path, cache_dir.as_deref(), &mut resizer);
+                if tx.send((path, img)).is_err() {
                     return; // receiver gone (App torn down)
+                }
+                if let Some(w) = &waker {
+                    w();
                 }
             }
         }
