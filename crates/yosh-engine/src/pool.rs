@@ -91,6 +91,11 @@ struct JobState {
     /// that is already running — shells rebuild pools at several sites, and the
     /// window the callback belongs to outlives every one of them.
     waker: Option<Waker>,
+    /// Parked: the pool is frozen (see [`DecodePool::park`]). Nothing is claimed
+    /// and everything already running abandons at its next yield point, so a
+    /// backgrounded app stops burning CPU/battery on a fill nobody can see. The
+    /// queues are deliberately *kept* — an unpark resumes the same work list.
+    paused: bool,
     running: bool,
 }
 
@@ -133,13 +138,18 @@ impl JobState {
     ///
     /// **`None` is exactly the worker's wait condition**, and every state change
     /// that can turn a `None` into a `Some` must notify the condvar:
-    /// `set_jobs` (window jobs appear), `set_lq_tail` (tail entries appear), and
-    /// the thumb-slot release in the worker's `drop_inflight` (a slot frees). The
-    /// last one is the deadlock to watch: with `LQ_CONCURRENCY` thumbs running and
-    /// every other worker parked on a full-slot `None`, nothing but that release
-    /// can restart the tail — a missing notify there strands it until the next
-    /// navigation.
+    /// `set_jobs` (window jobs appear), `set_lq_tail` (tail entries appear),
+    /// `unpark` (the whole pool thaws), and the thumb-slot release in the worker's
+    /// `drop_inflight` (a slot frees). The last one is the deadlock to watch: with
+    /// `LQ_CONCURRENCY` thumbs running and every other worker parked on a full-slot
+    /// `None`, nothing but that release can restart the tail — a missing notify
+    /// there strands it until the next navigation.
     fn claim(&mut self, allow_thumbs: bool) -> Option<(usize, u32, bool, bool)> {
+        // Parked pools claim nothing at all, of either tier — that is the whole
+        // point of [`DecodePool::park`]. The queues stay intact for the unpark.
+        if self.paused {
+            return None;
+        }
         if let Some((i, h, lq, thumb)) = self.jobs.pop_front() {
             self.inflight.insert(i);
             return Some((i, h, lq, thumb));
@@ -155,6 +165,45 @@ impl JobState {
             return Some((i, h, true, true));
         }
         None
+    }
+
+    /// Should the worker abandon the page it is part-way through? Called at the
+    /// read→decode and decode→upload boundaries; `true` means "drop it and go back
+    /// for another job" (the caller sends nothing). Split out of the worker loop
+    /// alongside [`JobState::claim`] so the rules are unit-testable without a GPU.
+    ///
+    /// Abandoning **releases the job's in-flight marker itself** — the worker's
+    /// stale path never reaches `drop_inflight` — so every `true` return here must
+    /// free the right one, or that page (window tier) or thumbnail slot (tail tier)
+    /// is leaked for the life of the pool.
+    ///
+    /// Two rules:
+    /// - **A parked pool abandons everything, thumbs included.** Park exists to
+    ///   stop the CPU dead while backgrounded, so in-flight work bails at the next
+    ///   yield instead of finishing a decode nobody will see.
+    /// - Otherwise **thumbs are never stale.** A whole-volume thumbnail is
+    ///   position-*independent* work — it isn't in `wanted` at all (the tail is a
+    ///   separate queue), and only its scheduling order depends on where the reader
+    ///   is, so abandoning it for a navigation would just throw away a finished
+    ///   decode. A window page is stale as soon as it leaves `wanted`.
+    fn stale(&mut self, index: usize, thumb: bool) -> bool {
+        if self.paused {
+            if thumb {
+                self.thumbs_inflight.remove(&index);
+            } else {
+                self.inflight.remove(&index);
+            }
+            return true;
+        }
+        if thumb {
+            return false;
+        }
+        if self.wanted.contains(&index) {
+            false
+        } else {
+            self.inflight.remove(&index);
+            true
+        }
     }
 }
 
@@ -177,6 +226,7 @@ impl DecodePool {
                 inflight: HashSet::new(),
                 wanted: HashSet::new(),
                 waker: None,
+                paused: false,
                 running: true,
             }),
             Condvar::new(),
@@ -202,30 +252,12 @@ impl DecodePool {
             // texture pool, source), so a straggler outliving the pool is safe.
             std::thread::spawn(move || {
                 let mut resizer = Resizer::new();
-                // Has `index` fallen out of the wanted window? If so, drop it from
-                // `inflight` (so it can be re-queued later) and report stale. Called
-                // at the read→decode and decode→upload boundaries to abandon work the
-                // latest navigation made useless.
-                //
-                // **Thumbs are never stale.** A whole-volume thumbnail is position-
-                // *independent* work — it is not in `wanted` at all (the tail is a
-                // separate queue), and only its scheduling order depends on where the
-                // reader is, so abandoning it for a navigation would just throw away a
-                // finished decode. (Phase 5's `paused` will be the one exception.)
-                // This is also why the thumb slot is released only in `drop_inflight`:
-                // a thumb can never leave the pipeline through this path.
+                // Abandon work the latest navigation (or a park) made useless — see
+                // `JobState::stale` for the rules and for why it, not `drop_inflight`,
+                // releases the marker on this path.
                 let stale = |index: usize, thumb: bool| -> bool {
-                    if thumb {
-                        return false;
-                    }
                     let (m, _) = &*shared;
-                    let mut st = lock_jobs(m);
-                    if st.wanted.contains(&index) {
-                        false
-                    } else {
-                        st.inflight.remove(&index);
-                        true
-                    }
+                    lock_jobs(m).stale(index, thumb)
                 };
                 // Release the job's in-flight marker: the `inflight` set for a window
                 // decode, the thumb slot for a tail decode. **Every** post-claim exit
@@ -429,6 +461,37 @@ impl DecodePool {
         lock_jobs(m).lq_tail.len()
     }
 
+    /// Freeze the pool without tearing it down: workers claim nothing (of either
+    /// tier) and every decode already in flight abandons at its next yield point.
+    ///
+    /// This is the *backgrounded* state. A mobile shell can sit suspended for hours
+    /// without being killed, and an unparked pool would happily spend that whole
+    /// time grinding the whole-volume thumbnail tail — full CPU, full battery, into
+    /// a channel nobody drains and textures nobody can see.
+    ///
+    /// The queues are **kept**: park is a pause, not a cancel, so [`Self::unpark`]
+    /// resumes exactly the work list that was pending. Teardown is still `Drop`'s
+    /// job (it clears the queues and retires the threads), and it works on a parked
+    /// pool — `running = false` is checked before `claim`, so a parked worker wakes
+    /// on `Drop`'s `notify_all` and exits rather than re-waiting.
+    pub fn park(&self) {
+        let (m, _) = &*self.shared;
+        lock_jobs(m).paused = true;
+    }
+
+    /// Thaw a [`park`](Self::park)ed pool. Every worker is woken, because any of
+    /// them may now have something claimable — `paused` suppressed *all* claims, so
+    /// unlike `set_jobs`/`set_lq_tail` there is no queue length to size the wakeup
+    /// from. Work abandoned during the park is simply re-queued by the next
+    /// `prefetch` (shells pair this with `Reader::invalidate_jobs`).
+    pub fn unpark(&self) {
+        let (m, cv) = &*self.shared;
+        let mut st = lock_jobs(m);
+        st.paused = false;
+        drop(st);
+        cv.notify_all();
+    }
+
     /// Swap the source the workers read from, without tearing down the thread pool.
     /// Used when a live folder refresh grows the page list by *appending* (existing
     /// indices unchanged): in-flight decodes stay valid, and there is no worker-join
@@ -540,6 +603,7 @@ mod tests {
             inflight: HashSet::new(),
             wanted: HashSet::new(),
             waker: None,
+            paused: false,
             running: true,
         }
     }
@@ -679,6 +743,79 @@ mod tests {
         assert_eq!(st.claim(true), Some((40, 540, true, true)));
         assert_eq!(st.claim(true), Some((41, 540, true, true)), "duplicate 40 skipped");
         assert_eq!(st.thumbs_inflight.len(), 2);
+    }
+
+    /// Parking freezes both tiers and preserves both queues, and unparking hands
+    /// the very same work back. (`DecodePool::park`/`unpark` set exactly this flag;
+    /// what they add on top is the `notify_all` that gets the waiting workers back
+    /// into `claim`, which needs a real pool — hence a wgpu `Device` — to exercise.)
+    #[test]
+    fn a_parked_pool_claims_nothing_and_resumes_where_it_left_off() {
+        let mut st = job_state();
+        st.jobs = VecDeque::from(vec![(5, 900, false, false)]);
+        st.lq_tail = VecDeque::from(vec![(40, 540), (41, 540)]);
+
+        st.paused = true;
+        assert_eq!(st.claim(true), None, "a parked pool claims no window job");
+        assert_eq!(st.claim(false), None, "…nor on the reserved lane");
+        assert_eq!(st.jobs.len(), 1, "park must preserve the window queue");
+        assert_eq!(st.lq_tail.len(), 2, "park must preserve the tail");
+        assert!(st.inflight.is_empty() && st.thumbs_inflight.is_empty());
+
+        // Unpark: the same jobs, in the same order, at the same priority.
+        st.paused = false;
+        assert_eq!(st.claim(true), Some((5, 900, false, false)));
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
+    }
+
+    /// While parked, work already in flight abandons at its next yield point —
+    /// **including thumbs**, the one case where `stale` ignores the "thumbs are
+    /// never stale" rule. The abandon path never reaches the worker's
+    /// `drop_inflight`, so `stale` must release the marker itself; a leaked thumb
+    /// slot would permanently halve tail throughput after a background/foreground
+    /// cycle, and a leaked `inflight` entry would stop that page ever re-decoding.
+    #[test]
+    fn parking_abandons_work_in_flight_and_frees_its_slot() {
+        let mut st = job_state();
+        st.jobs = VecDeque::from(vec![(5, 900, false, false)]);
+        st.lq_tail = VecDeque::from(vec![(40, 540)]);
+        st.wanted = HashSet::from([5]);
+        assert_eq!(st.claim(true), Some((5, 900, false, false)));
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
+        // Unparked: the window page is wanted, and a thumb is never stale.
+        assert!(!st.stale(5, false));
+        assert!(!st.stale(40, true));
+
+        st.paused = true;
+        assert!(st.stale(5, false), "parked: the window decode bails");
+        assert!(st.stale(40, true), "parked: the thumb bails too");
+        assert!(st.inflight.is_empty(), "abandoning must free the inflight marker");
+        assert!(st.thumbs_inflight.is_empty(), "…and the thumb concurrency slot");
+
+        // Both markers freed ⇒ after the unpark the pages are claimable again.
+        st.paused = false;
+        st.jobs.push_back((5, 900, false, false));
+        st.lq_tail.push_back((40, 540));
+        assert_eq!(st.claim(true), Some((5, 900, false, false)));
+        assert_eq!(st.claim(true), Some((40, 540, true, true)));
+    }
+
+    /// The staleness rule the two-tier queue rests on, unparked: a window page that
+    /// left `wanted` (a far jump landed mid-decode) is abandoned and re-queueable,
+    /// while a thumbnail — which is never in `wanted` — is always seen through.
+    #[test]
+    fn window_pages_go_stale_on_navigation_but_thumbs_do_not() {
+        let mut st = job_state();
+        st.wanted = HashSet::from([5]);
+        st.inflight = HashSet::from([5, 9]);
+        st.thumbs_inflight = HashSet::from([40]);
+
+        assert!(!st.stale(5, false), "still in the window");
+        assert!(st.stale(9, false), "jumped away → abandon");
+        assert!(!st.inflight.contains(&9), "and release it for a later re-queue");
+        assert!(st.inflight.contains(&5));
+        assert!(!st.stale(40, true), "a thumb outlives any navigation");
+        assert!(st.thumbs_inflight.contains(&40));
     }
 
     /// The `wake_pending` protocol, exercised on the flag alone: a real

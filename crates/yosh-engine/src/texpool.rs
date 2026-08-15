@@ -80,6 +80,18 @@ impl TexturePool {
         }
     }
 
+    /// Drop every pooled texture, returning their VRAM to the driver now. For the
+    /// shell's low-memory handler: the recycling pool is pure *speculation* — idle
+    /// textures kept around on the chance a future decode wants that exact size —
+    /// so it is the first thing to give back when the OS says it is that or death.
+    /// Nothing on screen is affected (live pages hold their own textures); the only
+    /// cost is that the next few decodes allocate instead of recycling.
+    pub fn clear(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.buckets.clear();
+        inner.total = 0;
+    }
+
     /// Reuse a matching texture if available, else create one.
     pub fn get(&self, device: &wgpu::Device, gray: bool, w: u32, h: u32) -> wgpu::Texture {
         {
