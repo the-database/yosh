@@ -18,6 +18,7 @@ pub use ziparc::ZipSource;
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::Encoding;
@@ -32,7 +33,14 @@ pub trait PageSource: Send + Sync {
     /// Entry name for page `index` (file name / archive entry path).
     fn name(&self, index: usize) -> &str;
     /// Read the encoded image bytes for page `index`. May block (rar).
-    fn read_page(&self, index: usize) -> io::Result<Vec<u8>>;
+    ///
+    /// Returns `Arc<Vec<u8>>`, not `Vec<u8>`: the sequential sources (rar / 7z)
+    /// already hold every extracted page in an in-memory map behind an `Arc`, so
+    /// handing that `Arc` out is a refcount bump instead of a full copy of a
+    /// multi-MB page. Every consumer only ever reads the bytes (`&[u8]`), so the
+    /// random-access sources (folder / zip) just wrap their fresh `Vec` — one
+    /// allocation, no copy.
+    fn read_page(&self, index: usize) -> io::Result<Arc<Vec<u8>>>;
     /// Modified timestamp for page `index`, formatted for display, if known.
     /// Default: unknown (archives without stored times, etc.).
     fn modified(&self, index: usize) -> Option<String> {

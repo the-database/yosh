@@ -4,16 +4,16 @@ The Android shell for yosh — a `cdylib` that loads as a NativeActivity and dri
 the reusable [`yosh-engine`](../yosh-engine) (decode pipeline + reading machine)
 through winit + wgpu, the same way the desktop shell (`crates/yosh`) does.
 
-**Status:** reads a comic. The shell drives the engine `Reader` in the winit frame
-loop (poll → decode-view debounce → prefetch → build-quads → draw, same as the
-desktop shell minus egui), rendering real pages sharp (single-resize invariant
+**Status:** feature-complete for reading. The shell drives the engine `Reader` in
+the winit frame loop (poll → decode-view debounce → prefetch → build-quads → draw,
+same as the desktop shell), rendering real pages sharp (single-resize invariant
 holds — verified converging to a crisp 1:1 render on-device), with tap-zones
-(left third = previous, right = next) and `KEEP_SCREEN_ON`. Verified on a physical
-Pixel 9 Pro XL and a Lenovo TB321FU tablet (wgpu on Vulkan).
-
-Still to come: the SAF picker (content:// → `ZipSource::from_bytes`, replacing the
-pushed test comic), swipe/pinch-zoom, on-demand redraw (currently redraws
-continuously — see the TODO in `lib.rs`), and egui chrome (seekbar / library).
+(left third = previous, right = next), swipe/pinch-zoom, the SAF picker
+(content:// → `ZipSource::from_bytes`), egui chrome (seekbar / library browser)
+and `KEEP_SCREEN_ON`. Redraws are **on demand** — the frame loop idles on a
+settled, decoded page and wakes on input, animation, or pending decode work (see
+the redraw guard at the end of `App::render`). Verified on a physical Pixel 9 Pro
+XL and a Lenovo TB321FU tablet (wgpu on Vulkan).
 
 RAR/CBR is unavailable on Android (the bundled UnRAR C++ uses `lutimes`, absent
 from Bionic libc), so the engine is built `--no-default-features`. Folder / CBZ /

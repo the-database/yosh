@@ -1688,7 +1688,7 @@ mod tests {
         fn name(&self, i: usize) -> &str {
             &self.0[i]
         }
-        fn read_page(&self, _: usize) -> std::io::Result<Vec<u8>> {
+        fn read_page(&self, _: usize) -> std::io::Result<std::sync::Arc<Vec<u8>>> {
             unreachable!("classifier never reads pixels")
         }
     }

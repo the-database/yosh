@@ -255,10 +255,9 @@ struct App {
     /// Decoded cover thumbnails by comic path (egui textures), filled off-thread.
     thumbs: HashMap<PathBuf, egui::TextureHandle>,
     thumb_rx: std::sync::mpsc::Receiver<(PathBuf, egui::ColorImage)>,
-    thumb_tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
-    /// On-disk cover-thumbnail cache dir (app-private `…/thumbs`); covers load from
-    /// here instead of re-decoding the full first page on every open.
-    thumb_cache_dir: Option<PathBuf>,
+    /// Queue into the persistent cover-decode worker (see [`spawn_cover_worker`]):
+    /// batches of comic paths in, decoded covers back out through `thumb_rx`.
+    cover_tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
     /// Covers already queued for decode (lazy, per visible series section).
     queued_covers: std::collections::HashSet<PathBuf>,
     /// Frame stamp a cover was last drawn (LRU for the `thumbs` cap — a big
@@ -311,6 +310,10 @@ struct App {
     theme: ThemePref,
     /// Cached OS night-mode flag (re-read on resume); resolves `ThemePref::System`.
     system_dark: bool,
+    /// Light/dark actually pushed into the egui context (`ctx.set_visuals` is
+    /// persistent state, so re-applying it every frame just rebuilds a `Visuals`
+    /// for nothing). `None` ⇒ not applied yet. Mirrors `Shell::applied_immersive`.
+    applied_light: Option<bool>,
     /// Where viewing options persist (mirrors Shell.view_file).
     view_file: Option<PathBuf>,
 }
@@ -606,7 +609,10 @@ impl ApplicationHandler for Shell {
         // First launch (or a forced rebuild): full build.
         let instance = GpuContext::create_instance();
         let surface = instance.create_surface(window.clone()).expect("create surface");
-        let ctx = GpuContext::create(instance, Some(&surface));
+        // A phone has exactly one GPU, so the preference picks no different
+        // adapter — but `LowPower` is the honest hint to the driver's power
+        // governor for a workload that draws a couple of quads per frame.
+        let ctx = GpuContext::create(instance, Some(&surface), wgpu::PowerPreference::LowPower);
         // Make wgpu errors non-fatal: the default handler panics, which is how a stray
         // validation error (notably surface.configure rejecting a post-background surface
         // on some e-ink GPUs) takes the app down. Log instead; the resume path detects the
@@ -679,6 +685,11 @@ impl ApplicationHandler for Shell {
         reader.transition_enabled = self.init_view.3; // page-turn animation (persisted; default on)
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (series_tx, series_rx) = std::sync::mpsc::channel();
+        // On-disk cover-thumbnail cache dir (app-private `…/thumbs`): covers load
+        // from here instead of re-decoding the full first page on every open. It's
+        // owned by the cover worker, the only thing that touches it.
+        let thumb_cache_dir = self.android_app.internal_data_path().map(|p| p.join("thumbs"));
+        let cover_tx = spawn_cover_worker(thumb_cache_dir, thumb_tx);
         self.app = Some(App {
             window: window.clone(),
             ctx,
@@ -696,11 +707,7 @@ impl ApplicationHandler for Shell {
             lib_entries: Vec::new(),
             thumbs: HashMap::new(),
             thumb_rx,
-            thumb_tx,
-            thumb_cache_dir: self
-                .android_app
-                .internal_data_path()
-                .map(|p| p.join("thumbs")),
+            cover_tx,
             queued_covers: std::collections::HashSet::new(),
             thumb_used: HashMap::new(),
             frame_no: 0,
@@ -722,6 +729,7 @@ impl ApplicationHandler for Shell {
             resume_on_startup: self.init_view.5,
             theme: self.init_view.6,
             system_dark: system_dark(&self.android_app),
+            applied_light: None,
             view_file: self.view_file.clone(),
         });
         // Pick up where we left off: with resume on, reopen the most-recent
@@ -1356,11 +1364,7 @@ impl Shell {
                 // Cover preview: same off-thread pipeline as the library; the
                 // result lands via the per-frame `thumb_rx` drain and the card
                 // picks it up while the prompt is still showing.
-                spawn_cover_decode(
-                    vec![p.clone()],
-                    app.thumb_cache_dir.clone(),
-                    app.thumb_tx.clone(),
-                );
+                let _ = app.cover_tx.send(vec![p.clone()]);
             }
             app.book_prompt = Some(BookPrompt {
                 dir,
@@ -1463,7 +1467,9 @@ impl Shell {
     /// counts) and the volume's total. Called every rendered frame while reading
     /// — cheap map math; the file write happens with `save_positions`.
     fn note_progress(&mut self) {
-        let (Some(key), Some(app)) = (self.current_key.clone(), self.app.as_ref()) else {
+        // `as_deref`, not `clone`: this runs every rendered frame, and the owned
+        // key is only ever needed the first time a book is seen.
+        let (Some(key), Some(app)) = (self.current_key.as_deref(), self.app.as_ref()) else {
             return;
         };
         let Some(src) = &app.reader.source else { return };
@@ -1474,9 +1480,17 @@ impl Shell {
         let (a, b) =
             view_pages(app.reader.layout, app.reader.index, len, app.reader.spread_offset);
         let seen = (b.unwrap_or(a) + 1) as u32;
-        let e = self.progress.entry(key).or_insert((0, 0));
-        e.0 = e.0.max(seen);
-        e.1 = len as u32;
+        // `key` borrows `current_key`, the update touches `progress` — disjoint
+        // fields, so no clone is needed to satisfy the borrow checker either.
+        match self.progress.get_mut(key) {
+            Some(e) => {
+                e.0 = e.0.max(seen);
+                e.1 = len as u32;
+            }
+            None => {
+                self.progress.insert(key.to_string(), (seen, len as u32));
+            }
+        }
     }
 
     /// Read the chosen content:// file's bytes off its descriptor and open it.
@@ -2859,11 +2873,21 @@ impl App {
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
         let cur = self.reader.index;
-        // Buffered (decode-ahead ready) page indices for the seekbar's cache bar.
-        let buffered: Vec<usize> = self.reader.cache.buffered_indices().collect();
-        let lq_buffered: Vec<usize> = self.reader.lq_cache.buffered_indices().collect();
         let library_view = self.library_view;
         let controls = self.controls;
+        // Buffered (decode-ahead ready) page indices for the seekbar's cache bar.
+        // Built only when the seekbar will actually draw (same condition as the
+        // `seekbar()` arm below) — `lq_buffered` alone is an lq_cap-sized Vec, and
+        // reading with the chrome hidden is the common case.
+        let seekbar_visible = controls && !library_view && len > 0;
+        let (buffered, lq_buffered): (Vec<usize>, Vec<usize>) = if seekbar_visible {
+            (
+                self.reader.cache.buffered_indices().collect(),
+                self.reader.lq_cache.buffered_indices().collect(),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let book_title = self.book_title.clone();
         let hints_visible = controls && self.controls_shown_at.elapsed().as_millis() < 1500;
         let show_options = self.show_options;
@@ -2888,8 +2912,16 @@ impl App {
         let cur_rotation = self.reader.rotation;
         let drag_seam = self.reader.drag_seam();
         let cur_zoom = self.reader.zoom;
-        let lib_dir_str = self.lib_dir.display().to_string();
-        let lib_root_str = self.lib_root.display().to_string();
+        // Path labels for the library header — only the library view shows them,
+        // so don't format two paths per reading frame.
+        let (lib_dir_str, lib_root_str) = if library_view {
+            (
+                self.lib_dir.display().to_string(),
+                self.lib_root.display().to_string(),
+            )
+        } else {
+            (String::new(), String::new())
+        };
         let browse = self.lib_browse;
         let series_pending = self.series_pending;
         // Browse mode (choose a library root) lists folders only — owned snapshot.
@@ -3033,15 +3065,22 @@ impl App {
         // ignores fitSystemWindows), so inset the library's top chrome by the
         // status-bar height — otherwise the clock/icons cover the top buttons.
         let top_inset_pt = status_bar_px as f32 / self.egui_ctx.pixels_per_point();
+        // `set_visuals` is persistent context state, so it only has to run when the
+        // resolved theme actually flips (first frame, options toggle, OS night-mode
+        // change) — not once per frame.
+        let apply_visuals = self.applied_light != Some(light);
+        self.applied_light = Some(light);
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             // Theme the whole frame up front: standard widgets (library grid, popups,
             // empty-state card, series headers) follow this; the hand-painted chrome
             // (seekbar, letterbox) reads `dark_mode` back off the visuals.
-            ctx.set_visuals(if light {
-                egui::Visuals::light()
-            } else {
-                egui::Visuals::dark()
-            });
+            if apply_visuals {
+                ctx.set_visuals(if light {
+                    egui::Visuals::light()
+                } else {
+                    egui::Visuals::dark()
+                });
+            }
             if library_view {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.add_space(top_inset_pt);
@@ -3342,7 +3381,7 @@ impl App {
             }
         }
         if !to_decode.is_empty() {
-            spawn_cover_decode(to_decode, self.thumb_cache_dir.clone(), self.thumb_tx.clone());
+            let _ = self.cover_tx.send(to_decode);
         }
         const THUMB_CAP: usize = 256;
         if self.thumbs.len() > THUMB_CAP {
@@ -3489,26 +3528,6 @@ impl App {
         // Keep drawing while the library is open, the view hasn't settled, or the
         // current page isn't HQ yet (missing, or only the LQ seek-tier — so it
         // sharpens to HQ once seeking stops).
-        // Redraw-loop diagnostic: a rare, so-far-unreproducible post-resume state
-        // kept the loop running on a static screen (~144 fps). While rendering is
-        // continuous this logs which guard leg is responsible ~every 2 s; an idle
-        // app logs nothing. Remove once the culprit is caught in logcat.
-        if self.frame_no % 300 == 0 {
-            log::info!(
-                "redraw? lib={} unsettled={} not_hq={} lq={} hints={} anim={} prompt={} live={} egui={} surface={}x{}",
-                self.library_view,
-                !self.reader.view_settled,
-                !self.reader.view_is_hq(),
-                self.reader.lq_fill_pending(),
-                hints_visible,
-                self.reader.animation_drawn(),
-                prompt_visible,
-                drew_live_anim,
-                egui_animating,
-                self.config.width,
-                self.config.height
-            );
-        }
         if self.library_view
             || !self.reader.view_settled
             || !self.reader.view_is_hq()
@@ -3625,23 +3644,34 @@ fn decode_logo() -> Option<egui::ColorImage> {
     ))
 }
 
-/// Spawn a worker that decodes the given comics' covers and streams them back,
+/// Spawn the single, persistent cover-decode worker: batches of comic paths in
+/// (`Sender<Vec<PathBuf>>`), decoded covers streamed back out through `tx`,
 /// reading/writing the on-disk thumbnail cache as it goes.
-fn spawn_cover_decode(
-    paths: Vec<PathBuf>,
+///
+/// One thread for the App's whole lifetime, reusing one `Resizer`, instead of a
+/// thread per batch — scrolling a library used to mint a fresh thread (and a
+/// fresh resizer) every few frames, all of them competing for the same cores as
+/// the decode pool. It is detached and never joined: when the App is dropped its
+/// `Sender` goes with it, `recv` fails, and the loop returns (a batch already in
+/// progress finishes first, then the `tx` send fails and it returns anyway).
+fn spawn_cover_worker(
     cache_dir: Option<PathBuf>,
     tx: std::sync::mpsc::Sender<(PathBuf, egui::ColorImage)>,
-) {
+) -> std::sync::mpsc::Sender<Vec<PathBuf>> {
+    let (job_tx, job_rx) = std::sync::mpsc::channel::<Vec<PathBuf>>();
     std::thread::spawn(move || {
         let mut resizer = fast_image_resize::Resizer::new();
-        for path in paths {
-            if let Some(img) = decode_cover(&path, cache_dir.as_deref(), &mut resizer)
-                && tx.send((path, img)).is_err()
-            {
-                break;
+        while let Ok(paths) = job_rx.recv() {
+            for path in paths {
+                if let Some(img) = decode_cover(&path, cache_dir.as_deref(), &mut resizer)
+                    && tx.send((path, img)).is_err()
+                {
+                    return; // receiver gone (App torn down)
+                }
             }
         }
     });
+    job_tx
 }
 
 /// List a directory's sub-folders + comic archives, folders first, natural order.

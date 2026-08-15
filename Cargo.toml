@@ -4,4 +4,11 @@ members = ["crates/decode_bench", "crates/present_bench", "crates/yosh", "crates
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+# Whole-program LTO + a single codegen unit: this is a decode-bound app whose hot
+# path crosses crate boundaries (yosh-engine's decode/resize into image/png/
+# jpeg-decoder/fast_image_resize), exactly the inlining "fat" LTO can do and
+# "thin" often won't. Costs build time, not correctness.
+# NOT `panic = "abort"`: `pool.rs` wraps each decode in `catch_unwind` so a
+# panicking decoder (corrupt page) fails that one page instead of the process.
+lto = "fat"
+codegen-units = 1

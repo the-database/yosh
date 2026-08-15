@@ -295,10 +295,10 @@ impl PageSource for ZipSource {
         &self.names[index]
     }
 
-    fn read_page(&self, index: usize) -> io::Result<Vec<u8>> {
+    fn read_page(&self, index: usize) -> io::Result<Arc<Vec<u8>>> {
         // Recovered archive: read directly from the entry's local-header offset.
         let entry_idx = match &self.index {
-            Index::Local(offsets) => return self.read_local(offsets[index]),
+            Index::Local(offsets) => return self.read_local(offsets[index]).map(Arc::new),
             Index::Central(idx) => idx[index],
         };
         let mut zip = self.checkout()?;
@@ -316,7 +316,7 @@ impl PageSource for ZipSource {
         if result.is_ok() {
             self.checkin(zip);
         }
-        result
+        result.map(Arc::new)
     }
 
     fn modified(&self, index: usize) -> Option<String> {
@@ -444,7 +444,7 @@ mod tests {
 
         assert_eq!(src.len(), 1, "the .jpg entry must survive filtering");
         assert_eq!(
-            src.read_page(0).unwrap(),
+            *src.read_page(0).unwrap(),
             b"SJIS-PAGE-ONE",
             "reading a legacy-encoded entry must not fail"
         );
@@ -475,7 +475,7 @@ mod tests {
             let src = ZipSource::from_bytes(raw_name_zip(&[(&raw, b"PAGE")])).unwrap();
             assert_eq!(src.len(), 1, "{}: entry must survive filtering", enc.name());
             assert_eq!(
-                src.read_page(0).unwrap(),
+                *src.read_page(0).unwrap(),
                 b"PAGE",
                 "{}: reads must not depend on the name encoding",
                 enc.name()
@@ -492,7 +492,7 @@ mod tests {
         let src = ZipSource::new(&path).unwrap();
         assert_eq!(src.len(), 1);
         assert_eq!(src.name(0), "第01話/café.png");
-        assert_eq!(src.read_page(0).unwrap(), b"FLAGGED");
+        assert_eq!(*src.read_page(0).unwrap(), b"FLAGGED");
     }
 
     /// A UTF-8 name stored *without* the UTF-8 flag (very common) round-trips as UTF-8
@@ -503,7 +503,7 @@ mod tests {
         let src = ZipSource::from_bytes(bytes).unwrap();
         assert_eq!(src.len(), 1);
         assert_eq!(src.name(0), "表紙.png");
-        assert_eq!(src.read_page(0).unwrap(), b"COVER");
+        assert_eq!(*src.read_page(0).unwrap(), b"COVER");
     }
 
     #[test]
@@ -558,8 +558,8 @@ mod tests {
         assert_eq!(src.name(0), "01.png");
         // Repeated reads exercise the in-memory handle pool.
         for _ in 0..10 {
-            assert_eq!(src.read_page(0).unwrap(), b"PNGDATA-ONE");
-            assert_eq!(src.read_page(1).unwrap(), b"JPGDATA-TWO");
+            assert_eq!(*src.read_page(0).unwrap(), b"PNGDATA-ONE");
+            assert_eq!(*src.read_page(1).unwrap(), b"JPGDATA-TWO");
         }
     }
 
@@ -573,8 +573,8 @@ mod tests {
         let src = ZipSource::new(&path).unwrap();
         // Repeated reads exercise the checkout/checkin handle pool.
         for _ in 0..20 {
-            assert_eq!(src.read_page(0).unwrap(), b"PNGDATA-ONE");
-            assert_eq!(src.read_page(1).unwrap(), b"JPGDATA-TWO");
+            assert_eq!(*src.read_page(0).unwrap(), b"PNGDATA-ONE");
+            assert_eq!(*src.read_page(1).unwrap(), b"JPGDATA-TWO");
         }
         let _ = std::fs::remove_file(&path);
     }
@@ -593,7 +593,7 @@ mod tests {
                 std::thread::spawn(move || {
                     for _ in 0..50 {
                         let want: &[u8] = if t % 2 == 0 { b"PNGDATA-ONE" } else { b"JPGDATA-TWO" };
-                        assert_eq!(src.read_page(t % 2).unwrap(), want);
+                        assert_eq!(*src.read_page(t % 2).unwrap(), want);
                     }
                 })
             })
@@ -661,7 +661,7 @@ mod tests {
         assert!(part.is_partial(), "opened via local-header recovery");
         assert_eq!(part.len(), 2, "two complete pages before the cutoff");
         assert_eq!(part.name(0), "01.png");
-        assert_eq!(part.read_page(0).unwrap(), b"PAGE-ONE");
-        assert_eq!(part.read_page(1).unwrap(), b"PAGE-TWO");
+        assert_eq!(*part.read_page(0).unwrap(), b"PAGE-ONE");
+        assert_eq!(*part.read_page(1).unwrap(), b"PAGE-TWO");
     }
 }

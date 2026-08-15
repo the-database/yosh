@@ -123,11 +123,13 @@ impl PageSource for SevenzSource {
         &self.names[index]
     }
 
-    fn read_page(&self, index: usize) -> io::Result<Vec<u8>> {
+    fn read_page(&self, index: usize) -> io::Result<Arc<Vec<u8>>> {
         let mut guard = self.shared.ready.lock().unwrap();
         loop {
+            // The extracted page already lives in the map behind an `Arc`: hand
+            // out a clone of that handle (refcount bump), never a byte copy.
             if let Some(bytes) = guard.map.get(&index) {
-                return Ok(bytes.as_ref().clone());
+                return Ok(bytes.clone());
             }
             if guard.done {
                 let msg = guard

@@ -37,18 +37,24 @@ impl GpuContext {
         })
     }
 
-    /// Request a high-performance adapter (compatible with `compatible`, the
-    /// shell's surface) and a device/queue. Requests the adapter's *full*
-    /// `max_texture_dimension_2d` (wgpu defaults to only 8192) so very wide/tall
-    /// pages fit in one texture, and publishes that limit to `decode::MAX_TEX_DIM`
-    /// — which must happen before the first `page_target_h`, i.e. before any
-    /// rendering, so callers build the context up front.
+    /// Request an adapter (compatible with `compatible`, the shell's surface) and
+    /// a device/queue. Requests the adapter's *full* `max_texture_dimension_2d`
+    /// (wgpu defaults to only 8192) so very wide/tall pages fit in one texture,
+    /// and publishes that limit to `decode::MAX_TEX_DIM` — which must happen
+    /// before the first `page_target_h`, i.e. before any rendering, so callers
+    /// build the context up front.
+    ///
+    /// `power` is the shell's call: a desktop with a discrete GPU wants
+    /// `HighPerformance`, a phone (one GPU, so the hint picks nothing different)
+    /// asks for `LowPower` — the right signal to the driver's power governor at
+    /// no cost in throughput.
     pub fn create(
         instance: wgpu::Instance,
         compatible: Option<&wgpu::Surface<'static>>,
+        power: wgpu::PowerPreference,
     ) -> Self {
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
+            power_preference: power,
             force_fallback_adapter: false,
             compatible_surface: compatible,
         }))

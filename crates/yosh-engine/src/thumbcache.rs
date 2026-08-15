@@ -90,7 +90,7 @@ fn store(cache_file: &Path, img: &DecodedImage) {
 /// bytes, which are decoded + downscaled to `target_h`, returned, and written to the
 /// cache for next time. `cache_dir == None` (or unreadable metadata) just decodes
 /// live without touching disk.
-pub fn load_or_decode<F: FnOnce() -> Option<Vec<u8>>>(
+pub fn load_or_decode<F: FnOnce() -> Option<std::sync::Arc<Vec<u8>>>>(
     cache_dir: Option<&Path>,
     vol_path: &Path,
     target_h: u32,
