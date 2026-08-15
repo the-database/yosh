@@ -62,8 +62,10 @@ fn android_main(app: AndroidApp) {
         log::warn!("android_main re-entered in a live process; exiting for a clean restart");
         std::process::exit(0);
     }
-    // A reader should keep the screen awake while a page is up.
-    app.set_window_flags(WindowManagerFlags::KEEP_SCREEN_ON, WindowManagerFlags::empty());
+    // KEEP_SCREEN_ON is *not* set here: it's applied per frame from the reading
+    // state (see the `applied_keep_on` block in `RedrawRequested`), because holding
+    // the screen awake while the user is browsing the library — or staring at the
+    // empty state — is just battery drain with no page to read.
     // Per-comic reading positions persist in the app's private dir.
     let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
     let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
@@ -152,6 +154,8 @@ fn android_main(app: AndroidApp) {
         drag_samples: VecDeque::new(),
         pinch: None,
         applied_immersive: None,
+        applied_keep_on: None,
+        parked_source: None,
         status_bar_px: None,
     };
     if let Err(e) = event_loop.run_app(&mut shell) {
@@ -306,6 +310,24 @@ struct Shell {
     pinch: Option<Pinch>,
     /// Last immersive state pushed to Android, to avoid redundant JNI each frame.
     applied_immersive: Option<bool>,
+    /// Last KEEP_SCREEN_ON state pushed to the window, same idea. `None` ⇒ not
+    /// applied yet, which is also the post-resume state: the flag lives on the
+    /// native window, and a resume builds a new one.
+    applied_keep_on: Option<bool>,
+
+    /// The open book's `(key, source)`, kept alive across a suspend so the resume
+    /// can re-attach it instead of re-reading the archive off storage. Only the
+    /// current book is parked (each `open_comic` replaces it), and it costs nothing
+    /// while that book is open — the reader holds the very same `Arc`.
+    ///
+    /// This is what makes a resume cheap: a full-teardown resume otherwise pays the
+    /// whole open again (a `read_dir`, a zip central directory, or — for a 7z/RAR —
+    /// a full re-decompress). It also gets SAF `content://` books through a suspend,
+    /// which nothing else can: their bytes came off a one-shot file descriptor that
+    /// can't be reopened, so before this a backgrounded picked book came back as a
+    /// failed open. Dropped by [`Shell::memory_warning`], since it can be several
+    /// hundred MB of archive.
+    parked_source: Option<(String, Arc<dyn PageSource>)>,
     /// Status-bar height in px (queried once, lazily); used to inset chrome under
     /// the bars. `None` until first queried.
     status_bar_px: Option<i32>,
@@ -799,6 +821,10 @@ impl ApplicationHandler for Shell {
             let w = window.clone();
             Arc::new(move || w.request_redraw())
         });
+        // KEEP_SCREEN_ON is a flag on the *native window*, which this resume
+        // replaces — so forget what we last pushed and let the first frame re-derive
+        // and re-apply it.
+        self.applied_keep_on = None;
         log::info!(
             "all-files access: {} | scale {}",
             self.has_files,
@@ -868,10 +894,8 @@ impl ApplicationHandler for Shell {
         // Japanese comic / file names render instead of tofu squares.
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
-        if let Ok(bytes) = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc") {
-            fonts
-                .font_data
-                .insert("cjk".to_owned(), egui::FontData::from_owned(bytes).into());
+        if let Some(cjk) = cjk_font() {
+            fonts.font_data.insert("cjk".to_owned(), cjk);
             for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts.families.entry(fam).or_default().push("cjk".to_owned());
             }
@@ -1003,13 +1027,27 @@ impl ApplicationHandler for Shell {
             self.picker_pending = false;
             self.open_picked(&uri);
         } else if let Some(key) = rebuild_book {
-            // Reopening is asynchronous now: a resume never blocks on re-reading an
-            // archive, it just draws the spinner for the first frames. A book that
-            // vanished (or a content:// one-off, which can't be rebuilt) fails the
-            // open and lands on the library, exactly as the old `is_reopenable_fs`
-            // filter did — see `resume_fallback`.
-            self.open_path(PathBuf::from(key));
-            self.resume_fallback = resume_library || lib_configured; // after: start_open clears it
+            // The book that was open is almost always still *parked* — the source
+            // outlives the App teardown above — so re-attach it directly: zero I/O,
+            // no spinner, the page is back on screen on the first frame. This is the
+            // whole point of `parked_source`, and it's the only way a SAF
+            // `content://` book can survive a suspend at all (its descriptor is
+            // long gone; only these bytes remain).
+            match self.parked_source.take() {
+                Some((k, src)) if k == key => self.open_comic(key, src),
+                parked => {
+                    // Something else was parked (or nothing was) — put it back and
+                    // rebuild from storage. Reopening is asynchronous, so a resume
+                    // still never blocks on re-reading an archive; it just draws the
+                    // spinner for the first frames. A book that vanished (or a
+                    // content:// one-off, which can't be rebuilt) fails the open and
+                    // lands on the library, exactly as the old `is_reopenable_fs`
+                    // filter did — see `resume_fallback`.
+                    self.parked_source = parked;
+                    self.open_path(PathBuf::from(key));
+                    self.resume_fallback = resume_library || lib_configured; // after: start_open clears it
+                }
+            }
         } else if resume_active {
             if resume_library || lib_configured {
                 self.open_library();
@@ -1037,6 +1075,58 @@ impl ApplicationHandler for Shell {
         self.dirty_libroot = true;
         self.dirty_since.get_or_insert_with(Instant::now);
         self.flush_saves(true);
+        // Stop decoding. Android may leave a backgrounded app alive for *hours*
+        // before it needs the memory, and an unparked pool would spend all of it
+        // grinding the whole-volume thumbnail tail at 8 threads — burning battery
+        // into textures no one can see. `park` also makes the work already in
+        // flight abandon at its next yield point, so this takes effect in
+        // milliseconds rather than after the current decode.
+        //
+        // (Today's `resumed` drops the whole App anyway, so nothing ever calls
+        // `unpark` — the park matters for the window *between* the two, which is
+        // the part that can last hours.)
+        if let Some(app) = self.app.as_mut() {
+            if let Some(pool) = &app.reader.pool {
+                pool.park();
+            }
+            // The LQ preview tier is the single biggest thing we hold (up to
+            // `lq_cap` GPU textures for the whole volume) and the most rebuildable:
+            // shed it so the OS has less reason to kill us while we're away.
+            app.reader.lq_cache.clear();
+            // Both of the above invalidate the prefetch memo — the next foreground
+            // frame must rebuild the job list and the thumbnail tail from scratch.
+            app.reader.invalidate_jobs();
+        }
+    }
+
+    /// The OS is under memory pressure and we are a candidate for death (Android
+    /// `onLowMemory`). Everything shed here is *derived* state that costs time, not
+    /// correctness, to rebuild — no reading state, no unsaved position.
+    fn memory_warning(&mut self, _event_loop: &ActiveEventLoop) {
+        // The parked source is the biggest single thing we hold (a whole in-memory
+        // archive for a SAF/7z/RAR book) and the most optional — losing it costs the
+        // *next* resume a re-open, nothing else.
+        let dropped_park = self.parked_source.take().is_some();
+        let mut shed_lq = 0;
+        if let Some(app) = self.app.as_mut() {
+            // The LQ preview tier: up to `lq_cap` whole-volume thumbnails, all of
+            // which the tail refills on demand. The live `cache` deliberately stays
+            // — evicting it would blank the page the user is looking at.
+            shed_lq = app.reader.lq_cache.len();
+            app.reader.lq_cache.clear();
+            // After the cache clear, not before: `PageCache::clear` recycles its
+            // textures *into* the pool, so clearing the pool first would just refill
+            // it with what we are trying to give back.
+            app.reader.tex_pool.clear();
+            // The thumbnails just went away; the next frame's prefetch has to
+            // reconsider them from scratch rather than trust its memo.
+            app.reader.invalidate_jobs();
+            app.window.request_redraw();
+        }
+        log::warn!(
+            "memory warning: shed {shed_lq} LQ previews + the texture pool{}",
+            if dropped_park { " + the parked source" } else { "" },
+        );
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1173,6 +1263,24 @@ impl ApplicationHandler for Shell {
                 if self.applied_immersive != Some(immersive) {
                     set_immersive(&self.android_app, immersive);
                     self.applied_immersive = Some(immersive);
+                }
+                // Hold the screen awake only while there is actually a page to read
+                // — a reader that never touches the screen for minutes at a time
+                // does need this, but the library grid and the empty state are just
+                // ordinary UI and should dim on the system timeout like anything
+                // else. Same cached-flag pattern as `applied_immersive`: the window
+                // flag is a JNI round-trip, so only push it when it changes.
+                let keep_on = self.current_key.is_some()
+                    && self.app.as_ref().is_some_and(|a| !a.library_view);
+                if self.applied_keep_on != Some(keep_on) {
+                    let flag = WindowManagerFlags::KEEP_SCREEN_ON;
+                    let (add, remove) = if keep_on {
+                        (flag, WindowManagerFlags::empty())
+                    } else {
+                        (WindowManagerFlags::empty(), flag)
+                    };
+                    self.android_app.set_window_flags(add, remove);
+                    self.applied_keep_on = Some(keep_on);
                 }
                 // Opportunistic: writes what has been dirty long enough. Frames stop
                 // when the reader idles, so this is a best-effort early write — the
@@ -1916,6 +2024,12 @@ impl Shell {
             // still opens with the pages recovered before the truncation.
             log::info!("partial archive recovered: {} pages", src.len());
         }
+        // Park it for the next resume *before* handing it to the reader: a suspend
+        // tears the whole App down, and re-attaching these same bytes is the
+        // difference between a resume that's instant and one that re-reads the
+        // archive off storage. Only one book is ever parked — this replaces whatever
+        // the last one was, so switching books can't accumulate archives in memory.
+        self.parked_source = Some((key.clone(), src.clone()));
         if let Some(app) = self.app.as_mut() {
             attach_source(
                 &mut app.reader,
@@ -2272,6 +2386,26 @@ fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
     map
 }
 
+/// The system CJK fallback font (`Noto Sans CJK`), loaded **once per process**.
+///
+/// egui's bundled fonts have no CJK glyphs, so Japanese comic and file names would
+/// render as tofu squares without this. The catch is that the file is ~40 MB and a
+/// resume rebuilds the whole egui context: re-reading and re-copying it on every
+/// foreground was one of the biggest single costs on the resume path. `FontData` is
+/// immutable and egui takes it behind an `Arc`, so every egui context this process
+/// builds can be handed the same one. `None` ⇒ the device has no such font (older /
+/// non-CJK builds), and the fallback is simply not installed.
+fn cjk_font() -> Option<Arc<egui::FontData>> {
+    static CJK_FONT: std::sync::OnceLock<Option<Arc<egui::FontData>>> = std::sync::OnceLock::new();
+    CJK_FONT
+        .get_or_init(|| {
+            let bytes = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()?;
+            log::info!("loaded CJK fallback font ({} KB)", bytes.len() / 1024);
+            Some(Arc::new(egui::FontData::from_owned(bytes)))
+        })
+        .clone()
+}
+
 /// Read one `/proc/meminfo` field in MB (the values are in kB).
 fn meminfo_mb(text: &str, field: &str) -> Option<u64> {
     text.lines()
@@ -2294,13 +2428,24 @@ fn meminfo_mb(text: &str, field: &str) -> Option<u64> {
 /// the smaller of a total-RAM slice and a third of what's actually free right now,
 /// then clamp into a range that keeps a small device conservative and a big one
 /// from claiming more than the reader can usefully hold.
+///
+/// **Probed once per process.** `MemTotal` is a constant, and while `MemAvailable`
+/// genuinely moves, re-reading it per resume bought nothing: the budget it feeds is
+/// a coarse tier of caps, and a resume is exactly when the number is least
+/// meaningful (we have just torn our own textures down, so free memory is
+/// transiently inflated). First-launch `MemAvailable` is as good a sample as any,
+/// and it keeps the resume path off `/proc`. The real answer to a squeeze is
+/// [`Shell::memory_warning`], which sheds caches on demand rather than guessing.
 fn device_mem() -> (u64, u64) {
-    let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let total = meminfo_mb(&info, "MemTotal:").unwrap_or(4096);
-    // Older kernels lack MemAvailable; fall back to the total-only estimate.
-    let avail = meminfo_mb(&info, "MemAvailable:").unwrap_or(total / 2);
-    let budget = (total / 8).min(avail / 3).clamp(192, 1024);
-    (budget, total)
+    static DEVICE_MEM: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *DEVICE_MEM.get_or_init(|| {
+        let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let total = meminfo_mb(&info, "MemTotal:").unwrap_or(4096);
+        // Older kernels lack MemAvailable; fall back to the total-only estimate.
+        let avail = meminfo_mb(&info, "MemAvailable:").unwrap_or(total / 2);
+        let budget = (total / 8).min(avail / 3).clamp(192, 1024);
+        (budget, total)
+    })
 }
 
 /// Highest CPU clock (kHz) the SoC advertises, across all cores. This is the
