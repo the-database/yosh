@@ -10,16 +10,36 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-#[derive(Default)]
 struct Inner {
     buckets: HashMap<(bool, u32, u32), Vec<wgpu::Texture>>,
     total: usize,
+    /// Global cap, **inside** the mutex so it can be re-set on a live pool (the
+    /// runtime performance setting) through the `Arc<TexturePool>` every worker
+    /// holds — there is no `&mut TexturePool` anywhere once decoding starts.
+    max_total: usize,
+}
+
+impl Inner {
+    /// Drop one pooled texture from any non-empty bucket. `false` ⇒ the pool was
+    /// already empty (so an eviction loop must stop rather than spin).
+    fn evict_one(&mut self) -> bool {
+        let Some(key) = self.buckets.iter().find(|(_, v)| !v.is_empty()).map(|(k, _)| *k) else {
+            return false;
+        };
+        if let Some(v) = self.buckets.get_mut(&key) {
+            v.pop();
+            if v.is_empty() {
+                self.buckets.remove(&key);
+            }
+            self.total -= 1;
+        }
+        true
+    }
 }
 
 pub struct TexturePool {
     inner: Mutex<Inner>,
     max_per_bucket: usize,
-    max_total: usize,
 }
 
 impl Default for TexturePool {
@@ -37,9 +57,26 @@ impl TexturePool {
     /// so constrained devices keep less VRAM live).
     pub fn with_max_total(max_total: usize) -> Self {
         Self {
-            inner: Mutex::new(Inner::default()),
+            inner: Mutex::new(Inner {
+                buckets: HashMap::new(),
+                total: 0,
+                max_total,
+            }),
             max_per_bucket: 8,
-            max_total,
+        }
+    }
+
+    /// Re-cap the pool at runtime (the performance setting changing the device
+    /// `Budget`), shedding pooled textures immediately so a lowered cap actually
+    /// returns VRAM instead of waiting for the next `put`. Only *idle* recycled
+    /// textures live here, so nothing on screen is affected.
+    pub fn set_max_total(&self, max_total: usize) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.max_total = max_total;
+        while inner.total > max_total {
+            if !inner.evict_one() {
+                break;
+            }
         }
     }
 
@@ -66,23 +103,11 @@ impl TexturePool {
     /// textures are evicted first to stay under the global cap.
     pub fn put(&self, tex: wgpu::Texture, gray: bool, w: u32, h: u32) {
         let mut inner = self.inner.lock().unwrap();
-        while inner.total >= self.max_total {
-            // Evict one texture from any non-empty bucket (bounds VRAM during
-            // resize/zoom size churn; the current working size stays recyclable).
-            let Some(key) = inner
-                .buckets
-                .iter()
-                .find(|(_, v)| !v.is_empty())
-                .map(|(k, _)| *k)
-            else {
+        // Make room first (bounds VRAM during resize/zoom size churn; the current
+        // working size stays recyclable).
+        while inner.total >= inner.max_total {
+            if !inner.evict_one() {
                 break;
-            };
-            if let Some(v) = inner.buckets.get_mut(&key) {
-                v.pop();
-                if v.is_empty() {
-                    inner.buckets.remove(&key);
-                }
-                inner.total -= 1;
             }
         }
         let v = inner.buckets.entry((gray, w, h)).or_default();

@@ -131,6 +131,32 @@ pub fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
 /// invariant. Below it, extreme zoom-out would otherwise decode a sub-pixel page.
 pub const MIN_TARGET: u32 = 32;
 
+/// How much of a volume the whole-volume LQ thumbnail tier covers. The tail is
+/// pure background filler, so a constrained device can shrink or drop it without
+/// touching the zero-hitch HQ path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LqTier {
+    /// Every page of the volume gets a thumbnail (desktop / flagship behavior).
+    Full,
+    /// Only pages within ±n of the read position — the pivot restride re-centres
+    /// the window as the reader travels, so scrubbing nearby still previews.
+    Windowed(u32),
+    /// No thumbnail tier at all.
+    Off,
+}
+
+/// Coarse device class, used to cap [`Budget`] on hardware that can't sustain the
+/// desktop configuration. Probed by the shell (RAM, CPU clock); a user-facing
+/// performance setting can override it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceTier {
+    Low,
+    Mid,
+    /// Flagship / desktop: **no ceilings at all** — `for_tier` returns exactly what
+    /// `derive` computed, so today's behavior is bit-identical.
+    High,
+}
+
 /// Per-device resource budget, derived from the memory the app may spend on
 /// decoded pages + GPU textures and the CPU count. Desktop-class inputs
 /// (≥ ~384 MB, ≥ 8 cores) reproduce the historical fixed budgets exactly; small
@@ -154,6 +180,18 @@ pub struct Budget {
     /// enough to hold a normal volume's worth of tiny previews; for huge volumes the
     /// cache's distance-eviction keeps the nearest pages.
     pub lq_cap: usize,
+    /// Ceiling on an uncached 1:1 (`FitMode::Actual`) decode, as a multiple of the
+    /// viewport height. `None` (desktop / High) keeps the historical behavior: an
+    /// uncached page decodes full-native, since its source size isn't known yet.
+    /// `Some(m)` bounds that first decode to `m × viewport.h` — a page can then be
+    /// GPU-*up*scaled (the one sanctioned resample) instead of spending ~96 MB of
+    /// RGBA on a page most of which is off-screen. Converges through the normal
+    /// `target_stale` re-decode once the source dims are known.
+    pub actual_cap_vh: Option<u32>,
+    /// Decoded height for whole-volume LQ thumbnails (see [`LQ_THUMB_H`]).
+    pub lq_thumb_h: u32,
+    /// How much of the volume the thumbnail tier covers (see [`LqTier`]).
+    pub lq_tier: LqTier,
 }
 
 impl Budget {
@@ -168,7 +206,47 @@ impl Budget {
         let fwd_max = (fwd * 5 / 2).clamp(12, 40);
         let back = (fwd / 2).clamp(3, 6);
         let lq_cap = cache_cap.saturating_mul(16);
-        Self { workers, cache_cap, texpool_max, fwd, fwd_max, back, lq_cap }
+        Self {
+            workers,
+            cache_cap,
+            texpool_max,
+            fwd,
+            fwd_max,
+            back,
+            lq_cap,
+            actual_cap_vh: None,
+            lq_thumb_h: LQ_THUMB_H,
+            lq_tier: LqTier::Full,
+        }
+    }
+
+    /// [`Budget::derive`], then per-tier **ceilings** for hardware that can't
+    /// sustain the desktop configuration.
+    ///
+    /// Every numeric ceiling is a `min`, never a raise: a device whose derived
+    /// budget is already smaller keeps it. [`DeviceTier::High`] applies nothing at
+    /// all, so a flagship (and every desktop caller, which goes on using `derive`
+    /// directly) is bit-identical to before this existed — that equality is pinned
+    /// by a unit test.
+    pub fn for_tier(tier: DeviceTier, mem_budget_mb: u64, cpus: usize) -> Self {
+        let mut b = Self::derive(mem_budget_mb, cpus);
+        let (workers, cache_cap, texpool_max, fwd, fwd_max, back, lq_cap, actual, thumb_h, lq) =
+            match tier {
+                DeviceTier::Low => (3, 20, 10, 6, 12, 3, 320, Some(2), 360, LqTier::Windowed(64)),
+                DeviceTier::Mid => (6, 32, 16, 10, 24, 4, 512, Some(4), 540, LqTier::Full),
+                DeviceTier::High => return b,
+            };
+        b.workers = b.workers.min(workers);
+        b.cache_cap = b.cache_cap.min(cache_cap);
+        b.texpool_max = b.texpool_max.min(texpool_max);
+        b.fwd = b.fwd.min(fwd);
+        b.fwd_max = b.fwd_max.min(fwd_max);
+        b.back = b.back.min(back);
+        b.lq_cap = b.lq_cap.min(lq_cap);
+        b.actual_cap_vh = actual;
+        b.lq_thumb_h = b.lq_thumb_h.min(thumb_h);
+        b.lq_tier = lq;
+        b
     }
 }
 
@@ -340,9 +418,10 @@ pub fn drag_resist(dx_px: f32, viewport_w: f32) -> f32 {
 /// Default h/w aspect estimate for not-yet-decoded pages in the scroll strip.
 pub const DEFAULT_ASPECT: f32 = 1.5;
 
-/// Decoded height (px) for whole-volume LQ-tier thumbnails — small enough that a
-/// full volume of previews is cheap (~0.2 MB/page gray), large enough to read which
-/// page you're on. Shown only transiently until the full-res page lands.
+/// Default decoded height (px) for whole-volume LQ-tier thumbnails — small enough
+/// that a full volume of previews is cheap (~0.2 MB/page gray), large enough to read
+/// which page you're on. Shown only transiently until the full-res page lands. The
+/// live value is [`Budget::lq_thumb_h`] (the Low device tier shrinks it).
 pub const LQ_THUMB_H: u32 = 540;
 
 /// How far (in pages) the reading position must travel before the whole-volume
@@ -361,6 +440,59 @@ fn tail_needs_restride(pivot: Option<usize>, index: usize) -> bool {
     match pivot {
         None => true,
         Some(p) => index.abs_diff(p) >= LQ_TAIL_RESTRIDE,
+    }
+}
+
+/// The 1:1 (`FitMode::Actual`) decode target: the page's displayed height —
+/// `src_h × zoom`, since 1:1 draws at native × zoom regardless of texture size —
+/// bounded by the GPU's aspect-derived ceiling `max_h` and, on a constrained
+/// device (`cap_vh = Some(m)`), by `m` viewport heights.
+///
+/// `src_h = None` is a page that isn't decoded yet, so its native size is unknown:
+/// an unclamped device (desktop / [`DeviceTier::High`]) asks for everything and
+/// lets `target_dims` cap at the source, then re-decodes exactly once the real dims
+/// land; a clamped device asks only for what the screen can show, since a
+/// full-native RGBA decode of a mostly-off-screen page is exactly the ~96 MB spike
+/// the cap exists to prevent.
+///
+/// Clamping *below* the displayed height is the one place the single-resize
+/// invariant is deliberately relaxed — the GPU then **up**scales, the sanctioned
+/// resample direction (no screentone moiré), never downscales. Pure so the clamp
+/// is unit-testable: a real `Reader` needs a wgpu `Device`.
+fn actual_target(
+    src_h: Option<f32>,
+    zoom: f32,
+    max_h: u32,
+    viewport_h: u32,
+    cap_vh: Option<u32>,
+) -> u32 {
+    let cap = match cap_vh {
+        Some(m) => max_h.min(viewport_h.max(1).saturating_mul(m).max(MIN_TARGET)),
+        None => max_h,
+    };
+    match src_h {
+        Some(h) => ((h * zoom).round() as u32).clamp(MIN_TARGET, cap),
+        None if cap_vh.is_some() => cap,
+        None => u32::MAX,
+    }
+}
+
+/// Which page indices the thumbnail tail may cover for reading position `index`,
+/// under the device's [`LqTier`]: the whole volume on `Full`, a ±n band on
+/// `Windowed` (the pivot restride re-centres it as the reader travels), and
+/// nothing on `Off`. `None` ⇒ skip the tail build entirely. Split out of
+/// `prefetch` so the range math is testable without a GPU-backed `Reader`.
+fn lq_tail_range(tier: LqTier, index: usize, len: usize) -> Option<std::ops::RangeInclusive<usize>> {
+    if len == 0 {
+        return None;
+    }
+    match tier {
+        LqTier::Off => None,
+        LqTier::Full => Some(0..=len - 1),
+        LqTier::Windowed(n) => {
+            let n = n as usize;
+            Some(index.saturating_sub(n)..=index.saturating_add(n).min(len - 1))
+        }
     }
 }
 
@@ -385,6 +517,13 @@ pub struct Reader {
     pub lq_cache: PageCache,
     /// Worker count for the decode pool, kept so `set_source` can rebuild it.
     pub workers: usize,
+    /// [`Budget::actual_cap_vh`] — the 1:1 uncached-decode ceiling, in viewport
+    /// heights. `None` on desktop / the High tier (no clamp at all).
+    pub actual_cap_vh: Option<u32>,
+    /// [`Budget::lq_thumb_h`] — decoded height of whole-volume thumbnails.
+    pub lq_thumb_h: u32,
+    /// [`Budget::lq_tier`] — how much of the volume the thumbnail tier covers.
+    pub lq_tier: LqTier,
     /// The shell's frame-wake callback, remembered so every pool the reader
     /// (re)builds gets it. Set once per window via [`Reader::set_waker`].
     pub waker: Option<Waker>,
@@ -514,6 +653,9 @@ impl Reader {
             source: None,
             pool: None,
             workers: budget.workers,
+            actual_cap_vh: budget.actual_cap_vh,
+            lq_thumb_h: budget.lq_thumb_h,
+            lq_tier: budget.lq_tier,
             waker: None,
             failed: HashMap::new(),
             index: 0,
@@ -1264,12 +1406,13 @@ impl Reader {
             // the reduction and the GPU samples 1:1 (no bilinear-downscale moiré).
             // (Rotation-independent: a 90° turn swaps which screen edge the texture
             // height maps to, but the target works out to src_h × zoom either way.)
-            return match self.cache.get(index) {
-                Some(t) => {
-                    ((t.src_h as f32 * self.zoom).round() as u32).clamp(MIN_TARGET, max_h)
-                }
-                None => u32::MAX, // native size unknown yet: decode full, re-decode once cached
-            };
+            return actual_target(
+                self.cache.get(index).map(|t| t.src_h as f32),
+                self.zoom,
+                max_h,
+                self.viewport.h,
+                self.actual_cap_vh,
+            );
         }
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
@@ -1387,11 +1530,17 @@ impl Reader {
         // actually is — instead of once per landed page, which is what made prefetch
         // O(volume) per frame during a fill. Stops once `lq_cache` is full, so a
         // volume larger than `lq_cap` doesn't churn.
+        //
+        // The device's `lq_tier` decides how much of the volume is eligible at all
+        // (`lq_tail_range`): the whole thing on desktop/High, a ±n band around the
+        // reader on the Low tier — which the restride re-centres as it travels — or
+        // nothing when the tier is off.
         if tail_needs_restride(self.lq_tail_pivot, self.index)
             && self.lq_cache.len() < self.lq_cache.cap()
+            && let Some(range) = lq_tail_range(self.lq_tier, self.index, len)
         {
             let in_window: std::collections::HashSet<usize> = window.iter().copied().collect();
-            let mut tail: Vec<usize> = (0..len)
+            let mut tail: Vec<usize> = range
                 .filter(|i| {
                     !in_window.contains(i)
                         && !self.cache.contains(*i)
@@ -1409,7 +1558,7 @@ impl Reader {
             // whatever room the cache has then.
             tail.truncate(self.lq_cache.cap().saturating_sub(self.lq_cache.len()));
             if let Some(pool) = &self.pool {
-                pool.set_lq_tail(tail.into_iter().map(|i| (i, LQ_THUMB_H)).collect());
+                pool.set_lq_tail(tail.into_iter().map(|i| (i, self.lq_thumb_h)).collect());
                 self.lq_tail_pivot = Some(self.index);
             }
         }
@@ -1567,6 +1716,129 @@ mod tests {
         assert_eq!(tiny.texpool_max, 8, "texpool floor");
         assert_eq!(tiny.fwd, 6, "fwd floor");
         assert_eq!(tiny.back, 3, "back floor");
+    }
+
+    // The flagship rule, pinned: `DeviceTier::High` applies **no** ceilings, so a
+    // High-tier budget is bit-identical to plain `derive` for every input — that is
+    // what makes this whole feature a no-op on desktop and on fast phones.
+    #[test]
+    fn for_tier_high_is_exactly_derive() {
+        use super::{Budget, DeviceTier};
+        for mem in [8u64, 64, 192, 256, 384, 512, 1024, 8192] {
+            for cpus in [1usize, 2, 4, 6, 8, 16] {
+                assert_eq!(
+                    Budget::for_tier(DeviceTier::High, mem, cpus),
+                    Budget::derive(mem, cpus),
+                    "High must not touch derive (mem {mem}, cpus {cpus})"
+                );
+            }
+        }
+    }
+
+    // Low/Mid apply the ceiling table to a device whose *derived* budget is bigger
+    // (the broken-probe case that started this: a 6 GB phone saturating every
+    // desktop clamp). Note what a ceiling is not: a floor.
+    #[test]
+    fn for_tier_low_and_mid_cap_a_desktop_class_budget() {
+        use super::{Budget, DeviceTier, LqTier};
+        let desktop = Budget::derive(1024, 8); // saturates every `derive` clamp
+        assert_eq!(desktop.workers, 8);
+        assert_eq!(desktop.cache_cap, 48);
+
+        let low = Budget::for_tier(DeviceTier::Low, 1024, 8);
+        assert_eq!(
+            (low.workers, low.cache_cap, low.texpool_max, low.fwd, low.fwd_max, low.back, low.lq_cap),
+            (3, 20, 10, 6, 12, 3, 320)
+        );
+        assert_eq!(low.actual_cap_vh, Some(2));
+        assert_eq!(low.lq_thumb_h, 360);
+        assert_eq!(low.lq_tier, LqTier::Windowed(64));
+
+        let mid = Budget::for_tier(DeviceTier::Mid, 1024, 8);
+        assert_eq!(
+            (mid.workers, mid.cache_cap, mid.texpool_max, mid.fwd, mid.fwd_max, mid.back, mid.lq_cap),
+            (6, 32, 16, 10, 24, 4, 512)
+        );
+        assert_eq!(mid.actual_cap_vh, Some(4));
+        assert_eq!(mid.lq_thumb_h, 540);
+        assert_eq!(mid.lq_tier, LqTier::Full);
+    }
+
+    // Ceilings are `min`s: a device whose derived budget is already below the tier
+    // ceiling keeps its (smaller) derived values — the tier must never *raise* a
+    // budget onto hardware that couldn't derive it.
+    #[test]
+    fn for_tier_never_raises_a_smaller_derived_budget() {
+        use super::{Budget, DeviceTier};
+        for tier in [DeviceTier::Low, DeviceTier::Mid] {
+            let tiny = Budget::derive(8, 2); // every floor: 2 workers, cache 16, fwd 6…
+            let capped = Budget::for_tier(tier, 8, 2);
+            assert_eq!(capped.workers, tiny.workers, "{tier:?}");
+            assert_eq!(capped.cache_cap, tiny.cache_cap, "{tier:?}");
+            assert_eq!(capped.texpool_max, tiny.texpool_max, "{tier:?}");
+            assert_eq!(capped.fwd, tiny.fwd, "{tier:?}");
+            assert_eq!(capped.back, tiny.back, "{tier:?}");
+            assert!(capped.lq_cap <= tiny.lq_cap, "{tier:?}");
+        }
+    }
+
+    // The mobile 1:1 clamp. Desktop (`None`) must stay exactly what the
+    // `decode_target_matches_drawn_size*` invariant tests model: displayed height
+    // when the page is decoded, `u32::MAX` (→ full native) when it isn't. A capped
+    // device bounds both arms at `m × viewport.h`, which is the whole point — the
+    // uncached arm's full-native decode is the ~96 MB spike on a 4K-ish page.
+    #[test]
+    fn actual_target_clamps_only_on_capped_devices() {
+        use super::actual_target;
+        let (max_h, vh) = (8192u32, 2400u32);
+
+        // Desktop / High: no cap anywhere.
+        assert_eq!(actual_target(None, 1.0, max_h, vh, None), u32::MAX, "uncached decodes full");
+        assert_eq!(actual_target(Some(5200.0), 1.0, max_h, vh, None), 5200);
+        assert_eq!(actual_target(Some(5200.0), 0.5, max_h, vh, None), 2600);
+
+        // Low tier (2× viewport heights = 4800): the uncached full-native decode
+        // becomes a bounded one, and a tall page at 1:1 is capped (GPU upscales).
+        assert_eq!(actual_target(None, 1.0, max_h, vh, Some(2)), 4800);
+        assert_eq!(actual_target(Some(5200.0), 1.0, max_h, vh, Some(2)), 4800);
+        // …but a page that already fits under the cap is untouched: no clamp, so
+        // the GPU still samples it 1:1.
+        assert_eq!(actual_target(Some(5200.0), 0.5, max_h, vh, Some(2)), 2600);
+        // Mid (4× = 9600) is above the GPU ceiling here, so `max_h` still wins.
+        assert_eq!(actual_target(Some(9000.0), 1.0, max_h, vh, Some(4)), max_h);
+
+        // Degenerate inputs can't produce an inverted clamp range (a panic).
+        assert_eq!(actual_target(Some(1000.0), 0.0, max_h, 0, Some(2)), super::MIN_TARGET);
+        assert_eq!(actual_target(None, 1.0, max_h, 1, Some(2)), super::MIN_TARGET);
+    }
+
+    // `LqTier` decides how much of a volume the thumbnail tail may cover: all of it
+    // (desktop / Mid / High), a ±n band that the pivot restride re-centres as the
+    // reader travels (Low), or none at all. The band is clamped to the volume at
+    // both ends — the low end must not underflow, the high end must not run past
+    // the last page.
+    #[test]
+    fn lq_tail_range_windows_the_thumbnail_tier() {
+        use super::{lq_tail_range, LqTier};
+        assert_eq!(lq_tail_range(LqTier::Full, 300, 500), Some(0..=499), "whole volume");
+        assert_eq!(lq_tail_range(LqTier::Off, 300, 500), None, "no tail at all");
+
+        let w = LqTier::Windowed(64);
+        assert_eq!(lq_tail_range(w, 300, 500), Some(236..=364));
+        assert_eq!(lq_tail_range(w, 10, 500), Some(0..=74), "clamped at the start");
+        assert_eq!(lq_tail_range(w, 480, 500), Some(416..=499), "clamped at the end");
+        assert_eq!(lq_tail_range(w, 5, 20), Some(0..=19), "a short volume is fully covered");
+        // Travelling a restride (32 pages) shifts the band, so pages that were
+        // outside it become eligible — this is what keeps a scrub previewable.
+        let before = lq_tail_range(w, 300, 500).unwrap();
+        let after = lq_tail_range(w, 332, 500).unwrap();
+        assert!(!before.contains(&396) && after.contains(&396));
+
+        // An empty volume has nothing to thumbnail under any tier (and `len - 1`
+        // must not underflow).
+        for t in [LqTier::Full, LqTier::Windowed(64), LqTier::Off] {
+            assert_eq!(lq_tail_range(t, 0, 0), None, "{t:?}");
+        }
     }
 
     // The cache cap is monotonic in the memory budget (more RAM never shrinks it).

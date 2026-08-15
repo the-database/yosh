@@ -53,6 +53,40 @@ impl PageCache {
         self.cap
     }
 
+    /// Re-cap the cache in place, evicting down to the new ceiling immediately
+    /// (furthest-from-`current` first, exactly like `insert`). Used when the device
+    /// `Budget` changes at runtime — the performance setting — so the memory
+    /// actually comes back without reopening the book: the pages nearest the read
+    /// position survive, so the current view never flashes.
+    pub fn set_cap(&mut self, cap: usize, current: usize) {
+        self.cap = cap;
+        if self.map.len() > self.cap {
+            self.epoch += 1; // pages left the cache: prefetch must reconsider them
+            self.evict_to_cap(current);
+        }
+    }
+
+    /// Drop entries furthest from `current` until the map fits `cap`. `current`
+    /// itself is never a victim (evicting the page on screen would flash it).
+    fn evict_to_cap(&mut self, current: usize) {
+        while self.map.len() > self.cap {
+            let victim = self
+                .map
+                .keys()
+                .copied()
+                .filter(|&k| k != current)
+                .max_by_key(|&k| (k as i64 - current as i64).abs());
+            match victim {
+                Some(k) => {
+                    if let Some(page) = self.map.remove(&k) {
+                        page.recycle(&self.pool);
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+
     pub fn get(&self, index: usize) -> Option<&PageTexture> {
         self.map.get(&index)
     }
@@ -97,21 +131,6 @@ impl PageCache {
         if let Some(old) = self.map.insert(index, page) {
             old.recycle(&self.pool);
         }
-        while self.map.len() > self.cap {
-            let victim = self
-                .map
-                .keys()
-                .copied()
-                .filter(|&k| k != current)
-                .max_by_key(|&k| (k as i64 - current as i64).abs());
-            match victim {
-                Some(k) => {
-                    if let Some(page) = self.map.remove(&k) {
-                        page.recycle(&self.pool);
-                    }
-                }
-                None => break,
-            }
-        }
+        self.evict_to_cap(current);
     }
 }
