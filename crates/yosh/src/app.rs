@@ -21,7 +21,7 @@ use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
 use yosh_engine::page::{FitMode, PagePipeline};
-use yosh_engine::pool::DecodePool;
+use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
 use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
@@ -409,6 +409,15 @@ fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
+/// The engine's "something new to draw" callback for this window: it only calls
+/// `Window::request_redraw`, which winit documents as thread-safe, so a decode
+/// worker can schedule the next frame the instant a page lands. The closure owns
+/// an `Arc<Window>` clone, so even a straggler worker's call lands on a live window.
+fn frame_waker(window: &Arc<Window>) -> Waker {
+    let w = window.clone();
+    Arc::new(move || w.request_redraw())
+}
+
 /// The window / taskbar / title-bar icon, decoded from the embedded logo PNG.
 /// (The icon embedded in the .exe via the build script is used by Explorer and
 /// shortcuts, but winit needs the window icon set explicitly at runtime.)
@@ -530,6 +539,10 @@ impl ApplicationHandler for App {
             let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
             state.gpu.recreate_surface(window.clone());
             state.window = window;
+            // The pool survives the surface rebuild, but its waker points at the
+            // window that just died — re-aim it at the new one.
+            let waker = frame_waker(&state.window);
+            state.reader.set_waker(Some(waker));
             state.window.request_redraw();
             return;
         }
@@ -683,6 +696,12 @@ impl ApplicationHandler for App {
             false, // two_tier: desktop keeps the always-HQ pipeline
         );
         reader.transition_enabled = settings.page_transition_enabled;
+        // Decode→UI wakeup: a worker that finishes a page schedules the frame that
+        // draws it (winit's `request_redraw` is thread-safe), so the loop doesn't
+        // have to keep drawing on the chance that one landed. Set once here and
+        // remembered by the `Reader`, which re-applies it to every pool it builds;
+        // shell-side rebuilds (`set_source`) re-apply it themselves.
+        reader.set_waker(Some(frame_waker(&window)));
         // Seed the OS day/night flag from the window (None on platforms that don't
         // report it → assume dark, egui's default look).
         let system_dark = window
@@ -1619,13 +1638,18 @@ impl State {
         };
         self.reader.start_index = 0;
 
-        self.reader.pool = Some(DecodePool::new(
+        let pool = DecodePool::new(
             source.clone(),
             self.gpu.device.clone(),
             self.gpu.queue.clone(),
             self.reader.tex_pool.clone(),
             self.reader.workers,
-        ));
+        );
+        // A fresh pool starts wakerless: hand it the window's frame waker (kept on
+        // the reader) or this volume's decodes would land without scheduling the
+        // frame that draws them.
+        pool.set_waker(self.reader.waker.clone());
+        self.reader.pool = Some(pool);
         self.reader.cache.clear();
         self.reader.lq_cache.clear();
         self.reader.failed.clear();

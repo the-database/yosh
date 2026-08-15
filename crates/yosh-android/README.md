@@ -11,9 +11,12 @@ holds — verified converging to a crisp 1:1 render on-device), with tap-zones
 (left third = previous, right = next), swipe/pinch-zoom, the SAF picker
 (content:// → `ZipSource::from_bytes`), egui chrome (seekbar / library browser)
 and `KEEP_SCREEN_ON`. Redraws are **on demand** — the frame loop idles on a
-settled, decoded page and wakes on input, animation, or pending decode work (see
-the redraw guard at the end of `App::render`). Verified on a physical Pixel 9 Pro
-XL and a Lenovo TB321FU tablet (wgpu on Vulkan).
+settled, decoded page and wakes on input, animation, or a *landing* result: the
+decode pool and the library producers call the shell's frame waker
+(`request_redraw`) right after sending, so nothing has to be polled for (see
+`pool.rs`'s wake ordering and the redraw guard at the end of `App::render`).
+Verified on a physical Pixel 9 Pro XL and a Lenovo TB321FU tablet (wgpu on
+Vulkan).
 
 RAR/CBR is unavailable on Android (the bundled UnRAR C++ uses `lutimes`, absent
 from Bionic libc), so the engine is built `--no-default-features`. Folder / CBZ /

@@ -14,7 +14,7 @@ use crate::cache::PageCache;
 use crate::decode::MAX_TEX_DIM;
 use crate::layout::{self, Layout};
 use crate::page::{fit_scale, FitMode, PageTexture, MAX_QUADS};
-use crate::pool::{DecodePool, Msg};
+use crate::pool::{DecodePool, Msg, Waker};
 use crate::prefetch::desired_window;
 use crate::source::PageSource;
 use crate::texpool::TexturePool;
@@ -366,6 +366,9 @@ pub struct Reader {
     pub lq_cache: PageCache,
     /// Worker count for the decode pool, kept so `set_source` can rebuild it.
     pub workers: usize,
+    /// The shell's frame-wake callback, remembered so every pool the reader
+    /// (re)builds gets it. Set once per window via [`Reader::set_waker`].
+    pub waker: Option<Waker>,
     /// Pages whose decode errored, mapped to the error message (shown to the user).
     pub failed: HashMap<usize, String>,
 
@@ -484,6 +487,7 @@ impl Reader {
             source: None,
             pool: None,
             workers: budget.workers,
+            waker: None,
             failed: HashMap::new(),
             index: 0,
             start_index,
@@ -523,6 +527,18 @@ impl Reader {
     /// Queue a transient message; the shell drains it into its timed toast.
     pub fn toast(&mut self, msg: impl Into<String>) {
         self.pending_toasts.push(msg.into());
+    }
+
+    /// Install the shell's frame-wake callback (see [`Waker`]): remembered on the
+    /// reader *and* pushed to the live pool, so a landing decode schedules the
+    /// frame that draws it instead of the shell polling for it. Every site that
+    /// rebuilds `self.pool` must re-apply it (`apply_refreshed_source` does; the
+    /// shells' own rebuilds call `DecodePool::set_waker` with `reader.waker`).
+    pub fn set_waker(&mut self, w: Option<Waker>) {
+        self.waker = w;
+        if let Some(pool) = &self.pool {
+            pool.set_waker(self.waker.clone());
+        }
     }
 
     /// Drain finished decodes from the pool into the right cache — full-res pages to
@@ -1932,13 +1948,17 @@ impl Reader {
                     .copied()
                     .unwrap_or_else(|| self.index.min(new_len - 1));
                 self.failed.clear();
-                self.pool = Some(DecodePool::new(
+                let pool = DecodePool::new(
                     new.clone(),
                     self.device.clone(),
                     self.queue.clone(),
                     self.tex_pool.clone(),
                     self.workers,
-                ));
+                );
+                // The rebuilt pool starts wakerless — hand it the shell's callback
+                // or landings from here on would never schedule a frame.
+                pool.set_waker(self.waker.clone());
+                self.pool = Some(pool);
                 self.source = Some(new);
                 self.prefetch();
             }
