@@ -15,10 +15,11 @@
 //! The whole crate is Android-only; the desktop shell is `crates/yosh`.
 #![cfg(target_os = "android")]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
@@ -101,11 +102,34 @@ fn android_main(app: AndroidApp) {
         .with_android_app(app.clone())
         .build()
         .expect("build event loop");
+    let (open_tx, open_rx) = std::sync::mpsc::channel();
+    let (sib_tx, sib_rx) = std::sync::mpsc::channel();
+    let (recents_ok_tx, recents_ok_rx) = std::sync::mpsc::channel();
     let mut shell = Shell {
         app: None,
         android_app: app,
         frame_waker: None,
         picker_pending: false,
+        open_gen: 0,
+        opening: None,
+        opening_key: None,
+        open_tx,
+        open_rx,
+        resume_fallback: false,
+        sib_cache: None,
+        sib_tx,
+        sib_rx,
+        pending_book_nav: None,
+        recents_ok: HashSet::new(),
+        recents_ok_tx,
+        recents_ok_rx,
+        dirty_positions: false,
+        dirty_progress: false,
+        dirty_recents: false,
+        dirty_collapsed: false,
+        dirty_view: false,
+        dirty_libroot: false,
+        dirty_since: None,
         positions,
         pos_path,
         progress,
@@ -144,6 +168,30 @@ fn android_main(app: AndroidApp) {
 /// Cap on the most-recently-read list (`recents.txt`); the head is the resume target.
 const RECENTS_CAP: usize = 32;
 
+/// How long a dirty persisted-state file waits before [`Shell::flush_saves`] writes
+/// it, so a burst of page turns costs one write instead of one per flip.
+const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Result of a background open: the comic's identity key (path or content:// URI)
+/// and its page source, or a message to log. The key travels *with* the result
+/// because the launch resume also decides which recent to open off-thread.
+type OpenResult = Result<(String, Arc<dyn PageSource>), String>;
+
+/// One off-thread info-overlay result: the open generation and the page index it
+/// was gathered for, plus the `(label, value)` rows. The two tags let the main
+/// thread drop a result it has already moved past — a book switch bumps the
+/// generation, a page turn changes the index.
+type InfoRows = (u64, usize, Vec<(String, String)>);
+
+/// Outcome of resolving the current book's neighbour in its folder. `Cold` means
+/// the listing isn't cached yet — a background scan has been kicked and the caller
+/// should park its request rather than scan on the UI thread.
+enum SibLookup {
+    Cold,
+    Missing,
+    Found(PathBuf),
+}
+
 struct Shell {
     app: Option<App>,
     /// Kept for JNI into the `YoshActivity` Java bridge (vm + activity pointers).
@@ -156,6 +204,60 @@ struct Shell {
     frame_waker: Option<Waker>,
     /// A document-picker launch is awaiting its result.
     picker_pending: bool,
+
+    // Async open: building a page source is pure I/O — a `read_dir`, a zip central
+    // directory, a whole-archive slurp off a SAF descriptor — and on phone storage
+    // that is exactly the multi-second stall that turns into an ANR. It runs on a
+    // worker thread; only the newest result is applied, so mashing "next book"
+    // supersedes in-flight opens instead of queuing stale swaps.
+    open_gen: u64,
+    /// Display name of the volume currently being opened (`None` = nothing in
+    /// flight). Drives the spinner card, so it must be cleared on *every* landing.
+    opening: Option<String>,
+    /// Identity of that volume, when it's known up front (the launch resume picks
+    /// its book off-thread, so it isn't). Next/prev-book resolves against this
+    /// rather than the still-open book, so a second tap during an open advances
+    /// from the pending target instead of repeating it.
+    opening_key: Option<String>,
+    open_tx: Sender<(u64, OpenResult)>,
+    open_rx: Receiver<(u64, OpenResult)>,
+    /// The in-flight open is the launch resume (which also picks *which* recent to
+    /// open, off-thread): a failure falls back to the library / empty state rather
+    /// than leaving the spinner's aftermath on a blank screen.
+    resume_fallback: bool,
+
+    /// Cached parent-dir comic listing for next/prev-book (`(parent, comics)`),
+    /// warmed in the background on open so the first boundary hit doesn't pay a
+    /// `read_dir` + per-entry stat on the UI thread.
+    sib_cache: Option<(PathBuf, Vec<PathBuf>)>,
+    sib_tx: Sender<(PathBuf, Vec<PathBuf>)>,
+    sib_rx: Receiver<(PathBuf, Vec<PathBuf>)>,
+    /// A next/prev-book request that arrived while `sib_cache` was cold, held until
+    /// the scan lands (then replayed). Requests accumulate, so mashing "next book"
+    /// three times before the scan finishes jumps three volumes rather than one.
+    pending_book_nav: Option<i64>,
+
+    /// Which `recents` entries still exist on disk. Computed off-thread (a stat per
+    /// entry against SD-card storage is not per-frame work) and refreshed when the
+    /// library opens; the library render only reads it.
+    recents_ok: HashSet<String>,
+    recents_ok_tx: Sender<HashSet<String>>,
+    recents_ok_rx: Receiver<HashSet<String>>,
+
+    // Debounced atomic saves. Every one of these is a whole-file rewrite, and page
+    // turns used to fire two of them synchronously per flip. Now a change only
+    // *marks* its file dirty; `flush_saves` writes what's dirty once the marks have
+    // settled (or immediately when forced: suspend, book switch), via a temp file +
+    // rename so a kill mid-write can't truncate the real one.
+    dirty_positions: bool,
+    dirty_progress: bool,
+    dirty_recents: bool,
+    dirty_collapsed: bool,
+    dirty_view: bool,
+    dirty_libroot: bool,
+    /// When the oldest un-flushed mark was made (`None` = nothing dirty).
+    dirty_since: Option<Instant>,
+
     /// Per-comic last-read page, keyed by comic identity (content:// URI or path).
     positions: HashMap<String, usize>,
     /// Where `positions` persists (app's private dir).
@@ -320,8 +422,25 @@ struct App {
     /// info popup is open — not every frame. `None` ⇒ rebuild on next render.
     info_for: Option<usize>,
     /// Cached (label, value) metadata lines for `info_for`'s page. Spliced into
-    /// `build_info`'s per-frame lines so the byte read stays gated.
+    /// `build_info`'s per-frame lines so the byte read stays gated. Placeholders
+    /// until the background read lands (see `info_rx`).
     info_meta: Vec<(String, String)>,
+    /// The info overlay's metadata needs `read_page` + `modified` — disk I/O, and on
+    /// a 7z still decompressing, a wait for that entry to land. It's gathered on a
+    /// thread and tagged with `(open_gen, page index)` so a result for a book that
+    /// has since been switched, or a page already turned past, is dropped.
+    info_tx: Sender<InfoRows>,
+    info_rx: Receiver<InfoRows>,
+    /// Off-thread listing for the "choose a library root" folder browser, tagged
+    /// with the directory it describes (a newer navigation supersedes it).
+    browse_tx: Sender<(PathBuf, Vec<Entry>)>,
+    browse_rx: Receiver<(PathBuf, Vec<Entry>)>,
+    /// A browse listing is in flight ("Scanning…" placeholder).
+    browse_pending: bool,
+    /// The egui frame changed the viewing options / library root; the Shell picks
+    /// these up after `render` and debounces the actual file writes.
+    view_dirty: bool,
+    libroot_dirty: bool,
     /// The user's layout choice. `reader.layout` is the concrete `Single`/`Spread`
     /// this resolves to (orientation-dependent for `Auto`); this is the source of
     /// truth that persists. See `apply_resolved_layout`.
@@ -346,8 +465,6 @@ struct App {
     /// persistent state, so re-applying it every frame just rebuilds a `Visuals`
     /// for nothing). `None` ⇒ not applied yet. Mirrors `Shell::applied_immersive`.
     applied_light: Option<bool>,
-    /// Where viewing options persist (mirrors Shell.view_file).
-    view_file: Option<PathBuf>,
 }
 
 /// A library browser row: a folder to descend into (or open if it holds images),
@@ -484,6 +601,9 @@ struct LibCtx<'a> {
     current_key: Option<&'a str>,
     /// Most-recently-read keys (newest first) for the "Recently read" row.
     recents: &'a [String],
+    /// Which of those still exist on disk (see [`Shell::recents_ok`]) — the render
+    /// filters against this set instead of stat-ing every recent, every frame.
+    recents_ok: &'a HashSet<String>,
 }
 
 /// Per-frame owned snapshot of one series section for the egui closure.
@@ -655,6 +775,11 @@ impl ApplicationHandler for Shell {
                 .expect("create window"),
         );
         self.has_files = has_all_files(&self.android_app);
+        // Anything still dirty belongs to the App that's about to be torn down (the
+        // view options are read back off it), so write it out before `init_view` is
+        // re-read below — otherwise a pending options change would be reverted by
+        // its own file.
+        self.flush_saves(true);
         // Every options toggle writes view.txt immediately, but `init_view` is the
         // snapshot this process *launched* with — and a resume rebuilds the whole
         // App from it. Re-read the file so options changed since launch (theme,
@@ -699,7 +824,8 @@ impl ApplicationHandler for Shell {
             // that saved page (not the fresh reader's index 0).
             if let (Some(k), Some(app)) = (self.current_key.take(), self.app.as_ref()) {
                 self.positions.insert(k.clone(), app.reader.index);
-                self.save_positions();
+                self.mark_positions();
+                self.flush_saves(true); // the App holding the view state is about to go
                 rebuild_book = Some(k);
             }
             self.app = None; // drops the old GPU context, Reader, decode pool + textures
@@ -801,6 +927,8 @@ impl ApplicationHandler for Shell {
         reader.set_waker(self.frame_waker.clone());
         let (thumb_tx, thumb_rx) = std::sync::mpsc::channel();
         let (series_tx, series_rx) = std::sync::mpsc::channel();
+        let (info_tx, info_rx) = std::sync::mpsc::channel();
+        let (browse_tx, browse_rx) = std::sync::mpsc::channel();
         // On-disk cover-thumbnail cache dir (app-private `…/thumbs`): covers load
         // from here instead of re-decoding the full first page on every open. It's
         // owned by the cover worker, the only thing that touches it.
@@ -843,6 +971,13 @@ impl ApplicationHandler for Shell {
             show_info: false,
             info_for: None,
             info_meta: Vec::new(),
+            info_tx,
+            info_rx,
+            browse_tx,
+            browse_rx,
+            browse_pending: false,
+            view_dirty: false,
+            libroot_dirty: false,
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
             theme: self.init_view.6,
@@ -852,7 +987,6 @@ impl ApplicationHandler for Shell {
             cpus,
             system_dark: system_dark(&self.android_app),
             applied_light: None,
-            view_file: self.view_file.clone(),
         });
         // Pick up where we left off: with resume on, reopen the most-recent
         // reopenable book (at its saved page); else, if a library is configured, open
@@ -868,16 +1002,21 @@ impl ApplicationHandler for Shell {
         {
             self.picker_pending = false;
             self.open_picked(&uri);
-        } else if let Some(key) = rebuild_book.filter(|k| is_reopenable_fs(k)) {
+        } else if let Some(key) = rebuild_book {
+            // Reopening is asynchronous now: a resume never blocks on re-reading an
+            // archive, it just draws the spinner for the first frames. A book that
+            // vanished (or a content:// one-off, which can't be rebuilt) fails the
+            // open and lands on the library, exactly as the old `is_reopenable_fs`
+            // filter did — see `resume_fallback`.
             self.open_path(PathBuf::from(key));
+            self.resume_fallback = resume_library || lib_configured; // after: start_open clears it
         } else if resume_active {
             if resume_library || lib_configured {
                 self.open_library();
             }
-        } else if self.init_view.5
-            && let Some(key) = self.recents.iter().find(|k| is_reopenable_fs(k)).cloned()
-        {
-            self.open_path(PathBuf::from(key));
+        } else if self.init_view.5 && !self.recents.is_empty() {
+            self.resume_recent();
+            self.resume_fallback = lib_configured; // after: start_open clears it
         } else if lib_configured {
             self.open_library();
         }
@@ -886,14 +1025,18 @@ impl ApplicationHandler for Shell {
 
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         // Persist the current position + library dir before the OS may kill us.
+        // Everything is written **synchronously** here: the process can be killed
+        // the moment this returns, so the debounce is force-flushed rather than
+        // trusted to a later frame that may never come.
         if let (Some(k), Some(app)) = (self.current_key.clone(), self.app.as_ref()) {
             self.positions.insert(k, app.reader.index);
         }
-        self.save_positions();
-        self.save_recents();
-        if let (Some(f), Some(app)) = (self.lib_dir_file.clone(), self.app.as_ref()) {
-            let _ = std::fs::write(f, app.lib_root.to_string_lossy().as_bytes());
-        }
+        self.dirty_positions = true;
+        self.dirty_progress = true;
+        self.dirty_recents = true;
+        self.dirty_libroot = true;
+        self.dirty_since.get_or_insert_with(Instant::now);
+        self.flush_saves(true);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -937,6 +1080,9 @@ impl ApplicationHandler for Shell {
                         self.open_picked(&uri);
                     }
                 }
+                // The single drain point for everything the shell's background
+                // threads produce (opens, sibling listings, recents existence).
+                self.poll_background();
                 // Advance an inertial scroll glide (if any) before drawing this frame.
                 self.tick_scroll_fling();
                 let has_files = self.has_files;
@@ -945,16 +1091,21 @@ impl ApplicationHandler for Shell {
                 let status_px = *self
                     .status_bar_px
                     .get_or_insert_with(|| status_bar_height(&self.android_app));
+                let opening = self.opening.clone();
+                let open_gen = self.open_gen;
                 let reqs = match &mut self.app {
                     Some(app) => app.render(
                         has_files,
                         status_px,
+                        opening.as_deref(),
+                        open_gen,
                         LibCtx {
                             progress: &self.progress,
                             positions: &self.positions,
                             collapsed: &self.collapsed,
                             current_key: self.current_key.as_deref(),
                             recents: &self.recents,
+                            recents_ok: &self.recents_ok,
                         },
                     ),
                     None => FrameReqs::default(),
@@ -962,11 +1113,30 @@ impl ApplicationHandler for Shell {
                 // Keep the read-tracking map current (cheap; persisted with the
                 // position saves) — covers seekbar jumps applied inside render.
                 self.note_progress();
+                // The egui frame may have changed the viewing options / library root;
+                // both live on the App, so it flags them and the debounce is the
+                // Shell's business.
+                let (view_dirty, libroot_dirty) = match self.app.as_mut() {
+                    Some(app) => (
+                        std::mem::take(&mut app.view_dirty),
+                        std::mem::take(&mut app.libroot_dirty),
+                    ),
+                    None => (false, false),
+                };
+                if view_dirty {
+                    self.dirty_view = true;
+                    self.dirty_since.get_or_insert_with(Instant::now);
+                }
+                if libroot_dirty {
+                    self.dirty_libroot = true;
+                    self.dirty_since.get_or_insert_with(Instant::now);
+                }
                 if let Some(dir) = reqs.toggle_series {
                     if !self.collapsed.remove(&dir) {
                         self.collapsed.insert(dir);
                     }
-                    self.save_collapsed();
+                    self.dirty_collapsed = true;
+                    self.dirty_since.get_or_insert_with(Instant::now);
                     if let Some(app) = self.app.as_ref() {
                         app.window.request_redraw();
                     }
@@ -1004,6 +1174,10 @@ impl ApplicationHandler for Shell {
                     set_immersive(&self.android_app, immersive);
                     self.applied_immersive = Some(immersive);
                 }
+                // Opportunistic: writes what has been dirty long enough. Frames stop
+                // when the reader idles, so this is a best-effort early write — the
+                // guaranteed ones are the forced flushes on suspend / book switch.
+                self.flush_saves(false);
             }
             _ => {}
         }
@@ -1293,8 +1467,88 @@ impl Shell {
             let idx = app.reader.index;
             if let Some(k) = self.current_key.clone() {
                 self.positions.insert(k, idx);
-                self.save_positions();
+                self.mark_positions();
             }
+        }
+    }
+
+    /// Drain everything the shell's background threads deliver. Called once per
+    /// frame from `RedrawRequested`, before the render — every producer wakes the
+    /// loop after sending, so a result never waits for an unrelated frame.
+    fn poll_background(&mut self) {
+        // Finished opens, newest generation only: a later open bumped `open_gen`,
+        // so a superseded result is dropped rather than swapping in a stale book.
+        loop {
+            match self.open_rx.try_recv() {
+                Ok((generation, res)) => {
+                    if generation != self.open_gen {
+                        continue; // superseded by a newer open
+                    }
+                    self.opening = None;
+                    self.opening_key = None;
+                    let fallback = std::mem::take(&mut self.resume_fallback);
+                    match res {
+                        Ok((key, src)) if !src.is_empty() => {
+                            log::info!("open {key}: {} pages", src.len());
+                            self.open_comic(key, src);
+                        }
+                        Ok((key, _)) => {
+                            log::warn!("no images found in {key}");
+                            self.after_failed_open(fallback);
+                        }
+                        Err(e) => {
+                            log::error!("open failed: {e}");
+                            self.after_failed_open(fallback);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                // The Shell owns the Sender, so this can't happen — but fold it into
+                // "nothing is opening" anyway so the spinner can never stick.
+                Err(TryRecvError::Disconnected) => {
+                    self.opening = None;
+                    self.opening_key = None;
+                    break;
+                }
+            }
+        }
+        // Sibling listings only warm the next/prev-book cache — nothing to show…
+        let mut sibs_landed = false;
+        while let Ok(entry) = self.sib_rx.try_recv() {
+            self.sib_cache = Some(entry);
+            sibs_landed = true;
+        }
+        if sibs_landed {
+            // …unless a book jump was parked waiting for exactly this listing: replay
+            // it now. If the book moved folders meanwhile this re-warms and re-parks
+            // instead — still terminating, since each pass needs a fresh scan.
+            if let Some(d) = self.pending_book_nav.take() {
+                self.open_sibling_book(d);
+            }
+            // An armed boundary prompt resolved to "no neighbour" only because the
+            // cache was cold: fill it in now that the listing is here.
+            if self
+                .app
+                .as_ref()
+                .and_then(|a| a.book_prompt.as_ref())
+                .is_some_and(|p| p.sibling.is_none())
+            {
+                self.refresh_prompt_sibling();
+            }
+        }
+        while let Ok(ok) = self.recents_ok_rx.try_recv() {
+            self.recents_ok = ok;
+        }
+    }
+
+    /// An open that produced nothing: with `fallback` (the launch/resume reopen)
+    /// land on the library rather than leaving the user staring at the last frame
+    /// of the spinner.
+    fn after_failed_open(&mut self, fallback: bool) {
+        if fallback {
+            self.open_library();
+        } else if let Some(app) = self.app.as_ref() {
+            app.window.request_redraw(); // drop the spinner
         }
     }
 
@@ -1320,6 +1574,9 @@ impl Shell {
     /// the top-strip tap and the empty-state "Browse library" button.
     fn open_library(&mut self) {
         self.has_files = has_all_files(&self.android_app);
+        // Which recents still exist is decided once here, off-thread, instead of
+        // stat-ing all 32 of them on every library frame.
+        self.refresh_recents_ok();
         if let Some(app) = self.app.as_mut() {
             app.library_view = true;
             app.lib_browse = false;
@@ -1428,31 +1685,112 @@ impl Shell {
     }
 
     /// The previous/next comic in the current comic's folder (`dir` = -1/+1),
-    /// natural-sorted like the library. `None` at the ends or for non-path
+    /// natural-sorted like the library. `Missing` at the ends or for non-path
     /// (SAF-picked) sources, whose keys aren't filesystem paths.
-    fn sibling_book_path(&self, dir: i64) -> Option<PathBuf> {
-        let cur = self.current_key.clone()?;
+    ///
+    /// Reads the background-warmed [`Shell::sib_cache`] only. On a miss it kicks the
+    /// scan and answers `Cold` — a `read_dir` plus a stat per entry on the UI thread
+    /// is precisely the hitch this phase exists to remove.
+    fn sibling_book_path(&mut self, dir: i64) -> SibLookup {
+        // Base "current" on the pending target while an open is in flight, so a
+        // second next-book tap advances from the not-yet-loaded neighbour instead
+        // of asking for it again.
+        let Some(cur) = self.opening_key.clone().or_else(|| self.current_key.clone()) else {
+            return SibLookup::Missing;
+        };
         let cur_path = PathBuf::from(&cur);
-        let parent = cur_path.parent()?;
-        let comics: Vec<PathBuf> = scan_dir(parent)
-            .into_iter()
-            .filter_map(|e| match e {
-                Entry::Comic(p) => Some(p),
-                _ => None,
-            })
-            .collect();
-        let i = comics.iter().position(|p| *p == cur_path)?;
+        let Some(parent) = cur_path.parent().map(|p| p.to_path_buf()) else {
+            return SibLookup::Missing;
+        };
+        if cur.starts_with("content://") {
+            return SibLookup::Missing; // SAF one-off: no folder to walk
+        }
+        if !matches!(&self.sib_cache, Some((p, _)) if *p == parent) {
+            self.warm_sib_cache(&cur_path);
+            return SibLookup::Cold;
+        }
+        let comics = &self.sib_cache.as_ref().unwrap().1;
+        let Some(i) = comics.iter().position(|p| *p == cur_path) else {
+            return SibLookup::Missing;
+        };
         let j = i as i64 + dir;
-        (0..comics.len() as i64)
-            .contains(&j)
-            .then(|| comics[j as usize].clone())
+        match (0..comics.len() as i64).contains(&j) {
+            true => SibLookup::Found(comics[j as usize].clone()),
+            false => SibLookup::Missing,
+        }
+    }
+
+    /// Scan the current book's folder for sibling comics on a background thread and
+    /// hand the listing back for `sib_cache` (consumed in `poll_background`).
+    fn warm_sib_cache(&self, vol: &Path) {
+        let Some(parent) = vol.parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let tx = self.sib_tx.clone();
+        let waker = self.frame_waker.clone();
+        std::thread::spawn(move || {
+            let comics: Vec<PathBuf> = scan_dir(&parent)
+                .into_iter()
+                .filter_map(|e| match e {
+                    Entry::Comic(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+            // Send, then wake: a parked jump replays on the frame this schedules.
+            let _ = tx.send((parent, comics));
+            if let Some(w) = &waker {
+                w();
+            }
+        });
     }
 
     /// Open the previous/next comic in the current comic's folder (`dir` = -1/+1).
-    /// No-op at the ends or for non-path sources.
+    /// No-op at the ends or for non-path sources. With a cold cache the request is
+    /// parked (accumulating, so repeated taps travel that many books) and replayed
+    /// when the listing lands.
     fn open_sibling_book(&mut self, dir: i64) {
-        if let Some(p) = self.sibling_book_path(dir) {
-            self.open_path(p);
+        match self.sibling_book_path(dir) {
+            SibLookup::Found(p) => self.open_path(p),
+            SibLookup::Cold => {
+                self.pending_book_nav = Some(self.pending_book_nav.take().unwrap_or(0) + dir);
+            }
+            SibLookup::Missing => {}
+        }
+    }
+
+    /// Fill in an armed boundary prompt's neighbour once the folder listing lands
+    /// (the prompt is shown immediately on the boundary hit, before the scan is
+    /// back, so its cover + "tap again to open" arrive a moment later).
+    fn refresh_prompt_sibling(&mut self) {
+        let Some(dir) = self
+            .app
+            .as_ref()
+            .and_then(|a| a.book_prompt.as_ref())
+            .map(|p| p.dir)
+        else {
+            return;
+        };
+        let SibLookup::Found(path) = self.sibling_book_path(dir) else {
+            return;
+        };
+        self.queue_cover(&path);
+        if let Some(app) = self.app.as_mut()
+            && let Some(p) = app.book_prompt.as_mut()
+        {
+            p.title = name_of(&path);
+            p.sibling = Some(path);
+            app.window.request_redraw();
+        }
+    }
+
+    /// Queue a comic's cover for background decode, unless it's already decoded.
+    /// (Shared by the boundary prompt's two arming paths.)
+    fn queue_cover(&mut self, path: &Path) {
+        if let Some(app) = self.app.as_mut()
+            && !app.thumbs.contains_key(path)
+            && app.cover_tx.send(vec![path.to_path_buf()]).is_ok()
+        {
+            app.covers_inflight += 1;
         }
     }
 
@@ -1477,19 +1815,21 @@ impl Shell {
             self.open_sibling_book(dir);
             return;
         }
-        let sibling = self.sibling_book_path(dir);
+        // Cache-only lookup: a cold cache arms the card with no neighbour yet and
+        // `poll_background` fills it in when the folder listing lands (the prompt is
+        // on screen instantly either way).
+        let sibling = match self.sibling_book_path(dir) {
+            SibLookup::Found(p) => Some(p),
+            SibLookup::Cold | SibLookup::Missing => None,
+        };
         let title = sibling.as_deref().map(name_of).unwrap_or_default();
+        if let Some(p) = &sibling {
+            // Cover preview: same off-thread pipeline as the library; the result
+            // lands via the per-frame `thumb_rx` drain (woken by the worker) and the
+            // card picks it up while the prompt is showing.
+            self.queue_cover(p);
+        }
         if let Some(app) = self.app.as_mut() {
-            if let Some(p) = &sibling
-                && !app.thumbs.contains_key(p)
-            {
-                // Cover preview: same off-thread pipeline as the library; the
-                // result lands via the per-frame `thumb_rx` drain (woken by the
-                // worker) and the card picks it up while the prompt is showing.
-                if app.cover_tx.send(vec![p.clone()]).is_ok() {
-                    app.covers_inflight += 1;
-                }
-            }
             app.book_prompt = Some(BookPrompt {
                 dir,
                 at: Instant::now(),
@@ -1502,13 +1842,60 @@ impl Shell {
 
     /// Open a comic by path: route by type (archive / image folder) to an engine
     /// source, then through `open_comic` (which restores its saved position).
+    /// The source construction runs on a background thread — see [`Shell::start_open`].
     fn open_path(&mut self, path: PathBuf) {
-        match build_source(&path) {
-            Some(src) => {
-                log::info!("open {:?}: {} pages", path, src.len());
-                self.open_comic(path.to_string_lossy().into_owned(), src);
+        let key = path.to_string_lossy().into_owned();
+        self.start_open(Some(key.clone()), move || {
+            build_source(&path)
+                .map(|src| (key, src))
+                .ok_or_else(|| format!("could not open {path:?}"))
+        });
+    }
+
+    /// Kick the launch resume: pick the most-recently-read book that still exists
+    /// and open it — **both** steps off-thread, since deciding which recent is still
+    /// on disk is a stat per entry and this runs before the first frame.
+    fn resume_recent(&mut self) {
+        let recents = self.recents.clone();
+        self.start_open(None, move || {
+            let key = recents
+                .into_iter()
+                .find(|k| is_reopenable_fs(k))
+                .ok_or_else(|| "no reopenable recent".to_string())?;
+            let src =
+                build_source(Path::new(&key)).ok_or_else(|| format!("could not open {key}"))?;
+            Ok((key, src))
+        });
+    }
+
+    /// Begin a background open. `target` is the comic's identity when the caller
+    /// knows it (it names the spinner and anchors next/prev-book); `job` does all
+    /// the I/O and returns that identity plus the source — the key comes back from
+    /// the job because the launch resume also *chooses* the book off-thread.
+    ///
+    /// Each call bumps `open_gen`, so only the newest result is applied: repeated
+    /// next-book taps supersede in-flight opens instead of queuing stale swaps.
+    fn start_open<F>(&mut self, target: Option<String>, job: F)
+    where
+        F: FnOnce() -> OpenResult + Send + 'static,
+    {
+        self.open_gen = self.open_gen.wrapping_add(1);
+        let generation = self.open_gen;
+        self.opening = Some(target.as_deref().map(book_display_name).unwrap_or_default());
+        self.opening_key = target;
+        self.resume_fallback = false; // a caller that wants it re-arms it after
+        let tx = self.open_tx.clone();
+        let waker = self.frame_waker.clone();
+        std::thread::spawn(move || {
+            // Send, then wake: the loop idles while the open runs, so the result
+            // only reaches the screen if this schedules the frame that drains it.
+            let _ = tx.send((generation, job()));
+            if let Some(w) = &waker {
+                w();
             }
-            None => log::error!("could not open {path:?}"),
+        });
+        if let Some(app) = self.app.as_ref() {
+            app.window.request_redraw(); // put the spinner up this frame
         }
     }
 
@@ -1546,44 +1933,113 @@ impl Shell {
         self.recents.retain(|k| k != &key);
         self.recents.insert(0, key.clone());
         self.recents.truncate(RECENTS_CAP);
-        self.save_recents();
+        // The book we just opened demonstrably exists, so the library's recents row
+        // can show it without waiting for another existence pass, and its folder is
+        // worth warming for the first next/prev-book request. (SAF one-offs are
+        // neither reopenable nor inside a browsable folder, so they get neither.)
+        if !key.starts_with("content://") {
+            self.recents_ok.insert(key.clone());
+            self.warm_sib_cache(Path::new(&key));
+        }
         self.positions.insert(key, start);
-        self.save_positions();
+        self.dirty_recents = true;
+        self.mark_positions();
+        // A book switch is a natural durability point (and rare): write now rather
+        // than leave the outgoing book's page riding on a debounce.
+        self.flush_saves(true);
     }
 
-    fn save_positions(&self) {
-        let Some(path) = &self.pos_path else { return };
-        let mut out = String::new();
-        for (k, v) in &self.positions {
-            out.push_str(&format!("{v}\t{k}\n"));
+    /// Note that the reading position — and the progress map that rides with it —
+    /// changed. The write itself is debounced; see [`Shell::flush_saves`].
+    fn mark_positions(&mut self) {
+        self.dirty_positions = true;
+        self.dirty_progress = true;
+        self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Write out whatever has been marked dirty. `force` writes immediately (book
+    /// switch, suspend, teardown); otherwise nothing happens until the oldest mark
+    /// is [`SAVE_DEBOUNCE`] old, so a burst of page turns costs one write.
+    ///
+    /// Each file is rewritten whole through a `<path>.tmp` + rename, so a kill in
+    /// the middle of a write leaves the previous file intact rather than a truncated
+    /// one (the model is `thumbcache::store`). The writes stay on the calling
+    /// thread: they are small, now rare, and `suspended()` must have them on disk
+    /// before it returns.
+    fn flush_saves(&mut self, force: bool) {
+        let Some(since) = self.dirty_since else { return };
+        if !force && since.elapsed() < SAVE_DEBOUNCE {
+            return;
         }
-        let _ = std::fs::write(path, out);
-        // Progress rides along: every position-save moment is also the right
-        // durability point for the read-tracking map (so they can't drift).
-        self.save_progress();
-    }
-
-    fn save_progress(&self) {
-        let Some(path) = &self.progress_path else { return };
-        let mut out = String::new();
-        for (k, (furthest, total)) in &self.progress {
-            out.push_str(&format!("{furthest}\t{total}\t{k}\n"));
+        self.dirty_since = None;
+        if std::mem::take(&mut self.dirty_positions)
+            && let Some(path) = &self.pos_path
+        {
+            let mut out = String::new();
+            for (k, v) in &self.positions {
+                out.push_str(&format!("{v}\t{k}\n"));
+            }
+            write_atomic(path, &out);
         }
-        let _ = std::fs::write(path, out);
-    }
-
-    fn save_collapsed(&self) {
-        let Some(path) = &self.collapsed_path else { return };
-        let mut out = String::new();
-        for p in &self.collapsed {
-            out.push_str(&format!("{}\n", p.display()));
+        if std::mem::take(&mut self.dirty_progress)
+            && let Some(path) = &self.progress_path
+        {
+            let mut out = String::new();
+            for (k, (furthest, total)) in &self.progress {
+                out.push_str(&format!("{furthest}\t{total}\t{k}\n"));
+            }
+            write_atomic(path, &out);
         }
-        let _ = std::fs::write(path, out);
+        if std::mem::take(&mut self.dirty_recents)
+            && let Some(path) = &self.recents_path
+        {
+            write_atomic(path, &self.recents.join("\n"));
+        }
+        if std::mem::take(&mut self.dirty_collapsed)
+            && let Some(path) = &self.collapsed_path
+        {
+            let mut out = String::new();
+            for p in &self.collapsed {
+                out.push_str(&format!("{}\n", p.display()));
+            }
+            write_atomic(path, &out);
+        }
+        // The viewing options and the library root live on the App (which the
+        // egui frame mutates); read the current values back off it at write time.
+        if std::mem::take(&mut self.dirty_view)
+            && let (Some(path), Some(app)) = (&self.view_file, &self.app)
+        {
+            save_view(
+                path,
+                app.reader.direction,
+                app.layout_mode,
+                app.reader.fit,
+                app.reader.transition_enabled,
+                app.reader.scroll_mode,
+                app.resume_on_startup,
+                app.theme,
+                app.perf,
+            );
+        }
+        if std::mem::take(&mut self.dirty_libroot)
+            && let (Some(path), Some(app)) = (&self.lib_dir_file, &self.app)
+        {
+            write_atomic(path, &app.lib_root.to_string_lossy());
+        }
     }
 
-    fn save_recents(&self) {
-        let Some(path) = &self.recents_path else { return };
-        let _ = std::fs::write(path, self.recents.join("\n"));
+    /// Recompute, off-thread, which `recents` entries still exist on disk.
+    fn refresh_recents_ok(&self) {
+        let keys = self.recents.clone();
+        let tx = self.recents_ok_tx.clone();
+        let waker = self.frame_waker.clone();
+        std::thread::spawn(move || {
+            let ok: HashSet<String> = keys.into_iter().filter(|k| is_reopenable_fs(k)).collect();
+            let _ = tx.send(ok);
+            if let Some(w) = &waker {
+                w();
+            }
+        });
     }
 
     /// Update the in-memory read-tracking entry for the open comic: the furthest
@@ -1618,27 +2074,40 @@ impl Shell {
     }
 
     /// Read the chosen content:// file's bytes off its descriptor and open it.
+    /// The JNI call that hands us the descriptor stays here (it wants the activity),
+    /// but the descriptor is just an integer — reading a whole archive off it, and
+    /// parsing it, happen on the open worker. A multi-hundred-MB SAF archive used to
+    /// slurp on the UI thread, which is an ANR with a progress bar drawn on it.
     fn open_picked(&mut self, uri: &str) {
         let fd = open_fd(&self.android_app, uri);
         if fd < 0 {
             log::warn!("openFd failed for {uri}");
             return;
         }
-        // We own the fd (Java detachFd'd it); reading to end + drop closes it.
-        let mut file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-        let mut bytes = Vec::new();
-        if let Err(e) = std::io::Read::read_to_end(&mut file, &mut bytes) {
-            log::error!("read picked fd: {e}");
-            return;
-        }
-        drop(file);
-        match ZipSource::from_bytes(bytes) {
-            Ok(src) => {
-                log::info!("picked comic: {} pages", src.len());
-                self.open_comic(uri.to_string(), Arc::new(src));
-            }
-            Err(e) => log::error!("from_bytes: {e}"),
-        }
+        let key = uri.to_string();
+        self.start_open(Some(key.clone()), move || {
+            // We own the fd (Java detachFd'd it); reading to end + drop closes it.
+            let mut file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)
+                .map_err(|e| format!("read picked fd: {e}"))?;
+            drop(file);
+            let src = ZipSource::from_bytes(bytes).map_err(|e| format!("from_bytes: {e}"))?;
+            Ok((key, Arc::new(src) as Arc<dyn PageSource>))
+        });
+    }
+}
+
+/// Rewrite `path` atomically: write a sibling `<path>.tmp`, then rename it over the
+/// target. A rename within a directory is atomic, so a kill (or a battery pull)
+/// mid-write leaves the previous file whole instead of a half-written one — these
+/// are whole-file rewrites of state the user would notice losing.
+fn write_atomic(path: &Path, contents: &str) {
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    if std::fs::write(&tmp, contents).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -1751,7 +2220,7 @@ fn save_view(
     let r = if resume { "resume" } else { "noresume" };
     let t = theme.label();
     let p = perf.label();
-    let _ = std::fs::write(path, format!("{d},{l},{f},{a},{s},{r},{t},{p}"));
+    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -2274,6 +2743,34 @@ fn empty_state(
                             .size(12.0)
                             .color(weak),
                     );
+                });
+            });
+        });
+}
+
+/// "Opening…" card: a spinner plus the book's name, shown while a background open
+/// is in flight (see [`Shell::start_open`]). `name` is empty when the open is the
+/// launch resume, which is still deciding *which* book to reopen.
+fn opening_card(ctx: &egui::Context, name: &str) {
+    egui::Area::new(egui::Id::new("opening_card"))
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            translucent_popup(ui.style()).show(ui, |ui| {
+                ui.set_max_width((ctx.screen_rect().width() * 0.8).min(360.0));
+                ui.vertical_centered(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
+                    ui.add(egui::Spinner::new().size(40.0));
+                    ui.label(egui::RichText::new("Opening…").strong().size(18.0));
+                    if !name.is_empty() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(name)
+                                    .size(14.0)
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
+                        );
+                    }
                 });
             });
         });
@@ -2823,6 +3320,32 @@ fn with_env<T>(
     r
 }
 
+/// Gather the info overlay's byte-derived metadata for page `index`: format,
+/// colour profile, compressed size and mtime. A free function over the bare source
+/// because it runs on a **background** thread — `read_page` and `modified` are disk
+/// I/O, and on an archive still decompressing `read_page` blocks until that entry
+/// lands, which would freeze the UI for as long as the extraction takes.
+fn page_meta(src: &dyn PageSource, index: usize) -> Vec<(String, String)> {
+    let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
+    let (size, fmt, color) = match src.read_page(index).ok() {
+        Some(b) => {
+            let detail = yosh_engine::meta::probe(&b).2;
+            let color = yosh_engine::icc::extract_icc(&b)
+                .as_deref()
+                .and_then(yosh_engine::icc::describe)
+                .unwrap_or_else(|| "—".to_string());
+            (yosh_engine::meta::human_size(b.len() as u64), detail, color)
+        }
+        None => ("—".to_string(), "—".to_string(), "—".to_string()),
+    };
+    vec![
+        ("Format".to_string(), fmt),
+        ("Color".to_string(), color),
+        ("Size".to_string(), size),
+        ("Modified".to_string(), modified),
+    ]
+}
+
 impl App {
     /// Start an off-thread series scan of the library root (results land via
     /// `series_rx` in render).
@@ -2836,11 +3359,35 @@ impl App {
         self.window.request_redraw();
     }
 
-    /// Re-read the displayed page's bytes once to compute the heavy info-overlay
-    /// metadata (Format / Color / Size / Modified), caching it under `info_for`. A
-    /// no-op unless the page changed since the last build, so the byte read stays
-    /// off the per-frame path. Mirrors the desktop `build_page_info`/`info_for`.
-    fn refresh_info_meta(&mut self) {
+    /// List `lib_dir` for the "choose a library root" browser on a background
+    /// thread (`read_dir` + a stat per entry — no different from any other storage
+    /// walk on a phone). The result is tagged with its directory, so a listing the
+    /// user has already navigated away from is discarded.
+    fn kick_browse_scan(&mut self) {
+        self.browse_pending = true;
+        self.lib_entries.clear();
+        let dir = self.lib_dir.clone();
+        let tx = self.browse_tx.clone();
+        let waker = self.frame_waker.clone();
+        std::thread::spawn(move || {
+            let entries = scan_dir(&dir);
+            let _ = tx.send((dir, entries));
+            if let Some(w) = &waker {
+                w();
+            }
+        });
+        self.window.request_redraw();
+    }
+
+    /// Refresh the heavy info-overlay metadata (Format / Color / Size / Modified)
+    /// for the displayed page. A no-op unless the page changed since the last build.
+    ///
+    /// The values need the page bytes — disk I/O, and on an archive still
+    /// decompressing a wait for that entry — so they are gathered **off-thread**
+    /// (`page_meta`), tagged with `(open_gen, page)`; the overlay shows "…"
+    /// placeholders until the result lands in `render`'s drain. Mirrors the desktop
+    /// `page_info` pattern.
+    fn refresh_info_meta(&mut self, open_gen: u64) {
         let Some(src) = &self.reader.source else {
             self.info_for = None;
             self.info_meta.clear();
@@ -2851,25 +3398,20 @@ impl App {
         if self.info_for == Some(idx) {
             return;
         }
-        let modified = src.modified(idx).unwrap_or_else(|| "—".to_string());
-        let (size, fmt, color) = match src.read_page(idx).ok() {
-            Some(b) => {
-                let detail = yosh_engine::meta::probe(&b).2;
-                let color = yosh_engine::icc::extract_icc(&b)
-                    .as_deref()
-                    .and_then(yosh_engine::icc::describe)
-                    .unwrap_or_else(|| "—".to_string());
-                (yosh_engine::meta::human_size(b.len() as u64), detail, color)
-            }
-            None => ("—".to_string(), "—".to_string(), "—".to_string()),
-        };
-        self.info_meta = vec![
-            ("Format".to_string(), fmt),
-            ("Color".to_string(), color),
-            ("Size".to_string(), size),
-            ("Modified".to_string(), modified),
-        ];
         self.info_for = Some(idx);
+        self.info_meta = ["Format", "Color", "Size", "Modified"]
+            .into_iter()
+            .map(|k| (k.to_string(), "…".to_string()))
+            .collect();
+        let src = src.clone();
+        let tx = self.info_tx.clone();
+        let waker = self.frame_waker.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((open_gen, idx, page_meta(src.as_ref(), idx)));
+            if let Some(w) = &waker {
+                w();
+            }
+        });
     }
 
     /// Build the image-info overlay lines from the current page + reader state
@@ -2944,23 +3486,12 @@ impl App {
         lines
     }
 
-    /// Write the current viewing options to disk (immediate, like positions).
-    /// Persists the layout *mode* (so `Auto` saves as "auto", not whatever
-    /// orientation it happened to resolve to).
-    fn persist_view(&self) {
-        if let Some(f) = &self.view_file {
-            save_view(
-                f,
-                self.reader.direction,
-                self.layout_mode,
-                self.reader.fit,
-                self.reader.transition_enabled,
-                self.reader.scroll_mode,
-                self.resume_on_startup,
-                self.theme,
-                self.perf,
-            );
-        }
+    /// Flag the viewing options as changed. The Shell picks this up after the frame
+    /// and debounces the write (`flush_saves`), reading the values back off the App
+    /// then — so a run of toggles costs one atomic rewrite of `view.txt`, not one
+    /// per tap.
+    fn persist_view(&mut self) {
+        self.view_dirty = true;
     }
 
     /// Apply the performance profile to the live reader — **no book reopen**. The
@@ -3023,7 +3554,14 @@ impl App {
         }
     }
 
-    fn render(&mut self, has_files: bool, status_bar_px: i32, lib: LibCtx<'_>) -> FrameReqs {
+    fn render(
+        &mut self,
+        has_files: bool,
+        status_bar_px: i32,
+        opening: Option<&str>,
+        open_gen: u64,
+        lib: LibCtx<'_>,
+    ) -> FrameReqs {
         self.frame_no += 1;
         // Resolved chrome theme this frame: drives the page-letterbox clear color
         // (below) and egui's visuals (set at the top of the egui run). The seekbar's
@@ -3152,6 +3690,22 @@ impl App {
             self.series = series;
             self.series_pending = false;
         }
+        // Off-thread info-overlay metadata: both tags must still match — a result for
+        // a book that has since been switched (generation) or for a page already
+        // turned past (index) describes something other than what's on screen.
+        while let Ok((generation, idx, meta)) = self.info_rx.try_recv() {
+            if generation == open_gen && self.info_for == Some(idx) {
+                self.info_meta = meta;
+            }
+        }
+        // Off-thread browse listing, keyed by the directory it describes (a newer
+        // navigation already replaced `lib_dir`, so its own result is what lands).
+        while let Ok((dir, entries)) = self.browse_rx.try_recv() {
+            if dir == self.lib_dir {
+                self.lib_entries = entries;
+                self.browse_pending = false;
+            }
+        }
         // egui chrome over the page: the library browser when open, else the seekbar.
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let len = self.reader.source.as_ref().map(|s| s.len()).unwrap_or(0);
@@ -3176,7 +3730,7 @@ impl App {
         let show_options = self.show_options;
         let show_info = self.show_info;
         if show_info {
-            self.refresh_info_meta(); // gated byte read → Format/Color/Size/Modified
+            self.refresh_info_meta(open_gen); // gated, off-thread → Format/Color/Size/Modified
         } else {
             self.info_for = None; // rebuild the metadata when the popup is next opened
         }
@@ -3208,6 +3762,7 @@ impl App {
         };
         let browse = self.lib_browse;
         let series_pending = self.series_pending;
+        let browse_pending = self.browse_pending;
         // Browse mode (choose a library root) lists folders only — owned snapshot.
         let entries: Vec<(String, PathBuf)> = if library_view && browse {
             self.lib_entries
@@ -3264,10 +3819,12 @@ impl App {
         // "Recently read" cells (newest first), built like `sections` so the egui
         // closure borrows no `self`. Filtered to reopenable filesystem entries — the
         // only ones with a cover + a working tap-to-open (SAF one-offs are skipped).
+        // The filter reads the background-computed set (`Shell::recents_ok`); it used
+        // to `Path::exists` all 32 recents on every library frame.
         let recents_cells: Vec<VolCell> = if library_view && !browse {
             lib.recents
                 .iter()
-                .filter(|k| is_reopenable_fs(k))
+                .filter(|k| lib.recents_ok.contains(k.as_str()))
                 .take(12)
                 .map(|k| {
                     let path = PathBuf::from(k);
@@ -3415,7 +3972,14 @@ impl App {
                                 }
                             }
                             if entries.is_empty() {
-                                ui.label(egui::RichText::new("(no sub-folders)").weak());
+                                ui.label(
+                                    egui::RichText::new(if browse_pending {
+                                        "Scanning…"
+                                    } else {
+                                        "(no sub-folders)"
+                                    })
+                                    .weak(),
+                                );
                             }
                         });
                     } else {
@@ -3533,6 +4097,13 @@ impl App {
                         });
                     }
                 });
+            } else if let Some(name) = opening {
+                // A book is being built on a worker thread: say so. Over the outgoing
+                // page when switching books, over the clear color on a cold start.
+                // egui's `Spinner` requests its own repaints, which the redraw guard's
+                // `egui_animating` leg honors — so it actually spins while the loop
+                // is otherwise idle.
+                opening_card(ctx, name);
             } else if len == 0 {
                 // No comic open: show the how-to-open helper instead of a blank screen.
                 if self.logo.is_none()
@@ -3624,16 +4195,18 @@ impl App {
             self.reader.goto(p);
         }
         if set_root {
-            // Browse mode picked a new library root: back to the series view
-            // and rescan it. (The root persists via `suspended`, as before.)
+            // Browse mode picked a new library root: back to the series view and
+            // rescan it. The root itself is persisted by the Shell's debounced flush
+            // (it was previously only written on suspend).
             self.lib_root = self.lib_dir.clone();
             self.lib_browse = false;
+            self.libroot_dirty = true;
             self.kick_series_scan();
         }
         if enter_browse {
             self.lib_browse = true;
             self.lib_dir = self.lib_root.clone();
-            self.lib_entries = scan_dir(&self.lib_dir);
+            self.kick_browse_scan();
         }
         if leave_browse {
             self.lib_browse = false;
@@ -3646,12 +4219,12 @@ impl App {
             // *elsewhere* gets picked.
             if let Some(parent) = self.lib_dir.parent() {
                 self.lib_dir = parent.to_path_buf();
-                self.lib_entries = scan_dir(&self.lib_dir);
+                self.kick_browse_scan();
             }
         }
         if let Some(d) = nav_to {
             self.lib_dir = d;
-            self.lib_entries = scan_dir(&self.lib_dir);
+            self.kick_browse_scan();
         }
         if close_lib {
             self.library_view = false;
@@ -3832,6 +4405,12 @@ impl App {
         if (self.library_view && (self.series_pending || self.covers_inflight > 0))
             || !self.reader.view_settled
             || hints_visible
+            // An open is in flight. Its worker wakes the loop when it lands, but a
+            // resume in the meantime replaces the window that waker belongs to — so
+            // keep drawing until the result has actually been drained. Self-limiting
+            // (the open finishes), and the spinner is animating anyway whenever it's
+            // the thing on screen.
+            || opening.is_some()
             // Draw-time flag, NOT transition_active()/drag_active(): re-sampling
             // the clock here can see the animation as just-expired even though
             // the frame above drew it mid-fade — freezing a half-faded ghost of
