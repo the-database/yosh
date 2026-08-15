@@ -26,7 +26,7 @@ use jni::JavaVM;
 use winit::application::ApplicationHandler;
 use winit::event::{Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::platform::android::activity::{AndroidApp, WindowManagerFlags};
+use winit::platform::android::activity::AndroidApp;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
 
@@ -1273,13 +1273,7 @@ impl ApplicationHandler for Shell {
                 let keep_on = self.current_key.is_some()
                     && self.app.as_ref().is_some_and(|a| !a.library_view);
                 if self.applied_keep_on != Some(keep_on) {
-                    let flag = WindowManagerFlags::KEEP_SCREEN_ON;
-                    let (add, remove) = if keep_on {
-                        (flag, WindowManagerFlags::empty())
-                    } else {
-                        (WindowManagerFlags::empty(), flag)
-                    };
-                    self.android_app.set_window_flags(add, remove);
+                    set_keep_screen_on(&self.android_app, keep_on);
                     self.applied_keep_on = Some(keep_on);
                 }
                 // Opportunistic: writes what has been dirty long enough. Frames stop
@@ -3424,6 +3418,21 @@ fn open_fd(app: &AndroidApp, uri: &str) -> i32 {
         Ok(res.i()?)
     })
     .unwrap_or(-1)
+}
+
+/// Hold (true) / release (false) the KEEP_SCREEN_ON window flag, via the
+/// `YoshActivity` JNI bridge. Deliberately NOT `AndroidApp::set_window_flags`:
+/// that wrapper holds android-activity's glue mutex across
+/// `ANativeActivity_setWindowFlags`, and calling it from the event-loop thread
+/// mid-dispatch deadlocks against the UI thread's lifecycle callbacks on some
+/// ROMs (froze the whole app on ZUI / Android 16 — the Java main thread futex-
+/// waited in `NativeActivity.onPause` while our loop never returned from the
+/// flags call). The bridge just `runOnUiThread`s the flag change, fire-and-forget.
+fn set_keep_screen_on(app: &AndroidApp, on: bool) {
+    let _ = with_env(app, |env, activity| {
+        env.call_method(activity, "setKeepScreenOn", "(Z)V", &[JValue::Bool(on as u8)])?;
+        Ok(())
+    });
 }
 
 /// Hide (true) / show (false) the Android status + navigation bars. The window

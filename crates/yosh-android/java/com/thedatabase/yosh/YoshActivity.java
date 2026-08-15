@@ -15,6 +15,7 @@ import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 
 // A thin NativeActivity subclass that exists only to bridge the Storage Access
 // Framework, which the NDK can't reach: a bare NativeActivity receives no
@@ -130,6 +131,23 @@ public class YoshActivity extends NativeActivity {
                 } else {
                     decor.setSystemUiVisibility(layout);
                 }
+            }
+        });
+    }
+
+    /** Hold (or release) the screen-on wakelock window flag. Called over JNI from
+     *  the native thread instead of android-activity's set_window_flags: that
+     *  wrapper holds the native glue mutex across ANativeActivity_setWindowFlags,
+     *  which deadlocks against the UI thread's lifecycle callbacks on some ROMs
+     *  (observed hanging the whole event loop on ZUI / Android 16). runOnUiThread
+     *  posts asynchronously, which is all a window flag needs. */
+    public void setKeepScreenOn(boolean on) {
+        runOnUiThread(() -> {
+            Window window = getWindow();
+            if (on) {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } else {
+                window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
         });
     }
