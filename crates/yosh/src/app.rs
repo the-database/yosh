@@ -1663,6 +1663,10 @@ impl State {
         self.ui.opened = Some(path.to_path_buf());
         self.reader.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
+        // Fresh pool, fresh caches: drop the cross-frame prefetch memo *and* the
+        // thumbnail-tail pivot, or the new pool's empty tail would stay empty until
+        // the reader happened to travel a full stride.
+        self.reader.invalidate_jobs();
         self.reader.prefetch();
         // Live refresh: watch a folder (added/removed images) or a still-being-written
         // .cbz/.zip (pages appended on disk). RAR/7z can't be partially read, so this
@@ -2736,6 +2740,11 @@ impl State {
         // still moving or landing; otherwise the loop sleeps until an input event
         // (or the `about_to_wait` background heartbeat) wakes it. Mirrors the
         // Android shell's redraw guard.
+        //
+        // Note what is *not* here: "a decode is still pending". Landing pages
+        // schedule their own frame from the worker thread (`Reader::set_waker`), so
+        // waiting for one costs zero frames instead of a full egui pass + present at
+        // refresh rate for the whole decode.
         let egui_animating = full_output
             .viewport_output
             .values()
@@ -2745,8 +2754,6 @@ impl State {
             || self.scanning                   // library scan in flight (show "Scanning…")
             || !self.queued_covers.is_empty()  // covers still decoding off-thread
             || !self.reader.view_settled       // resize/zoom debounce needs a settle frame
-            || !self.reader.view_is_hq()       // in-view page missing/LQ/stale → wait for decode
-            || self.reader.lq_fill_pending()   // whole-volume LQ tier still filling
             // Draw-time flag, not transition_active(): a clock re-check can see
             // the animation as just-expired even though this frame drew it
             // mid-fade, freezing a half-faded ghost (decision must match draw).

@@ -1586,6 +1586,10 @@ fn attach_source(
     reader.rotation = 0; // each comic opens upright (mirrors the desktop shell)
     reader.index = start;
     reader.source = Some(src);
+    // Fresh pool, fresh caches: drop the cross-frame prefetch memo *and* the
+    // thumbnail-tail pivot, or the new pool's empty tail would stay empty until the
+    // reader happened to travel a full stride.
+    reader.invalidate_jobs();
     reader.prefetch();
 }
 

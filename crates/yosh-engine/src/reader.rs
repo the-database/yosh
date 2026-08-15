@@ -345,6 +345,25 @@ pub const DEFAULT_ASPECT: f32 = 1.5;
 /// page you're on. Shown only transiently until the full-res page lands.
 pub const LQ_THUMB_H: u32 = 540;
 
+/// How far (in pages) the reading position must travel before the whole-volume
+/// thumbnail tail is rebuilt around the new position. The tail is only *ordered*
+/// by distance from the reader — every entry is work worth doing wherever you
+/// are — so re-centring it is a scheduling nicety, not a correctness need, and
+/// doing it once per stride keeps the O(volume log volume) sort off the frame
+/// path. Small enough that a few page turns' worth of travel still re-aims it.
+pub const LQ_TAIL_RESTRIDE: usize = 32;
+
+/// Does the whole-volume thumbnail tail need rebuilding for reading position
+/// `index`, given the position it was last built around (`None` = never built, or
+/// invalidated by a source/pool swap)? Split out of `prefetch` so the stride rule
+/// is testable on its own.
+fn tail_needs_restride(pivot: Option<usize>, index: usize) -> bool {
+    match pivot {
+        None => true,
+        Some(p) => index.abs_diff(p) >= LQ_TAIL_RESTRIDE,
+    }
+}
+
 /// The platform-agnostic reading-state machine: navigation, zoom/pan, fit/layout,
 /// the continuous-scroll anchor, the decode-view debounce, and the engine
 /// resources (page source, decode pool, cache, texture pool) it drives. A shell
@@ -438,14 +457,23 @@ pub struct Reader {
 
     /// Inputs of the last `prefetch()` job-list rebuild. Shells call `prefetch()`
     /// every frame; when neither the view nor the caches changed since the last
-    /// call the desired job list is identical, so it skips the rebuild (which is
-    /// O(volume) while the LQ thumbnail tier is filling).
+    /// call the desired job list is identical, so it skips the rebuild (and the
+    /// `set_jobs` lock + wakeups it would cost).
     last_jobs_key: Option<JobsKey>,
+    /// Reading position the whole-volume thumbnail tail was last built around, or
+    /// `None` when the tail needs (re)building — see [`LQ_TAIL_RESTRIDE`].
+    lq_tail_pivot: Option<usize>,
 }
 
 /// Everything the `prefetch()` job list depends on. Cache/failed contents are
 /// captured via change counters (`PageCache::epoch`) rather than the sets
 /// themselves; `zoom` as bits so the key is `Eq`-comparable.
+///
+/// Note what is deliberately *absent*: the `lq_cache` epoch. The job list this key
+/// guards is the **HQ window only** — the whole-volume thumbnail tail lives in the
+/// pool now and is maintained on its own stride (`lq_tail_pivot`), so a landing
+/// thumbnail changes nothing here. Including it made every one of the hundreds of
+/// thumbnails in a volume fill force a full job-list rebuild + `set_jobs`.
 #[derive(PartialEq, Clone, Copy)]
 struct JobsKey {
     index: usize,
@@ -460,7 +488,6 @@ struct JobsKey {
     rotation: u8,
     scroll_mode: bool,
     cache_epoch: u64,
-    lq_epoch: u64,
     failed_len: usize,
 }
 
@@ -521,7 +548,18 @@ impl Reader {
             anim_drawn: std::cell::Cell::new(false),
             drag_seam: std::cell::Cell::new(None),
             last_jobs_key: None,
+            lq_tail_pivot: None,
         }
+    }
+
+    /// Force the next `prefetch()` to rebuild everything it caches across frames:
+    /// the HQ job list *and* the whole-volume thumbnail tail. Call it whenever the
+    /// pool or the source is replaced — a fresh pool has an empty tail, and a stale
+    /// pivot would suppress the rebuild that refills it until the reader happened to
+    /// travel `LQ_TAIL_RESTRIDE` pages.
+    pub fn invalidate_jobs(&mut self) {
+        self.last_jobs_key = None;
+        self.lq_tail_pivot = None;
     }
 
     /// Queue a transient message; the shell drains it into its timed toast.
@@ -557,6 +595,12 @@ impl Reader {
                     } else {
                         self.est_aspect = page.h as f32 / page.w as f32;
                         self.cache.insert(index, page, self.index);
+                        // The page has a real texture now, so any thumbnail still
+                        // queued for it is wasted work. Cancelling is a set insert;
+                        // the tail itself is only rebuilt on the pivot stride.
+                        if let Some(pool) = &self.pool {
+                            pool.cancel_lq(index);
+                        }
                     }
                 }
                 Msg::Failed { index, error } => {
@@ -567,27 +611,11 @@ impl Reader {
     }
 
     /// The texture to draw for page `i`: the full-res page if cached, else the
-    /// whole-volume LQ thumbnail — a transient upscaled preview that `view_is_hq()`
-    /// still reports as not-HQ, so the view keeps redrawing until the full-res decode
-    /// lands and snaps in.
+    /// whole-volume LQ thumbnail — a transient upscaled preview shown until the
+    /// full-res decode lands and snaps in (the decode wakes the frame loop itself,
+    /// so nothing has to keep redrawing on the chance that it did).
     pub fn page_texture(&self, i: usize) -> Option<&PageTexture> {
         self.cache.get(i).or_else(|| self.lq_cache.get(i))
-    }
-
-    /// True while the LQ thumbnail cache still has room *and* pages with neither a
-    /// full-res nor a thumbnail texture — the shell keeps redrawing so the background
-    /// fill (and its drain) completes. Once `lq_cache` is full (a volume larger than
-    /// `lq_cap` filled what fits) it returns false, so the loop idles instead of
-    /// spinning forever.
-    pub fn lq_fill_pending(&self) -> bool {
-        if self.lq_cache.len() >= self.lq_cache.cap() {
-            return false;
-        }
-        let Some(src) = &self.source else {
-            return false;
-        };
-        (0..src.len())
-            .any(|i| !self.cache.contains(i) && !self.lq_cache.contains(i) && !self.failed.contains_key(&i))
     }
 }
 
@@ -1313,7 +1341,6 @@ impl Reader {
             rotation: self.rotation,
             scroll_mode: self.scroll_mode,
             cache_epoch: self.cache.epoch(),
-            lq_epoch: self.lq_cache.epoch(),
             failed_len: self.failed.len(),
         };
         if self.last_jobs_key == Some(key) {
@@ -1328,7 +1355,7 @@ impl Reader {
         let anchor = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
         let lq = self.two_tier && !self.cache.contains(anchor);
         let window = desired_window(self.index, len, fwd, self.back);
-        let mut jobs: Vec<(usize, u32, bool, bool)> = window
+        let jobs: Vec<(usize, u32, bool, bool)> = window
             .iter()
             .copied()
             .filter(|i| !self.failed.contains_key(i))
@@ -1344,13 +1371,25 @@ impl Reader {
                 }
             })
             .collect();
-        // Whole-volume LQ tier: append a lowest-priority tail of tiny thumbnail jobs
-        // for every page not in the HQ window, not already full-res cached, and not
-        // already thumbnailed — nearest-first so a scrub finds previews sooner. The
-        // by-index inflight dedup in `set_jobs` keeps these from colliding with the
-        // window, and the list self-empties as `lq_cache` fills. Stops once the cache
-        // is full so a volume larger than `lq_cap` doesn't churn every frame.
-        if self.lq_cache.len() < self.lq_cache.cap() {
+        if let Some(pool) = &self.pool {
+            pool.set_jobs(jobs);
+        }
+        // Whole-volume LQ tier: a lowest-priority queue of tiny thumbnail jobs for
+        // every page not in the HQ window, not already full-res cached, and not
+        // already thumbnailed — nearest-first so a scrub finds previews sooner. It
+        // lives in the pool (a second queue the workers only touch when the window
+        // queue is empty), so it does *not* need rebuilding whenever the window
+        // changes: pages that land a real texture are cancelled individually
+        // (`drain_pool` → `cancel_lq`) and the list self-empties as it is consumed.
+        //
+        // The O(volume log volume) rebuild therefore runs once per `LQ_TAIL_RESTRIDE`
+        // pages of travel — enough to re-centre "nearest-first" on where the reader
+        // actually is — instead of once per landed page, which is what made prefetch
+        // O(volume) per frame during a fill. Stops once `lq_cache` is full, so a
+        // volume larger than `lq_cap` doesn't churn.
+        if tail_needs_restride(self.lq_tail_pivot, self.index)
+            && self.lq_cache.len() < self.lq_cache.cap()
+        {
             let in_window: std::collections::HashSet<usize> = window.iter().copied().collect();
             let mut tail: Vec<usize> = (0..len)
                 .filter(|i| {
@@ -1362,34 +1401,19 @@ impl Reader {
                 .collect();
             let cur = self.index as i64;
             tail.sort_by_key(|&i| (i as i64 - cur).abs());
-            jobs.extend(tail.into_iter().map(|i| (i, LQ_THUMB_H, true, true)));
-        }
-        if let Some(pool) = &self.pool {
-            pool.set_jobs(jobs);
+            // Hand the pool no more thumbs than the cache has room for: the tail is
+            // consumed to completion once queued, so on a volume larger than `lq_cap`
+            // an untruncated tail would keep decoding thumbs whose inserts just evict
+            // each other. Nearest-first order means the truncation keeps exactly the
+            // pages a scrub is most likely to preview; a later restride re-fills from
+            // whatever room the cache has then.
+            tail.truncate(self.lq_cache.cap().saturating_sub(self.lq_cache.len()));
+            if let Some(pool) = &self.pool {
+                pool.set_lq_tail(tail.into_iter().map(|i| (i, LQ_THUMB_H)).collect());
+                self.lq_tail_pivot = Some(self.index);
+            }
         }
     }
-
-    /// Whether the in-view page(s) are decoded at full HQ *for the current target*
-    /// (or failed). False while a page is missing, only LQ-decoded, or decoded at a
-    /// stale target (after a rotation/resize/zoom) — the shell keeps redrawing until
-    /// the HQ re-decode lands, so it sharpens and never leaves a GPU-downscaled
-    /// (moiré) texture on screen.
-    pub fn view_is_hq(&self) -> bool {
-        let Some(src) = &self.source else {
-            return true;
-        };
-        let len = src.len();
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        let ok = |i: usize| {
-            self.failed.contains_key(&i)
-                || self
-                    .cache
-                    .get(i)
-                    .is_some_and(|p| !p.lq && p.target_h == self.page_target_h(i))
-        };
-        ok(a) && b.is_none_or(ok)
-    }
-
 }
 
 #[cfg(test)]
@@ -1458,6 +1482,62 @@ mod tests {
         }
         // …and a full-width travel gets within ~5% of it.
         assert!(drag_resist(w, w) > max * 0.94);
+    }
+
+    // The whole-volume thumbnail tail is rebuilt on a *stride*, not per landed
+    // page: the O(volume log volume) scan runs once per `LQ_TAIL_RESTRIDE` pages of
+    // travel in either direction. Travelling less than a stride must reuse the tail
+    // already queued in the pool (that reuse is the whole point of Phase 2); a
+    // cleared pivot (source/pool swap) always rebuilds.
+    #[test]
+    fn tail_rebuilds_once_per_stride_of_travel() {
+        use super::{tail_needs_restride, LQ_TAIL_RESTRIDE};
+        let pivot = Some(100);
+        assert!(tail_needs_restride(None, 100), "no tail yet → build one");
+        assert!(!tail_needs_restride(pivot, 100), "standing still never rebuilds");
+        assert!(
+            !tail_needs_restride(pivot, 100 + LQ_TAIL_RESTRIDE - 1),
+            "31 pages of travel keeps the queued tail"
+        );
+        assert!(
+            tail_needs_restride(pivot, 100 + LQ_TAIL_RESTRIDE),
+            "32 pages of travel re-centres it"
+        );
+        // Symmetric: reading backwards re-centres the same way (and can't underflow).
+        assert!(!tail_needs_restride(pivot, 100 - (LQ_TAIL_RESTRIDE - 1)));
+        assert!(tail_needs_restride(pivot, 100 - LQ_TAIL_RESTRIDE));
+        assert!(tail_needs_restride(Some(0), LQ_TAIL_RESTRIDE));
+        assert!(!tail_needs_restride(Some(LQ_TAIL_RESTRIDE), 1));
+    }
+
+    // `JobsKey` guards the **HQ window** job list only. A landing whole-volume
+    // thumbnail must not change it: the tail lives in the pool and is maintained on
+    // its own stride, so rebuilding the job list for each of a volume's hundreds of
+    // thumbnails was pure O(volume) waste per landed page. A landing full-res page
+    // still must rebuild (it feeds target_stale / quality_stale / the two-tier
+    // anchor). The unused `lq_epoch` parameter is the trip-wire: re-adding that
+    // field to the key breaks this test.
+    #[test]
+    fn jobs_key_ignores_the_thumbnail_tier() {
+        use super::{FitMode, JobsKey, Layout};
+        let key = |cache_epoch: u64, _lq_epoch: u64| JobsKey {
+            index: 12,
+            len: 500,
+            fwd: 16,
+            viewport: (3840, 2160),
+            zoom_bits: 1.0f32.to_bits(),
+            settled: true,
+            fit: FitMode::Window,
+            layout: Layout::Single,
+            spread_offset: 0,
+            rotation: 0,
+            scroll_mode: false,
+            cache_epoch,
+            failed_len: 0,
+        };
+        // `Layout` has no `Debug`, so compare with `==` rather than assert_eq!.
+        assert!(key(7, 1) == key(7, 99), "a landing thumbnail must not rebuild the job list");
+        assert!(key(7, 1) != key(8, 1), "a landing full-res page still rebuilds it");
     }
 
     // Desktop-class inputs reproduce the historical fixed budget exactly.
@@ -1901,6 +1981,7 @@ impl Reader {
     pub fn apply_refreshed_source(&mut self, new: Arc<dyn PageSource>) {
         let Some(old) = self.source.clone() else {
             self.source = Some(new); // nothing open yet — just adopt it
+            self.invalidate_jobs();
             self.prefetch();
             return;
         };
@@ -1929,6 +2010,9 @@ impl Reader {
                     pool.set_source(new.clone());
                 }
                 self.source = Some(new);
+                // Appended/trimmed pages change what the thumbnail tail should hold,
+                // and the old tail's indices were built against the old listing.
+                self.invalidate_jobs();
                 self.prefetch();
             }
             // A file landed/left mid-list, so indices shift. Re-key the read position and
@@ -1960,6 +2044,9 @@ impl Reader {
                 pool.set_waker(self.waker.clone());
                 self.pool = Some(pool);
                 self.source = Some(new);
+                // The new pool's queues are empty (and indices shifted), so both the
+                // job list and the thumbnail tail must be rebuilt from scratch.
+                self.invalidate_jobs();
                 self.prefetch();
             }
         }
