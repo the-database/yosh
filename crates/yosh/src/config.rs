@@ -159,12 +159,24 @@ pub fn load() -> Settings {
         .unwrap_or_default()
 }
 
+/// Persist the settings. One file holds every setting, reading position and
+/// recent, so the write is atomic — a temp file plus a rename over the target
+/// (same trick as `thumbcache::store`). A plain `fs::write` killed mid-flight
+/// leaves truncated JSON, which `load()` silently discards for defaults; the
+/// rename either lands whole or not at all. Both `config_file()` branches keep
+/// the temp beside the target, so it's a same-volume atomic replace on Windows
+/// and POSIX alike. Best-effort throughout: a failed write leaves the previous
+/// state file intact.
 pub fn save(settings: &Settings) {
     let Some(path) = config_file() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(json) = serde_json::to_vec_pretty(settings) {
-        let _ = std::fs::write(path, json);
+        // The UI thread is the only writer, so a fixed temp name can't collide.
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 }
