@@ -413,6 +413,11 @@ fn install_fonts(ctx: &egui::Context) {
 /// `Window::request_redraw`, which winit documents as thread-safe, so a decode
 /// worker can schedule the next frame the instant a page lands. The closure owns
 /// an `Arc<Window>` clone, so even a straggler worker's call lands on a live window.
+///
+/// Every background producer in this shell clones one and calls it *after* its
+/// `tx.send` — send-then-wake, the same order the pool uses (`pool.rs`): the
+/// woken frame drains the channel, so a result that lands while the app is idle
+/// is applied immediately instead of waiting for the next background poll.
 fn frame_waker(window: &Arc<Window>) -> Waker {
     let w = window.clone();
     Arc::new(move || w.request_redraw())
@@ -617,12 +622,14 @@ impl ApplicationHandler for App {
         } else if settings.resume_on_startup && !settings.recents.is_empty() {
             let (tx, rx) = std::sync::mpsc::channel();
             let recents = settings.recents.clone();
+            let wake = frame_waker(&window);
             std::thread::spawn(move || {
                 let found = recents
                     .into_iter()
                     .find(|p| std::path::Path::new(p).exists())
                     .map(PathBuf::from);
                 let _ = tx.send(found);
+                wake(); // send-then-wake
             });
             resume_rx = Some(rx);
         }
@@ -649,9 +656,11 @@ impl ApplicationHandler for App {
         window.request_redraw();
         // Kick off a background update check against the public GitHub releases.
         let (update_tx, update_rx) = std::sync::mpsc::channel();
+        let wake = frame_waker(&window);
         std::thread::spawn(move || {
             if let Some(u) = update::check() {
                 let _ = update_tx.send(u);
+                wake(); // send-then-wake (nothing to show when already current)
             }
         });
         // Channels for background archive opens, sibling-volume prescans, and the
@@ -671,8 +680,10 @@ impl ApplicationHandler for App {
         if let Some(root) = settings.library_root.clone() {
             scan_gen = 1;
             let tx = scan_tx.clone();
+            let wake = frame_waker(&window);
             std::thread::spawn(move || {
                 let _ = tx.send((1, Library::scan(std::path::Path::new(&root))));
+                wake(); // send-then-wake
             });
         }
         let mut reader = Reader::new(
@@ -1512,8 +1523,10 @@ impl State {
         self.scanning = true;
         let generation = self.scan_gen;
         let tx = self.scan_tx.clone();
+        let wake = frame_waker(&self.window);
         std::thread::spawn(move || {
             let _ = tx.send((generation, Library::scan(&root)));
+            wake(); // send-then-wake
         });
         self.window.request_redraw();
     }
@@ -1556,6 +1569,7 @@ impl State {
             if !batch.is_empty() {
                 let tx = self.cover_tx.clone();
                 let cache_dir = config::cache_dir();
+                let wake = frame_waker(&self.window);
                 std::thread::spawn(move || {
                     let mut resizer = Resizer::new();
                     for (path, kind) in batch {
@@ -1565,9 +1579,11 @@ impl State {
                             THUMB_H,
                             &mut resizer,
                             || cover_bytes(&path, kind),
-                        ) && tx.send((path, img)).is_err()
-                        {
-                            break; // receiver gone (app closing)
+                        ) {
+                            if tx.send((path, img)).is_err() {
+                                break; // receiver gone (app closing)
+                            }
+                            wake(); // send-then-wake, per cover — they stream in
                         }
                     }
                 });
@@ -1611,8 +1627,10 @@ impl State {
         let path = path.to_path_buf();
         self.opening = true;
         self.opening_key = Some(path.clone());
+        let wake = frame_waker(&self.window);
         std::thread::spawn(move || {
             let _ = tx.send((generation, build_source(&path)));
+            wake(); // send-then-wake (the drain for this one lives in `render`)
         });
     }
 
@@ -1708,7 +1726,15 @@ impl State {
         } else {
             return; // RAR/7z/complete file: can't grow, not watched
         };
-        if let Ok(mut w) = notify::recommended_watcher(self.watch_tx.clone())
+        // notify calls the handler from its own thread, so the event only reaches
+        // the debounce in `poll_folder_watch` when a frame runs: send-then-wake.
+        let tx = self.watch_tx.clone();
+        let wake = frame_waker(&self.window);
+        let handler = move |res| {
+            let _ = tx.send(res);
+            wake();
+        };
+        if let Ok(mut w) = notify::recommended_watcher(handler)
             && w.watch(&target, notify::RecursiveMode::NonRecursive).is_ok()
         {
             self.watcher = Some(w);
@@ -1761,6 +1787,7 @@ impl State {
             self.rescanning = true;
             let generation = self.open_gen;
             let tx = self.rescan_tx.clone();
+            let wake = frame_waker(&self.window);
             std::thread::spawn(move || {
                 // Reuse the open-path dispatcher: a directory rebuilds a `FolderSource`, a
                 // still-growing `.cbz`/`.zip` a `ZipSource` (local-header recovery). On a
@@ -1770,6 +1797,7 @@ impl State {
                 let built = build_source(&path).ok().map(|(src, _, _)| src);
                 // Always send (even on error) so `rescanning` clears.
                 let _ = tx.send((generation, built));
+                wake(); // send-then-wake
             });
         }
         // Apply finished rebuilds — newest generation only (a `[`/`]` volume switch
@@ -1941,12 +1969,14 @@ impl State {
     fn warm_sib_cache(&self, vol: &Path) {
         let tx = self.sib_tx.clone();
         let of = vol.to_path_buf();
+        let wake = frame_waker(&self.window);
         std::thread::spawn(move || {
             let Some(parent) = of.parent().map(|p| p.to_path_buf()) else {
                 return;
             };
             let want_folder = of.is_dir();
             let _ = tx.send((parent, want_folder, crate::library::sibling_volumes(&of)));
+            wake(); // send-then-wake (a parked `[`/`]` jump replays on that frame)
         });
     }
 
@@ -2281,12 +2311,14 @@ impl State {
                     self.ui.info = rows;
                     let tx = self.info_tx.clone();
                     let generation = self.open_gen;
+                    let wake = frame_waker(&self.window);
                     std::thread::spawn(move || {
                         let mut blocks = vec![(a, page_info(src.as_ref(), a))];
                         if let Some(b) = b {
                             blocks.push((b, page_info(src.as_ref(), b)));
                         }
                         let _ = tx.send((generation, visible, blocks));
+                        wake(); // send-then-wake
                     });
                 }
                 None => self.ui.info = Vec::new(),
@@ -2639,8 +2671,10 @@ impl State {
             self.updating = true;
             self.update_error = None;
             let (tx, rx) = std::sync::mpsc::channel();
+            let wake = frame_waker(&self.window);
             std::thread::spawn(move || {
                 let _ = tx.send(update::apply(&u));
+                wake(); // send-then-wake
             });
             self.update_apply_rx = Some(rx);
             ui_acted = true;
