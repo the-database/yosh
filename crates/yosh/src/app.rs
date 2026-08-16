@@ -152,6 +152,10 @@ struct State {
     /// fullscreen. Persisted instead of a live `is_maximized()` so quitting from
     /// fullscreen still restores the maximized state underneath it.
     win_maximized: bool,
+    /// Whether the decode pool is currently frozen because the window can't be
+    /// seen (minimized / fully occluded). Purely for idempotence: the park and
+    /// unpark signals both repeat, so `park`/`unpark` act only on a transition.
+    parked: bool,
     volume_key: Option<String>,
     /// Visible page(s) the Tab info overlay text was built for, as
     /// `Reader::visible_pages` reports them (None = rebuild needed).
@@ -739,6 +743,7 @@ impl ApplicationHandler for App {
             last_mid_click: None,
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             win_maximized: settings.window.is_some_and(|w| w.maximized),
+            parked: false,
             settings,
             system_dark,
             volume_key: None,
@@ -823,6 +828,16 @@ impl ApplicationHandler for App {
                 // input event between renders sees the new size (as it did when
                 // these reads came straight from `gpu.config`).
                 state.reader.viewport = state.content_viewport();
+                // A minimize arrives on Windows as a resize to 0×0 — and often as
+                // *only* that, since `Occluded` isn't guaranteed to be delivered
+                // there. Treat it as the park signal, and any real size as the
+                // unpark; both are idempotent, so the pair of signals can overlap
+                // freely with `Occluded` on platforms that send both.
+                if size.width == 0 || size.height == 0 {
+                    state.park();
+                } else {
+                    state.unpark();
+                }
             }
             // Geometry is sampled in `render`, not here — see
             // `record_window_geometry` for why the event-time state is unreliable.
@@ -866,9 +881,20 @@ impl ApplicationHandler for App {
             // CursorLeft isn't guaranteed on focus loss / occlusion (alt-tab, a
             // fast monitor switch), which would otherwise strand a hover arrow
             // on screen. A later CursorMoved / CursorEntered re-arms the flag.
-            WindowEvent::Focused(false) | WindowEvent::Occluded(true) => {
-                state.cursor_in_window = false
+            //
+            // Focus loss deliberately does *not* park: reading with another window
+            // focused (notes, a browser) is normal use, and freezing the decode
+            // pool on every alt-tab would stall the read-ahead the app exists for.
+            // Only "can't be seen at all" — occluded or minimized — parks.
+            WindowEvent::Focused(false) => state.cursor_in_window = false,
+            WindowEvent::Occluded(true) => {
+                state.cursor_in_window = false;
+                state.park();
             }
+            // Visible again: thaw and let the next frame re-queue the work the park
+            // abandoned. `Focused(true)` is a backstop for a restore that arrives
+            // without an `Occluded(false)` or a resize.
+            WindowEvent::Occluded(false) | WindowEvent::Focused(true) => state.unpark(),
             _ => {}
         }
 
@@ -1889,6 +1915,44 @@ impl State {
             // Toast expiry: `render` drops the message once this passes.
             self.toast.as_ref().map(|&(_, t)| t + TOAST_DURATION),
         ]
+    }
+
+    /// Freeze the decode pool because the window can't be seen (minimized, or fully
+    /// occluded). A hidden window otherwise keeps every worker busy — the prefetch
+    /// window, and behind it the whole-volume thumbnail tail, which on a long book
+    /// runs for a good while — all of it real CPU spent behind a surface nobody is
+    /// looking at. So parking is worth it the moment the pixels stop being visible,
+    /// and costs nothing when the pool happened to be idle already.
+    ///
+    /// Park is a *pause*, not a cancel: the queues survive, and the caches are
+    /// deliberately kept (desktop RAM is plentiful and restoring should be
+    /// instant — no `lq_cache` clear, unlike the memory-pressed Android shell).
+    /// A no-op when nothing is open: the pool is `None` until a book is.
+    fn park(&mut self) {
+        if self.parked {
+            return;
+        }
+        self.parked = true;
+        if let Some(pool) = &self.reader.pool {
+            pool.park();
+        }
+    }
+
+    /// Thaw after [`Self::park`]. Decodes abandoned mid-flight during the park are
+    /// simply re-queued: `invalidate_jobs` drops the cross-frame prefetch memo (the
+    /// `JobsKey` is unchanged by a park, so without this the next `prefetch` would
+    /// no-op and the pool would sit idle), and the redraw buys the frame that runs
+    /// that prefetch — same pairing as a fresh pool in `set_source`.
+    fn unpark(&mut self) {
+        if !self.parked {
+            return;
+        }
+        self.parked = false;
+        if let Some(pool) = &self.reader.pool {
+            pool.unpark();
+        }
+        self.reader.invalidate_jobs();
+        self.window.request_redraw();
     }
 
     /// Poll the channels that background threads deliver on — called once per frame
