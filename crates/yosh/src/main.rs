@@ -30,11 +30,13 @@ fn main() {
         .unwrap_or(0);
 
     let event_loop = EventLoop::new().expect("create event loop");
-    // On-demand rendering: sleep until an event (or the background-poll heartbeat
-    // `about_to_wait` re-arms) instead of free-running. Frames are driven by input
-    // events and by `render()` re-requesting itself while anything is in flight
-    // (decodes pending, animation playing, transition, toast) — so the app costs
-    // ~zero CPU/GPU on a static page but still never misses a decode landing.
+    // On-demand rendering: sleep until an event instead of free-running. Frames are
+    // driven by input events, by background threads waking the loop when a result
+    // lands, by the timer deadlines `about_to_wait` schedules, and by `render()`
+    // re-requesting itself while something is animating — so the app costs ~zero
+    // CPU/GPU on a static page but still never misses a decode landing. The initial
+    // control flow set here is the baseline `about_to_wait` returns to when it has
+    // no deadline armed.
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = app::App::new(path, start_index);
