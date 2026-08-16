@@ -33,6 +33,11 @@ pub struct UiState {
     pub fit_mode: u8,
     pub rotation: u8,
     pub theme: crate::config::ThemePref,
+    /// Selected performance profile, and — for the `Auto` sub-label — what it
+    /// currently resolves to (e.g. "currently Performance (plugged in)"). Both set
+    /// by the app each frame.
+    pub perf: crate::config::PerfPref,
+    pub perf_auto: String,
     /// Whether a volume is currently loaded. Distinguishes the onboarding panel
     /// (nothing open) from the library grid; set by the app each frame.
     pub reader_open: bool,
@@ -57,6 +62,8 @@ pub struct UiState {
     pub req_set_fit: Option<u8>,
     /// Direct theme selection from the panel's radio group.
     pub req_set_theme: Option<crate::config::ThemePref>,
+    /// Direct performance-profile selection from the panel's radio group.
+    pub req_set_perf: Option<crate::config::PerfPref>,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
     pub rescan: bool,
     /// Series whose section the user clicked to expand/collapse this frame
@@ -497,7 +504,9 @@ pub fn chrome(
             }
             if ui
                 .button("⚙ Settings")
-                .on_hover_text("Reading mode, direction, layout, fit, rotation, page-turn, resume, theme")
+                .on_hover_text(
+                    "Reading mode, direction, layout, fit, rotation, page-turn, resume, theme, performance",
+                )
                 .clicked()
             {
                 st.settings_open = !st.settings_open;
@@ -811,9 +820,9 @@ pub fn chrome(
 /// The Settings panel (top-bar ⚙ button): a full mirror of the Android view-options
 /// popup (`yosh-android` `options_popup`). Frequently-changed view controls
 /// (direction/layout/fit) also have quick top-bar buttons; the set-and-forget ones
-/// (page-turn / resume / theme) live only here. Each control sets a `req_*` flag that
-/// the app drains after the frame. `.open` takes a local copy so the body can still
-/// borrow `st` for the controls.
+/// (page-turn / resume / theme / performance) live only here. Each control sets a
+/// `req_*` flag that the app drains after the frame. `.open` takes a local copy so
+/// the body can still borrow `st` for the controls.
 fn settings_window(ctx: &egui::Context, st: &mut UiState) {
     if !st.settings_open {
         return;
@@ -916,6 +925,28 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     }
                 }
             });
+
+            // How hard the decode pipeline is allowed to work. `Auto` follows the
+            // power source (full budget on mains, throttled on battery); the rest
+            // pin a tier. Same four choices and wording as the Android shell.
+            ui.label(egui::RichText::new("Performance").strong());
+            ui.horizontal(|ui| {
+                for (p, text) in [
+                    (crate::config::PerfPref::Auto, "Auto"),
+                    (crate::config::PerfPref::Low, "Battery saver"),
+                    (crate::config::PerfPref::Mid, "Balanced"),
+                    (crate::config::PerfPref::High, "Performance"),
+                ] {
+                    if ui.selectable_label(st.perf == p, text).clicked() {
+                        st.req_set_perf = Some(p);
+                    }
+                }
+            });
+            // Under Auto, spell out what it resolved to — otherwise the setting is
+            // the only one in the panel whose effect is invisible.
+            if st.perf == crate::config::PerfPref::Auto && !st.perf_auto.is_empty() {
+                ui.label(egui::RichText::new(&st.perf_auto).weak().small());
+            }
         });
     st.settings_open = open;
 }

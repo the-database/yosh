@@ -48,6 +48,38 @@ impl ThemePref {
     }
 }
 
+/// Performance profile: how hard the reader is allowed to work this machine.
+/// A single picker rather than individual knobs — the [`yosh_engine::reader::Budget`]
+/// fields are interdependent (a wider prefetch window with a small cache just evicts
+/// itself), so exposing them separately would only let a user build a worse
+/// configuration. `Auto` (the default) follows the power source: the full desktop
+/// budget on AC, the `Mid` tier on battery. The rest pin a tier, which is how a
+/// machine can be held at full aggression while unplugged (`High`) or kept quiet
+/// even on mains (`Low`/`Mid`). Same four-way choice — and the same wording in the
+/// UI — as the Android shell's `PerfPref`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum PerfPref {
+    #[default]
+    Auto,
+    Low,
+    Mid,
+    High,
+}
+
+impl PerfPref {
+    /// The tier this pins, or `None` for `Auto` (resolve it from the power source).
+    pub fn tier(self) -> Option<yosh_engine::reader::DeviceTier> {
+        use yosh_engine::reader::DeviceTier;
+        match self {
+            PerfPref::Auto => None,
+            PerfPref::Low => Some(DeviceTier::Low),
+            PerfPref::Mid => Some(DeviceTier::Mid),
+            PerfPref::High => Some(DeviceTier::High),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -94,6 +126,8 @@ pub struct Settings {
     pub page_transition_enabled: bool,
     /// Chrome theme: System (follow OS) / Light (e-ink) / Dark. Cycled from the top bar.
     pub theme: ThemePref,
+    /// Performance profile (Auto = full budget on AC, throttled on battery).
+    pub perf: PerfPref,
     /// Last window geometry (size/position/maximized). None until first saved.
     pub window: Option<WindowState>,
 }
@@ -119,6 +153,7 @@ impl Default for Settings {
             // Dark by default on desktop (a backlit monitor); intentionally unlike the
             // Android shell, which defaults to System so e-ink panels get Light.
             theme: ThemePref::Dark,
+            perf: PerfPref::Auto,
             window: None,
         }
     }
@@ -178,5 +213,56 @@ pub fn save(settings: &Settings) {
         if std::fs::write(&tmp, json).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state file written by an older build has no `perf` key at all. The
+    /// container-level `#[serde(default)]` must fill it from `Settings::default()`
+    /// rather than failing the whole parse — a failed parse is silently swallowed by
+    /// `load()`, which would reset every setting, position and recent the user had.
+    #[test]
+    fn old_state_json_without_perf_still_loads() {
+        let old = r#"{
+            "direction_rtl": false,
+            "fit": 2,
+            "theme": "light",
+            "recents": ["C:\\books\\vol1.cbz"],
+            "help_seen": true
+        }"#;
+        let s: Settings = serde_json::from_str(old).expect("old state.json must still parse");
+        assert_eq!(s.perf, PerfPref::Auto, "missing perf defaults to Auto");
+        // The keys that *were* present survive, so this isn't a silent reset.
+        assert!(!s.direction_rtl);
+        assert_eq!(s.fit, 2);
+        assert!(matches!(s.theme, ThemePref::Light));
+        assert_eq!(s.recents.len(), 1);
+    }
+
+    /// The persisted tokens are the lowercase variant names, and they round-trip.
+    #[test]
+    fn perf_pref_round_trips_as_lowercase_tokens() {
+        for (pref, token) in [
+            (PerfPref::Auto, "\"auto\""),
+            (PerfPref::Low, "\"low\""),
+            (PerfPref::Mid, "\"mid\""),
+            (PerfPref::High, "\"high\""),
+        ] {
+            assert_eq!(serde_json::to_string(&pref).unwrap(), token);
+            assert_eq!(serde_json::from_str::<PerfPref>(token).unwrap(), pref);
+        }
+    }
+
+    /// `Auto` defers to the power source; every other choice pins its tier.
+    #[test]
+    fn perf_pref_tier_mapping() {
+        use yosh_engine::reader::DeviceTier;
+        assert_eq!(PerfPref::Auto.tier(), None);
+        assert_eq!(PerfPref::Low.tier(), Some(DeviceTier::Low));
+        assert_eq!(PerfPref::Mid.tier(), Some(DeviceTier::Mid));
+        assert_eq!(PerfPref::High.tier(), Some(DeviceTier::High));
     }
 }

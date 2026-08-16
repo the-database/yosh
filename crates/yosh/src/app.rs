@@ -24,7 +24,7 @@ use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
 use yosh_engine::layout::{self, Layout};
-use yosh_engine::reader::{Budget, Direction, Reader, Viewport};
+use yosh_engine::reader::{Budget, DeviceTier, Direction, Reader, Viewport};
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
 use crate::update;
@@ -63,6 +63,75 @@ fn total_ram_mb() -> Option<u64> {
 fn total_ram_mb() -> Option<u64> {
     None
 }
+
+/// Is the machine running on battery right now? `None` = can't tell (no probe on
+/// this platform, or the OS reports "unknown"), which every caller treats as AC —
+/// the conservative choice, since guessing "battery" would silently throttle a
+/// desktop. A machine with no battery at all answers `Some(false)`, so a tower
+/// never pays for this beyond one cheap syscall.
+#[cfg(windows)]
+fn on_battery() -> Option<bool> {
+    use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    let mut s: SYSTEM_POWER_STATUS = unsafe { std::mem::zeroed() };
+    // SAFETY: `s` is a correctly-sized, zeroed SYSTEM_POWER_STATUS.
+    if unsafe { GetSystemPowerStatus(&mut s) } == 0 {
+        return None;
+    }
+    // BatteryFlag bit 7 (128) = "no system battery" — a desktop PC, always on mains,
+    // whatever `ACLineStatus` claims.
+    if s.BatteryFlag & 128 != 0 {
+        return Some(false);
+    }
+    match s.ACLineStatus {
+        0 => Some(true),  // offline → battery
+        1 => Some(false), // online → AC
+        _ => None,        // 255 = unknown
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn on_battery() -> Option<bool> {
+    // /sys/class/power_supply/<name>/type == "Mains" is the AC adapter; its
+    // `online` is 1 when plugged in. Same sysfs walk shape as the Android shell's
+    // CPU-clock probe. A machine with no Mains node at all (desktop, container,
+    // VM) counts as plugged in.
+    let mut found_mains = false;
+    let mut any_online = false;
+    for entry in std::fs::read_dir("/sys/class/power_supply").ok()?.flatten() {
+        let dir = entry.path();
+        if !std::fs::read_to_string(dir.join("type")).is_ok_and(|t| t.trim() == "Mains") {
+            continue;
+        }
+        found_mains = true;
+        any_online |= std::fs::read_to_string(dir.join("online")).is_ok_and(|o| o.trim() == "1");
+    }
+    Some(found_mains && !any_online)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn on_battery() -> Option<bool> {
+    None
+}
+
+/// The tier to actually run at: the pinned one if the user chose a profile, else
+/// `Auto`'s rule — the uncapped desktop budget on mains, the `Mid` ceilings on
+/// battery (fewer workers, smaller cache/prefetch, a bounded 1:1 decode), which is
+/// the difference between reading and heating the laptop. A free function because
+/// `resumed` needs it before a `State` exists.
+fn effective_tier(perf: config::PerfPref, on_battery: bool) -> DeviceTier {
+    perf.tier().unwrap_or(if on_battery {
+        DeviceTier::Mid
+    } else {
+        DeviceTier::High
+    })
+}
+
+/// How often `Auto` re-checks the power source. The probe is one syscall, so the
+/// interval is belt-and-braces rather than a cost concern: it keeps the check off
+/// the per-frame path during a fast seek, and a plug/unplug taking up to this long
+/// to register is imperceptible for something that only changes decode aggression.
+const POWER_RECHECK: Duration = Duration::from_secs(20);
+
 /// Pixels scrolled per mouse-wheel line in continuous-scroll mode.
 const SCROLL_WHEEL_PX: f32 = 110.0;
 /// Library cover thumbnail height (decoded off-thread; see `pump_covers`).
@@ -156,6 +225,22 @@ struct State {
     /// seen (minimized / fully occluded). Purely for idempotence: the park and
     /// unpark signals both repeat, so `park`/`unpark` act only on a transition.
     parked: bool,
+
+    // Performance profile. The two probe results are captured once at startup
+    // (they can't change while the process runs) so the budget can be rebuilt at
+    // any time — a picker change, or the power source flipping under `Auto`.
+    /// Memory (MB) the reader may spend on decoded pages + GPU textures.
+    mem_budget_mb: u64,
+    /// Logical CPUs, as `Budget` wants them.
+    cpus: usize,
+    /// Last probed power source (`on_battery()`, `None` → treated as AC).
+    on_battery: bool,
+    /// When that probe last ran — `Auto` re-checks at most every `POWER_RECHECK`.
+    power_checked: Instant,
+    /// The tier the live `Reader` is currently configured for, so `apply_perf` can
+    /// skip the work when the effective tier hasn't actually moved (re-clicking the
+    /// selected option, or a power re-check that found no change).
+    applied_tier: DeviceTier,
     volume_key: Option<String>,
     /// Visible page(s) the Tab info overlay text was built for, as
     /// `Reader::visible_pages` reports them (None = rebuild needed).
@@ -609,8 +694,16 @@ impl ApplicationHandler for App {
         // Size the reader's resource budget to the device: CPU count + a slice of
         // system RAM. Desktop reproduces the historical fixed budget; a constrained
         // device (e.g. Android) scales cache / textures / prefetch down.
+        // …then to the performance profile: `Auto` (the default) resolves to the
+        // uncapped `High` tier on mains and throttles to `Mid` on battery, and a
+        // pinned choice overrides both. `for_tier(High, ..)` *is* `derive(..)` —
+        // pinned by the engine's `for_tier_high_is_exactly_derive` — so a plugged-in
+        // machine on `Auto` gets exactly the budget it always got.
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let budget = Budget::derive(detect_mem_budget_mb(), cpus);
+        let mem_budget_mb = detect_mem_budget_mb();
+        let on_battery = on_battery().unwrap_or(false);
+        let tier = effective_tier(settings.perf, on_battery);
+        let budget = Budget::for_tier(tier, mem_budget_mb, cpus);
         let tex_pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
 
         let mut ui = UiState {
@@ -744,6 +837,11 @@ impl ApplicationHandler for App {
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             win_maximized: settings.window.is_some_and(|w| w.maximized),
             parked: false,
+            mem_budget_mb,
+            cpus,
+            on_battery,
+            power_checked: Instant::now(),
+            applied_tier: tier,
             settings,
             system_dark,
             volume_key: None,
@@ -1955,6 +2053,69 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// The tier this machine should be running at right now (the setting, or
+    /// `Auto`'s power-source rule).
+    fn effective_tier(&self) -> DeviceTier {
+        effective_tier(self.settings.perf, self.on_battery)
+    }
+
+    /// Apply the performance profile to the live reader — **no book reopen**. Every
+    /// budget field is runtime-settable: the window sizes are plain fields, both
+    /// caches and the texture pool re-cap in place (evicting down keeps the pages
+    /// nearest the read position, so nothing on screen flashes), and the worker count
+    /// is the one thing that needs a new pool. Rebuilding the pool is cheap and
+    /// hitch-free because its teardown is signal-only and the caches are deliberately
+    /// **kept** — the current page stays decoded and on screen while the new pool
+    /// refills around it. Port of the Android shell's `apply_perf`.
+    ///
+    /// A no-op when the effective tier hasn't moved, so re-picking the selected
+    /// option (or a power re-check that found nothing new) costs nothing.
+    fn apply_perf(&mut self) {
+        let tier = self.effective_tier();
+        if tier == self.applied_tier {
+            return;
+        }
+        self.applied_tier = tier;
+        let b = Budget::for_tier(tier, self.mem_budget_mb, self.cpus);
+        let current = self.reader.index;
+        self.reader.workers = b.workers;
+        self.reader.fwd = b.fwd;
+        self.reader.fwd_max = b.fwd_max;
+        self.reader.back = b.back;
+        self.reader.actual_cap_vh = b.actual_cap_vh;
+        self.reader.lq_thumb_h = b.lq_thumb_h;
+        self.reader.lq_tier = b.lq_tier;
+        self.reader.cache.set_cap(b.cache_cap, current);
+        self.reader.lq_cache.set_cap(b.lq_cap, current);
+        self.reader.tex_pool.set_max_total(b.texpool_max);
+        // Nothing open (library view): the fields above are enough — the next book's
+        // pool is built with `reader.workers`.
+        let Some(src) = self.reader.source.clone() else {
+            return;
+        };
+        let pool = DecodePool::new(
+            src,
+            self.gpu.device.clone(),
+            self.gpu.queue.clone(),
+            self.reader.tex_pool.clone(),
+            b.workers,
+        );
+        // A fresh pool starts wakerless and with empty queues: re-install the wake
+        // callback, then force a full rebuild of both the job list and the thumbnail
+        // tail (`JobsKey` doesn't capture budget fields, so the memoized key would
+        // otherwise suppress the very prefetch that refills the new pool).
+        pool.set_waker(self.reader.waker.clone());
+        self.reader.pool = Some(pool);
+        // A profile change while minimized must not un-park the reader.
+        if self.parked
+            && let Some(pool) = &self.reader.pool
+        {
+            pool.park();
+        }
+        self.reader.invalidate_jobs();
+        self.reader.prefetch();
+    }
+
     /// Poll the channels that background threads deliver on — called once per frame
     /// from `render`. Every producer wakes the loop right after its send, so a frame
     /// is always coming when there is something here to drain. Returns true when
@@ -2374,6 +2535,27 @@ impl State {
         // Background channels (sibling scans, folder watch, update check). Their
         // producers wake the loop on send, so this frame is the one that lands them.
         self.poll_background();
+        // Battery-aware `Auto`: re-probe the power source now and then, and re-tier
+        // if it flipped. Rendered frames are the right clock for this — the budget
+        // only matters while decode work is producing frames — so it needs no timer
+        // of its own; the `Instant` gate just keeps even a cheap syscall off the
+        // per-frame path of a fast seek. A pinned profile never probes at all.
+        if self.settings.perf == config::PerfPref::Auto
+            && self.power_checked.elapsed() > POWER_RECHECK
+        {
+            self.power_checked = Instant::now();
+            self.on_battery = on_battery().unwrap_or(false);
+            if self.effective_tier() != self.applied_tier {
+                self.apply_perf();
+                // Auto only ever moves between High (mains) and Mid (battery), so
+                // the power source names the direction.
+                self.toast(if self.on_battery {
+                    "Battery saver"
+                } else {
+                    "Performance restored"
+                });
+            }
+        }
         self.ui.update_version = self.update.as_ref().map(|u| u.version.clone());
         self.ui.updating = self.updating;
         self.ui.update_failed = self.update_error.is_some();
@@ -2417,6 +2599,22 @@ impl State {
         self.ui.fit_mode = fit_to_u8(self.reader.fit);
         self.ui.rotation = self.reader.rotation;
         self.ui.theme = self.settings.theme;
+        self.ui.perf = self.settings.perf;
+        // What `Auto` currently resolves to, so the picker shows the live answer
+        // instead of leaving the user to guess.
+        self.ui.perf_auto = format!(
+            "Auto — currently {} ({})",
+            match self.effective_tier() {
+                DeviceTier::Low => "Battery saver",
+                DeviceTier::Mid => "Balanced",
+                DeviceTier::High => "Performance",
+            },
+            if self.on_battery {
+                "on battery"
+            } else {
+                "plugged in"
+            }
+        );
         // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
         // library grid; `ui.opened` is sticky once set, so it can't.
         self.ui.reader_open = self.reader.source.is_some();
@@ -2775,6 +2973,14 @@ impl State {
             self.window.request_redraw(); // repaint chrome + letterbox under the new theme
             ui_acted = true;
         }
+        if let Some(p) = self.ui.req_set_perf.take() {
+            self.settings.perf = p;
+            config::save(&self.settings);
+            // Re-tiers the live reader in place (no reopen); a no-op if the pick
+            // resolves to the tier already running.
+            self.apply_perf();
+            ui_acted = true;
+        }
         // Seekbar jump: re-clamp against the live source, skip a redundant goto
         // (which would needlessly reset pan when landing on the current page).
         if let Some(page) = self.ui.seek_request.take()
@@ -2944,3 +3150,42 @@ impl State {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_tier, DeviceTier};
+    use crate::config::PerfPref;
+    use yosh_engine::reader::Budget;
+
+    /// The load-bearing property of the whole performance setting: the shipped
+    /// default (`Auto`) on a machine that isn't on battery must build **exactly**
+    /// the budget the desktop had before any of this existed. `for_tier(High) ==
+    /// derive` is pinned engine-side; what's pinned here is that Auto-on-mains
+    /// really does resolve to `High`.
+    #[test]
+    fn auto_on_ac_is_the_historical_desktop_budget() {
+        for mem in [64u64, 512, 8192] {
+            for cpus in [2usize, 8, 32] {
+                let tier = effective_tier(PerfPref::Auto, false);
+                assert_eq!(tier, DeviceTier::High);
+                assert_eq!(
+                    Budget::for_tier(tier, mem, cpus),
+                    Budget::derive(mem, cpus),
+                    "Auto on AC must be bit-identical to the old derive path"
+                );
+            }
+        }
+    }
+
+    /// Auto throttles to `Mid` on battery; a pinned profile ignores the power
+    /// source entirely (so a laptop can be held at full aggression unplugged).
+    #[test]
+    fn auto_throttles_on_battery_and_pins_override_it() {
+        assert_eq!(effective_tier(PerfPref::Auto, true), DeviceTier::Mid);
+        for on_battery in [false, true] {
+            assert_eq!(effective_tier(PerfPref::Low, on_battery), DeviceTier::Low);
+            assert_eq!(effective_tier(PerfPref::Mid, on_battery), DeviceTier::Mid);
+            assert_eq!(effective_tier(PerfPref::High, on_battery), DeviceTier::High);
+        }
+    }
+}
