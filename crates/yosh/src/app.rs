@@ -71,11 +71,6 @@ const THUMB_H: u32 = 360;
 /// loads don't flash an indicator on every flip — only genuinely slow decodes
 /// (e.g. seeking fast through very high-res pages) cross it.
 const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(150);
-/// How often `about_to_wait` polls the background channels (update check, folder
-/// watch, sibling scan) while the app is otherwise idle. With on-demand rendering
-/// these are no longer drained every frame, so the loop wakes on this heartbeat,
-/// pumps them without rendering, and buys a frame only when something landed.
-const BACKGROUND_POLL: Duration = Duration::from_millis(250);
 /// Fraction of the window width on each side that flips pages on click (and
 /// shows a hover arrow). The middle is reserved for double-click → fullscreen.
 const EDGE_FRAC: f32 = 0.15;
@@ -87,6 +82,12 @@ const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// before a further scroll flips the page — turns the edge into a perceptible
 /// hard stop instead of an instant jump to the next page.
 const EDGE_DWELL: Duration = Duration::from_millis(350);
+/// Live-refresh debounce: how quiet the watched folder/archive must go after a
+/// change before the volume is rebuilt (see `poll_folder_watch`).
+const WATCH_QUIET: Duration = Duration::from_millis(250);
+/// Cap on that debounce: a *continuously* written archive never goes quiet, so
+/// rebuild at least this often after the first event of a burst.
+const WATCH_MAX_WAIT: Duration = Duration::from_millis(1000);
 
 pub struct App {
     initial_path: Option<PathBuf>,
@@ -417,7 +418,9 @@ fn install_fonts(ctx: &egui::Context) {
 /// Every background producer in this shell clones one and calls it *after* its
 /// `tx.send` — send-then-wake, the same order the pool uses (`pool.rs`): the
 /// woken frame drains the channel, so a result that lands while the app is idle
-/// is applied immediately instead of waiting for the next background poll.
+/// is applied immediately. This is *the* delivery mechanism for background work
+/// — the loop polls nothing on its own (see `about_to_wait`), so a producer that
+/// forgets to wake would strand its result until the next unrelated event.
 fn frame_waker(window: &Arc<Window>) -> Waker {
     let w = window.clone();
     Arc::new(move || w.request_redraw())
@@ -874,17 +877,45 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// The shell's **only** clock: a pure deadline scheduler, run once after every
+    /// batch of events. Nothing here polls — every background producer wakes the
+    /// loop itself right after its `tx.send` (see `frame_waker`), so results land
+    /// on a frame the instant they arrive rather than on a heartbeat; everything
+    /// else is either event-driven or animation-guarded (`render`'s redraw guard
+    /// re-requests frames while something is moving).
+    ///
+    /// What is left is the handful of *timed* transitions — state set at T that
+    /// must become visible at T + D with no further input — enumerated by
+    /// `State::deadlines`: the folder-watch debounce, the loading-spinner grace
+    /// period, and toast expiry.
+    ///
+    /// A deadline that has come due buys exactly one frame (`request_redraw`) and
+    /// is **not** re-armed: the frame's `poll_background` / `render` is what
+    /// consumes the ripe state, and the redraw wakes the loop by itself. Only
+    /// still-future deadlines go into `WaitUntil`, and the control flow is re-set
+    /// on *every* pass — explicitly back to `Wait` when nothing is armed — because
+    /// a fired `WaitUntil` left in place would spin the loop at full speed.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Idle pump: background results (update check, folder watch / live refresh,
-        // sibling scan) are no longer drained per frame, so poll them here; anything
-        // visible that landed buys one frame. The heartbeat re-arms the wake-up so
-        // this keeps running while the app is otherwise asleep.
-        if let Some(state) = self.state.as_mut()
-            && state.poll_background()
-        {
-            state.window.request_redraw();
+        let mut next: Option<Instant> = None;
+        // `about_to_wait` also runs before `resumed` has built the window/state.
+        if let Some(state) = self.state.as_mut() {
+            let now = Instant::now();
+            let mut due = false;
+            for deadline in state.deadlines().into_iter().flatten() {
+                if deadline <= now {
+                    due = true;
+                } else {
+                    next = Some(next.map_or(deadline, |n: Instant| n.min(deadline)));
+                }
+            }
+            if due {
+                state.window.request_redraw();
+            }
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + BACKGROUND_POLL));
+        event_loop.set_control_flow(match next {
+            Some(deadline) => ControlFlow::WaitUntil(deadline),
+            None => ControlFlow::Wait,
+        });
     }
 }
 
@@ -1768,15 +1799,15 @@ impl State {
             self.watch_dirty = Some(now);
             self.watch_dirty_since.get_or_insert(now);
         }
-        // Fire once the burst has settled for `QUIET`, OR it's been churning for `MAX_WAIT`
-        // without a gap (a continuously-streamed archive never goes quiet, so the settle
-        // alone would starve). The rebuild runs off-thread (a `read_dir` or a full archive
-        // local-header scan shouldn't touch the UI thread); `rescanning` prevents overlap;
-        // the watcher is only present for watched volumes, so this never fires otherwise.
-        const QUIET: Duration = Duration::from_millis(250);
-        const MAX_WAIT: Duration = Duration::from_millis(1000);
-        let ready = self.watch_dirty.is_some_and(|t| t.elapsed() >= QUIET)
-            || self.watch_dirty_since.is_some_and(|t| t.elapsed() >= MAX_WAIT);
+        // Fire once the burst has settled for `WATCH_QUIET`, OR it's been churning for
+        // `WATCH_MAX_WAIT` without a gap (a continuously-streamed archive never goes quiet,
+        // so the settle alone would starve). The rebuild runs off-thread (a `read_dir` or a
+        // full archive local-header scan shouldn't touch the UI thread); `rescanning`
+        // prevents overlap; the watcher is only present for watched volumes, so this never
+        // fires otherwise. `watch_deadline` mirrors this test for the frame scheduler —
+        // keep the two in step.
+        let ready = self.watch_dirty.is_some_and(|t| t.elapsed() >= WATCH_QUIET)
+            || self.watch_dirty_since.is_some_and(|t| t.elapsed() >= WATCH_MAX_WAIT);
         if ready
             && !self.rescanning
             && self.watcher.is_some()
@@ -1815,9 +1846,54 @@ impl State {
         refreshed
     }
 
-    /// Poll the channels that background threads deliver on — called every frame
-    /// from `render` and, while the app is idle, from the `about_to_wait` heartbeat
-    /// (no frames are flowing then, so this is the only drain). Returns true when
+    /// When the pending watch burst is due to rebuild the volume — exactly the
+    /// instant `poll_folder_watch`'s `ready` test above flips true: the settle
+    /// delay measured from the **last** event (`watch_dirty`) or the max-wait cap
+    /// measured from the **first** (`watch_dirty_since`), whichever comes first.
+    ///
+    /// `None` when no burst is pending — and also in the cases where `ready` would
+    /// be true but the rebuild is gated off (one already in flight, or the volume
+    /// isn't watched at all, e.g. stale events drained after switching to a RAR):
+    /// there the stamps deliberately stay standing, so a scheduled frame could not
+    /// consume them and the scheduler would re-fire forever. A finishing rescan
+    /// wakes the loop itself (`rescan_tx` + waker), which re-opens the question.
+    fn watch_deadline(&self) -> Option<Instant> {
+        if self.rescanning || self.watcher.is_none() || self.ui.opened.is_none() {
+            return None;
+        }
+        let settle = self.watch_dirty.map(|t| t + WATCH_QUIET);
+        let cap = self.watch_dirty_since.map(|t| t + WATCH_MAX_WAIT);
+        match (settle, cap) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Every timer the shell has armed, for `about_to_wait`'s scheduler: state that
+    /// was set at some T and must become visible at T + delay with no further input.
+    /// Each is armed **only while its transition is still pending**, so the frame a
+    /// ripe deadline buys always consumes it — a deadline the frame couldn't clear
+    /// would be re-scheduled every pass and spin the loop.
+    fn deadlines(&self) -> [Option<Instant>; 3] {
+        [
+            // Live folder refresh: the debounced rebuild (mirrors `poll_folder_watch`).
+            self.watch_deadline(),
+            // Loading spinner grace: the moment the centered spinner is due to appear.
+            // Dropped once it *has* appeared (`ui.loading`) — from then on the page
+            // either lands (its decode wakes a frame) or egui's own `Spinner` keeps
+            // repainting, and re-arming a deadline the frame can't clear would spin.
+            match self.loading_pending {
+                Some((_, t)) if !self.ui.loading => Some(t + LOADING_INDICATOR_DELAY),
+                _ => None,
+            },
+            // Toast expiry: `render` drops the message once this passes.
+            self.toast.as_ref().map(|&(_, t)| t + TOAST_DURATION),
+        ]
+    }
+
+    /// Poll the channels that background threads deliver on — called once per frame
+    /// from `render`. Every producer wakes the loop right after its send, so a frame
+    /// is always coming when there is something here to drain. Returns true when
     /// something user-visible landed and is worth one frame: an update-check result,
     /// an update-apply failure, or a live-refreshed volume listing.
     fn poll_background(&mut self) -> bool {
@@ -2231,8 +2307,8 @@ impl State {
                 Err(e) => self.ui.status = format!("open failed: {e}"),
             }
         }
-        // Background channels (sibling scans, folder watch, update check) — shared
-        // with the idle pump in `about_to_wait`.
+        // Background channels (sibling scans, folder watch, update check). Their
+        // producers wake the loop on send, so this frame is the one that lands them.
         self.poll_background();
         self.ui.update_version = self.update.as_ref().map(|u| u.version.clone());
         self.ui.updating = self.updating;
@@ -2770,31 +2846,34 @@ impl State {
             self.pump_covers();
         }
 
-        // On-demand rendering: request the next frame only while something is
-        // still moving or landing; otherwise the loop sleeps until an input event
-        // (or the `about_to_wait` background heartbeat) wakes it. Mirrors the
+        // On-demand rendering: request the next frame only while something is still
+        // *moving*; otherwise the loop sleeps until an event wakes it. Mirrors the
         // Android shell's redraw guard.
         //
-        // Note what is *not* here: "a decode is still pending". Landing pages
-        // schedule their own frame from the worker thread (`Reader::set_waker`), so
-        // waiting for one costs zero frames instead of a full egui pass + present at
-        // refresh rate for the whole decode.
+        // Everything else that used to be listed here has a better source of frames:
+        // background work (decodes, library scans, cover decodes, folder rebuilds,
+        // update checks) wakes the loop from the producing thread the moment it
+        // sends — one frame per landing, which is exactly what drawing it needs —
+        // and the *timed* transitions (toast expiry, spinner grace, watch debounce)
+        // get their one frame from the deadline scheduler in `about_to_wait`.
+        // Free-running at refresh rate for any of them would only burn a full egui
+        // pass + present per frame to redraw an unchanged screen.
+        //
+        // So what remains is animation (each frame differs from the last) plus the
+        // one-shot confirmations that this frame's own drawing was already stale.
         let egui_animating = full_output
             .viewport_output
             .values()
             .any(|v| v.repaint_delay.is_zero());
         if ui_acted                            // a chrome request landed after quads were built
             || self.opening                    // background open: spinner over the old page
-            || self.scanning                   // library scan in flight (show "Scanning…")
-            || !self.queued_covers.is_empty()  // covers still decoding off-thread
             || !self.reader.view_settled       // resize/zoom debounce needs a settle frame
             // Draw-time flag, not transition_active(): a clock re-check can see
             // the animation as just-expired even though this frame drew it
             // mid-fade, freezing a half-faded ghost (decision must match draw).
             || self.reader.animation_drawn()   // a page-turn frame was drawn
             || drew_live_anim                  // a GIF/WebP is playing
-            || self.toast.is_some()            // timed toast needs frames to expire
-            || egui_animating                  // egui-driven animation (bar reveal, …)
+            || egui_animating                  // egui-driven animation (bar reveal, spinner, …)
         {
             self.window.request_redraw();
         }
