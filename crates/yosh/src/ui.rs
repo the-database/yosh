@@ -22,6 +22,10 @@ pub struct UiState {
     pub layout_label: &'static str,
     /// Whether the page-turn transition is on (for the "Turn:" button label).
     pub transition_on: bool,
+    /// Whether fits may stretch a page past 100% native. The *inverse* of the
+    /// persisted `no_stretch` setting — the panel row reads "Stretch small pages",
+    /// since stretching is what yosh has always done. Set each frame by the app.
+    pub stretch_on: bool,
     /// Spine-shadow (two-page gutter shading) state, set each frame for the
     /// Settings panel's toggle + strength slider.
     pub spine_shadow_on: bool,
@@ -54,6 +58,8 @@ pub struct UiState {
     pub req_cycle_fit: bool,
     pub req_toggle_layout: bool,
     pub req_toggle_transition: bool,
+    /// "Stretch small pages" row click (key `Z` does the same thing).
+    pub req_toggle_stretch: bool,
     /// Spine-shadow toggle click / new strength from the panel's slider. Strength
     /// applies live every change; the save is requested separately (drag end) so a
     /// drag doesn't rewrite the config file once per frame.
@@ -628,6 +634,7 @@ pub fn chrome(
                 ui.separator();
                 ui.heading("View");
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
+                ui.label("Z   stretch small pages (off: fit stops at 100% native)");
                 ui.label("R   rotate 90° (clockwise)");
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");
@@ -893,6 +900,23 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     }
                 }
             });
+
+            // Sits directly under the fit radios because it *modifies* them: it
+            // bounds every fit at 100% native rather than being a mode of its own.
+            ui.label(egui::RichText::new("Stretch small pages").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(st.stretch_on, "On").clicked() && !st.stretch_on {
+                    st.req_toggle_stretch = true;
+                }
+                if ui.selectable_label(!st.stretch_on, "Off").clicked() && st.stretch_on {
+                    st.req_toggle_stretch = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new("Off: fit never scales past 100% native (zoom still can) — Z")
+                    .weak()
+                    .small(),
+            );
 
             ui.label(egui::RichText::new("Rotation").strong());
             if ui

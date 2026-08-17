@@ -99,13 +99,17 @@ pub fn next_zoom_preset(ladder: &[f32], current_pct: f32, zoom_in: bool) -> f32 
 /// On-screen scale (device-px per *native* source-px) for a page, mirroring the
 /// draw scale in `build_quads`. `content` feeds `fit_scale` (a single page: its
 /// own dims; a facing pair: the combined width and shared height); `decoded_h` is
-/// the anchor's displayed decoded height; `src_h` its native.
+/// the anchor's displayed decoded height; `src_h` its native. `cap` bounds the fit
+/// scale so it never pushes the page past 100% native ([`Reader::upscale_cap`]);
+/// [`f32::INFINITY`] — what every caller passes with the option off — leaves the
+/// expression bit-identical.
 pub fn anchor_native_scale(
     fit: FitMode,
     screen: (f32, f32),
     content: (f32, f32),
     decoded_h: f32,
     src_h: f32,
+    cap: f32,
     zoom: f32,
 ) -> f32 {
     // 1:1 now draws at native × zoom regardless of the decoded texture size (see
@@ -115,7 +119,7 @@ pub fn anchor_native_scale(
         return zoom;
     }
     let ((sw, sh), (fit_w, fit_h)) = (screen, content);
-    fit_scale(fit, sw, sh, fit_w, fit_h) * zoom * decoded_h / src_h.max(1.0)
+    fit_scale(fit, sw, sh, fit_w, fit_h).min(cap) * zoom * decoded_h / src_h.max(1.0)
 }
 
 /// Clamp a fit-multiplier `zoom` so the *effective native* zoom stays within
@@ -603,6 +607,21 @@ pub struct Reader {
     pub fwd_max: usize,
     pub back: usize,
 
+    /// Never let a **fit** scale a page above 100% of its native resolution
+    /// (issue #13). With this on, Window/Width/Height fits and the continuous-scroll
+    /// width-fit stop at 1:1 for a page smaller than the viewport instead of
+    /// stretching it; pages larger than the viewport still fit *down* exactly as
+    /// before, and `FitMode::Actual` is untouched. Explicit `zoom` multiplies
+    /// *after* the cap, so zooming past native still magnifies (the one sanctioned
+    /// GPU upscale). Off by default = today's stretch-to-fit, bit for bit — every
+    /// capped expression reduces to `<today>.min(f32::INFINITY)`. Set by the shell
+    /// from its own setting after construction.
+    ///
+    /// It also *strengthens* the single-resize invariant: a small page's decode
+    /// target becomes its native size, so the GPU samples it 1:1 rather than
+    /// upscaling a texture that was already at full source resolution.
+    pub fit_no_upscale: bool,
+
     // --- Page-turn transition (in-book flip animation) ---
     /// Animate page flips with an outgoing-page blur+fade. Set by the shell from
     /// settings; off by default (each shell opts in after construction).
@@ -659,6 +678,18 @@ struct JobsKey {
     spread_offset: usize,
     rotation: u8,
     scroll_mode: bool,
+    /// [`Reader::fit_no_upscale`] — toggling it changes every small page's target,
+    /// so the window must be re-walked.
+    ///
+    /// The flag makes a target depend on the page's *own* decoded `src_h`, which is
+    /// unknown until the page lands — so a small page's first decode uses the
+    /// uncapped (fit) target, `decode::target_dims` caps it at the source anyway,
+    /// and the *next* `prefetch` (woken by `cache_epoch`, which the landing page
+    /// bumped) sees the real dims, wants `src_h × zoom`, and re-decodes once at that
+    /// height. That second decode stores `target_h == want`, so the third pass is a
+    /// no-op: exactly **one** convergence re-decode per page, never a loop. Same
+    /// shape as the `FitMode::Actual` uncached-decode path.
+    no_upscale: bool,
     cache_epoch: u64,
     failed_len: usize,
 }
@@ -717,6 +748,7 @@ impl Reader {
             fwd_max: budget.fwd_max,
             back: budget.back,
             two_tier,
+            fit_no_upscale: false,
             transition_enabled: false,
             spine_strength: 0.0,
             transition: None,
@@ -793,6 +825,39 @@ impl Reader {
     pub fn page_texture(&self, i: usize) -> Option<&PageTexture> {
         self.cache.get(i).or_else(|| self.lq_cache.get(i))
     }
+
+    /// Ceiling on a *fit* scale so the page is never drawn above 100% of its native
+    /// resolution: `src_h / tex_h` is exactly the fit scale at which one device
+    /// pixel covers one *source* pixel. [`f32::INFINITY`] when
+    /// [`Reader::fit_no_upscale`] is off, so every call site reads
+    /// `fit_scale(..).min(cap)` and reduces to today's value unchanged.
+    ///
+    /// Rotation-invariant, so `single_quad` can use it for both orientations: a
+    /// 90°/270° turn maps the texture's *height* onto the screen width, and the
+    /// source's height along with it, so the same ratio bounds either axis.
+    fn upscale_cap(&self, src_h: f32, tex_h: f32) -> f32 {
+        if self.fit_no_upscale {
+            src_h.max(1.0) / tex_h.max(1.0)
+        } else {
+            f32::INFINITY
+        }
+    }
+
+    /// Content width (device px) of page `i` in the continuous-scroll strip:
+    /// `sw × zoom`, but never wider than the page's native width when
+    /// [`Reader::fit_no_upscale`] is on — a narrow page then draws at 100% and
+    /// `horizontal_left` centers it. The texture lookup sits *behind* the flag, so
+    /// the default path is the bare `sw * self.zoom` it has always been, with no
+    /// extra cache probe.
+    fn scroll_content_w(&self, i: usize, sw: f32) -> f32 {
+        let mut w = sw;
+        if self.fit_no_upscale
+            && let Some(t) = self.page_texture(i)
+        {
+            w = w.min(t.src_w.max(1) as f32);
+        }
+        w * self.zoom
+    }
 }
 
 impl Reader {
@@ -802,7 +867,9 @@ impl Reader {
             return false;
         };
         let (sw, sh) = (self.viewport.w.max(1) as f32, self.viewport.h.max(1) as f32);
-        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32) * self.zoom;
+        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32)
+            .min(self.upscale_cap(pt.src_h as f32, pt.h as f32))
+            * self.zoom;
         pt.h as f32 * s > sh + 0.5
     }
 
@@ -825,17 +892,24 @@ impl Reader {
         let sh = self.viewport.h.max(1) as f32;
         match self.cache.get(self.index) {
             Some(t) => {
-                t.h as f32 * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32) * self.zoom
+                t.h as f32
+                    * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32)
+                        .min(self.upscale_cap(t.src_h as f32, t.h as f32))
+                    * self.zoom
             }
             None => sh,
         }
     }
 
-    /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h)` — the inputs
-    /// `anchor_native_scale` needs, computed once and shared by `anchor_scale`
+    /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h, cap)` — the
+    /// inputs `anchor_native_scale` needs, computed once and shared by `anchor_scale`
     /// (current fit/zoom) and `fit_native_pct` (an arbitrary fit at zoom 1). `None`
     /// in scroll mode (no facing-pair layout) or before the anchor is decoded.
-    pub fn anchor_metrics(&self) -> Option<(f32, f32, f32, f32, f32, f32)> {
+    /// `cap` is the no-upscale fit ceiling ([`Reader::upscale_cap`], `INFINITY` when
+    /// the option is off), computed here so it matches `place_view` exactly: a
+    /// facing pair shares one display height, so the pair's ceiling is the *smaller*
+    /// of the two natives.
+    pub fn anchor_metrics(&self) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
         if self.scroll_mode {
             return None;
         }
@@ -850,16 +924,26 @@ impl Reader {
         // Wide (landscape) page is shown alone; otherwise pair with `b` if ready.
         let force_single = ta.w > ta.h;
         let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
-        let (fit_w, fit_h, dec_h) = match tb {
+        let (fit_w, fit_h, dec_h, cap) = match tb {
             Some(tb) => {
                 let h_ref = ta.h.max(tb.h) as f32;
                 let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
                 let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
-                (wa + wb, h_ref, h_ref)
+                (
+                    wa + wb,
+                    h_ref,
+                    h_ref,
+                    self.upscale_cap(ta.src_h.min(tb.src_h) as f32, h_ref),
+                )
             }
-            None => (ta.w as f32, ta.h as f32, ta.h as f32),
+            None => (
+                ta.w as f32,
+                ta.h as f32,
+                ta.h as f32,
+                self.upscale_cap(ta.src_h as f32, ta.h as f32),
+            ),
         };
-        Some((sw, sh, fit_w, fit_h, dec_h, ta.src_h.max(1) as f32))
+        Some((sw, sh, fit_w, fit_h, dec_h, ta.src_h.max(1) as f32, cap))
     }
 
     /// The page(s) actually on screen right now, as `(anchor, facing?)`.
@@ -895,18 +979,20 @@ impl Reader {
     /// isn't decoded yet.
     pub fn anchor_scale(&self) -> Option<f32> {
         if self.scroll_mode {
-            // Strip pages are laid out at width = sw * zoom (height follows aspect).
+            // Strip pages are laid out at the per-page content width (sw * zoom,
+            // capped at native when no-upscale is on); height follows aspect.
             let sw = self.viewport.w.max(1) as f32;
             let t = self.cache.get(self.index)?;
-            return Some(sw * self.zoom / t.src_w.max(1) as f32);
+            return Some(self.scroll_content_w(self.index, sw) / t.src_w.max(1) as f32);
         }
-        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
+        let (sw, sh, fit_w, fit_h, dec_h, src_h, cap) = self.anchor_metrics()?;
         Some(anchor_native_scale(
             self.fit,
             (sw, sh),
             (fit_w, fit_h),
             dec_h,
             src_h,
+            cap,
             self.zoom,
         ))
     }
@@ -915,8 +1001,8 @@ impl Reader {
     /// — used to splice fit-to-window / fit-to-width stops into the zoom ladder.
     /// `None` in scroll mode (handled inline in `zoom_ladder`) or before decode.
     pub fn fit_native_pct(&self, fit: FitMode) -> Option<f32> {
-        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        Some(anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, 1.0) * 100.0)
+        let (sw, sh, fit_w, fit_h, dec_h, src_h, cap) = self.anchor_metrics()?;
+        Some(anchor_native_scale(fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, cap, 1.0) * 100.0)
     }
 
     /// Zoom relative to the *original* image resolution (1 image px : 1 screen px
@@ -938,11 +1024,14 @@ impl Reader {
         if self.scroll_mode {
             let t = self.cache.get(self.index)?;
             let sw = self.viewport.w.max(1) as f32;
-            return Some(sw * self.zoom / t.w.max(1) as f32); // strip drawn at width sw*zoom
+            // Strip drawn at the page's content width (sw*zoom, native-capped when
+            // the no-upscale option is on).
+            return Some(self.scroll_content_w(self.index, sw) / t.w.max(1) as f32);
         }
         // Equals single_quad's draw scale `s`: native scale × (src_h / decoded_h).
-        let (sw, sh, fit_w, fit_h, dec_h, src_h) = self.anchor_metrics()?;
-        let native = anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, self.zoom);
+        let (sw, sh, fit_w, fit_h, dec_h, src_h, cap) = self.anchor_metrics()?;
+        let native =
+            anchor_native_scale(self.fit, (sw, sh), (fit_w, fit_h), dec_h, src_h, cap, self.zoom);
         Some(native * src_h / dec_h.max(1.0))
     }
 
@@ -1020,6 +1109,13 @@ impl Reader {
             if let Some(t) = self.cache.get(self.index) {
                 let sw = self.viewport.w.max(1) as f32;
                 let sh = self.viewport.h.max(1) as f32;
+                // These two stops are *native percentages* the page can be shown at,
+                // so [`Reader::fit_no_upscale`] leaves them alone: the option caps
+                // the fit scale, but zoom still multiplies after the cap, so every
+                // percentage on the ladder stays reachable (`zoom_to_preset` rescales
+                // the multiplier by target/current, which is cap-proportional). The
+                // page-flip ladder below needs no note either — it goes through
+                // `fit_native_pct`, which is capped for free.
                 stops.push(sw / t.src_w.max(1) as f32 * 100.0); // fit width (strip @ zoom 1)
                 stops.push(sh / t.src_h.max(1) as f32 * 100.0); // fit window (height fills)
             }
@@ -1064,7 +1160,7 @@ impl Reader {
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
         if self.scroll_mode {
-            let cw = sw * self.zoom;
+            let cw = self.scroll_content_w(self.index, sw);
             let mx = ((cw - sw) / 2.0).max(0.0);
             self.pan_x = self.pan_x.clamp(-mx, mx);
             return;
@@ -1078,7 +1174,9 @@ impl Reader {
             } else {
                 (t.w as f32, t.h as f32)
             };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            let s = fit_scale(self.fit, sw, sh, ew, eh)
+                .min(self.upscale_cap(t.src_h as f32, t.h as f32))
+                * self.zoom;
             let mx = ((ew * s - sw) / 2.0).max(0.0);
             let my = ((eh * s - sh) / 2.0).max(0.0);
             self.pan_x = self.pan_x.clamp(-mx, mx);
@@ -1108,7 +1206,13 @@ impl Reader {
             } else {
                 (t.w as f32, t.h as f32)
             };
-            let s = fit_scale(self.fit, sw, sh, ew, eh) * self.zoom;
+            // No-upscale (issue #13): the fit never scales the page past 100% of
+            // its native resolution. The cap is `INFINITY` when the option is off,
+            // and zoom multiplies *after* it, so zooming past native still
+            // magnifies. Rotation-safe — see `upscale_cap`.
+            let s = fit_scale(self.fit, sw, sh, ew, eh)
+                .min(self.upscale_cap(t.src_h as f32, t.h as f32))
+                * self.zoom;
             (ew * s, eh * s)
         };
         // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
@@ -1268,7 +1372,14 @@ impl Reader {
                 let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
                 let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
                 let combined_w = wa + wb;
-                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref) * self.zoom;
+                // No-upscale: the pair is drawn at one shared height, so its
+                // ceiling is the *smaller* of the two natives — that way neither
+                // page exceeds 100%, and both land on the same drawn height so the
+                // pair still samples 1:1. (`INFINITY` when the option is off, and
+                // `page_target_h`'s spread arm applies the identical min.)
+                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref)
+                    .min(self.upscale_cap(ta.src_h.min(tb.src_h) as f32, h_ref))
+                    * self.zoom;
                 let x0 = self.horizontal_left(combined_w * s, sw);
                 let dh = h_ref * s;
                 // Screen order: LTR puts the lower index on the left; RTL reverses.
@@ -1320,7 +1431,7 @@ impl Reader {
     }
 
     pub fn page_display_h(&self, i: usize, sw: f32) -> f32 {
-        let cw = sw * self.zoom; // strip content width (zoomable)
+        let cw = self.scroll_content_w(i, sw); // strip content width (zoomable)
         match self.page_texture(i) {
             Some(t) => cw * (t.h as f32 / t.w as f32),
             None => cw * self.est_aspect,
@@ -1378,18 +1489,21 @@ impl Reader {
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
         let mut quads = Vec::new();
-        let cw = sw * self.zoom; // strip width (zoom); centered with horizontal pan
-        let x = self.horizontal_left(cw, sw);
         let mut y = -self.top_offset;
         let mut i = self.index;
         let mut slot = 0;
         while i < len && y < sh && slot < MAX_QUADS {
             let dh = self.page_display_h(i, sw);
-            if y + dh > 0.0
-                && self.page_texture(i).is_some() {
-                    quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
-                    slot += 1;
-                }
+            if y + dh > 0.0 && self.page_texture(i).is_some() {
+                // Strip width (zoom); centered with horizontal pan. Per page rather
+                // than once for the strip, because the no-upscale option caps each
+                // page at its own native width — with the option off every page gets
+                // the same `sw * zoom` the whole strip used to share.
+                let cw = self.scroll_content_w(i, sw);
+                let x = self.horizontal_left(cw, sw);
+                quads.push(quad_from_px(slot, i, x, y, cw, dh, sw, sh, 0));
+                slot += 1;
+            }
             y += dh;
             i += 1;
         }
@@ -1423,6 +1537,38 @@ impl Reader {
             return t.src_w as f32 / t.src_h.max(1) as f32;
         }
         1.0 / self.est_aspect.max(0.01) // est_aspect is h / w
+    }
+
+    /// The no-upscale ceiling on page `index`'s **decode target**: the height it is
+    /// displayed at when its fit is pinned to 100% native, i.e. `src_h × zoom`.
+    /// [`f32::INFINITY`] — today's uncapped target — when the option is off, and
+    /// also when the page hasn't been decoded yet, because its native size is not
+    /// known until then. That unknown case costs exactly one extra decode and can't
+    /// loop; the argument is on [`JobsKey::no_upscale`].
+    ///
+    /// `paired` marks the two-page-spread arm, where both pages are drawn at one
+    /// shared height: the pair's ceiling is then the *smaller* of the two natives,
+    /// matching `place_view`'s draw-side cap, so both textures land at the same
+    /// drawn height and the pair samples 1:1 even when the two pages differ in
+    /// resolution.
+    fn upscale_target_cap(&self, index: usize, paired: bool) -> f32 {
+        if !self.fit_no_upscale {
+            return f32::INFINITY;
+        }
+        let Some(t) = self.cache.get(index) else {
+            return f32::INFINITY;
+        };
+        let mut src_h = t.src_h.max(1) as f32;
+        if paired
+            && let Some(src) = &self.source
+        {
+            let (a, b) = layout::view_pages(self.layout, index, src.len(), self.spread_offset);
+            let facing = if a == index { b } else { Some(a) };
+            if let Some(tb) = facing.and_then(|f| self.cache.get(f)) {
+                src_h = src_h.min(tb.src_h.max(1) as f32);
+            }
+        }
+        src_h * self.zoom
     }
 
     /// The *exact* decode target (on-screen displayed pixel height) for page
@@ -1460,6 +1606,10 @@ impl Reader {
         }
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
+        // Two non-wide pages in a spread are drawn at one shared height, so their
+        // no-upscale ceiling spans the pair. Mirrors the `single` test below: a wide
+        // (landscape) page force-shows alone and is therefore never paired.
+        let paired = !self.scroll_mode && self.layout == Layout::Spread && aspect <= 1.0;
         let target = if self.scroll_mode {
             // Continuous strip: width-fit at width sw*zoom, height follows aspect.
             sw * self.zoom / aspect
@@ -1484,7 +1634,15 @@ impl Reader {
             // the target is the box width (box_h * content_aspect); else box height.
             if rotated { box_h * content_aspect } else { box_h }
         };
-        (target.round() as u32).clamp(MIN_TARGET, max_h)
+        // No-upscale (issue #13): a fit never scales a page past 100% native, so the
+        // decode target is bounded by the page's own displayed-at-native height,
+        // `src_h × zoom`. Every branch above reduces to that same form — the scroll
+        // strip's width cap, the rotated single's box *width*, and the spread's
+        // shared height all scale linearly with the fit — so one `min` here covers
+        // the lot, and it is the *identical* value the draw sites apply through
+        // `upscale_cap`. `INFINITY` with the option off ⇒ today's target verbatim.
+        (target.min(self.upscale_target_cap(index, paired)).round() as u32)
+            .clamp(MIN_TARGET, max_h)
     }
 
     /// Debounce the decode view. While the surface size or zoom is changing (a
@@ -1527,6 +1685,7 @@ impl Reader {
             spread_offset: self.spread_offset,
             rotation: self.rotation,
             scroll_mode: self.scroll_mode,
+            no_upscale: self.fit_no_upscale,
             cache_epoch: self.cache.epoch(),
             failed_len: self.failed.len(),
         };
@@ -1725,6 +1884,7 @@ mod tests {
             spread_offset: 0,
             rotation: 0,
             scroll_mode: false,
+            no_upscale: false,
             cache_epoch,
             failed_len: 0,
         };
@@ -1896,7 +2056,9 @@ mod tests {
     }
 
     // A 2048-tall portrait page on a 4K (2160-tall) screen, fit-to-window and
-    // height-constrained, is displayed at 2160 → ~105% of native, not 100%.
+    // height-constrained, is displayed at 2160 → ~105% of native, not 100%. The
+    // `INFINITY` cap is the no-upscale option *off*, so this stays the baseline
+    // (`no_upscale_anchor_native_scale_caps_at_unity` is the same case with it on).
     #[test]
     pub fn anchor_native_scale_fit_to_window_reports_upscale() {
         let s = super::anchor_native_scale(
@@ -1905,6 +2067,7 @@ mod tests {
             (1448.0, 2048.0),
             2048.0,
             2048.0,
+            f32::INFINITY,
             1.0,
         );
         assert!((s - 2160.0 / 2048.0).abs() < 1e-4, "got {s}");
@@ -1919,6 +2082,7 @@ mod tests {
             (1448.0, 2048.0),
             2048.0,
             2048.0,
+            f32::INFINITY,
             1.0,
         );
         assert!((s - 1.0).abs() < 1e-6, "got {s}");
@@ -2034,6 +2198,222 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- No-upscale fit (issue #13) ---------------------------------------------
+    //
+    // The five tests below mirror the flag inline, the same way the tests above
+    // re-implement `page_target_h` / `single_quad` / `place_view`: the decode target
+    // gains `.min(src_h * zoom)` and the draw scale gains `.min(src_h / tex_h)`.
+    // What they prove is that those two caps are the *same* number, so a page the
+    // option holds at 100% is still resampled exactly once — and, unlike today, is
+    // no longer GPU-*up*scaled to fill the window. With the option off both `min`s
+    // take `f32::INFINITY` and the models collapse into the tests above.
+
+    // Page-flip fits with the option on. A page smaller than the viewport decodes to
+    // its native height and is drawn at exactly that height (GPU 1:1) instead of
+    // being stretched; a page larger than the viewport keeps today's fit-down
+    // behavior; and explicit zoom past 100% still magnifies, because zoom multiplies
+    // *after* the cap.
+    #[test]
+    pub fn no_upscale_decode_target_matches_drawn_size() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                // A small page (every fit would stretch it) and a large one (every
+                // fit shrinks it — the cap must be inert there).
+                for (src_w, src_h) in [(400.0_f32, 600.0_f32), (3000.0, 4500.0)] {
+                    let aspect = src_w / src_h;
+                    for zoom in [0.5_f32, 1.0] {
+                        // page_target_h: today's displayed height, then the no-upscale
+                        // clamp; `target_dims` still caps the decode at the source.
+                        let fit_h = fit_scale(fit, sw, sh, aspect, 1.0) * zoom;
+                        let th = fit_h.min(src_h * zoom).min(src_h).round().max(1.0);
+                        let tw = (th * aspect).round().max(1.0);
+                        // single_quad's capped draw scale, on that decoded texture.
+                        let s = fit_scale(fit, sw, sh, tw, th).min(src_h / th) * zoom;
+                        let drawn = th * s;
+                        assert!(
+                            (drawn - th).abs() <= 2.0,
+                            "fit {} src {src_w}x{src_h} z {zoom} {sw}x{sh}: drawn {drawn} vs texture {th}",
+                            fit.label(),
+                        );
+                        // …and the page is never shown above 100% of native.
+                        assert!(
+                            drawn <= src_h * zoom + 2.0,
+                            "fit {} src {src_w}x{src_h} z {zoom}: drawn {drawn} exceeds native {}",
+                            fit.label(),
+                            src_h * zoom,
+                        );
+                    }
+                    // Zoom past native is the one sanctioned GPU resample: the cap
+                    // bounds the *fit*, not the zoom, so a small page at 200% is
+                    // magnified 2× off a full-native texture.
+                    if src_h < 1000.0 {
+                        let zoom = 2.0_f32;
+                        let fit_h = fit_scale(fit, sw, sh, aspect, 1.0) * zoom;
+                        let th = fit_h.min(src_h * zoom).min(src_h).round().max(1.0);
+                        let tw = (th * aspect).round().max(1.0);
+                        let s = fit_scale(fit, sw, sh, tw, th).min(src_h / th) * zoom;
+                        assert!(
+                            (th - src_h).abs() <= 1.0,
+                            "fit {}: zoomed-in small page must keep full native res, got {th}",
+                            fit.label(),
+                        );
+                        assert!(
+                            (s - zoom).abs() <= 0.01,
+                            "fit {}: gpu scale {s} should be the zoom {zoom}",
+                            fit.label(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Same invariant under a 90°/270° turn: the target is the on-screen box *width*
+    // (the turned texture's height lands along the screen width), so the no-upscale
+    // clamp is still `src_h × zoom` and the draw cap is still `src_h / tex_h` —
+    // `upscale_cap` is rotation-invariant precisely so both orientations share it.
+    #[test]
+    pub fn no_upscale_rotated() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                for (src_w, src_h) in [(400.0_f32, 600.0_f32), (3000.0, 4500.0)] {
+                    let aspect = src_w / src_h;
+                    for zoom in [0.5_f32, 1.0] {
+                        // page_target_h (rotated): content_aspect = 1/aspect, target =
+                        // box width = box_h / aspect, then the no-upscale clamp.
+                        let box_h = fit_scale(fit, sw, sh, 1.0 / aspect, 1.0) * zoom;
+                        let th = (box_h / aspect).min(src_h * zoom).min(src_h).round().max(1.0);
+                        let tw = (th * aspect).round().max(1.0);
+                        // single_quad swaps (w,h) for the odd rotation: ew = th, eh = tw.
+                        let s = fit_scale(fit, sw, sh, th, tw).min(src_h / th) * zoom;
+                        let drawn_w = th * s; // screen width the turned texture's height fills
+                        assert!(
+                            (drawn_w - th).abs() <= 2.0,
+                            "rot fit {} src {src_w}x{src_h} z {zoom} {sw}x{sh}: drawn_w {drawn_w} vs texture-h {th}",
+                            fit.label(),
+                        );
+                        assert!(
+                            drawn_w <= src_h * zoom + 2.0,
+                            "rot fit {}: drawn_w {drawn_w} exceeds native {}",
+                            fit.label(),
+                            src_h * zoom,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // A facing pair shares one displayed height, so the pair's ceiling is the
+    // *smaller* of the two natives — `page_target_h`'s spread arm and `place_view`
+    // both apply that same min. Uniform pairs and mixed-resolution pairs alike must
+    // end up with both textures decoded at the shared drawn height (GPU 1:1 for
+    // both), and neither page above 100% of its own native.
+    #[test]
+    pub fn no_upscale_spread_pair() {
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                // (uniform small, mixed small/large, uniform large) — same aspect in
+                // each pair, which is what `page_target_h` assumes for the facing page.
+                for (ha, hb) in [(600.0_f32, 600.0_f32), (600.0, 2400.0), (4500.0, 4500.0)] {
+                    let aspect = 2.0 / 3.0; // portrait pages
+                    let pair_cap = ha.min(hb);
+                    for zoom in [0.5_f32, 1.0] {
+                        // page_target_h (spread arm): content_aspect = aspect * 2, then
+                        // the pair's no-upscale clamp; `target_dims` caps at each page's
+                        // own source height.
+                        let box_h = fit_scale(fit, sw, sh, aspect * 2.0, 1.0) * zoom;
+                        let capped = box_h.min(pair_cap * zoom);
+                        let (ta_h, tb_h) = (
+                            capped.min(ha).round().max(1.0),
+                            capped.min(hb).round().max(1.0),
+                        );
+                        // place_view: size both to a common reference height, fit the
+                        // combined width, and cap at the pair's smaller native.
+                        let h_ref = ta_h.max(tb_h);
+                        let combined_w = ta_h * aspect * h_ref / ta_h + tb_h * aspect * h_ref / tb_h;
+                        let s = fit_scale(fit, sw, sh, combined_w, h_ref).min(pair_cap / h_ref) * zoom;
+                        let dh = h_ref * s;
+                        for (label, th, native) in [("a", ta_h, ha), ("b", tb_h, hb)] {
+                            assert!(
+                                (dh - th).abs() <= 2.0,
+                                "spread fit {} {ha}/{hb} z {zoom} {sw}x{sh}: page {label} drawn {dh} vs texture {th}",
+                                fit.label(),
+                            );
+                            assert!(
+                                dh <= native * zoom + 2.0,
+                                "spread fit {}: page {label} drawn {dh} exceeds native {}",
+                                fit.label(),
+                                native * zoom,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Continuous scroll: the strip is laid out at `sw * zoom`, capped per page at
+    // its native width, and the page's height follows from that width. A page
+    // narrower than the viewport is therefore drawn at exactly 100% (and centered by
+    // `horizontal_left`), with the decode target matching — GPU 1:1, not an upscale.
+    #[test]
+    pub fn no_upscale_scroll_native_width() {
+        for sw in [3840.0_f32, 1920.0, 1600.0] {
+            for (src_w, src_h) in [(400.0_f32, 600.0_f32), (3000.0, 4500.0)] {
+                let aspect = src_w / src_h;
+                for zoom in [0.5_f32, 1.0] {
+                    // build_scroll_quads / page_display_h: per-page content width.
+                    let cw = sw.min(src_w) * zoom;
+                    // page_target_h (scroll arm) + the no-upscale clamp; target_dims
+                    // then caps the decode at the source height.
+                    let th = (sw * zoom / aspect).min(src_h * zoom).min(src_h).round().max(1.0);
+                    let tw = (th * aspect).round().max(1.0);
+                    let drawn_h = cw * (th / tw); // page_display_h uses the decoded aspect
+                    assert!(
+                        (drawn_h - th).abs() <= 2.0,
+                        "scroll {src_w}x{src_h} z {zoom} sw {sw}: drawn {drawn_h} vs texture {th}"
+                    );
+                    assert!(
+                        cw <= src_w * zoom + 1.0,
+                        "scroll {src_w}x{src_h} z {zoom} sw {sw}: content width {cw} exceeds native"
+                    );
+                }
+                // At zoom 1 a page narrower than the strip is shown at its native
+                // width — that is the whole point of the option.
+                if src_w < 1600.0 {
+                    assert_eq!(sw.min(src_w) * 1.0, src_w, "narrow page draws at 100%");
+                }
+            }
+        }
+    }
+
+    // The readout side: `anchor_native_scale` with a real cap reports at most 100%
+    // at zoom 1 (so the info overlay, the zoom ladder's fit stops and
+    // `clamp_zoom_native` all agree with what is drawn), while zoom still scales it
+    // and a page bigger than the window is untouched by the cap.
+    #[test]
+    pub fn no_upscale_anchor_native_scale_caps_at_unity() {
+        use super::anchor_native_scale;
+        use crate::page::FitMode;
+        let screen = (3840.0_f32, 2160.0_f32);
+        // A 2048-tall page that fit-to-window would stretch to 2160 (~105%) — see
+        // `anchor_native_scale_fit_to_window_reports_upscale`, the same case uncapped.
+        let cap = 2048.0 / 2048.0; // upscale_cap(src_h, tex_h)
+        let s = anchor_native_scale(FitMode::Window, screen, (1448.0, 2048.0), 2048.0, 2048.0, cap, 1.0);
+        assert!((s - 1.0).abs() < 1e-4, "capped fit must report 100%, got {s}");
+        // Zoom multiplies after the cap, so manual magnification still works.
+        let z = anchor_native_scale(FitMode::Window, screen, (1448.0, 2048.0), 2048.0, 2048.0, cap, 2.5);
+        assert!((z - 2.5).abs() < 1e-4, "zoom past the cap must magnify, got {z}");
+        // A page *larger* than the window fits down as always: the cap (1.0) is
+        // above the fit scale (2160/4500 = 0.48), so the min leaves it alone.
+        let big = anchor_native_scale(FitMode::Window, screen, (3000.0, 4500.0), 4500.0, 4500.0, 1.0, 1.0);
+        assert!((big - 2160.0 / 4500.0).abs() < 1e-4, "large page still fits down, got {big}");
     }
 
     // Spine-shadow sign convention: the screen-left page shades its right edge

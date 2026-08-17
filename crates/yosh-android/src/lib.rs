@@ -101,6 +101,7 @@ fn android_main(app: AndroidApp) {
             PerfPref::Auto,
             false,
             DEFAULT_SPINE_STRENGTH,
+            false,
         ));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
@@ -955,6 +956,8 @@ impl ApplicationHandler for Shell {
             true, // two_tier: LQ while seeking → HQ on settle
         );
         reader.transition_enabled = self.init_view.3; // page-turn animation (persisted; default on)
+        // No-upscale fit (persisted; default off = stretch small pages, as before).
+        reader.fit_no_upscale = self.init_view.10;
         // Spine shadow: the shell owns on/off × strength, the reader takes one number.
         reader.spine_strength = if self.init_view.8 { self.init_view.9 } else { 0.0 };
         // Landing decodes schedule their own frame from the worker thread; every
@@ -2142,6 +2145,7 @@ impl Shell {
                 app.perf,
                 app.spine_shadow_on,
                 app.spine_shadow_strength,
+                app.reader.fit_no_upscale,
             );
         }
         if std::mem::take(&mut self.dirty_libroot)
@@ -2269,7 +2273,8 @@ fn attach_source(
 
 /// The persisted viewing options, in `view.txt`'s positional order: direction,
 /// layout mode, fit, page-turn animation, scroll mode, resume-on-startup, chrome
-/// theme, performance profile, spine shadow on/off, spine-shadow strength.
+/// theme, performance profile, spine shadow on/off, spine-shadow strength,
+/// no-upscale fit.
 type InitView = (
     Direction,
     LayoutMode,
@@ -2281,6 +2286,7 @@ type InitView = (
     PerfPref,
     bool,
     f32,
+    bool,
 );
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
@@ -2298,6 +2304,7 @@ fn load_view(path: &Path) -> InitView {
         PerfPref::Auto,
     );
     let (mut spine, mut spine_strength) = (false, DEFAULT_SPINE_STRENGTH);
+    let mut no_upscale = false;
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -2333,12 +2340,14 @@ fn load_view(path: &Path) -> InitView {
             .and_then(|v| v.parse::<i32>().ok())
             .map(|p| p.clamp(0, 100) as f32 / 100.0)
             .unwrap_or(DEFAULT_SPINE_STRENGTH);
+        // 11th slot: no-upscale fit; absent (older files) ⇒ off (stretch to fit).
+        no_upscale = t.get(10) == Some(&"noupscale");
     }
-    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength)
+    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale)
 }
 
 /// Persist viewing options as
-/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength".
+/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale".
 #[allow(clippy::too_many_arguments)]
 fn save_view(
     path: &Path,
@@ -2352,6 +2361,7 @@ fn save_view(
     perf: PerfPref,
     spine: bool,
     spine_strength: f32,
+    no_upscale: bool,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -2368,7 +2378,8 @@ fn save_view(
     let p = perf.label();
     let sp = if spine { "spine" } else { "nospine" };
     let ss = (spine_strength.clamp(0.0, 1.0) * 100.0).round() as i32;
-    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss}"));
+    let nu = if no_upscale { "noupscale" } else { "stretch" };
+    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -3196,6 +3207,10 @@ fn options_popup(
     layout: LayoutMode,
     effective_spread: bool,
     fit: FitMode,
+    // Whether fits may stretch a page past 100% native — the *inverse* of the
+    // reader's `fit_no_upscale`, because the row reads "Stretch small pages"
+    // (stretching is what yosh has always done). Mirrors the desktop panel.
+    stretch_on: bool,
     transition_on: bool,
     spine_on: bool,
     spine_strength: f32,
@@ -3207,6 +3222,8 @@ fn options_popup(
     set_dir: &mut Option<Direction>,
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
+    // Chosen `fit_no_upscale` (the inverse of the row's On/Off).
+    set_no_upscale: &mut Option<bool>,
     set_transition: &mut Option<bool>,
     set_spine_on: &mut Option<bool>,
     set_spine_strength: &mut Option<f32>,
@@ -3305,6 +3322,30 @@ fn options_popup(
                         }
                     }
                 });
+
+                // Sits directly under the fit choices because it *modifies* them:
+                // it bounds every fit at 100% native rather than being a fit of its
+                // own (issue #13). Same row and wording as the desktop panel.
+                ui.label(egui::RichText::new("Stretch small pages").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(stretch_on, egui::RichText::new("On").size(16.0))
+                        .clicked()
+                    {
+                        *set_no_upscale = Some(false);
+                    }
+                    if ui
+                        .selectable_label(!stretch_on, egui::RichText::new("Off").size(16.0))
+                        .clicked()
+                    {
+                        *set_no_upscale = Some(true);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Off: fit never scales past 100% native (zoom still can).")
+                        .size(12.0)
+                        .color(egui::Color32::from_white_alpha(150)),
+                );
 
                 // Manual page rotation (single-page draws only — the engine ignores
                 // it for spreads). Per-comic and transient: not persisted, reset to
@@ -3974,6 +4015,8 @@ impl App {
         let cur_layout = self.reader.layout;
         let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
+        // The popup row is phrased as "Stretch small pages", so invert the flag.
+        let cur_stretch_on = !self.reader.fit_no_upscale;
         let cur_transition = self.reader.transition_enabled;
         let cur_spine_on = self.spine_shadow_on;
         let cur_spine_strength = self.spine_shadow_strength;
@@ -4111,6 +4154,7 @@ impl App {
         let mut set_dir: Option<Direction> = None;
         let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
+        let mut set_no_upscale: Option<bool> = None;
         let mut set_transition: Option<bool> = None;
         let mut set_spine_on: Option<bool> = None;
         let mut set_spine_strength: Option<f32> = None;
@@ -4383,6 +4427,7 @@ impl App {
                         cur_layout_mode,
                         cur_layout == Layout::Spread,
                         cur_fit,
+                        cur_stretch_on,
                         cur_transition,
                         cur_spine_on,
                         cur_spine_strength,
@@ -4394,6 +4439,7 @@ impl App {
                         &mut set_dir,
                         &mut set_layout,
                         &mut set_fit,
+                        &mut set_no_upscale,
                         &mut set_transition,
                         &mut set_spine_on,
                         &mut set_spine_strength,
@@ -4526,6 +4572,22 @@ impl App {
             self.reader.fit = f;
             self.reader.prefetch();
             self.persist_view();
+        }
+        if let Some(v) = set_no_upscale {
+            // Whether fits may upscale changes every small page's displayed size, so
+            // the derived view state is re-derived with it (zoom clamp against the
+            // native scale, pan clamp against the drawn box, scroll anchor against
+            // the strip heights) before re-prefetching at the new decode targets —
+            // `JobsKey` carries the flag, so the job list rebuilds exactly once.
+            self.reader.fit_no_upscale = v;
+            self.reader.clamp_zoom_native();
+            self.reader.clamp_pan();
+            if self.reader.scroll_mode {
+                self.reader.normalize();
+            }
+            self.reader.prefetch();
+            self.persist_view();
+            self.window.request_redraw();
         }
         if let Some(v) = set_transition {
             self.reader.transition_enabled = v;
