@@ -301,10 +301,12 @@ pub fn quad_from_px(
 }
 
 /// Spine-shadow width as a fraction of the page's on-screen width, clamped in
-/// device px so it stays subtle at any zoom.
-const SPINE_FRAC: f32 = 0.025;
+/// device px so it stays proportionate at any zoom. The fraction was measured
+/// from the CDisplayEx reference in issue #11: ~132 px of gradient on a
+/// ~1630 px page ≈ 8% of the page width.
+const SPINE_FRAC: f32 = 0.08;
 const SPINE_MIN_PX: f32 = 6.0;
-const SPINE_MAX_PX: f32 = 40.0;
+const SPINE_MAX_PX: f32 = 256.0;
 
 /// Signed spine-shadow widths in UV for the (screen-left, screen-right) pages of
 /// a spread, from their on-screen pixel widths. Left page shades its right
@@ -2052,10 +2054,10 @@ mod tests {
     // vanishes on a small page nor balloons when zoomed. Always ≤ the page (UV ≤ 1).
     #[test]
     fn spine_uv_px_clamps() {
-        let (l, _) = super::spine_uv(2000.0, 2000.0);
-        assert!((l - super::SPINE_MAX_PX / 2000.0).abs() < 1e-6, "wide page hits the px cap");
-        let (l, _) = super::spine_uv(100.0, 100.0);
-        assert!((l - super::SPINE_MIN_PX / 100.0).abs() < 1e-6, "narrow page hits the px floor");
+        let (l, _) = super::spine_uv(4000.0, 4000.0);
+        assert!((l - super::SPINE_MAX_PX / 4000.0).abs() < 1e-6, "wide page hits the px cap");
+        let (l, _) = super::spine_uv(60.0, 60.0);
+        assert!((l - super::SPINE_MIN_PX / 60.0).abs() < 1e-6, "narrow page hits the px floor");
         let (l, _) = super::spine_uv(800.0, 800.0);
         assert!((l - super::SPINE_FRAC).abs() < 1e-6, "mid page uses the fraction");
         for w in [2.0_f32, 50.0, 240.0, 800.0, 4000.0] {

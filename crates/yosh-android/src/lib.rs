@@ -179,7 +179,7 @@ const RECENTS_CAP: usize = 32;
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Spine-shadow peak darkening when the user hasn't picked one (matches desktop).
-const DEFAULT_SPINE_STRENGTH: f32 = 0.35;
+const DEFAULT_SPINE_STRENGTH: f32 = 0.55;
 
 /// Result of a background open: the comic's identity key (path or content:// URI)
 /// and its page source, or a message to log. The key travels *with* the result
