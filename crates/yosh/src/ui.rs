@@ -22,6 +22,10 @@ pub struct UiState {
     pub layout_label: &'static str,
     /// Whether the page-turn transition is on (for the "Turn:" button label).
     pub transition_on: bool,
+    /// Spine-shadow (two-page gutter shading) state, set each frame for the
+    /// Settings panel's toggle + strength slider.
+    pub spine_shadow_on: bool,
+    pub spine_shadow_strength: f32,
     /// Whether resume-last-book-on-startup is on. Set each frame; drives the
     /// Settings panel's Resume toggle.
     pub resume_on_startup: bool,
@@ -50,6 +54,12 @@ pub struct UiState {
     pub req_cycle_fit: bool,
     pub req_toggle_layout: bool,
     pub req_toggle_transition: bool,
+    /// Spine-shadow toggle click / new strength from the panel's slider. Strength
+    /// applies live every change; the save is requested separately (drag end) so a
+    /// drag doesn't rewrite the config file once per frame.
+    pub req_spine_toggle: bool,
+    pub req_spine_strength: Option<f32>,
+    pub req_spine_save: bool,
     pub req_toggle_resume: bool,
     pub req_toggle_library: bool,
     /// Whether the Settings panel window is open (toggled by the top-bar gear).
@@ -505,7 +515,7 @@ pub fn chrome(
             if ui
                 .button("⚙ Settings")
                 .on_hover_text(
-                    "Reading mode, direction, layout, fit, rotation, page-turn, resume, theme, performance",
+                    "Reading mode, direction, layout, fit, rotation, page-turn, spine shadow, resume, theme, performance",
                 )
                 .clicked()
             {
@@ -622,6 +632,7 @@ pub fn chrome(
                 ui.label("I   show image info overlay");
                 ui.label("B   toggle bottom seekbar");
                 ui.label("T   page-turn transition (slide + fade on flip)");
+                ui.label("spine shadow on two-page spreads — ⚙ Settings (no key)");
                 ui.label("G   show/hide the animation panel (animated GIF / WebP)");
                 ui.label("F11   fullscreen      Esc   quit");
                 ui.separator();
@@ -902,6 +913,41 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     st.req_toggle_transition = true;
                 }
             });
+
+            ui.label(egui::RichText::new("Spine shadow (two-page)").strong());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(st.spine_shadow_on, "On").clicked() && !st.spine_shadow_on {
+                    st.req_spine_toggle = true;
+                }
+                if ui.selectable_label(!st.spine_shadow_on, "Off").clicked() && st.spine_shadow_on {
+                    st.req_spine_toggle = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new("Book-gutter shading on un-joined spreads")
+                    .weak()
+                    .small(),
+            );
+            // The slider edits a local copy; only a real change raises the request
+            // (the app owns the setting and drains it after the frame). The value
+            // applies live per change, but the config write waits for the drag to
+            // end — a non-drag change (keyboard) saves immediately.
+            let mut strength = st.spine_shadow_strength;
+            let r = ui.add_enabled(
+                st.spine_shadow_on,
+                egui::Slider::new(&mut strength, 0.0..=1.0)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                    .text("strength"),
+            );
+            if r.changed() {
+                st.req_spine_strength = Some(strength);
+                if !r.dragged() {
+                    st.req_spine_save = true;
+                }
+            }
+            if r.drag_stopped() {
+                st.req_spine_save = true;
+            }
 
             ui.label(egui::RichText::new("Resume on startup").strong());
             ui.horizontal(|ui| {

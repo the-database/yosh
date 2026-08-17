@@ -99,6 +99,8 @@ fn android_main(app: AndroidApp) {
             true,
             ThemePref::System,
             PerfPref::Auto,
+            false,
+            DEFAULT_SPINE_STRENGTH,
         ));
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
@@ -175,6 +177,9 @@ const RECENTS_CAP: usize = 32;
 /// How long a dirty persisted-state file waits before [`Shell::flush_saves`] writes
 /// it, so a burst of page turns costs one write instead of one per flip.
 const SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Spine-shadow peak darkening when the user hasn't picked one (matches desktop).
+const DEFAULT_SPINE_STRENGTH: f32 = 0.35;
 
 /// Result of a background open: the comic's identity key (path or content:// URI)
 /// and its page source, or a message to log. The key travels *with* the result
@@ -469,6 +474,10 @@ struct App {
     layout_mode: LayoutMode,
     /// Reopen the last book on launch (persisted in view.txt; toggled in options).
     resume_on_startup: bool,
+    /// Book-gutter shading on un-joined two-page spreads, and its peak darkening
+    /// (persisted in view.txt; toggled in options). The reader takes the product.
+    spine_shadow_on: bool,
+    spine_shadow_strength: f32,
     /// Chrome theme preference (persisted in view.txt; toggled in options).
     theme: ThemePref,
     /// Performance profile (persisted in view.txt; toggled in options). Applied
@@ -946,6 +955,8 @@ impl ApplicationHandler for Shell {
             true, // two_tier: LQ while seeking → HQ on settle
         );
         reader.transition_enabled = self.init_view.3; // page-turn animation (persisted; default on)
+        // Spine shadow: the shell owns on/off × strength, the reader takes one number.
+        reader.spine_strength = if self.init_view.8 { self.init_view.9 } else { 0.0 };
         // Landing decodes schedule their own frame from the worker thread; every
         // pool this reader builds inherits the callback.
         reader.set_waker(self.frame_waker.clone());
@@ -1004,6 +1015,8 @@ impl ApplicationHandler for Shell {
             libroot_dirty: false,
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
+            spine_shadow_on: self.init_view.8,
+            spine_shadow_strength: self.init_view.9,
             theme: self.init_view.6,
             perf,
             auto_tier,
@@ -2127,6 +2140,8 @@ impl Shell {
                 app.resume_on_startup,
                 app.theme,
                 app.perf,
+                app.spine_shadow_on,
+                app.spine_shadow_strength,
             );
         }
         if std::mem::take(&mut self.dirty_libroot)
@@ -2254,8 +2269,19 @@ fn attach_source(
 
 /// The persisted viewing options, in `view.txt`'s positional order: direction,
 /// layout mode, fit, page-turn animation, scroll mode, resume-on-startup, chrome
-/// theme, performance profile.
-type InitView = (Direction, LayoutMode, FitMode, bool, bool, bool, ThemePref, PerfPref);
+/// theme, performance profile, spine shadow on/off, spine-shadow strength.
+type InitView = (
+    Direction,
+    LayoutMode,
+    FitMode,
+    bool,
+    bool,
+    bool,
+    ThemePref,
+    PerfPref,
+    bool,
+    f32,
+);
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
 /// Parse persisted viewing options ("dir,layout,fit,anim"); default RTL / single /
@@ -2271,6 +2297,7 @@ fn load_view(path: &Path) -> InitView {
         ThemePref::System,
         PerfPref::Auto,
     );
+    let (mut spine, mut spine_strength) = (false, DEFAULT_SPINE_STRENGTH);
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -2298,11 +2325,20 @@ fn load_view(path: &Path) -> InitView {
         theme = ThemePref::parse(t.get(6));
         // 8th slot: performance profile; absent (older files) ⇒ auto (the probed tier).
         perf = PerfPref::parse(t.get(7));
+        // 9th slot: spine shadow; absent (older files) ⇒ off.
+        spine = t.get(8) == Some(&"spine");
+        // 10th slot: spine-shadow strength as a whole percent; absent ⇒ the default.
+        spine_strength = t
+            .get(9)
+            .and_then(|v| v.parse::<i32>().ok())
+            .map(|p| p.clamp(0, 100) as f32 / 100.0)
+            .unwrap_or(DEFAULT_SPINE_STRENGTH);
     }
-    (dir, lay, fit, anim, scroll, resume, theme, perf)
+    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength)
 }
 
-/// Persist viewing options as "dir,layout,fit,anim,scroll,resume,theme,perf".
+/// Persist viewing options as
+/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength".
 #[allow(clippy::too_many_arguments)]
 fn save_view(
     path: &Path,
@@ -2314,6 +2350,8 @@ fn save_view(
     resume: bool,
     theme: ThemePref,
     perf: PerfPref,
+    spine: bool,
+    spine_strength: f32,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -2328,7 +2366,9 @@ fn save_view(
     let r = if resume { "resume" } else { "noresume" };
     let t = theme.label();
     let p = perf.label();
-    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p}"));
+    let sp = if spine { "spine" } else { "nospine" };
+    let ss = (spine_strength.clamp(0.0, 1.0) * 100.0).round() as i32;
+    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -3157,6 +3197,8 @@ fn options_popup(
     effective_spread: bool,
     fit: FitMode,
     transition_on: bool,
+    spine_on: bool,
+    spine_strength: f32,
     resume_on: bool,
     scroll_on: bool,
     theme: ThemePref,
@@ -3166,6 +3208,8 @@ fn options_popup(
     set_layout: &mut Option<LayoutMode>,
     set_fit: &mut Option<FitMode>,
     set_transition: &mut Option<bool>,
+    set_spine_on: &mut Option<bool>,
+    set_spine_strength: &mut Option<f32>,
     set_resume: &mut Option<bool>,
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
@@ -3288,6 +3332,38 @@ fn options_popup(
                         *set_transition = Some(false);
                     }
                 });
+
+                // Book-gutter shading only means anything on an un-joined pair, so
+                // show it with the other spread-only controls' gate.
+                if effective_spread {
+                    ui.label(egui::RichText::new("Spine shadow").strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(spine_on, egui::RichText::new("On").size(16.0))
+                            .clicked()
+                        {
+                            *set_spine_on = Some(true);
+                        }
+                        if ui
+                            .selectable_label(!spine_on, egui::RichText::new("Off").size(16.0))
+                            .clicked()
+                        {
+                            *set_spine_on = Some(false);
+                        }
+                    });
+                    let mut strength = spine_strength;
+                    if ui
+                        .add_enabled(
+                            spine_on,
+                            egui::Slider::new(&mut strength, 0.0..=1.0)
+                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                .text("strength"),
+                        )
+                        .changed()
+                    {
+                        *set_spine_strength = Some(strength);
+                    }
+                }
 
                 ui.label(egui::RichText::new("Resume on startup").strong());
                 ui.horizontal(|ui| {
@@ -3767,6 +3843,8 @@ impl App {
                         q.rot,
                         q.alpha,
                         q.blur,
+                        q.spine,
+                        q.spine_strength,
                     )
                 })
             })
@@ -3897,6 +3975,8 @@ impl App {
         let cur_layout_mode = self.layout_mode;
         let cur_fit = self.reader.fit;
         let cur_transition = self.reader.transition_enabled;
+        let cur_spine_on = self.spine_shadow_on;
+        let cur_spine_strength = self.spine_shadow_strength;
         let cur_resume = self.resume_on_startup;
         let cur_scroll = self.reader.scroll_mode;
         let cur_theme = self.theme;
@@ -4032,6 +4112,8 @@ impl App {
         let mut set_layout: Option<LayoutMode> = None;
         let mut set_fit: Option<FitMode> = None;
         let mut set_transition: Option<bool> = None;
+        let mut set_spine_on: Option<bool> = None;
+        let mut set_spine_strength: Option<f32> = None;
         let mut set_resume: Option<bool> = None;
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
@@ -4302,6 +4384,8 @@ impl App {
                         cur_layout == Layout::Spread,
                         cur_fit,
                         cur_transition,
+                        cur_spine_on,
+                        cur_spine_strength,
                         cur_resume,
                         cur_scroll,
                         cur_theme,
@@ -4311,6 +4395,8 @@ impl App {
                         &mut set_layout,
                         &mut set_fit,
                         &mut set_transition,
+                        &mut set_spine_on,
+                        &mut set_spine_strength,
                         &mut set_resume,
                         &mut set_scroll,
                         &mut set_theme,
@@ -4444,6 +4530,20 @@ impl App {
         if let Some(v) = set_transition {
             self.reader.transition_enabled = v;
             self.persist_view();
+        }
+        if let Some(v) = set_spine_on {
+            self.spine_shadow_on = v;
+            self.reader.spine_strength = if v { self.spine_shadow_strength } else { 0.0 };
+            self.persist_view();
+            self.window.request_redraw();
+        }
+        if let Some(v) = set_spine_strength {
+            self.spine_shadow_strength = v.clamp(0.0, 1.0);
+            if self.spine_shadow_on {
+                self.reader.spine_strength = self.spine_shadow_strength;
+            }
+            self.persist_view();
+            self.window.request_redraw();
         }
         if let Some(v) = set_resume {
             self.resume_on_startup = v;
