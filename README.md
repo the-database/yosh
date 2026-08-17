@@ -58,7 +58,8 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `Esc` | quit |
 
 Reading position (per volume), reading direction, fit, layout, spread offset, scroll,
-seekbar visibility, and the page-turn transition toggle are persisted.
+seekbar visibility, the page-turn transition toggle, and the spine shadow (book-gutter
+shading on un-joined two-page spreads, in ⚙ Settings) are persisted.
 
 ## AVIF (optional)
 AVIF decode uses the `image` crate's native (dav1d) backend, gated behind an off-by-default feature so

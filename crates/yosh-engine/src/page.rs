@@ -59,6 +59,8 @@ struct Uniforms {
     rotation: u32,
     alpha: f32,
     blur: f32,
+    spine: f32,          // signed spine-shadow width in UV: >0 = right edge, <0 = left, 0 = off
+    spine_strength: f32, // peak darkening at the seam, 0..1 (0 = off)
 };
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var tex: texture_2d<f32>;
@@ -119,19 +121,34 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         }
         s = sum / f32(BLUR_TAPS);
     }
+    // Spine shadow: dark gradient along the inner (spine) edge of each page of an
+    // un-joined two-page spread, mimicking a book gutter. Both uniforms are 0 for
+    // singles, wide joined spreads, scroll mode, and when disabled — then shade is
+    // exactly 1.0 and output is bit-identical. Uniform control flow; ~5 ALU when on.
+    var shade = 1.0;
+    if (u.spine != 0.0) {
+        let d = select(in.uv.x, 1.0 - in.uv.x, u.spine > 0.0); // distance from spine edge
+        let t = clamp(d / abs(u.spine), 0.0, 1.0);             // 0 at seam → 1 at full width
+        let f = 1.0 - t;
+        shade = 1.0 - u.spine_strength * f * f;                // quadratic ease-out
+    }
     if (u.gray != 0u) {
         // Premultiply the fade into the opaque gray page so it composites over the
         // page underneath (u.alpha == 1.0 ⇒ the original opaque output).
-        let g = s.r;
+        let g = s.r * shade;
         return vec4<f32>(g * u.alpha, g * u.alpha, g * u.alpha, u.alpha);
     }
     // Color pages are stored premultiplied (see decode.rs); scaling by alpha keeps
     // them premultiplied for the pipeline's premultiplied-alpha blend. At alpha==1
     // this is the original passthrough — transparent areas show the background.
-    return s * u.alpha;
+    // Shading rgb but not alpha keeps the premultiplied invariant (shade <= 1).
+    return vec4<f32>(s.rgb * shade, s.a) * u.alpha;
 }
 "#;
 
+// 40 bytes; fine on the PRIMARY backends (Vulkan/Metal/DX12), but GL/ANGLE would
+// reject a uniform binding that isn't a multiple of 16 — pad to 48 if a GL backend
+// is ever enabled.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
@@ -141,6 +158,8 @@ struct Uniforms {
     rotation: u32, // 0/1/2/3 = 0/90/180/270° CW (UV turn in the vertex shader)
     alpha: f32,    // opacity multiplier (1.0 normally; < 1.0 for a fading flip overlay)
     blur: f32,     // horizontal motion-blur smear half-width in UV (0.0 normally)
+    spine: f32,    // signed spine-shadow width in UV (>0 = right edge, <0 = left, 0.0 = off)
+    spine_strength: f32, // spine-shadow peak darkening, 0..1 (0.0 = off)
 }
 
 /// One frame of an animated page (GIF/WebP), beyond frame 0. Frame 0 lives in the
@@ -477,6 +496,8 @@ impl PagePipeline {
         rotation: u32,
         alpha: f32,
         blur: f32,
+        spine: f32,
+        spine_strength: f32,
     ) -> wgpu::BindGroup {
         let u = Uniforms {
             scale,
@@ -485,6 +506,8 @@ impl PagePipeline {
             rotation,
             alpha,
             blur,
+            spine,
+            spine_strength,
         };
         queue.write_buffer(&self.ubos[slot], 0, bytemuck::bytes_of(&u));
         device.create_bind_group(&wgpu::BindGroupDescriptor {

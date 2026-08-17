@@ -264,6 +264,13 @@ pub struct Quad {
     /// doesn't clash with the sharp incoming page beneath. The slide carries the
     /// direction; the smear is along the (horizontal) slide axis.
     pub blur: f32,
+    /// Signed spine-shadow width in UV (0.0 = none). Set only on the two pages of
+    /// an un-joined spread pair: >0 shades the page's right edge (screen-left page),
+    /// <0 its left edge (screen-right page). Singles, wide joined spreads, and
+    /// scroll always carry 0.0.
+    pub spine: f32,
+    /// Spine-shadow peak darkening, 0..1 (0.0 = off).
+    pub spine_strength: f32,
 }
 
 /// Build a [`Quad`] from pixel-space placement — top-left `(x_px, y_px)` and size
@@ -288,7 +295,28 @@ pub fn quad_from_px(
         rot,
         alpha: 1.0,
         blur: 0.0,
+        spine: 0.0,
+        spine_strength: 0.0,
     }
+}
+
+/// Spine-shadow width as a fraction of the page's on-screen width, clamped in
+/// device px so it stays subtle at any zoom.
+const SPINE_FRAC: f32 = 0.025;
+const SPINE_MIN_PX: f32 = 6.0;
+const SPINE_MAX_PX: f32 = 40.0;
+
+/// Signed spine-shadow widths in UV for the (screen-left, screen-right) pages of
+/// a spread, from their on-screen pixel widths. Left page shades its right
+/// edge (+), right its left edge (−). 0.0 for degenerate widths.
+pub fn spine_uv(dwl: f32, dwr: f32) -> (f32, f32) {
+    let w = |d: f32| {
+        if d <= 1.0 {
+            return 0.0;
+        }
+        (d * SPINE_FRAC).clamp(SPINE_MIN_PX, SPINE_MAX_PX).min(d) / d
+    };
+    (w(dwl), -w(dwr))
 }
 
 /// Duration of the page-flip transition animation (outgoing page blur + fade).
@@ -577,6 +605,9 @@ pub struct Reader {
     /// Animate page flips with an outgoing-page blur+fade. Set by the shell from
     /// settings; off by default (each shell opts in after construction).
     pub transition_enabled: bool,
+    /// Effective spine-shadow strength, 0..1 (`0.0` = disabled). Set by the shell,
+    /// which owns the enabled × strength settings; the engine sees one number.
+    pub spine_strength: f32,
     /// The live flip animation, if one is in flight. Cleared once it expires.
     transition: Option<PageTransition>,
     /// Live interactive page drag (page-flip mode only), if one is in progress.
@@ -685,6 +716,7 @@ impl Reader {
             back: budget.back,
             two_tier,
             transition_enabled: false,
+            spine_strength: 0.0,
             transition: None,
             drag: None,
             anim_drawn: std::cell::Cell::new(false),
@@ -1249,10 +1281,20 @@ impl Reader {
                 let dhr = dh.round();
                 let xl = x0.round();
                 let dwl_r = dwl.round();
-                vec![
+                let mut v = vec![
                     quad_from_px(slot_base, l_idx, xl, yt, dwl_r, dhr, sw, sh, 0),
                     quad_from_px(slot_base + 1, r_idx, xl + dwl_r, yt, dwr.round(), dhr, sw, sh, 0),
-                ]
+                ];
+                // Only an un-joined pair gets the gutter shading; the wide-spread and
+                // single arms below never touch these fields.
+                if self.spine_strength > 0.0 {
+                    let (sl, sr) = spine_uv(dwl_r, dwr.round());
+                    v[0].spine = sl;
+                    v[1].spine = sr;
+                    v[0].spine_strength = self.spine_strength;
+                    v[1].spine_strength = self.spine_strength;
+                }
+                v
             }
             (Some(ta), None) => {
                 let mut q = self.single_quad(a, ta, sw, sh);
@@ -1990,6 +2032,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Spine-shadow sign convention: the screen-left page shades its right edge
+    // (positive), the screen-right page its left edge (negative). The shader's
+    // `select` reads the sign, so a flip here would put both shadows on the outer
+    // edges. Equal widths ⇒ a symmetric seam; degenerate widths ⇒ off.
+    #[test]
+    fn spine_uv_signs_and_sides() {
+        let (l, r) = super::spine_uv(800.0, 800.0);
+        assert!(l > 0.0, "screen-left page shades its right edge (+)");
+        assert!(r < 0.0, "screen-right page shades its left edge (−)");
+        assert!((l + r).abs() < 1e-6, "equal widths ⇒ symmetric seam");
+        let (l, r) = super::spine_uv(0.0, 1.0);
+        assert!(l == 0.0 && r == 0.0, "degenerate widths ⇒ no shadow");
+    }
+
+    // The width is a fraction of the page, clamped in device px so it neither
+    // vanishes on a small page nor balloons when zoomed. Always ≤ the page (UV ≤ 1).
+    #[test]
+    fn spine_uv_px_clamps() {
+        let (l, _) = super::spine_uv(2000.0, 2000.0);
+        assert!((l - super::SPINE_MAX_PX / 2000.0).abs() < 1e-6, "wide page hits the px cap");
+        let (l, _) = super::spine_uv(100.0, 100.0);
+        assert!((l - super::SPINE_MIN_PX / 100.0).abs() < 1e-6, "narrow page hits the px floor");
+        let (l, _) = super::spine_uv(800.0, 800.0);
+        assert!((l - super::SPINE_FRAC).abs() < 1e-6, "mid page uses the fraction");
+        for w in [2.0_f32, 50.0, 240.0, 800.0, 4000.0] {
+            let (l, r) = super::spine_uv(w, w);
+            assert!(l <= 1.0 && -r <= 1.0, "w {w}: uv width {l} exceeds the page");
+        }
+    }
+
+    // Every quad is built by `quad_from_px`, which leaves the shadow off — so the
+    // single, wide-joined-spread, scroll and hold-last paths are shadow-free by
+    // construction (only `place_view`'s pair arm ever stamps the fields).
+    #[test]
+    fn quad_from_px_defaults_no_spine() {
+        let q = super::quad_from_px(0, 7, 100.0, 20.0, 800.0, 1200.0, 1920.0, 1080.0, 0);
+        assert_eq!(q.spine, 0.0);
+        assert_eq!(q.spine_strength, 0.0);
     }
 
     // The fit-multiplier clamp maps to native bounds: far zoom-out hits the 5%

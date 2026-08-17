@@ -462,6 +462,16 @@ fn fit_to_u8(f: FitMode) -> u8 {
     }
 }
 
+/// Spine-shadow strength the engine sees: the shell owns the enabled × strength
+/// pair, the `Reader` takes one number (0.0 = off).
+fn effective_spine(s: &config::Settings) -> f32 {
+    if s.spine_shadow_enabled {
+        s.spine_shadow_strength
+    } else {
+        0.0
+    }
+}
+
 /// Install the egui chrome fonts: the Phosphor icon set (for the library section
 /// carets) is added unconditionally, and a best-effort system CJK font is appended
 /// as a fallback so Japanese/Chinese/Korean text (paths, filenames, library
@@ -807,6 +817,7 @@ impl ApplicationHandler for App {
             false, // two_tier: desktop keeps the always-HQ pipeline
         );
         reader.transition_enabled = settings.page_transition_enabled;
+        reader.spine_strength = effective_spine(&settings);
         // Decode→UI wakeup: a worker that finishes a page schedules the frame that
         // draws it (winit's `request_redraw` is thread-safe), so the loop doesn't
         // have to keep drawing on the chance that one landed. Set once here and
@@ -2591,6 +2602,8 @@ impl State {
             self.reader.layout.label()
         };
         self.ui.transition_on = self.settings.page_transition_enabled;
+        self.ui.spine_shadow_on = self.settings.spine_shadow_enabled;
+        self.ui.spine_shadow_strength = self.settings.spine_shadow_strength;
         self.ui.resume_on_startup = self.settings.resume_on_startup;
         // Current view state for the Settings panel's active-value highlighting.
         self.ui.scroll_on = self.reader.scroll_mode;
@@ -2811,6 +2824,8 @@ impl State {
                         q.rot,
                         q.alpha,
                         q.blur,
+                        q.spine,
+                        q.spine_strength,
                     )
                 })
             })
@@ -2937,6 +2952,28 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_transition) {
             self.apply_action(Action::TogglePageTransition);
+            ui_acted = true;
+        }
+        // Panel-only (no key): the reader takes the combined enabled × strength.
+        if std::mem::take(&mut self.ui.req_spine_toggle) {
+            self.settings.spine_shadow_enabled = !self.settings.spine_shadow_enabled;
+            self.reader.spine_strength = effective_spine(&self.settings);
+            config::save(&self.settings);
+            self.toast(if self.settings.spine_shadow_enabled {
+                "Spine shadow: on"
+            } else {
+                "Spine shadow: off"
+            });
+            ui_acted = true;
+        }
+        if let Some(v) = self.ui.req_spine_strength.take() {
+            self.settings.spine_shadow_strength = v.clamp(0.0, 1.0);
+            self.reader.spine_strength = effective_spine(&self.settings);
+            ui_acted = true;
+        }
+        // Deferred config write: once per slider release, not once per drag frame.
+        if std::mem::take(&mut self.ui.req_spine_save) {
+            config::save(&self.settings);
             ui_acted = true;
         }
         if std::mem::take(&mut self.ui.req_toggle_resume) {
