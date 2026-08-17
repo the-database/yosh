@@ -124,6 +124,12 @@ pub struct Settings {
     /// fast sweep across a large monitor is more fatiguing than on a phone (Android
     /// enables it unconditionally in its own shell).
     pub page_transition_enabled: bool,
+    /// Don't let a fit stretch a page above 100% of its native resolution (issue
+    /// #13) — the settings panel shows it inverted, as "Stretch small pages",
+    /// because stretching is what yosh has always done. `false` (stretch) keeps
+    /// that behavior bit for bit; `true` feeds [`yosh_engine::reader::Reader::fit_no_upscale`].
+    /// Toggled with key `Z`.
+    pub no_stretch: bool,
     /// Book-gutter shading along the inner edges of an un-joined two-page spread.
     /// Settings-panel only (no key); off by default.
     pub spine_shadow_enabled: bool,
@@ -155,6 +161,7 @@ impl Default for Settings {
             help_seen: false,
             seekbar_enabled: true,
             page_transition_enabled: false, // desktop default off; Android shell forces on
+            no_stretch: false,              // stretch-to-fit, as yosh has always done
             spine_shadow_enabled: false,
             spine_shadow_strength: 0.55,
             // Dark by default on desktop (a backlit monitor); intentionally unlike the
@@ -244,6 +251,7 @@ mod tests {
         assert_eq!(s.perf, PerfPref::Auto, "missing perf defaults to Auto");
         assert!(!s.spine_shadow_enabled, "missing spine shadow defaults to off");
         assert_eq!(s.spine_shadow_strength, 0.55);
+        assert!(!s.no_stretch, "missing no-stretch defaults to off (stretch to fit)");
         // The keys that *were* present survive, so this isn't a silent reset.
         assert!(!s.direction_rtl);
         assert_eq!(s.fit, 2);

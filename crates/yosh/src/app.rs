@@ -817,6 +817,7 @@ impl ApplicationHandler for App {
             false, // two_tier: desktop keeps the always-HQ pipeline
         );
         reader.transition_enabled = settings.page_transition_enabled;
+        reader.fit_no_upscale = settings.no_stretch;
         reader.spine_strength = effective_spine(&settings);
         // Decode→UI wakeup: a worker that finishes a page schedules the frame that
         // draws it (winit's `request_redraw` is thread-safe), so the loop doesn't
@@ -1079,6 +1080,7 @@ enum Action {
     ToggleInfo,
     ToggleSeekbar,
     TogglePageTransition,
+    ToggleStretch,
     ToggleAnimBar,
     PrevVolume,
     NextVolume,
@@ -1105,6 +1107,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyC => return Some(Action::ToggleScroll),
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
             KeyCode::KeyT => return Some(Action::TogglePageTransition),
+            KeyCode::KeyZ => return Some(Action::ToggleStretch),
             KeyCode::KeyG => return Some(Action::ToggleAnimBar),
             KeyCode::KeyE => return Some(Action::ShowInExplorer),
             KeyCode::KeyR => return Some(Action::Rotate),
@@ -1305,6 +1308,7 @@ impl State {
                     "Page transition: off"
                 });
             }
+            Action::ToggleStretch => self.toggle_stretch(),
             Action::ToggleAnimBar => self.playback.hidden = !self.playback.hidden,
             Action::ToggleFullscreen => {
                 let fs = match self.window.fullscreen() {
@@ -1347,6 +1351,35 @@ impl State {
     /// Raise a transient on-screen toast (boundary reached, zoom level).
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Flip "stretch small pages" (key `Z` and the Settings panel row) — the shell
+    /// side of [`yosh_engine::reader::Reader::fit_no_upscale`]. Shared by both entry
+    /// points so they can't drift.
+    ///
+    /// Whether a fit may upscale changes every small page's *displayed* size, so the
+    /// derived view state has to be re-derived with it: the zoom clamp is measured
+    /// against the native scale, the pan clamp against the drawn box, and the scroll
+    /// anchor against the strip's page heights. `prefetch` then re-queues the pages
+    /// whose decode target moved — `JobsKey` carries the flag, so the job list is
+    /// rebuilt exactly once rather than on the next unrelated change.
+    fn toggle_stretch(&mut self) {
+        self.settings.no_stretch = !self.settings.no_stretch;
+        self.reader.fit_no_upscale = self.settings.no_stretch;
+        self.reader.clamp_zoom_native();
+        self.reader.clamp_pan();
+        if self.reader.scroll_mode {
+            self.reader.normalize();
+        }
+        self.reader.prefetch();
+        config::save(&self.settings);
+        // Phrased as the user-facing setting (stretching is the default), so the
+        // toast matches the panel row rather than inverting it.
+        self.toast(if self.settings.no_stretch {
+            "Stretch small pages: off"
+        } else {
+            "Stretch small pages: on"
+        });
     }
 
     /// "Show in Explorer" (key `E`): open the containing folder of the current
@@ -2602,6 +2635,8 @@ impl State {
             self.reader.layout.label()
         };
         self.ui.transition_on = self.settings.page_transition_enabled;
+        // Shown inverted in the panel: the row is "Stretch small pages".
+        self.ui.stretch_on = !self.settings.no_stretch;
         self.ui.spine_shadow_on = self.settings.spine_shadow_enabled;
         self.ui.spine_shadow_strength = self.settings.spine_shadow_strength;
         self.ui.resume_on_startup = self.settings.resume_on_startup;
@@ -2952,6 +2987,10 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_transition) {
             self.apply_action(Action::TogglePageTransition);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_toggle_stretch) {
+            self.apply_action(Action::ToggleStretch);
             ui_acted = true;
         }
         // Panel-only (no key): the reader takes the combined enabled × strength.
