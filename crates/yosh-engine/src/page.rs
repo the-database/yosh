@@ -129,8 +129,11 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     if (u.spine != 0.0) {
         let d = select(in.uv.x, 1.0 - in.uv.x, u.spine > 0.0); // distance from spine edge
         let t = clamp(d / abs(u.spine), 0.0, 1.0);             // 0 at seam → 1 at full width
-        let f = 1.0 - t;
-        shade = 1.0 - u.spine_strength * f * f;                // quadratic ease-out
+        // Exponential falloff (tau = width/3), normalized to hit exactly 0 at t = 1.
+        // Curve measured from the CDisplayEx reference in issue #11: a dark shoulder
+        // at the seam with a long soft feather — a quadratic reads thinner.
+        let f = (exp(-3.0 * t) - 0.049787) / 0.950213;
+        shade = 1.0 - u.spine_strength * f;
     }
     if (u.gray != 0u) {
         // Premultiply the fade into the opaque gray page so it composites over the

@@ -156,7 +156,7 @@ impl Default for Settings {
             seekbar_enabled: true,
             page_transition_enabled: false, // desktop default off; Android shell forces on
             spine_shadow_enabled: false,
-            spine_shadow_strength: 0.35,
+            spine_shadow_strength: 0.55,
             // Dark by default on desktop (a backlit monitor); intentionally unlike the
             // Android shell, which defaults to System so e-ink panels get Light.
             theme: ThemePref::Dark,
@@ -243,7 +243,7 @@ mod tests {
         let s: Settings = serde_json::from_str(old).expect("old state.json must still parse");
         assert_eq!(s.perf, PerfPref::Auto, "missing perf defaults to Auto");
         assert!(!s.spine_shadow_enabled, "missing spine shadow defaults to off");
-        assert_eq!(s.spine_shadow_strength, 0.35);
+        assert_eq!(s.spine_shadow_strength, 0.55);
         // The keys that *were* present survive, so this isn't a silent reset.
         assert!(!s.direction_rtl);
         assert_eq!(s.fit, 2);
