@@ -54,3 +54,7 @@ encoding_rs = "0.8"
 # `zip`'s writer only accepts `&str` names, so it can't produce those archives.
 crc32fast = "1"
 jpeg-encoder = "0.7.1"
+# wgpu's stub backend (`Device::noop`), so `gesture.rs`'s tests can build a real
+# `Reader` — which needs a Device/Queue — with no GPU and no windowing. Resolver 2
+# keeps this feature out of every non-test build of the crate.
+wgpu = { version = "29.0.3", features = ["noop"] }
