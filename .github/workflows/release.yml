@@ -138,7 +138,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          draft: true # v0.5.0 only: keep the release a draft for on-device touch testing
           files: ${{ matrix.asset }}
 
       - name: Upload Windows installer artifacts
@@ -154,7 +153,6 @@ jobs:
         if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          draft: true # v0.5.0 only: keep the release a draft for on-device touch testing
           files: |
             yosh-windows-x64-portable.zip
             yosh-setup-x64.exe
@@ -236,5 +234,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
-          draft: true # v0.5.0 only: keep the release a draft for on-device touch testing
           files: yosh-android.apk
