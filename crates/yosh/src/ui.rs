@@ -118,6 +118,10 @@ pub struct UiState {
     /// appended to the info overlay each frame so HQ vs. a stray GPU resize is
     /// always visible. Empty when nothing is decoded yet.
     pub resize_path: String,
+    /// Touch scroll physics readout `(last release velocity, live glide velocity)`
+    /// in px/s, appended to the info overlay once a touch fling has happened —
+    /// makes "no physics" reports diagnosable from a screenshot. None until then.
+    pub touch_fling: Option<(f32, f32)>,
     /// Transient toast message (boundary reached, zoom level); None when idle.
     pub toast: Option<String>,
     /// Whether to show the centered loading spinner (the current page's decode
@@ -732,6 +736,20 @@ pub fn chrome(
                                         .monospace(),
                                 );
                                 ui.end_row();
+                                if let Some((vy, glide)) = st.touch_fling {
+                                    ui.label(
+                                        egui::RichText::new("Touch")
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "release {vy:.0} px/s · glide {glide:.0} px/s"
+                                        ))
+                                        .color(egui::Color32::WHITE)
+                                        .monospace(),
+                                    );
+                                    ui.end_row();
+                                }
                                 if !st.resize_path.is_empty() {
                                     ui.label(
                                         egui::RichText::new("Resize")
