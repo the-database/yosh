@@ -154,6 +154,11 @@ const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// before a further scroll flips the page — turns the edge into a perceptible
 /// hard stop instead of an instant jump to the next page.
 const EDGE_DWELL: Duration = Duration::from_millis(350);
+/// A touch landing within this window after a drag release is the digitizer's
+/// lift-off bounce (a phantom contact as the finger peels off the glass), not
+/// deliberate input: a human re-tap takes ≳200 ms. Without this, panels that
+/// bounce kill every fling at birth — "touch has no physics" (issue #9).
+const BOUNCE_WINDOW: Duration = Duration::from_millis(150);
 /// Live-refresh debounce: how quiet the watched folder/archive must go after a
 /// change before the volume is rebuilt (see `poll_folder_watch`).
 const WATCH_QUIET: Duration = Duration::from_millis(250);
@@ -237,6 +242,16 @@ struct State {
     drag_samples: VecDeque<(Instant, f64)>,
     /// Active pinch, captured at its start (see `Pinch`).
     pinch: Option<Pinch>,
+    /// When the last touch drag (scroll or page) released — the reference point
+    /// for `BOUNCE_WINDOW` lift-off bounce detection.
+    last_drag_release: Option<Instant>,
+    /// The glide a suspected bounce contact interrupted: `(when it landed,
+    /// scroll velocity at that moment)`. If the contact lifts again without
+    /// becoming anything, the release hands the glide back (see `handle_touch`).
+    caught_fling: Option<(Instant, f32)>,
+    /// Velocity (px/s) measured at the last touch scroll release, surfaced in
+    /// the info overlay so touch physics are diagnosable from a screenshot.
+    last_touch_vy: Option<f32>,
 
     settings: config::Settings,
     /// Cached OS day/night flag (from `winit::window::Theme`), consulted when the
@@ -884,6 +899,9 @@ impl ApplicationHandler for App {
             last_fling_tick: Instant::now(),
             drag_samples: VecDeque::new(),
             pinch: None,
+            last_drag_release: None,
+            caught_fling: None,
+            last_touch_vy: None,
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             win_maximized: settings.window.is_some_and(|w| w.maximized),
             parked: false,
@@ -1746,7 +1764,7 @@ impl State {
                 let now = Instant::now();
                 let vy = self.drag_samples.front().map_or(0.0, |(t0, y0)| {
                     let dt = now.duration_since(*t0).as_secs_f64();
-                    if dt > 0.005 { (self.cursor_y - y0) / dt } else { 0.0 }
+                    (self.cursor_y - y0) / dt.max(0.016) // floored, see handle_touch
                 });
                 self.last_fling_tick = now;
                 self.reader.start_fling(-vy as f32); // strip velocity = −pointer velocity
@@ -1773,7 +1791,14 @@ impl State {
                     self.gesture_start = Some((x, y));
                     self.page_drag = false;
                     self.scroll_drag = false;
-                    // A finger down catches any in-flight scroll glide.
+                    // A finger down catches any in-flight scroll glide. But one
+                    // landing faster after a drag release than a human can re-tap
+                    // may be the digitizer's lift-off bounce — remember the glide
+                    // so the release can hand it back if the contact comes to
+                    // nothing (a press that lingers or travels is a real grab).
+                    self.caught_fling = (self.reader.flinging()
+                        && self.last_drag_release.is_some_and(|t| t.elapsed() < BOUNCE_WINDOW))
+                        .then(|| (Instant::now(), self.reader.scroll_velocity));
                     self.reader.stop_fling();
                     self.drag_samples.clear();
                     // Windows may also synthesize mouse events for this finger. The
@@ -1784,6 +1809,7 @@ impl State {
                     // Begin a pinch; cancel the single-finger gesture — including
                     // a live page drag, which snaps back.
                     self.gesture_start = None;
+                    self.caught_fling = None; // two fingers are never a bounce
                     if self.page_drag {
                         self.page_drag = false;
                         self.reader.drag_cancel();
@@ -1924,15 +1950,24 @@ impl State {
                     let was_drag = std::mem::take(&mut self.page_drag);
                     let was_scroll = std::mem::take(&mut self.scroll_drag);
                     let start = self.gesture_start.take();
+                    if was_scroll || was_drag {
+                        // Reference point for lift-off bounce detection: a contact
+                        // landing within BOUNCE_WINDOW of this is digitizer noise.
+                        self.last_drag_release = Some(Instant::now());
+                    }
                     if was_scroll {
                         // Scroll release → inertial fling from the recent y-velocity.
                         if !matches!(phase, TouchPhase::Cancelled) {
                             let now = Instant::now();
+                            // dt is floored, not gated to zero: samples processed in a
+                            // burst (a stalled frame) compress the window's timestamps,
+                            // and a zeroed velocity would silently kill the fling.
                             let vy = self.drag_samples.front().map_or(0.0, |(t0, y0)| {
                                 let dt = now.duration_since(*t0).as_secs_f64();
-                                if dt > 0.005 { (y - y0) / dt } else { 0.0 }
+                                (y - y0) / dt.max(0.016)
                             });
                             self.last_fling_tick = now;
+                            self.last_touch_vy = Some(vy as f32);
                             // strip velocity = −finger velocity (flick up → forward)
                             self.reader.start_fling(-vy as f32);
                         }
@@ -1949,22 +1984,39 @@ impl State {
                             let now = Instant::now();
                             let v = self.drag_samples.front().map_or(0.0, |(t0, x0)| {
                                 let dt = now.duration_since(*t0).as_secs_f64();
-                                if dt > 0.005 { (x - x0) / dt } else { 0.0 }
+                                (x - x0) / dt.max(0.016) // floored, see the scroll arm
                             });
                             self.reader.drag_release(v as f32);
                         }
                         self.drag_samples.clear();
-                    } else if let Some((sx, sy)) = start
-                        && !self.library_view
-                        && !egui_consumed
-                    {
+                    } else if let Some((sx, sy)) = start {
                         // Nothing locked in: a near-stationary release is a tap;
                         // anything that travelled was a zoomed pan (or a vertical
                         // scrub) and is not. Unzoomed horizontal motion locks into the
                         // interactive drag long before reaching here, so flipping by
                         // swipe is handled by `drag_release` above.
                         let w = self.gpu.config.width as f64;
-                        if (x - sx).abs() < w * 0.015 && (y - sy).abs() < w * 0.015 {
+                        let micro =
+                            (x - sx).abs() < w * 0.015 && (y - sy).abs() < w * 0.015;
+                        if let Some((t0, v)) = self.caught_fling.take() {
+                            // The contact landed moments after a drag release (see
+                            // Started): a micro-contact that lifts right off again is
+                            // the digitizer's lift-off bounce — hand back the glide it
+                            // interrupted, and never treat it as a tap. A press that
+                            // lingered is a real grab: the glide stays caught.
+                            if micro && t0.elapsed() < Duration::from_millis(120) {
+                                self.last_fling_tick = Instant::now();
+                                self.reader.start_fling(v);
+                            }
+                        } else if micro
+                            && !self.library_view
+                            && !egui_consumed
+                            && self
+                                .last_drag_release
+                                .is_none_or(|t| t.elapsed() >= BOUNCE_WINDOW)
+                        {
+                            // The bounce guard doesn't slow rapid tap-tap flipping:
+                            // a tap's own release never arms `last_drag_release`.
                             self.on_tap(sx, sy);
                         }
                     }
@@ -3052,6 +3104,8 @@ impl State {
         // overlay, refreshed every frame so it tracks zooming without a rebuild)
         // and the active toast (dropped once it expires).
         self.ui.zoom_pct = self.reader.effective_zoom_pct();
+        self.ui.touch_fling =
+            self.last_touch_vy.map(|vy| (vy, self.reader.scroll_velocity));
         self.reader.update_resize_readout();
         self.ui.resize_path = self.reader.resize_path_label();
         // Drain transient messages the reader queued (boundary hit, zoom level)
