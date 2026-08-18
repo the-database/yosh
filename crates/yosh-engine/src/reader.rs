@@ -585,6 +585,9 @@ pub struct Reader {
     /// Inertial scroll velocity (px/sec applied to `top_offset`; +ve scrolls the
     /// strip forward). 0 when not flinging; driven by `fling_tick`.
     pub scroll_velocity: f32,
+    /// Inertial pan velocity (px/sec applied to `pan_x`/`pan_y` — a thrown
+    /// overflowing/zoomed page). (0, 0) when idle; driven by `pan_fling_tick`.
+    pub pan_velocity: (f32, f32),
     pub est_aspect: f32, // h/w estimate for undecoded pages in the strip
 
     // --- Surface + decode-view debounce ---
@@ -737,6 +740,7 @@ impl Reader {
             scroll_mode,
             top_offset: 0.0,
             scroll_velocity: 0.0,
+            pan_velocity: (0.0, 0.0),
             est_aspect: DEFAULT_ASPECT,
             viewport: Viewport::default(),
             pending_view: (0, 0, 1.0),
@@ -2881,6 +2885,49 @@ impl Reader {
             return false;
         }
         self.scroll_velocity.abs() >= SCROLL_FLING_MIN_V
+    }
+
+    /// Begin an inertial 2-D pan glide at `(vx, vy)` px/sec (clamped) — the pan
+    /// counterpart of `start_fling`, for throwing an overflowing/zoomed page.
+    /// Driven by `pan_fling_tick` each frame.
+    pub fn start_pan_fling(&mut self, vx: f32, vy: f32) {
+        self.pan_velocity = (
+            vx.clamp(-SCROLL_FLING_MAX_V, SCROLL_FLING_MAX_V),
+            vy.clamp(-SCROLL_FLING_MAX_V, SCROLL_FLING_MAX_V),
+        );
+    }
+
+    /// Stop any in-flight pan glide (a finger touched down to catch it).
+    pub fn stop_pan_fling(&mut self) {
+        self.pan_velocity = (0.0, 0.0);
+    }
+
+    /// Whether a pan glide is currently active (combined speed above the floor).
+    pub fn pan_flinging(&self) -> bool {
+        let (vx, vy) = self.pan_velocity;
+        vx.hypot(vy) >= SCROLL_FLING_MIN_V
+    }
+
+    /// Advance the inertial pan by `dt` seconds: move `pan_x`/`pan_y`, decay the
+    /// velocity, and stop each axis dead where `clamp_pan` pins it (the page
+    /// edge), so a diagonal throw can keep gliding along the free axis. Returns
+    /// whether the glide continues. Mirrors `fling_tick`.
+    pub fn pan_fling_tick(&mut self, dt: f32) -> bool {
+        if !self.pan_flinging() {
+            self.pan_velocity = (0.0, 0.0);
+            return false;
+        }
+        let (vx, vy) = self.pan_velocity;
+        let (dx, dy) = (vx * dt, vy * dt);
+        let before = (self.pan_x, self.pan_y);
+        self.pan_x += dx;
+        self.pan_y += dy;
+        self.clamp_pan();
+        let decay = (-SCROLL_FLING_FRICTION * dt).exp();
+        let vx = if dx.abs() > 0.5 && (self.pan_x - before.0).abs() < 0.5 { 0.0 } else { vx * decay };
+        let vy = if dy.abs() > 0.5 && (self.pan_y - before.1).abs() < 0.5 { 0.0 } else { vy * decay };
+        self.pan_velocity = (vx, vy);
+        self.pan_flinging()
     }
 }
 
