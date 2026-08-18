@@ -135,6 +135,11 @@ pub struct Settings {
     pub spine_shadow_enabled: bool,
     /// Peak darkening at the seam, 0..1.
     pub spine_shadow_strength: f32,
+    /// Mouse-wheel scrolling speed in continuous-scroll mode: a multiplier on the
+    /// stock 110 px per wheel line, so `1.0` is the historical feel (issue #9).
+    /// Scales the **wheel only** — a finger drag is direct manipulation and stays
+    /// 1:1, and a release fling continues the gesture that was actually measured.
+    pub scroll_speed: f32,
     /// Chrome theme: System (follow OS) / Light (e-ink) / Dark. Cycled from the top bar.
     pub theme: ThemePref,
     /// Performance profile (Auto = full budget on AC, throttled on battery).
@@ -164,6 +169,7 @@ impl Default for Settings {
             no_stretch: false,              // stretch-to-fit, as yosh has always done
             spine_shadow_enabled: false,
             spine_shadow_strength: 0.55,
+            scroll_speed: 1.0, // the stock 110 px per wheel line
             // Dark by default on desktop (a backlit monitor); intentionally unlike the
             // Android shell, which defaults to System so e-ink panels get Light.
             theme: ThemePref::Dark,
@@ -251,6 +257,7 @@ mod tests {
         assert_eq!(s.perf, PerfPref::Auto, "missing perf defaults to Auto");
         assert!(!s.spine_shadow_enabled, "missing spine shadow defaults to off");
         assert_eq!(s.spine_shadow_strength, 0.55);
+        assert_eq!(s.scroll_speed, 1.0, "missing scroll speed keeps the stock wheel feel");
         assert!(!s.no_stretch, "missing no-stretch defaults to off (stretch to fit)");
         // The keys that *were* present survive, so this isn't a silent reset.
         assert!(!s.direction_rtl);

@@ -30,6 +30,9 @@ pub struct UiState {
     /// Settings panel's toggle + strength slider.
     pub spine_shadow_on: bool,
     pub spine_shadow_strength: f32,
+    /// Mouse-wheel scrolling speed (scroll mode) as a multiplier on the stock rate,
+    /// set each frame for the Settings panel's slider.
+    pub scroll_speed: f32,
     /// Whether resume-last-book-on-startup is on. Set each frame; drives the
     /// Settings panel's Resume toggle.
     pub resume_on_startup: bool,
@@ -66,6 +69,10 @@ pub struct UiState {
     pub req_spine_toggle: bool,
     pub req_spine_strength: Option<f32>,
     pub req_spine_save: bool,
+    /// New mouse-wheel scrolling speed from the panel's slider, on the same
+    /// apply-live / save-on-release split as the spine strength above.
+    pub req_scroll_speed: Option<f32>,
+    pub req_scroll_speed_save: bool,
     pub req_toggle_resume: bool,
     pub req_toggle_library: bool,
     /// Whether the Settings panel window is open (toggled by the top-bar gear).
@@ -208,6 +215,31 @@ fn nav_arrow(ctx: &egui::Context, id: &str, align: egui::Align2, offset: egui::V
             p.line_segment([c + egui::vec2(back, -dy), c + egui::vec2(tip, 0.0)], stroke);
             p.line_segment([c + egui::vec2(tip, 0.0), c + egui::vec2(back, dy)], stroke);
         });
+}
+
+/// A soft drop shadow riding the dragged page's leading edge (page-flip swipe), cast
+/// onto the revealed page beneath. `frac` is the seam x (0..1 of width); `si`'s sign
+/// is the revealed side, magnitude the intensity. Painted on the background layer so
+/// it sits over the page but under the chrome.
+pub(crate) fn drag_shadow(ctx: &egui::Context, frac: f32, si: f32) {
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Background,
+        egui::Id::new("drag_shadow"),
+    ));
+    let rect = ctx.content_rect();
+    let seam_x = rect.left() + frac * rect.width();
+    let w = 22.0;
+    let far_x = if si > 0.0 { seam_x - w } else { seam_x + w };
+    let dark = egui::Color32::from_black_alpha((si.abs() * 60.0).clamp(0.0, 255.0) as u8);
+    let clear = egui::Color32::TRANSPARENT;
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(egui::pos2(seam_x, rect.top()), dark);
+    mesh.colored_vertex(egui::pos2(seam_x, rect.bottom()), dark);
+    mesh.colored_vertex(egui::pos2(far_x, rect.top()), clear);
+    mesh.colored_vertex(egui::pos2(far_x, rect.bottom()), clear);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    painter.add(mesh);
 }
 
 /// BandiView-style seekbar: a translucent pill floating above the bottom edge
@@ -862,6 +894,29 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     st.req_toggle_scroll = true;
                 }
             });
+            // Same live-apply / save-on-release idiom as the spine slider below.
+            // Always enabled: the mode it applies to is the row directly above, and
+            // greying it out would only hide the setting from whoever came looking.
+            let mut speed = st.scroll_speed;
+            let r = ui.add(
+                egui::Slider::new(&mut speed, 0.25..=3.0)
+                    .custom_formatter(|v, _| format!("{v:.2}×"))
+                    .text("scroll speed"),
+            );
+            if r.changed() {
+                st.req_scroll_speed = Some(speed);
+                if !r.dragged() {
+                    st.req_scroll_speed_save = true;
+                }
+            }
+            if r.drag_stopped() {
+                st.req_scroll_speed_save = true;
+            }
+            ui.label(
+                egui::RichText::new("Mouse-wheel scrolling speed (scroll mode)")
+                    .weak()
+                    .small(),
+            );
 
             ui.label(egui::RichText::new("Reading direction").strong());
             ui.horizontal(|ui| {
