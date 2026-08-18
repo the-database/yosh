@@ -3,13 +3,16 @@
 //! navigation. The current page is drawn from the cache; if a target isn't ready
 //! yet the last-drawn page is held (no flicker).
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    ElementState, KeyEvent, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -187,6 +190,16 @@ impl Default for Playback {
     }
 }
 
+/// Active two-finger pinch, captured at start so each move can both scale
+/// about — and pan with — the finger midpoint (zoom-to-focal-point).
+#[derive(Clone, Copy)]
+struct Pinch {
+    dist0: f64,       // finger separation when the pinch began
+    zoom0: f32,       // reader.zoom when it began
+    pan0: (f32, f32), // reader.pan_x / pan_y when it began
+    mid0: (f64, f64), // finger midpoint (screen px) when it began
+}
+
 struct State {
     window: Arc<Window>,
     gpu: Gpu,
@@ -206,6 +219,24 @@ struct State {
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     cursor_in_window: bool, // gates the edge-hover navigation arrows
     last_mid_click: Option<Instant>, // middle-zone double-click → fullscreen
+
+    /// Active touch points by finger id, for swipe / pinch-zoom / pan.
+    touches: HashMap<u64, (f64, f64)>,
+    /// Single-finger gesture start (for swipe-vs-tap on release).
+    gesture_start: Option<(f64, f64)>,
+    /// A single-finger move locked in as an interactive page drag (the page
+    /// follows the finger; the engine renders it via `Reader::drag_update`).
+    /// Locks once the motion is clearly horizontal; cleared on release/pinch.
+    page_drag: bool,
+    /// A single-finger vertical drag locked in as continuous scroll (scroll mode).
+    scroll_drag: bool,
+    /// Last `fling_tick` time, for the per-frame dt of the inertial scroll glide.
+    last_fling_tick: Instant,
+    /// Recent `(time, x|y)` samples of the dragging finger or pointer (~last 100 ms):
+    /// x for the page-flip flick-to-commit, y for the scroll-release fling velocity.
+    drag_samples: VecDeque<(Instant, f64)>,
+    /// Active pinch, captured at its start (see `Pinch`).
+    pinch: Option<Pinch>,
 
     settings: config::Settings,
     /// Cached OS day/night flag (from `winit::window::Theme`), consulted when the
@@ -846,6 +877,13 @@ impl ApplicationHandler for App {
             drag_dist: 0.0,
             cursor_in_window: false,
             last_mid_click: None,
+            touches: HashMap::new(),
+            gesture_start: None,
+            page_drag: false,
+            scroll_drag: false,
+            last_fling_tick: Instant::now(),
+            drag_samples: VecDeque::new(),
+            pinch: None,
             win_geom: settings.window.map(|w| (w.x, w.y, w.w, w.h)),
             win_maximized: settings.window.is_some_and(|w| w.maximized),
             parked: false,
@@ -971,7 +1009,19 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
+            // Touchscreen gestures (swipe-to-flip, pinch-zoom, finger scroll + fling,
+            // tap) — the reader's own layer, since egui only ever sees the primary
+            // finger. `consumed` is what keeps a drag begun on the chrome off the page.
+            WindowEvent::Touch(Touch {
+                phase,
+                location,
+                id,
+                ..
+            }) => state.handle_touch(phase, id, location.x, location.y, response.consumed),
+            // The mouse arms below stand down while any finger is on the glass:
+            // Windows can also deliver OS-synthesized mouse events for a touch, and
+            // acting on both would pan twice (and fake a click on release).
+            WindowEvent::CursorMoved { position, .. } if state.touches.is_empty() => {
                 state.on_cursor_moved(position.x, position.y)
             }
             // Non-scrollable chrome (seekbar, anim panel) isn't allowed to swallow
@@ -985,7 +1035,9 @@ impl ApplicationHandler for App {
                 state: btn,
                 button: MouseButton::Left,
                 ..
-            } if !response.consumed => state.on_left_button(btn == ElementState::Pressed),
+            } if !response.consumed && state.touches.is_empty() => {
+                state.on_left_button(btn == ElementState::Pressed)
+            }
             WindowEvent::CursorEntered { .. } => state.cursor_in_window = true,
             WindowEvent::CursorLeft { .. } => state.cursor_in_window = false,
             // CursorLeft isn't guaranteed on focus loss / occlusion (alt-tab, a
@@ -1546,10 +1598,14 @@ impl State {
     /// the page already fits.
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
         if self.reader.scroll_mode {
+            // The wheel is the one abstract ratchet in the app — its px-per-line
+            // constant is a made-up number — so it is what the speed setting scales.
+            // A finger drag is direct manipulation (stays 1:1) and a release fling
+            // continues the gesture that was actually measured; neither is scaled.
             let dy_px = match delta {
                 MouseScrollDelta::LineDelta(_, y) => y * SCROLL_WHEEL_PX,
                 MouseScrollDelta::PixelDelta(p) => p.y as f32,
-            };
+            } * self.settings.scroll_speed;
             self.reader.scroll_by(-dy_px); // wheel down (y<0) scrolls the strip down
             return;
         }
@@ -1650,6 +1706,18 @@ impl State {
         }
         self.drag_dist += dx.abs() + dy.abs();
         if self.reader.scroll_mode {
+            // Sample (time, y) so the release can glide on from the recent pointer
+            // velocity — the same ~100 ms window (and the same buffer) the touch
+            // path uses, so a thrown strip behaves identically either way.
+            let now = Instant::now();
+            self.drag_samples.push_back((now, y));
+            while self
+                .drag_samples
+                .front()
+                .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
+            {
+                self.drag_samples.pop_front();
+            }
             // Grab the strip: pan horizontally, scroll vertically.
             self.reader.pan_x += dx;
             self.reader.top_offset -= dy;
@@ -1663,16 +1731,279 @@ impl State {
     }
 
     /// Left button: a clean press/release (little movement) flips; a press +
-    /// drag pans instead.
+    /// drag pans instead, and in scroll mode a thrown strip keeps gliding.
     fn on_left_button(&mut self, pressed: bool) {
         if pressed {
             self.mouse_down = true;
             self.drag_dist = 0.0;
+            // A press catches an in-flight glide and starts a fresh velocity window.
+            self.reader.stop_fling();
+            self.drag_samples.clear();
         } else {
+            if self.mouse_down && self.reader.scroll_mode && self.drag_dist >= 6.0 {
+                // Grab-and-throw: release velocity from the recent samples, on the
+                // same rule (and dt guard) as a finger release.
+                let now = Instant::now();
+                let vy = self.drag_samples.front().map_or(0.0, |(t0, y0)| {
+                    let dt = now.duration_since(*t0).as_secs_f64();
+                    if dt > 0.005 { (self.cursor_y - y0) / dt } else { 0.0 }
+                });
+                self.last_fling_tick = now;
+                self.reader.start_fling(-vy as f32); // strip velocity = −pointer velocity
+            }
             if self.mouse_down && self.drag_dist < 6.0 {
                 self.on_click();
             }
             self.mouse_down = false;
+        }
+    }
+
+    /// Route a touch event into swipe/tap (one finger) or pinch-zoom/pan (two).
+    fn handle_touch(&mut self, phase: TouchPhase, id: u64, x: f64, y: f64, egui_consumed: bool) {
+        match phase {
+            TouchPhase::Started => {
+                self.touches.insert(id, (x, y));
+                // The library grid is egui's: its own kinetic scrolling handles the
+                // finger, and `egui_consumed` lags a frame on a press, so gate on the
+                // view itself. Only the touch map is kept up to date there.
+                if self.library_view {
+                    return;
+                }
+                if self.touches.len() == 1 {
+                    self.gesture_start = Some((x, y));
+                    self.page_drag = false;
+                    self.scroll_drag = false;
+                    // A finger down catches any in-flight scroll glide.
+                    self.reader.stop_fling();
+                    self.drag_samples.clear();
+                    // Windows may also synthesize mouse events for this finger. The
+                    // mouse arms already stand down while a touch is live; dropping
+                    // any drag they had begun keeps a stale one from resuming.
+                    self.mouse_down = false;
+                } else if self.touches.len() == 2 {
+                    // Begin a pinch; cancel the single-finger gesture — including
+                    // a live page drag, which snaps back.
+                    self.gesture_start = None;
+                    if self.page_drag {
+                        self.page_drag = false;
+                        self.reader.drag_cancel();
+                    }
+                    if let Some((d, mx, my)) = self.two_finger_metrics() {
+                        self.pinch = Some(Pinch {
+                            dist0: d,
+                            zoom0: self.reader.zoom,
+                            pan0: (self.reader.pan_x, self.reader.pan_y),
+                            mid0: (mx, my),
+                        });
+                    }
+                }
+            }
+            TouchPhase::Moved => {
+                let prev = self.touches.insert(id, (x, y));
+                if self.library_view {
+                    return;
+                }
+                if let Some(p) = self.pinch {
+                    // Pinch → zoom (engine re-decodes HQ once it settles), anchored
+                    // to the finger midpoint so the content under the fingers stays
+                    // put (and follows a two-finger drag). Deliberately *not* gated
+                    // on `egui_consumed`: two fingers are never chrome interaction.
+                    if p.dist0 > 1.0
+                        && let Some((d, mx, my)) = self.two_finger_metrics()
+                    {
+                        // The page is drawn below the top bar, so the focal math runs
+                        // in content space: the reading viewport's size, and finger y
+                        // measured from under the bar. Fullscreen insets by 0, which
+                        // makes this identical to the phone's screen-space version.
+                        let inset = self.top_inset_px() as f64;
+                        let (sw, sh) =
+                            (self.reader.viewport.w as f32, self.reader.viewport.h as f32);
+                        // Raw target from finger spread, then a fit "detent": within
+                        // ONE gesture the zoom can approach the fit scale (zoom == 1.0)
+                        // but not cross it, so a single max zoom-out from above — or
+                        // zoom-in from below — lands exactly on fit. Crossing requires
+                        // releasing and re-pinching (then zoom0 ~= 1.0, so no barrier).
+                        // Barrier side comes from the immutable zoom0; we hard-clamp (no
+                        // dist0 re-baseline) so the barrier holds — at the cost of a
+                        // small dead zone if the user over-pinches past fit and reverses
+                        // mid-gesture.
+                        const FIT: f32 = 1.0;
+                        const EPS: f32 = 0.001; // matches the fit-reset button's "fitted" test
+                        let raw = p.zoom0 * (d / p.dist0) as f32;
+                        self.reader.zoom = if p.zoom0 > FIT + EPS {
+                            raw.max(FIT) // started above fit: can't drop below it this gesture
+                        } else if p.zoom0 < FIT - EPS {
+                            raw.min(FIT) // started below fit: can't rise above it this gesture
+                        } else {
+                            raw // started at fit: free to cross either way (re-pinch path)
+                        };
+                        self.reader.clamp_zoom_native();
+                        // Actual (post-clamp) scale ratio: keep the content point
+                        // under the initial midpoint pinned to the current one.
+                        let k = self.reader.zoom / p.zoom0;
+                        self.reader.pan_x =
+                            mx as f32 - sw / 2.0 - k * (p.mid0.0 as f32 - sw / 2.0 - p.pan0.0);
+                        self.reader.pan_y = (my - inset) as f32
+                            - sh / 2.0
+                            - k * ((p.mid0.1 - inset) as f32 - sh / 2.0 - p.pan0.1);
+                        self.reader.clamp_pan();
+                    }
+                } else if self.touches.len() == 1 && !egui_consumed {
+                    // Single finger over content that doesn't fit → pan. Zoomed in
+                    // always; in page-flip mode also a page that overflows the window
+                    // under its fit (fit-width on a tall page), which is what the mouse
+                    // drag already does. The cost is that swipe-to-flip can't lock in
+                    // while a page overflows — flips are edge taps there, same as with
+                    // the mouse.
+                    if self.reader.zoom > 1.001
+                        || (!self.reader.scroll_mode && self.reader.current_overflows())
+                    {
+                        if let Some((px, py)) = prev {
+                            self.reader.pan_x += (x - px) as f32;
+                            self.reader.pan_y += (y - py) as f32;
+                            self.reader.clamp_pan();
+                        }
+                    } else if let Some((sx, sy)) = self.gesture_start {
+                        let (dx, dy) = (x - sx, y - sy);
+                        if self.reader.scroll_mode {
+                            // Scroll mode: a vertical drag scrolls the strip
+                            // continuously (incremental, finger-tracking). Locks once
+                            // the motion is clearly vertical so taps/seekbar survive.
+                            if !self.scroll_drag {
+                                let h = self.gpu.config.height as f64;
+                                self.scroll_drag = dy.abs() > h * 0.01 && dy.abs() > dx.abs();
+                            }
+                            if self.scroll_drag {
+                                // Sample (time, y) for the release fling velocity
+                                // (reuses drag_samples; page-flip uses it for x, but
+                                // the two modes are mutually exclusive per gesture).
+                                let now = Instant::now();
+                                self.drag_samples.push_back((now, y));
+                                while self
+                                    .drag_samples
+                                    .front()
+                                    .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
+                                {
+                                    self.drag_samples.pop_front();
+                                }
+                                if let Some((_, py)) = prev {
+                                    self.reader.top_offset -= (y - py) as f32;
+                                    self.reader.normalize();
+                                }
+                            }
+                        } else {
+                            // Page-flip: the page follows the finger (Chunky-style),
+                            // the neighbor revealed underneath. Locks once the motion
+                            // is clearly horizontal, so taps and the seekbar stay intact.
+                            if !self.page_drag {
+                                let w = self.gpu.config.width as f64;
+                                self.page_drag = dx.abs() > w * 0.015 && dx.abs() > dy.abs();
+                            }
+                            if self.page_drag {
+                                let now = Instant::now();
+                                self.drag_samples.push_back((now, x));
+                                while self
+                                    .drag_samples
+                                    .front()
+                                    .is_some_and(|(t, _)| now.duration_since(*t).as_millis() > 100)
+                                {
+                                    self.drag_samples.pop_front();
+                                }
+                                self.reader.drag_update(dx as f32);
+                            }
+                        }
+                    }
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                self.touches.remove(&id);
+                if self.touches.len() < 2 {
+                    self.pinch = None;
+                }
+                if self.touches.is_empty() {
+                    let was_drag = std::mem::take(&mut self.page_drag);
+                    let was_scroll = std::mem::take(&mut self.scroll_drag);
+                    let start = self.gesture_start.take();
+                    if was_scroll {
+                        // Scroll release → inertial fling from the recent y-velocity.
+                        if !matches!(phase, TouchPhase::Cancelled) {
+                            let now = Instant::now();
+                            let vy = self.drag_samples.front().map_or(0.0, |(t0, y0)| {
+                                let dt = now.duration_since(*t0).as_secs_f64();
+                                if dt > 0.005 { (y - y0) / dt } else { 0.0 }
+                            });
+                            self.last_fling_tick = now;
+                            // strip velocity = −finger velocity (flick up → forward)
+                            self.reader.start_fling(-vy as f32);
+                        }
+                    } else if was_drag {
+                        // The interactive drag owns this gesture end-to-end; the
+                        // old end-of-gesture swipe must not also fire.
+                        if matches!(phase, TouchPhase::Cancelled) {
+                            self.reader.drag_cancel();
+                        } else {
+                            // Release velocity from the ~100 ms sample window —
+                            // decides flick-to-commit on short drags. Whether it
+                            // committed doesn't matter here: a committed flip keeps
+                            // the zoom/pan it had, exactly like a click flip.
+                            let now = Instant::now();
+                            let v = self.drag_samples.front().map_or(0.0, |(t0, x0)| {
+                                let dt = now.duration_since(*t0).as_secs_f64();
+                                if dt > 0.005 { (x - x0) / dt } else { 0.0 }
+                            });
+                            self.reader.drag_release(v as f32);
+                        }
+                        self.drag_samples.clear();
+                    } else if let Some((sx, sy)) = start
+                        && !self.library_view
+                        && !egui_consumed
+                    {
+                        // Nothing locked in: a near-stationary release is a tap;
+                        // anything that travelled was a zoomed pan (or a vertical
+                        // scrub) and is not. Unzoomed horizontal motion locks into the
+                        // interactive drag long before reaching here, so flipping by
+                        // swipe is handled by `drag_release` above.
+                        let w = self.gpu.config.width as f64;
+                        if (x - sx).abs() < w * 0.015 && (y - sy).abs() < w * 0.015 {
+                            self.on_tap(sx, sy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Distance and midpoint (screen px) of the first two active touch points.
+    /// Returning both from one call keeps them on the same finger pair.
+    fn two_finger_metrics(&self) -> Option<(f64, f64, f64)> {
+        let mut it = self.touches.values();
+        let a = it.next()?;
+        let b = it.next()?;
+        let dist = ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+        Some((dist, (a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0))
+    }
+
+    /// A touch tap routes through the existing click semantics: edge strips flip,
+    /// the middle double-taps to fullscreen. `on_click` reads the cursor fields.
+    fn on_tap(&mut self, x: f64, y: f64) {
+        self.cursor_x = x;
+        self.cursor_y = y;
+        self.on_click();
+    }
+
+    /// Advance the inertial scroll glide one frame (a no-op unless flinging): apply
+    /// the velocity to the strip, decay it, and schedule the next frame while it
+    /// lasts. Self-sustaining, and deliberately *not* a `deadlines()` entry — a
+    /// glide is an animation, so it belongs to the redraw guard, not the scheduler.
+    fn tick_scroll_fling(&mut self) {
+        if !self.reader.flinging() {
+            return;
+        }
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_fling_tick).as_secs_f32().clamp(0.0, 0.05);
+        self.last_fling_tick = now;
+        if self.reader.fling_tick(dt) {
+            self.window.request_redraw();
         }
     }
 
@@ -2075,6 +2406,10 @@ impl State {
             return;
         }
         self.parked = true;
+        // An inertial glide would otherwise keep asking for frames behind a surface
+        // nobody can see — and would land the strip somewhere the user never watched
+        // it travel to. Kill it here; the position it had is what comes back.
+        self.reader.stop_fling();
         if let Some(pool) = &self.reader.pool {
             pool.park();
         }
@@ -2548,6 +2883,8 @@ impl State {
         self.reader.viewport = self.content_viewport();
         // Sample window geometry here, where a move/resize has fully settled.
         self.record_window_geometry();
+        // Advance an inertial scroll glide (if any) before drawing this frame.
+        self.tick_scroll_fling();
         if let Some(p) = self.ui.pending_open.take() {
             self.open(&p);
         }
@@ -2639,6 +2976,7 @@ impl State {
         self.ui.stretch_on = !self.settings.no_stretch;
         self.ui.spine_shadow_on = self.settings.spine_shadow_enabled;
         self.ui.spine_shadow_strength = self.settings.spine_shadow_strength;
+        self.ui.scroll_speed = self.settings.scroll_speed;
         self.ui.resume_on_startup = self.settings.resume_on_startup;
         // Current view state for the Settings panel's active-value highlighting.
         self.ui.scroll_on = self.reader.scroll_mode;
@@ -2963,9 +3301,21 @@ impl State {
         } else {
             egui::Visuals::light()
         });
-        let full_output = self
-            .egui_ctx
-            .run(raw_input, |ctx| ui::chrome(ctx, ui_state, lib, &libctx, library_view));
+        // Where a live page-flip drag's leading edge is, so the chrome can cast a
+        // shadow off it. Read before the run (the closure can't borrow the reader),
+        // and `None` whenever no drag is in flight — an idle frame pays one read.
+        let drag_seam = if library_view {
+            None
+        } else {
+            self.reader.drag_seam()
+        };
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            ui::chrome(ctx, ui_state, lib, &libctx, library_view);
+            // Page-flip drag drop shadow — over the page, under the chrome.
+            if let Some((frac, si)) = drag_seam {
+                ui::drag_shadow(ctx, frac, si);
+            }
+        });
         self.egui_state
             .handle_platform_output(&self.window, full_output.platform_output);
 
@@ -3012,6 +3362,17 @@ impl State {
         }
         // Deferred config write: once per slider release, not once per drag frame.
         if std::mem::take(&mut self.ui.req_spine_save) {
+            config::save(&self.settings);
+            ui_acted = true;
+        }
+        // Wheel scroll speed: same live-apply / deferred-save split as the spine
+        // strength above (the wheel reads the setting directly, so nothing else
+        // has to be told about the change).
+        if let Some(v) = self.ui.req_scroll_speed.take() {
+            self.settings.scroll_speed = v.clamp(0.25, 3.0);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_scroll_speed_save) {
             config::save(&self.settings);
             ui_acted = true;
         }
