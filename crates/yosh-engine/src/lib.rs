@@ -11,6 +11,7 @@
 
 pub mod cache;
 pub mod decode;
+pub mod gesture;
 pub mod gpu;
 pub mod icc;
 pub mod layout;
