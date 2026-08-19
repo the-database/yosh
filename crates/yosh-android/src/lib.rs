@@ -32,7 +32,7 @@ use winit::window::{Window, WindowId};
 
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
 use yosh_engine::gpu::GpuContext;
-use yosh_engine::layout::{view_pages, view_start, Layout};
+use yosh_engine::layout::Layout;
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::reader::{Budget, DeviceTier, Direction, Reader, Viewport};
@@ -1937,8 +1937,7 @@ impl Shell {
         if len == 0 {
             return;
         }
-        let (a, b) =
-            view_pages(app.reader.layout, app.reader.index, len, app.reader.spread_offset);
+        let (a, b) = app.reader.visible_pages();
         let seen = (b.unwrap_or(a) + 1) as u32;
         // `key` borrows `current_key`, the update touches `progress` — disjoint
         // fields, so no clone is needed to satisfy the borrow checker either.
@@ -2011,9 +2010,7 @@ fn attach_source(
     // decodes would land without ever scheduling the frame that draws them.
     pool.set_waker(reader.waker.clone());
     reader.pool = Some(pool);
-    reader.cache.clear();
-    reader.lq_cache.clear();
-    reader.failed.clear();
+    reader.reset_volume_state();
     reader.rotation = 0; // each comic opens upright (mirrors the desktop shell)
     reader.index = start;
     reader.source = Some(src);
@@ -3417,8 +3414,7 @@ impl App {
             self.info_meta.clear();
             return;
         };
-        let len = src.len();
-        let idx = view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
+        let idx = self.reader.visible_pages().0;
         if self.info_for == Some(idx) {
             return;
         }
@@ -3446,7 +3442,7 @@ impl App {
             return Vec::new();
         };
         let len = src.len();
-        let idx = view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0;
+        let idx = self.reader.visible_pages().0;
         let mut lines = vec![
             ("Book".to_string(), self.book_title.clone()),
             ("File".to_string(), src.name(idx).to_string()),
@@ -3572,8 +3568,7 @@ impl App {
         let desired = self.layout_mode.resolve(self.config.width, self.config.height);
         if desired != self.reader.layout {
             self.reader.layout = desired;
-            self.reader.index =
-                view_start(desired, self.reader.index, self.reader.spread_offset);
+            self.reader.snap_to_view_start();
             self.reader.prefetch();
         }
     }
@@ -4399,8 +4394,7 @@ impl App {
         }
         if toggle_offset {
             self.reader.spread_offset ^= 1;
-            self.reader.index =
-                view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+            self.reader.snap_to_view_start();
             self.reader.prefetch();
         }
         if rotate {

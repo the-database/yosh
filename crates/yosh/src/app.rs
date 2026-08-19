@@ -26,7 +26,7 @@ use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
-use yosh_engine::layout::{self, Layout};
+use yosh_engine::layout::Layout;
 use yosh_engine::reader::{Budget, DeviceTier, Direction, Reader, Viewport};
 use yosh_engine::texpool::TexturePool;
 use crate::ui::{self, UiState};
@@ -1325,7 +1325,7 @@ impl State {
             Action::ToggleLayout => {
                 self.reader.layout = self.reader.layout.toggled();
                 // Snap to the current view's anchor so pairing is consistent.
-                self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+                self.reader.snap_to_view_start();
                 self.reader.pan_y = 0.0;
                 self.settings.layout_spread = self.reader.layout == Layout::Spread;
                 config::save(&self.settings);
@@ -1388,7 +1388,7 @@ impl State {
                     config::save(&self.settings);
                 }
                 // Re-anchor so the current view re-pairs with the new parity.
-                self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+                self.reader.snap_to_view_start();
                 self.reader.prefetch();
                 self.toast(format!("Spread offset: {}", self.reader.spread_offset));
             }
@@ -1869,12 +1869,7 @@ impl State {
         if len == 0 {
             return;
         }
-        let (a, b) = layout::view_pages(
-            self.reader.layout,
-            self.reader.index,
-            len,
-            self.reader.spread_offset,
-        );
+        let (a, b) = self.reader.visible_pages();
         let seen = b.unwrap_or(a) + 1;
         let e = self.settings.progress.entry(key).or_insert((0, 0));
         e.0 = e.0.max(seen);
@@ -2043,10 +2038,7 @@ impl State {
         // frame that draws them.
         pool.set_waker(self.reader.waker.clone());
         self.reader.pool = Some(pool);
-        self.reader.cache.clear();
-        self.reader.lq_cache.clear();
-        self.reader.failed.clear();
-        self.reader.last_drawn = None;
+        self.reader.reset_volume_state();
         self.info_for = None;
         self.reader.nav_times.clear();
         self.reader.rotation = 0; // each volume opens upright
@@ -2519,7 +2511,7 @@ impl State {
         if let Some(d) = dir {
             self.reader.direction = d;
         }
-        self.reader.index = layout::view_start(self.reader.layout, self.reader.index, self.reader.spread_offset);
+        self.reader.snap_to_view_start();
         self.reader.zoom = 1.0;
         self.reader.pan_x = 0.0;
         self.reader.pan_y = 0.0;
@@ -2551,12 +2543,8 @@ impl State {
         if self.library_view {
             return None;
         }
-        let len = self.reader.source.as_ref()?.len();
-        let anchor = if self.reader.scroll_mode {
-            self.reader.index
-        } else {
-            layout::view_pages(self.reader.layout, self.reader.index, len, self.reader.spread_offset).0
-        };
+        self.reader.source.as_ref()?;
+        let anchor = self.reader.visible_pages().0;
         (self.reader.cache.get(anchor)?.frame_count() > 1).then_some(anchor)
     }
 
