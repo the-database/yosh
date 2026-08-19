@@ -129,6 +129,74 @@ pub fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
     zoom.clamp(lo.min(hi), lo.max(hi))
 }
 
+/// Drawn box `(w, h)` in device px of a page shown **alone** — the sizing half of
+/// [`Reader::single_quad`]. Split out so the pan bounds read the very numbers the quad
+/// is built from rather than re-deriving them; the two had drifted (see
+/// [`Reader::view_box`]).
+///
+/// `tex` is the decoded texture's `(w, h)`, `src` its native `(w, h)`; `rotated` marks
+/// a 90°/270° turn, which swaps the box's axes. `cap` bounds the fit scale so it never
+/// pushes the page past 100% native ([`Reader::upscale_cap`]); [`f32::INFINITY`] — what
+/// every caller passes with the option off — leaves the expression bit-identical.
+fn single_box_px(
+    fit: FitMode,
+    screen: (f32, f32),
+    tex: (f32, f32),
+    src: (f32, f32),
+    rotated: bool,
+    cap: f32,
+    zoom: f32,
+) -> (f32, f32) {
+    if fit == FitMode::Actual {
+        // 1:1: size from the *source* dims × zoom, not the decoded dims, so the
+        // displayed box is the same native size whether the texture is full res
+        // (zoom ≥ 1) or re-decoded smaller for zoom-out — the latter then samples
+        // 1:1 instead of the GPU bilinear-downscaling a full-res texture.
+        let (nw, nh) = if rotated { (src.1, src.0) } else { src };
+        return (nw * zoom, nh * zoom);
+    }
+    let (sw, sh) = screen;
+    let (ew, eh) = if rotated { (tex.1, tex.0) } else { tex };
+    // No-upscale (issue #13): the fit never scales the page past 100% of its native
+    // resolution. Zoom multiplies *after* the cap, so zooming past native still
+    // magnifies. Rotation-safe — see `upscale_cap`.
+    let s = fit_scale(fit, sw, sh, ew, eh).min(cap) * zoom;
+    (ew * s, eh * s)
+}
+
+/// Drawn widths of the two pages of a facing pair plus their shared height,
+/// `(wa, wb, h)` in device px — the sizing half of [`Reader::place_view`]'s spread arm,
+/// split out for the same reason as [`single_box_px`]. `a`/`b` are the two decoded
+/// textures' `(w, h)` in *view* order (`a` is the anchor, so screen order still depends
+/// on [`Direction`]); the pair's combined box is `(wa + wb, h)`.
+///
+/// `cap` bounds the fit scale as in [`single_box_px`], but for a pair it must be built
+/// from the *smaller* of the two natives against the shared reference height: the pair
+/// draws at one height, so that way neither page exceeds 100% and both still land on
+/// the same drawn height (so the pair samples 1:1).
+fn pair_box_px(
+    fit: FitMode,
+    screen: (f32, f32),
+    a: (f32, f32),
+    b: (f32, f32),
+    cap: f32,
+    zoom: f32,
+) -> (f32, f32, f32) {
+    let (sw, sh) = screen;
+    // Facing pages share a display height. Size each to a common reference height
+    // (its width following its own aspect ratio) before fitting the pair to the
+    // window. Aspect ratios are stable across decode resolutions, so if the two
+    // pages are momentarily decoded at different heights — e.g. mid re-decode
+    // after a fullscreen toggle / resize, where one updates a frame before the
+    // other — neither page jumps size. (Identical to per-pixel sizing when both
+    // heights already match.)
+    let h_ref = a.1.max(b.1);
+    let wa = a.0 * h_ref / a.1.max(1.0);
+    let wb = b.0 * h_ref / b.1.max(1.0);
+    let s = fit_scale(fit, sw, sh, wa + wb, h_ref).min(cap) * zoom;
+    (wa * s, wb * s, h_ref * s)
+}
+
 /// Decode-target height floor. Each page's decode target tracks its exact
 /// on-screen size (see `page_target_h`) so the HQ linear-light CPU resize does the
 /// *full* reduction in one pass and the GPU samples 1:1 — the single-resize
@@ -865,16 +933,56 @@ impl Reader {
 }
 
 impl Reader {
-    /// Does the current page overflow the window vertically under the active fit?
-    pub fn current_overflows(&self) -> bool {
-        let Some(pt) = self.cache.get(self.index) else {
-            return false;
+    /// The drawn box `(w, h)` in device px of the current **page-flip** view, exactly
+    /// as [`Reader::build_quads`] lays it out — the one source of truth for the pan
+    /// bounds, the wheel's overflow test and the edge dwell. `None` when nothing is
+    /// drawable yet.
+    ///
+    /// Deriving those separately from the quads is precisely what let them drift: they
+    /// each sized the view from the anchor page's texture alone, so a facing pair
+    /// clamped to roughly half its drawn width (horizontal pan was dead on a zoomed
+    /// spread, and its outer edges unreachable), 1:1 below 100% clamped to
+    /// `src × zoom²` instead of `src × zoom` (the foot of a tall page unreachable, and
+    /// `current_overflows` reporting "fits" so the wheel flipped instead of panning),
+    /// and a rotated page shown alone inside [`Layout::Spread`] clamped to its
+    /// unturned box. So this mirrors `place_view`'s dispatch exactly — same texture
+    /// source (cache → LQ thumbnails), same wide-page and hold-last fallbacks — and
+    /// shares its sizing via [`Reader::single_box`] / [`Reader::pair_box`].
+    ///
+    /// Continuous scroll has no such box and returns `None`: the strip's width is
+    /// [`Reader::scroll_content_w`], its height [`Reader::page_display_h`], and its
+    /// vertical position is `top_offset`, not `pan_y`. Every caller is already a
+    /// page-flip path; the guard just keeps that from being a caller's job.
+    pub fn view_box(&self) -> Option<(f32, f32)> {
+        if self.scroll_mode {
+            return None;
+        }
+        let sw = self.viewport.w.max(1) as f32;
+        let sh = self.viewport.h.max(1) as f32;
+        let len = self.source.as_ref()?.len();
+        if len == 0 {
+            return None;
+        }
+        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let Some(ta) = self.page_texture(a) else {
+            // Anchor has no texture yet: `place_view` holds the last-drawn page.
+            return Some(self.single_box(self.page_texture(self.last_drawn?)?, sw, sh));
         };
-        let (sw, sh) = (self.viewport.w.max(1) as f32, self.viewport.h.max(1) as f32);
-        let s = fit_scale(self.fit, sw, sh, pt.w as f32, pt.h as f32)
-            .min(self.upscale_cap(pt.src_h as f32, pt.h as f32))
-            * self.zoom;
-        pt.h as f32 * s > sh + 0.5
+        // Wide (landscape) page is a double-spread image → shown alone.
+        let tb = if ta.w > ta.h { None } else { b.and_then(|bi| self.page_texture(bi)) };
+        Some(match tb {
+            Some(tb) => {
+                let (wa, wb, dh) = self.pair_box(ta, tb, sw, sh);
+                (wa + wb, dh)
+            }
+            None => self.single_box(ta, sw, sh),
+        })
+    }
+
+    /// Does the current view overflow the window vertically under the active fit?
+    pub fn current_overflows(&self) -> bool {
+        let sh = self.viewport.h.max(1) as f32;
+        self.view_box().is_some_and(|(_, dh)| dh > sh + 0.5)
     }
 
     /// Top edge (screen px): centered, then panned by `pan_y`, clamped so the
@@ -890,19 +998,10 @@ impl Reader {
         (sw - dw) / 2.0 + self.pan_x.clamp(-maxp, maxp)
     }
 
-    /// Displayed height of the current page under the active fit + zoom.
+    /// Displayed height of the current view under the active fit + zoom.
     pub fn current_display_h(&self) -> f32 {
-        let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
-        match self.cache.get(self.index) {
-            Some(t) => {
-                t.h as f32
-                    * fit_scale(self.fit, sw, sh, t.w as f32, t.h as f32)
-                        .min(self.upscale_cap(t.src_h as f32, t.h as f32))
-                    * self.zoom
-            }
-            None => sh,
-        }
+        self.view_box().map_or(sh, |(_, dh)| dh)
     }
 
     /// Flip-mode anchor metrics `(sw, sh, fit_w, fit_h, dec_h, src_h, cap)` — the
@@ -1169,23 +1268,40 @@ impl Reader {
             self.pan_x = self.pan_x.clamp(-mx, mx);
             return;
         }
-        if let Some(t) = self.cache.get(self.index) {
-            // Match single_quad's rotated bounding box so pan clamps to the
-            // displayed (possibly turned) page, not the source orientation.
-            let single = self.layout == Layout::Single || t.w > t.h;
-            let (ew, eh) = if single && self.rotation % 2 == 1 {
-                (t.h as f32, t.w as f32)
-            } else {
-                (t.w as f32, t.h as f32)
-            };
-            let s = fit_scale(self.fit, sw, sh, ew, eh)
-                .min(self.upscale_cap(t.src_h as f32, t.h as f32))
-                * self.zoom;
-            let mx = ((ew * s - sw) / 2.0).max(0.0);
-            let my = ((eh * s - sh) / 2.0).max(0.0);
+        // Clamp to the box `build_quads` actually draws — spread-, 1:1- and
+        // rotation-aware, because it *is* the drawing code's own sizing. See
+        // `view_box` for what re-deriving it here used to get wrong.
+        if let Some((dw, dh)) = self.view_box() {
+            let mx = ((dw - sw) / 2.0).max(0.0);
+            let my = ((dh - sh) / 2.0).max(0.0);
             self.pan_x = self.pan_x.clamp(-mx, mx);
             self.pan_y = self.pan_y.clamp(-my, my);
         }
+    }
+
+    /// [`single_box_px`] for `t` under the active fit / zoom / rotation.
+    fn single_box(&self, t: &PageTexture, sw: f32, sh: f32) -> (f32, f32) {
+        single_box_px(
+            self.fit,
+            (sw, sh),
+            (t.w as f32, t.h as f32),
+            (t.src_w as f32, t.src_h as f32),
+            self.rotation % 2 == 1,
+            self.upscale_cap(t.src_h as f32, t.h as f32),
+            self.zoom,
+        )
+    }
+
+    /// [`pair_box_px`] for the facing pair `ta`/`tb` under the active fit / zoom.
+    fn pair_box(&self, ta: &PageTexture, tb: &PageTexture, sw: f32, sh: f32) -> (f32, f32, f32) {
+        pair_box_px(
+            self.fit,
+            (sw, sh),
+            (ta.w as f32, ta.h as f32),
+            (tb.w as f32, tb.h as f32),
+            self.upscale_cap(ta.src_h.min(tb.src_h) as f32, ta.h.max(tb.h) as f32),
+            self.zoom,
+        )
     }
 
     pub fn single_quad(&self, idx: usize, t: &PageTexture, sw: f32, sh: f32) -> Quad {
@@ -1193,32 +1309,7 @@ impl Reader {
         // shader then turns the texture inside this (rotated) bounding box. The box
         // dimensions stay whole texels at the fit scale, so 1:1 sampling holds (the
         // decode target in `page_target_h` is rotation-aware to match).
-        let (dw, dh) = if self.fit == FitMode::Actual {
-            // 1:1: size from the *source* dims × zoom, not the decoded dims, so the
-            // displayed box is the same native size whether the texture is full res
-            // (zoom ≥ 1) or re-decoded smaller for zoom-out — the latter then samples
-            // 1:1 instead of the GPU bilinear-downscaling a full-res texture.
-            let (nw, nh) = if self.rotation % 2 == 1 {
-                (t.src_h as f32, t.src_w as f32)
-            } else {
-                (t.src_w as f32, t.src_h as f32)
-            };
-            (nw * self.zoom, nh * self.zoom)
-        } else {
-            let (ew, eh) = if self.rotation % 2 == 1 {
-                (t.h as f32, t.w as f32)
-            } else {
-                (t.w as f32, t.h as f32)
-            };
-            // No-upscale (issue #13): the fit never scales the page past 100% of
-            // its native resolution. The cap is `INFINITY` when the option is off,
-            // and zoom multiplies *after* it, so zooming past native still
-            // magnifies. Rotation-safe — see `upscale_cap`.
-            let s = fit_scale(self.fit, sw, sh, ew, eh)
-                .min(self.upscale_cap(t.src_h as f32, t.h as f32))
-                * self.zoom;
-            (ew * s, eh * s)
-        };
+        let (dw, dh) = self.single_box(t, sw, sh);
         // Snap the page to the device-pixel grid. At 1:1 (fit-to-window) a
         // fractional offset would make the bilinear sampler blend every column
         // 50/50 with its neighbour — a horizontal smear that also beats against
@@ -1364,34 +1455,16 @@ impl Reader {
 
         match (ta, tb) {
             (Some(ta), Some((bi, tb))) => {
-                // Facing pages share a display height. Size each to a common
-                // reference height (its width following its own aspect ratio)
-                // before fitting the pair to the window. Aspect ratios are
-                // stable across decode resolutions, so if the two pages are
-                // momentarily decoded at different heights — e.g. mid re-decode
-                // after a fullscreen toggle / resize, where one updates a frame
-                // before the other — neither page jumps size. (Identical to
-                // per-pixel sizing when both heights already match.)
-                let h_ref = ta.h.max(tb.h) as f32;
-                let wa = ta.w as f32 * h_ref / ta.h.max(1) as f32;
-                let wb = tb.w as f32 * h_ref / tb.h.max(1) as f32;
-                let combined_w = wa + wb;
-                // No-upscale: the pair is drawn at one shared height, so its
-                // ceiling is the *smaller* of the two natives — that way neither
-                // page exceeds 100%, and both land on the same drawn height so the
-                // pair still samples 1:1. (`INFINITY` when the option is off, and
-                // `page_target_h`'s spread arm applies the identical min.)
-                let s = fit_scale(self.fit, sw, sh, combined_w, h_ref)
-                    .min(self.upscale_cap(ta.src_h.min(tb.src_h) as f32, h_ref))
-                    * self.zoom;
-                let x0 = self.horizontal_left(combined_w * s, sw);
-                let dh = h_ref * s;
+                // Sizing lives in `pair_box_px` (via `pair_box`) so `view_box` — and
+                // through it the pan bounds — measure the very box drawn here.
+                // (`page_target_h`'s spread arm applies the identical no-upscale min.)
+                let (wa, wb, dh) = self.pair_box(ta, tb, sw, sh);
+                let x0 = self.horizontal_left(wa + wb, sw);
                 // Screen order: LTR puts the lower index on the left; RTL reverses.
-                let (l_idx, wl, r_idx, wr) = match self.direction {
+                let (l_idx, dwl, r_idx, dwr) = match self.direction {
                     Direction::Ltr => (a, wa, bi, wb),
                     Direction::Rtl => (bi, wb, a, wa),
                 };
-                let (dwl, dwr) = (wl * s, wr * s);
                 // Snap to the pixel grid (see single_quad). The right page starts
                 // at the left's snapped right edge, so there's no sub-pixel seam.
                 let yt = self.vertical_top(dh, sh).round();
@@ -2170,6 +2243,128 @@ mod tests {
                     (gpu_scale - 1.0).abs() <= 0.01,
                     "actual {src_w}x{src_h} z {zoom}: gpu_scale {gpu_scale} (drawn {drawn}, texture {th})",
                 );
+            }
+        }
+    }
+
+    // Pan bounds on a facing pair come from the pair's *combined* box. Sizing them
+    // from the anchor page alone (what `clamp_pan` did) left horizontal panning dead
+    // on a zoomed spread and its outer edges unreachable — it gave 0 / 0 / 0 / 200
+    // for the zooms below. Both pages are identical portraits, so the pair is exactly
+    // twice as wide as one page.
+    #[test]
+    pub fn pan_bounds_match_drawn_spread() {
+        use super::pair_box_px;
+        use crate::page::{fit_scale, FitMode};
+        let (sw, sh) = (1600.0_f32, 1000.0_f32);
+        let (src_w, src_h) = (1000.0_f32, 1500.0_f32);
+        let aspect = src_w / src_h;
+        for (zoom, want) in [(1.25_f32, 33.0_f32), (1.5, 200.0), (2.0, 533.3), (3.0, 1200.0)] {
+            // page_target_h's spread arm: both pages decode to the pair's drawn
+            // height (content aspect = 2 × the page's), capped at the source height.
+            let th = (fit_scale(FitMode::Window, sw, sh, aspect * 2.0, 1.0) * zoom).min(src_h).round();
+            let tw = (th * aspect).round();
+            let (wa, wb, _) =
+                pair_box_px(FitMode::Window, (sw, sh), (tw, th), (tw, th), f32::INFINITY, zoom);
+            let mx = ((wa + wb - sw) / 2.0).max(0.0);
+            assert!((mx - want).abs() <= 1.0, "zoom {zoom}: pan_x limit {mx}, want {want}");
+        }
+    }
+
+    // 1:1 (Actual) below 100%: the box is `src × zoom` (`single_quad` sizes from the
+    // source, decode-independent), so the pan bounds must be too. The anchor-page
+    // formula fed the *decoded* texture — already `src × zoom` — through `× zoom`
+    // again, i.e. `src × zoom²`: the foot of a tall page was unreachable, and at 0.5
+    // the derived overflow test said "fits" while the page drew 2000 px tall on a
+    // 1000 px viewport, so the wheel flipped the page instead of panning it.
+    #[test]
+    pub fn pan_bounds_match_drawn_actual_zoomed_out() {
+        use super::single_box_px;
+        use crate::page::FitMode;
+        let (sw, sh) = (1600.0_f32, 1000.0_f32);
+        let (src_w, src_h) = (3000.0_f32, 4000.0_f32);
+        for (zoom, want_my, want_overflow) in
+            [(1.0_f32, 1500.0_f32, true), (0.75, 1000.0, true), (0.5, 500.0, true), (0.25, 0.0, false)]
+        {
+            let th = (src_h * zoom).round(); // actual_target decodes to the shown height
+            let tw = (th * (src_w / src_h)).round();
+            let (dw, dh) = single_box_px(
+                FitMode::Actual,
+                (sw, sh),
+                (tw, th),
+                (src_w, src_h),
+                false,
+                f32::INFINITY,
+                zoom,
+            );
+            assert!(
+                (dw - src_w * zoom).abs() <= 0.5 && (dh - src_h * zoom).abs() <= 0.5,
+                "zoom {zoom}: box {dw}x{dh}, want {}x{}",
+                src_w * zoom,
+                src_h * zoom,
+            );
+            let my = ((dh - sh) / 2.0).max(0.0);
+            assert!((my - want_my).abs() <= 0.5, "zoom {zoom}: pan_y limit {my}, want {want_my}");
+            assert_eq!(dh > sh + 0.5, want_overflow, "zoom {zoom}: overflow from drawn height {dh}");
+        }
+    }
+
+    // A page shown alone under a 90°/270° turn is drawn inside a *swapped* box, so
+    // its pan bounds swap with it. `clamp_pan` applied the swap only when the layout
+    // was Single or the page was wide, so a portrait page shown alone inside a spread
+    // (an odd last page) clamped to its unturned box.
+    #[test]
+    pub fn pan_bounds_match_drawn_rotated_single() {
+        use super::single_box_px;
+        use crate::page::{fit_scale, FitMode};
+        let (sw, sh) = (1600.0_f32, 1000.0_f32);
+        let (tw, th) = (1000.0_f32, 1500.0_f32); // portrait texture, decoded == source
+        let boxed = |rotated| {
+            single_box_px(FitMode::Window, (sw, sh), (tw, th), (tw, th), rotated, f32::INFINITY, 2.0)
+        };
+        let (dw, dh) = boxed(true);
+        let s = fit_scale(FitMode::Window, sw, sh, th, tw) * 2.0; // fits the swapped dims
+        assert!((dw - th * s).abs() <= 0.5 && (dh - tw * s).abs() <= 0.5, "turned box {dw}x{dh}");
+        let (uw, uh) = boxed(false);
+        assert!(
+            (uw - dw).abs() > 1.0 || (uh - dh).abs() > 1.0,
+            "turned box must differ from the unturned one, else the test proves nothing",
+        );
+    }
+
+    // Regression guard for the extraction: a page shown alone under a scaling fit —
+    // the overwhelmingly common case — must reproduce the old anchor-page formula
+    // exactly. This change may only move the bounds where they were provably wrong
+    // (spread, 1:1 zoomed out, rotated-alone-in-a-spread).
+    #[test]
+    pub fn pan_bounds_unchanged_for_single_page_fits() {
+        use super::single_box_px;
+        use crate::page::{fit_scale, FitMode};
+        for (sw, sh) in [(3840.0_f32, 2160.0_f32), (1920.0, 1080.0), (1600.0, 2560.0)] {
+            for fit in [FitMode::Window, FitMode::Width, FitMode::Height] {
+                for aspect in [0.5_f32, 0.69, 1.0, 1.5] {
+                    for zoom in [0.5_f32, 1.0, 2.0] {
+                        let th = 1500.0_f32;
+                        let tw = (th * aspect).round();
+                        let (dw, dh) = single_box_px(
+                            fit,
+                            (sw, sh),
+                            (tw, th),
+                            (tw, th),
+                            false,
+                            f32::INFINITY,
+                            zoom,
+                        );
+                        let s = fit_scale(fit, sw, sh, tw, th) * zoom; // the pre-change formula
+                        assert!(
+                            (dw - tw * s).abs() <= 1e-3 && (dh - th * s).abs() <= 1e-3,
+                            "fit {} a {aspect} z {zoom} {sw}x{sh}: {dw}x{dh} vs {}x{}",
+                            fit.label(),
+                            tw * s,
+                            th * s,
+                        );
+                    }
+                }
             }
         }
     }
