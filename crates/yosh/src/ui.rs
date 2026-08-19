@@ -670,6 +670,7 @@ pub fn chrome(
                 ui.separator();
                 ui.heading("View");
                 ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
+                ui.label("Ctrl+wheel   zoom at the cursor (same steps as + / −)");
                 ui.label("Z   stretch small pages (off: fit stops at 100% native)");
                 ui.label("R   rotate 90° (clockwise)");
                 ui.label("I   show image info overlay");

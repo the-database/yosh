@@ -129,6 +129,34 @@ pub fn clamp_zoom_multiplier(zoom: f32, base: f32) -> f32 {
     zoom.clamp(lo.min(hi), lo.max(hi))
 }
 
+/// Pan that leaves the content point currently under `from` sitting under `to` once the
+/// view scales by `k` about the viewport centre — the focal-point ("zoom about a
+/// point") kernel shared by the pinch gesture and Ctrl+wheel zoom.
+///
+/// A point at screen offset `o = from - center` is at content offset `o - pan0` before
+/// the scale; after scaling by `k` about the centre with a new pan `p` it lands at
+/// `k * (o - pan0) + p`. Setting that equal to `to - center` gives the expression below.
+///
+/// `from == to` pins the point exactly (what the pinch does when the fingers hold
+/// still, and what Ctrl+wheel does at every notch). Passing a `to` pulled toward the
+/// centre glides the focus inward as you zoom; passing the *current* finger midpoint
+/// lets a two-finger drag pan while it scales.
+///
+/// All coordinates are content space — screen px measured inside the reading viewport,
+/// i.e. below any top-bar inset the shell reserves.
+pub fn pan_about(
+    from: (f32, f32),
+    to: (f32, f32),
+    center: (f32, f32),
+    pan0: (f32, f32),
+    k: f32,
+) -> (f32, f32) {
+    (
+        to.0 - center.0 - k * (from.0 - center.0 - pan0.0),
+        to.1 - center.1 - k * (from.1 - center.1 - pan0.1),
+    )
+}
+
 /// Drawn box `(w, h)` in device px of a page shown **alone** — the sizing half of
 /// [`Reader::single_quad`]. Split out so the pan bounds read the very numbers the quad
 /// is built from rather than re-deriving them; the two had drifted (see
@@ -2369,6 +2397,86 @@ mod tests {
         }
     }
 
+    /// Where a content point sitting under `screen` (given `pan`, at some scale) lands
+    /// once the view scales by `k` about `center` with the new pan `pan1` — the forward
+    /// direction of what `pan_about` inverts. Used to check the focal pin end to end
+    /// rather than restating the formula.
+    fn projected(screen: (f32, f32), center: (f32, f32), pan: (f32, f32), pan1: (f32, f32), k: f32) -> (f32, f32) {
+        (
+            center.0 + k * (screen.0 - center.0 - pan.0) + pan1.0,
+            center.1 + k * (screen.1 - center.1 - pan.1) + pan1.1,
+        )
+    }
+
+    // The focal-zoom contract: after scaling by `k`, the content that was under `from`
+    // is under `to`. With `from == to` that is a strict pin — the pixel under the
+    // cursor (or under held pinch fingers) does not move at all.
+    #[test]
+    pub fn pan_about_pins_the_focal_point() {
+        use super::pan_about;
+        let center = (800.0_f32, 500.0_f32);
+        for from in [(800.0_f32, 500.0_f32), (0.0, 0.0), (1600.0, 1000.0), (123.0, 940.0)] {
+            for pan in [(0.0_f32, 0.0_f32), (-250.0, 90.0), (400.0, -300.0)] {
+                for k in [0.25_f32, 0.5, 1.0, 1.3, 4.0] {
+                    let pan1 = pan_about(from, from, center, pan, k);
+                    let landed = projected(from, center, pan, pan1, k);
+                    assert!(
+                        (landed.0 - from.0).abs() <= 1e-2 && (landed.1 - from.1).abs() <= 1e-2,
+                        "k {k} pan {pan:?} from {from:?}: landed {landed:?}",
+                    );
+                    // k == 1 is a no-op scale, so it must not shift the pan either.
+                    if k == 1.0 {
+                        assert!(
+                            (pan1.0 - pan.0).abs() <= 1e-3 && (pan1.1 - pan.1).abs() <= 1e-3,
+                            "k=1 moved the pan: {pan:?} -> {pan1:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // A two-finger drag moves the midpoint mid-pinch, so `from != to`: the content
+    // under the *initial* midpoint must follow to the *current* one, which is how a
+    // pinch pans while it scales.
+    #[test]
+    pub fn pan_about_follows_a_moving_focal_point() {
+        use super::pan_about;
+        let center = (800.0_f32, 500.0_f32);
+        let (from, to) = ((400.0_f32, 300.0_f32), (980.0_f32, 620.0_f32));
+        for k in [0.4_f32, 1.0, 2.5] {
+            let pan1 = pan_about(from, to, center, (60.0, -20.0), k);
+            let landed = projected(from, center, (60.0, -20.0), pan1, k);
+            assert!(
+                (landed.0 - to.0).abs() <= 1e-2 && (landed.1 - to.1).abs() <= 1e-2,
+                "k {k}: landed {landed:?}, wanted {to:?}",
+            );
+        }
+    }
+
+    // Repeated focal steps must not let the pinned point creep: zooming in several
+    // notches and back out again has to leave it exactly where it started, which is
+    // what makes the wheel feel anchored rather than drifty.
+    #[test]
+    pub fn repeated_focal_steps_do_not_creep() {
+        use super::pan_about;
+        let center = (800.0_f32, 500.0_f32);
+        let focal = (1360.0_f32, 210.0_f32);
+        let mut pan = (0.0_f32, 0.0_f32);
+        // Six steps up the ladder, then the same six back down.
+        let ratios = [1.2_f32, 1.25, 1.1, 1.3, 1.15, 1.2];
+        for r in ratios {
+            pan = pan_about(focal, focal, center, pan, r);
+        }
+        for r in ratios {
+            pan = pan_about(focal, focal, center, pan, 1.0 / r);
+        }
+        assert!(
+            pan.0.abs() <= 1e-2 && pan.1.abs() <= 1e-2,
+            "round trip left the pan at {pan:?}, expected back at the origin",
+        );
+    }
+
     // A source taller than the *former* fixed 3840 cap, viewed below native, must
     // decode to its displayed height — capped only by the GPU's real max texture
     // size, aspect-aware so the width fits too — so the GPU samples 1:1. The old
@@ -2990,8 +3098,26 @@ impl Reader {
     /// Snap zoom to the next ladder stop above/below the current native %. The
     /// ladder mixes the fixed BandiView presets with this page's fit stops, so a
     /// step can land exactly on fit-to-window / fit-to-width.
+    /// Step the zoom ladder about the viewport centre (the `+` / `-` keys).
     pub fn zoom_to_preset(&mut self, zoom_in: bool) {
+        self.zoom_to_preset_about(zoom_in, None);
+    }
+
+    /// Step the zoom ladder, optionally anchored to `focal` — a point in *content*
+    /// space (screen px inside the reading viewport, so the shell subtracts any
+    /// top-bar inset first). The pixel under `focal` stays under it, exactly as the
+    /// pinch gesture pins its finger midpoint. `None` reproduces the centred keyboard
+    /// behaviour exactly.
+    ///
+    /// Sharing the ladder with `+` / `-` is what lets a Ctrl+wheel notch land exactly on
+    /// this page's fit-to-window / fit-to-width stop — `zoom_ladder` splices those in —
+    /// with the same labelled toast, so the wheel needs no fit detent of its own.
+    ///
+    /// In continuous scroll only `pan_x` moves: the strip's vertical position is
+    /// `top_offset`, not `pan_y` (and `clamp_pan`'s scroll arm only clamps `pan_x`).
+    pub fn zoom_to_preset_about(&mut self, zoom_in: bool, focal: Option<(f32, f32)>) {
         let cur = self.effective_zoom_pct();
+        let (zoom0, pan0) = (self.zoom, (self.pan_x, self.pan_y));
         let mut label: Option<&'static str> = None;
         if self.anchor_scale().is_some() && cur > 0.0 {
             let ladder = self.zoom_ladder();
@@ -3011,6 +3137,19 @@ impl Reader {
             self.zoom *= if zoom_in { 1.25 } else { 1.0 / 1.25 };
         }
         self.clamp_zoom_native();
+        // Anchor the (post-clamp) scale ratio to the focal point, so the content under
+        // it stays put instead of the view scaling about the viewport centre.
+        if let Some(focal) = focal
+            && zoom0 > 0.0
+        {
+            let center = (self.viewport.w.max(1) as f32 / 2.0, self.viewport.h.max(1) as f32 / 2.0);
+            // `from == to`: the focal point maps back to itself, i.e. a strict pin.
+            let (px, py) = pan_about(focal, focal, center, pan0, self.zoom / zoom0);
+            self.pan_x = px;
+            if !self.scroll_mode {
+                self.pan_y = py;
+            }
+        }
         self.clamp_pan();
         let pct = self.effective_zoom_pct();
         match label {

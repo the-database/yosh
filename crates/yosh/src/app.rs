@@ -205,6 +205,15 @@ struct State {
     page_pipeline: PagePipeline,
     cursor_x: f64,
     cursor_y: f64,
+    /// Ctrl down right now — the modifier that turns the wheel into a focal zoom.
+    /// Tracked from `ModifiersChanged` and cleared on focus loss, since a Ctrl-held
+    /// alt-tab releases the key while another window has focus and we'd never see it.
+    ctrl_held: bool,
+    /// Fractional wheel notches banked toward the next zoom-ladder step. A ladder
+    /// step is inherently a whole thing, but a precision touchpad's Ctrl+two-finger
+    /// scroll arrives as a stream of small `PixelDelta`s — without banking them the
+    /// zoom would tear through the ladder. Reset whenever the wheel reverses.
+    zoom_notches: f32,
     mouse_down: bool,
     drag_dist: f32, // accumulated drag distance, to distinguish click from pan
     cursor_in_window: bool, // gates the edge-hover navigation arrows
@@ -480,6 +489,23 @@ fn effective_spine(s: &config::Settings) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Bank `dy` wheel notches into `bank` and return the whole zoom-ladder steps it is
+/// now worth, keeping the fraction for the next event.
+///
+/// A ladder step is inherently a whole thing, but a precision touchpad's Ctrl +
+/// two-finger scroll arrives as a stream of small `PixelDelta`s worth a fraction of a
+/// notch each; stepping per *event* would tear through the ladder. A reversal drops
+/// the bank instead of letting a half-notch of the old direction eat into the new one.
+fn bank_notches(bank: &mut f32, dy: f32) -> i32 {
+    if *bank != 0.0 && bank.signum() != dy.signum() {
+        *bank = 0.0;
+    }
+    *bank += dy;
+    let steps = bank.trunc();
+    *bank -= steps;
+    steps as i32
 }
 
 /// Install the egui chrome fonts: the Phosphor icon set (for the library section
@@ -852,6 +878,8 @@ impl ApplicationHandler for App {
             page_pipeline,
             cursor_x: 0.0,
             cursor_y: 0.0,
+            ctrl_held: false,
+            zoom_notches: 0.0,
             mouse_down: false,
             drag_dist: 0.0,
             cursor_in_window: false,
@@ -1021,7 +1049,16 @@ impl ApplicationHandler for App {
             // focused (notes, a browser) is normal use, and freezing the decode
             // pool on every alt-tab would stall the read-ahead the app exists for.
             // Only "can't be seen at all" — occluded or minimized — parks.
-            WindowEvent::Focused(false) => state.cursor_in_window = false,
+            // Ctrl arms the wheel's focal zoom. Not routed through `action_from`: this
+            // is modifier *state*, not a keypress, and the wheel needs it on the frame
+            // the notch arrives.
+            WindowEvent::ModifiersChanged(m) => state.ctrl_held = m.state().control_key(),
+            WindowEvent::Focused(false) => {
+                state.cursor_in_window = false;
+                // A Ctrl-held alt-tab releases the key while we're unfocused, so the
+                // flag would stay stuck on until the next ModifiersChanged.
+                state.ctrl_held = false;
+            }
             WindowEvent::Occluded(true) => {
                 state.cursor_in_window = false;
                 state.park();
@@ -1567,9 +1604,35 @@ impl State {
             .is_some_and(|l| Self::WHEEL_PASSTHROUGH.iter().any(|&id| l.id == egui::Id::new(id)))
     }
 
-    /// Mouse wheel: pan within an overflowing page, or flip at the edges / when
-    /// the page already fits.
+    /// Wheel notches this delta is worth. A mouse's detent is one `LineDelta`; a
+    /// precision touchpad reports `PixelDelta`, where the same physical gesture arrives
+    /// as many small deltas — `WHEEL_PX_PER_NOTCH` is what makes a two-finger swipe
+    /// worth a comparable number of notches.
+    fn wheel_notches(delta: MouseScrollDelta) -> f32 {
+        const WHEEL_PX_PER_NOTCH: f32 = 50.0;
+        match delta {
+            MouseScrollDelta::LineDelta(_, y) => y,
+            MouseScrollDelta::PixelDelta(p) => p.y as f32 / WHEEL_PX_PER_NOTCH,
+        }
+    }
+
+    /// Mouse wheel: zoom at the cursor with Ctrl held; otherwise pan within an
+    /// overflowing page, or flip at the edges / when the page already fits.
     fn on_wheel(&mut self, delta: MouseScrollDelta) {
+        if self.ctrl_held {
+            // Zoom about the cursor in *content* space: `reader.viewport` excludes the
+            // pinned top bar, so the cursor's window y has to lose that inset or the
+            // anchored point drifts by the bar's height.
+            let steps = bank_notches(&mut self.zoom_notches, Self::wheel_notches(delta));
+            if steps == 0 {
+                return;
+            }
+            let focal = (self.cursor_x as f32, self.cursor_y as f32 - self.top_inset_px());
+            for _ in 0..steps.abs() {
+                self.reader.zoom_to_preset_about(steps > 0, Some(focal));
+            }
+            return;
+        }
         if self.reader.scroll_mode {
             // The wheel is the one abstract ratchet in the app — its px-per-line
             // constant is a made-up number — so it is what the speed setting scales.
@@ -3411,5 +3474,36 @@ mod tests {
             assert_eq!(effective_tier(PerfPref::Mid, on_battery), DeviceTier::Mid);
             assert_eq!(effective_tier(PerfPref::High, on_battery), DeviceTier::High);
         }
+    }
+
+    /// A mouse detent is a whole notch and steps the zoom ladder once; a precision
+    /// touchpad's Ctrl+two-finger scroll arrives as a stream of fractional notches and
+    /// must bank up to whole steps instead of stepping per event.
+    #[test]
+    fn wheel_notches_bank_into_whole_ladder_steps() {
+        use super::bank_notches;
+        // Mouse: one detent, one step, nothing left over.
+        let mut bank = 0.0;
+        assert_eq!(bank_notches(&mut bank, 1.0), 1);
+        assert_eq!(bank, 0.0);
+        assert_eq!(bank_notches(&mut bank, -1.0), -1);
+
+        // Touchpad: ten deltas worth 0.3 notches each = 3 steps total, never more
+        // than one at a time, with the remainder carried between events.
+        let mut bank = 0.0;
+        let mut total = 0;
+        for _ in 0..10 {
+            let s = bank_notches(&mut bank, 0.3);
+            assert!((0..=1).contains(&s), "a 0.3-notch delta stepped {s} stops");
+            total += s;
+        }
+        assert_eq!(total, 3, "10 x 0.3 notches = 3 whole steps");
+        assert!(bank > 0.0 && bank < 1.0, "leftover fraction is kept: {bank}");
+
+        // Reversing drops the bank, so a part-notch one way can't be spent the other.
+        let mut bank = 0.0;
+        assert_eq!(bank_notches(&mut bank, 0.9), 0);
+        assert_eq!(bank_notches(&mut bank, -0.5), 0, "0.9 up must not complete a down step");
+        assert_eq!(bank, -0.5);
     }
 }

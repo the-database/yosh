@@ -22,7 +22,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::reader::{drag_commits, drag_dir, Reader};
+use crate::reader::{drag_commits, drag_dir, pan_about, Reader};
 
 /// A touch landing within this window after a drag release is the digitizer's
 /// lift-off bounce (a phantom contact as the finger peels off the glass), not
@@ -377,13 +377,19 @@ impl TouchGestures {
                         };
                         reader.clamp_zoom_native();
                         // Actual (post-clamp) scale ratio: keep the content point
-                        // under the initial midpoint pinned to the current one.
+                        // under the initial midpoint pinned to the current one — so
+                        // the pair also pans as the fingers travel. Same kernel
+                        // Ctrl+wheel zoom uses, which passes the cursor as both points.
                         let k = reader.zoom / p.zoom0;
-                        reader.pan_x =
-                            mx as f32 - sw / 2.0 - k * (p.mid0.0 as f32 - sw / 2.0 - p.pan0.0);
-                        reader.pan_y = (my - inset) as f32
-                            - sh / 2.0
-                            - k * ((p.mid0.1 - inset) as f32 - sh / 2.0 - p.pan0.1);
+                        let (px, py) = pan_about(
+                            (p.mid0.0 as f32, (p.mid0.1 - inset) as f32),
+                            (mx as f32, (my - inset) as f32),
+                            (sw / 2.0, sh / 2.0),
+                            p.pan0,
+                            k,
+                        );
+                        reader.pan_x = px;
+                        reader.pan_y = py;
                         reader.clamp_pan();
                         resp.redraw = true;
                     }
