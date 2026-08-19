@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::PageCache;
 use crate::decode::MAX_TEX_DIM;
-use crate::layout::{self, Layout};
+use crate::layout::{Grid, Layout, WideSet};
 use crate::page::{fit_scale, FitMode, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg, Waker};
 use crate::prefetch::desired_window;
@@ -667,6 +667,12 @@ pub struct Reader {
     pub fit: FitMode,
     pub layout: Layout,
     pub spread_offset: usize, // spread pairing parity (0 or 1), per-volume
+    /// Which pages are pre-joined double-page spreads, learned from landed decodes.
+    /// Private: it feeds every pairing decision, so a shell must not be able to let
+    /// it drift out of sync with the volume — [`Reader::reset_volume_state`] is the
+    /// only way to drop it. Kept outside the caches deliberately: those evict, and
+    /// un-learning a joined page would re-pair the volume under the reader.
+    wide: WideSet,
     pub rotation: u8,         // 90° CW steps (0..=3); single-page draws only
     pub zoom: f32,            // page-flip zoom factor (1.0 = fit)
     pub pan_x: f32,           // page-flip pan offset in screen px (from centered)
@@ -790,6 +796,13 @@ struct JobsKey {
     /// shape as the `FitMode::Actual` uncached-decode path.
     no_upscale: bool,
     cache_epoch: u64,
+    /// [`WideSet::epoch`]. Unlike the `lq_cache` epoch above, this changes only when
+    /// a page's *orientation* is newly learned — a handful of times per volume, not
+    /// once per landed thumbnail — so it can't reintroduce the rebuild storm. It has
+    /// to be here: a joined spread discovered from an **LQ thumbnail** re-pairs the
+    /// volume (and so re-targets the decodes around it) without touching
+    /// `cache_epoch`, and those pages would otherwise never be reconsidered.
+    wide_epoch: u64,
     failed_len: usize,
 }
 
@@ -827,6 +840,7 @@ impl Reader {
             fit,
             layout,
             spread_offset: 0,
+            wide: WideSet::default(),
             rotation: 0,
             zoom: 1.0,
             pan_x: 0.0,
@@ -895,9 +909,14 @@ impl Reader {
             Some(pool) => pool.poll(),
             None => return,
         };
+        // A landed page can reveal that it is a pre-joined double-page spread, which
+        // re-pairs everything after it — so the read position has to be re-anchored
+        // once the whole batch is in (see below).
+        let mut repaired = false;
         for msg in msgs {
             match msg {
                 Msg::Done { index, page, thumb } => {
+                    repaired |= self.note_orientation(index, &page);
                     if thumb {
                         self.lq_cache.insert(index, page, self.index);
                     } else {
@@ -915,6 +934,14 @@ impl Reader {
                     self.failed.insert(index, error);
                 }
             }
+        }
+        // Pairing shifts by one across a newly-discovered joined spread, so an anchor
+        // set under the old phase can now be a pair's *second* page. Re-anchor rather
+        // than let the view straddle two pairs. `prefetch` picks the change up on its
+        // own via `JobsKey::wide_epoch`; `invalidate_jobs` here would also drop the
+        // thumbnail-tail pivot and force a full O(volume log volume) rebuild.
+        if repaired {
+            self.snap_to_view_start();
         }
     }
 
@@ -961,6 +988,79 @@ impl Reader {
 }
 
 impl Reader {
+    /// The pairing for the open volume — the one source of truth for which pages
+    /// share a view, joined double-page spreads included. `None` when nothing is open.
+    fn grid(&self) -> Option<Grid<'_>> {
+        Some(self.grid_of(self.source.as_ref()?.len()))
+    }
+
+    /// [`Reader::grid`] against an explicit length, for the live-refresh paths that
+    /// have to ask about the listing they are replacing.
+    fn grid_of(&self, len: usize) -> Grid<'_> {
+        Grid {
+            layout: self.layout,
+            len,
+            offset: self.spread_offset,
+            wide: &self.wide,
+        }
+    }
+
+    /// The anchor (lower page) of the view containing `index`.
+    pub fn view_start(&self, index: usize) -> usize {
+        self.grid().map_or(index, |g| g.view_start(index))
+    }
+
+    /// The page(s) sharing the view that contains `index`, `(first, second?)`.
+    pub fn view_pages(&self, index: usize) -> (usize, Option<usize>) {
+        self.grid().map_or((index, None), |g| g.view_pages(index))
+    }
+
+    /// Anchor of the view after the one containing `index` (`index` itself at the end).
+    pub fn next_view(&self, index: usize) -> usize {
+        self.grid().map_or(index, |g| g.next_view(index))
+    }
+
+    /// Anchor of the view before the one containing `index` (`0` at the start).
+    pub fn prev_view(&self, index: usize) -> usize {
+        self.grid().map_or(index, |g| g.prev_view(index))
+    }
+
+    /// Is page `index` drawn beside a facing page? Continuous scroll has no pairing.
+    pub fn is_paired(&self, index: usize) -> bool {
+        !self.scroll_mode && self.grid().is_some_and(|g| g.is_paired(index))
+    }
+
+    /// Record what a landed decode says about page `index`'s orientation, so the
+    /// pairing knows which pages are pre-joined double-page spreads. Returns `true`
+    /// if this is news. Keyed off the *source* dimensions, not the decoded ones, so
+    /// a thumbnail and a full-res decode of the same page can never disagree.
+    fn note_orientation(&mut self, index: usize, page: &PageTexture) -> bool {
+        self.wide.set(index, page.src_w > page.src_h)
+    }
+
+    /// Re-anchor the read position onto a real view start. The shells call this after
+    /// anything that re-pairs the volume (layout toggle, spread-offset toggle, a view
+    /// preset), so the view can't straddle two pairs. No-op in scroll mode, where
+    /// `index` is a strip position rather than an anchor.
+    pub fn snap_to_view_start(&mut self) {
+        if !self.scroll_mode {
+            self.index = self.view_start(self.index);
+        }
+    }
+
+    /// Forget everything learned about the volume being replaced. One call rather
+    /// than a checklist each shell maintains itself — the wide map especially, since
+    /// carrying it into a different book would pair the new one against the old
+    /// one's joined spreads.
+    pub fn reset_volume_state(&mut self) {
+        self.cache.clear();
+        self.lq_cache.clear();
+        self.failed.clear();
+        self.wide.clear();
+        self.last_drawn = None;
+        self.invalidate_jobs();
+    }
+
     /// The drawn box `(w, h)` in device px of the current **page-flip** view, exactly
     /// as [`Reader::build_quads`] lays it out — the one source of truth for the pan
     /// bounds, the wheel's overflow test and the edge dwell. `None` when nothing is
@@ -973,8 +1073,8 @@ impl Reader {
     /// `src × zoom²` instead of `src × zoom` (the foot of a tall page unreachable, and
     /// `current_overflows` reporting "fits" so the wheel flipped instead of panning),
     /// and a rotated page shown alone inside [`Layout::Spread`] clamped to its
-    /// unturned box. So this mirrors `place_view`'s dispatch exactly — same texture
-    /// source (cache → LQ thumbnails), same wide-page and hold-last fallbacks — and
+    /// unturned box. So this mirrors `place_view`'s dispatch exactly — same pairing,
+    /// same texture source (cache → LQ thumbnails), same hold-last fallback — and
     /// shares its sizing via [`Reader::single_box`] / [`Reader::pair_box`].
     ///
     /// Continuous scroll has no such box and returns `None`: the strip's width is
@@ -991,13 +1091,12 @@ impl Reader {
         if len == 0 {
             return None;
         }
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let (a, b) = self.view_pages(self.index);
         let Some(ta) = self.page_texture(a) else {
             // Anchor has no texture yet: `place_view` holds the last-drawn page.
             return Some(self.single_box(self.page_texture(self.last_drawn?)?, sw, sh));
         };
-        // Wide (landscape) page is a double-spread image → shown alone.
-        let tb = if ta.w > ta.h { None } else { b.and_then(|bi| self.page_texture(bi)) };
+        let tb = b.and_then(|bi| self.page_texture(bi));
         Some(match tb {
             Some(tb) => {
                 let (wa, wb, dh) = self.pair_box(ta, tb, sw, sh);
@@ -1050,11 +1149,11 @@ impl Reader {
         if len == 0 {
             return None;
         }
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let (a, b) = self.view_pages(self.index);
         let ta = self.cache.get(a)?;
-        // Wide (landscape) page is shown alone; otherwise pair with `b` if ready.
-        let force_single = ta.w > ta.h;
-        let tb = if force_single { None } else { b.and_then(|bi| self.cache.get(bi)) };
+        // The pairing already withholds a facing slot from a joined spread, so the
+        // only question left here is whether the facing page has decoded.
+        let tb = b.and_then(|bi| self.cache.get(bi));
         let (fit_w, fit_h, dec_h, cap) = match tb {
             Some(tb) => {
                 let h_ref = ta.h.max(tb.h) as f32;
@@ -1079,18 +1178,21 @@ impl Reader {
 
     /// The page(s) actually on screen right now, as `(anchor, facing?)`.
     ///
-    /// [`layout::view_pages`] gives the *pairing* for an index, but two reader-side
-    /// rules decide what's really drawn, and shells must not re-derive them: a wide
-    /// (landscape) page is a pre-joined double-spread and shows alone, and continuous
-    /// scroll has no pairing at all. Both mirror `place_view`.
+    /// The pairing already knows a pre-joined double-page spread shows alone, so
+    /// this is [`Reader::view_pages`] plus the one rule that lives outside it:
+    /// continuous scroll has no pairing. Shells must not re-derive either.
     ///
-    /// This also normalizes the anchor: `goto` sets `index` directly, so after a
-    /// seekbar jump `index` can be the *second* page of a pair — callers that use it
-    /// raw end up describing a different page than the title does.
+    /// It also normalizes the anchor: `index` can be the *second* page of a pair
+    /// while a re-pairing settles, and callers that use it raw end up describing a
+    /// different page than the title does.
     ///
     /// Deliberately independent of decode state, so the answer doesn't flicker while
-    /// the facing page is still decoding. Don't read `build_quads()` for this: during
-    /// a page-turn transition or a live drag it also carries the outgoing view.
+    /// the facing page is still decoding — which is also why wideness now comes from
+    /// the persistent map rather than a texture. The old texture test read a
+    /// different cache here than `place_view` did, so with only an LQ thumbnail
+    /// resident this claimed a facing page that wasn't on screen. Don't read
+    /// `build_quads()` for this either: during a page-turn transition or a live drag
+    /// it also carries the outgoing view.
     pub fn visible_pages(&self) -> (usize, Option<usize>) {
         let len = self.source.as_ref().map_or(0, |s| s.len());
         if len == 0 {
@@ -1099,10 +1201,7 @@ impl Reader {
         if self.scroll_mode {
             return (self.index.min(len - 1), None);
         }
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
-        // Wide (landscape) anchor is a double-page image → it shows alone.
-        let wide = self.cache.get(a).is_some_and(|t| t.w > t.h);
-        (a, if wide { None } else { b })
+        self.view_pages(self.index)
     }
 
     /// device-px-per-native-px of the in-view anchor page, matching exactly what
@@ -1183,7 +1282,7 @@ impl Reader {
         let anchor = if self.scroll_mode {
             self.index
         } else {
-            layout::view_pages(self.layout, self.index, len, self.spread_offset).0
+            self.view_pages(self.index).0
         };
         let t = self.cache.get(anchor)?;
         let s = self.gpu_sample_scale()?;
@@ -1371,7 +1470,7 @@ impl Reader {
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
 
-        let (a, b) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+        let (a, b) = self.view_pages(self.index);
 
         // Live interactive drag: the current view follows the finger; the neighbor
         // view it's being dragged toward shows underneath (drawn first — pages are
@@ -1384,13 +1483,13 @@ impl Reader {
             let raw = d.current_dx();
             let toward = drag_dir(self.direction, raw);
             let incoming = if toward > 0 {
-                layout::next_view(self.layout, self.index, len, self.spread_offset)
+                self.next_view(self.index)
             } else {
-                layout::prev_view(self.layout, self.index, len, self.spread_offset)
+                self.prev_view(self.index)
             };
             let mut quads = Vec::new();
             let finger = if incoming != self.index {
-                let (ia, ib) = layout::view_pages(self.layout, incoming, len, self.spread_offset);
+                let (ia, ib) = self.view_pages(incoming);
                 quads = self.place_view(ia, ib, sw, sh, 0, false);
                 raw
             } else {
@@ -1469,16 +1568,14 @@ impl Reader {
         self.drag_seam.get()
     }
 
-    /// Place one view's pages into draw quads — 1 for a single page (or a wide
-    /// double-spread image shown alone), 2 for a ready facing-page spread.
+    /// Place one view's pages into draw quads — 1 for a single page (a lone page, or
+    /// a pre-joined double-spread the pairing already gave a view of its own), 2 for
+    /// a ready facing-page spread.
     /// `slot_base` is the first GPU quad slot to use. `hold_last` falls back to the
     /// last-drawn page when the anchor isn't cached yet (current view only; the
     /// transition overlay passes `false` so a missing outgoing page just snaps).
     fn place_view(&self, a: usize, b: Option<usize>, sw: f32, sh: f32, slot_base: usize, hold_last: bool) -> Vec<Quad> {
         let ta = self.page_texture(a);
-        // Wide (landscape) page is a double-spread image → show it alone.
-        let force_single = ta.is_some_and(|t| t.w > t.h);
-        let b = if force_single { None } else { b };
         let tb = b.and_then(|bi| self.page_texture(bi).map(|t| (bi, t)));
 
         match (ta, tb) {
@@ -1664,10 +1761,8 @@ impl Reader {
             return f32::INFINITY;
         };
         let mut src_h = t.src_h.max(1) as f32;
-        if paired
-            && let Some(src) = &self.source
-        {
-            let (a, b) = layout::view_pages(self.layout, index, src.len(), self.spread_offset);
+        if paired {
+            let (a, b) = self.view_pages(index);
             let facing = if a == index { b } else { Some(a) };
             if let Some(tb) = facing.and_then(|f| self.cache.get(f)) {
                 src_h = src_h.min(tb.src_h.max(1) as f32);
@@ -1711,24 +1806,26 @@ impl Reader {
         }
         let sw = self.viewport.w.max(1) as f32;
         let sh = self.viewport.h.max(1) as f32;
-        // Two non-wide pages in a spread are drawn at one shared height, so their
-        // no-upscale ceiling spans the pair. Mirrors the `single` test below: a wide
-        // (landscape) page force-shows alone and is therefore never paired.
-        let paired = !self.scroll_mode && self.layout == Layout::Spread && aspect <= 1.0;
+        // Whether this page is drawn beside a facing one is the pairing's answer, not
+        // a guess from its own aspect: the cover, a trailing orphan and a page
+        // orphaned by a joined neighbour are all drawn alone, and calling them paired
+        // decoded them at half their drawn height — a GPU *upscale*, the one thing
+        // the single-resize invariant forbids. Two paired pages are drawn at one
+        // shared height, so their no-upscale ceiling also spans the pair.
+        let paired = self.is_paired(index);
         let target = if self.scroll_mode {
             // Continuous strip: width-fit at width sw*zoom, height follows aspect.
             sw * self.zoom / aspect
         } else {
-            // A page is drawn alone when layout is Single or it's a wide
-            // (landscape) page that force-shows alone — only then does rotation
-            // apply. `content_aspect` is the on-screen box's width/height.
-            let single = self.layout == Layout::Single || aspect > 1.0;
-            let rotated = single && self.rotation % 2 == 1;
+            // Rotation only applies to a page drawn alone — which `single_quad` also
+            // assumes, so the two must agree on what "alone" means.
+            // `content_aspect` is the on-screen box's width/height.
+            let rotated = !paired && self.rotation % 2 == 1;
             let content_aspect = if rotated {
                 1.0 / aspect // rotated single page: box is the inverse of the source
-            } else if self.layout == Layout::Spread && aspect <= 1.0 {
-                // Pair two non-wide pages (assume a same-size facing page — exact
-                // for uniform volumes; wide pages always show alone).
+            } else if paired {
+                // Assume a same-size facing page — exact for uniform volumes, and a
+                // joined spread is never paired in the first place.
                 aspect * 2.0
             } else {
                 aspect
@@ -1788,6 +1885,7 @@ impl Reader {
             fit: self.fit,
             layout: self.layout,
             spread_offset: self.spread_offset,
+            wide_epoch: self.wide.epoch(),
             rotation: self.rotation,
             scroll_mode: self.scroll_mode,
             no_upscale: self.fit_no_upscale,
@@ -1803,7 +1901,7 @@ impl Reader {
         // immediately. Once the anchor is cached the next prefetch wants HQ and
         // upgrades the LQ pages in place. (Pages prefetched HQ-ahead stay HQ — no
         // LQ flash when the buffer keeps up.)
-        let anchor = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
+        let anchor = self.view_pages(self.index).0;
         let lq = self.two_tier && !self.cache.contains(anchor);
         let window = desired_window(self.index, len, fwd, self.back);
         let jobs: Vec<(usize, u32, bool, bool)> = window
@@ -1977,7 +2075,7 @@ mod tests {
     #[test]
     fn jobs_key_ignores_the_thumbnail_tier() {
         use super::{FitMode, JobsKey, Layout};
-        let key = |cache_epoch: u64, _lq_epoch: u64| JobsKey {
+        let key = |cache_epoch: u64, _lq_epoch: u64, wide_epoch: u64| JobsKey {
             index: 12,
             len: 500,
             fwd: 16,
@@ -1991,11 +2089,13 @@ mod tests {
             scroll_mode: false,
             no_upscale: false,
             cache_epoch,
+            wide_epoch,
             failed_len: 0,
         };
         // `Layout` has no `Debug`, so compare with `==` rather than assert_eq!.
-        assert!(key(7, 1) == key(7, 99), "a landing thumbnail must not rebuild the job list");
-        assert!(key(7, 1) != key(8, 1), "a landing full-res page still rebuilds it");
+        assert!(key(7, 1, 0) == key(7, 99, 0), "a landing thumbnail must not rebuild the job list");
+        assert!(key(7, 1, 0) != key(8, 1, 0), "a landing full-res page still rebuilds it");
+        assert!(key(7, 1, 0) != key(7, 1, 1), "a newly-learned joined spread re-pairs, so it must rebuild");
     }
 
     // Desktop-class inputs reproduce the historical fixed budget exactly.
@@ -2885,9 +2985,9 @@ impl Reader {
             return false;
         }
         let next = if dir > 0 {
-            layout::next_view(self.layout, self.index, len, self.spread_offset)
+            self.next_view(self.index)
         } else {
-            layout::prev_view(self.layout, self.index, len, self.spread_offset)
+            self.prev_view(self.index)
         };
         next == self.index
     }
@@ -2901,7 +3001,7 @@ impl Reader {
         if len == 0 {
             return false;
         }
-        let cur = layout::view_pages(self.layout, self.index, len, self.spread_offset).0;
+        let cur = self.view_pages(self.index).0;
         if self.page_texture(cur).is_none()
             && !self.failed.contains_key(&cur)
             && self.lq_cache.len() < self.lq_cache.cap()
@@ -2909,9 +3009,9 @@ impl Reader {
             return false;
         }
         let next = if dir > 0 {
-            layout::next_view(self.layout, self.index, len, self.spread_offset)
+            self.next_view(self.index)
         } else {
-            layout::prev_view(self.layout, self.index, len, self.spread_offset)
+            self.prev_view(self.index)
         };
         if next != self.index {
             // Arm the page-flip animation: the current view slides+fades out over
@@ -2927,7 +3027,7 @@ impl Reader {
                 if rapid {
                     self.transition = None; // clear any in-flight one too
                 } else {
-                    let (oa, ob) = layout::view_pages(self.layout, self.index, len, self.spread_offset);
+                    let (oa, ob) = self.view_pages(self.index);
                     let mut out_pages = vec![oa];
                     if let Some(b) = ob {
                         out_pages.push(b);
@@ -3008,7 +3108,13 @@ impl Reader {
     }
 
     pub fn goto(&mut self, index: usize) {
-        self.index = index;
+        // Land on a real view start: a seekbar scrub or a "go to page N" can name the
+        // *second* page of a pair, and an index that isn't an anchor makes the pairing
+        // re-snap under the reader on the next frame. `step` already passes an anchor,
+        // so this is a no-op there (and in single-page layout). Scroll mode is excluded
+        // because `layout` persists across the mode toggle, and there `index` is a
+        // strip position, not a pairing anchor.
+        self.index = if self.scroll_mode { index } else { self.view_start(index) };
         self.pan_x = 0.0;
         self.pan_y = 0.0; // start new page centered
         self.top_offset = 0.0;
@@ -3045,6 +3151,7 @@ impl Reader {
                 if new_len < old_len {
                     self.cache.remap(|i| (i < new_len).then_some(i));
                     self.lq_cache.remap(|i| (i < new_len).then_some(i));
+                    self.wide.remap(|i| (i < new_len).then_some(i));
                     if self.index >= new_len {
                         self.index = new_len - 1;
                     }
@@ -3053,6 +3160,8 @@ impl Reader {
                     pool.set_source(new.clone());
                 }
                 self.source = Some(new);
+                // The trim clamp above can land on a pair's second page.
+                self.snap_to_view_start();
                 // Appended/trimmed pages change what the thumbnail tail should hold,
                 // and the old tail's indices were built against the old listing.
                 self.invalidate_jobs();
@@ -3065,11 +3174,13 @@ impl Reader {
             Refresh::Reorder => {
                 let new_pos: HashMap<&str, usize> =
                     (0..new_len).map(|i| (new.name(i), i)).collect();
-                let anchor =
-                    layout::view_pages(self.layout, self.index, old_len, self.spread_offset).0;
+                let anchor = self.grid_of(old_len).view_pages(self.index).0;
                 let anchor_name = old.name(anchor).to_string();
                 self.cache.remap(|i| new_pos.get(old.name(i)).copied());
                 self.lq_cache.remap(|i| new_pos.get(old.name(i)).copied());
+                // Orientation follows the *file*, so a page inserted mid-list doesn't
+                // make the reader re-pair around a joined spread that hasn't moved.
+                self.wide.remap(|i| new_pos.get(old.name(i)).copied());
                 self.index = new_pos
                     .get(anchor_name.as_str())
                     .copied()
@@ -3087,6 +3198,8 @@ impl Reader {
                 pool.set_waker(self.waker.clone());
                 self.pool = Some(pool);
                 self.source = Some(new);
+                // Re-pairing can move the anchor even though the file didn't.
+                self.snap_to_view_start();
                 // The new pool's queues are empty (and indices shifted), so both the
                 // job list and the thumbnail tail must be rebuilt from scratch.
                 self.invalidate_jobs();
