@@ -49,6 +49,7 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `S` / `D` / `C` / `O` | spread ↔ single · direction RTL↔LTR · continuous scroll · shift spread pairing |
 | `R` | rotate 90° clockwise (single-page view; resets on opening a new book) |
 | `+` `-` | zoom; drag to pan |
+| `Ctrl`+wheel | zoom at the cursor — the pixel under it stays put, in the same steps as `+` `-` |
 | `Z` | stretch small pages (off: a fit never scales past 100% native; zoom still can) |
 | `E` | show in Explorer (opens the folder and selects the file/archive) |
 | `I` | image info overlay |
