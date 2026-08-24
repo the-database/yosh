@@ -2,7 +2,9 @@
 //! `ZipArchive` handle (the central directory is tiny for a comic), so worker
 //! threads never share a cursor. Parsed handles are recycled through `pool`
 //! instead of re-opening + re-parsing the archive on every read — that repeated
-//! open + central-directory scan is a real cost over a network share.
+//! open + central-directory scan is a real cost over a network share; the handle
+//! `build` already parsed seeds the pool, so the very first worker read reuses it
+//! rather than paying that cost once more before the pool has anything in it.
 //!
 //! Pages are addressed by *archive index*, not by name — `zip`'s name lookup cannot
 //! round-trip an entry whose name isn't ASCII/UTF-8 (see `ZipSource::list_central`),
@@ -113,7 +115,14 @@ impl ZipSource {
                     names,
                     index: Index::Central(idx),
                     partial: false,
-                    pool: Mutex::new(Vec::new()),
+                    // Seed the pool with the handle we just parsed instead of dropping
+                    // it: the first decode worker checks this one out rather than
+                    // paying a second `File::open` + central-directory parse (a real
+                    // cost on a network share, right when the first page is wanted).
+                    // Where `list_central` left the cursor is irrelevant — `read_page`
+                    // seeks via `by_index`. Helps `Backend::Bytes` (Android
+                    // `from_bytes`) too, where the re-parse is the avoidable part.
+                    pool: Mutex::new(vec![zip]),
                 })
             }
             // No usable central directory (truncated / damaged download, sync cut
@@ -132,6 +141,8 @@ impl ZipSource {
                     names,
                     index: Index::Local(offsets),
                     partial: true,
+                    // Recovered archives read straight from the local-header offsets,
+                    // never through a parsed handle — nothing to seed the pool with.
                     pool: Mutex::new(Vec::new()),
                 })
             }
@@ -561,6 +572,26 @@ mod tests {
             assert_eq!(*src.read_page(0).unwrap(), b"PNGDATA-ONE");
             assert_eq!(*src.read_page(1).unwrap(), b"JPGDATA-TWO");
         }
+    }
+
+    /// `build` must seed the handle pool with the archive it just parsed, so the
+    /// first worker read reuses it instead of re-opening + re-parsing.
+    #[test]
+    fn build_seeds_handle_pool() {
+        let path = write_zip("seedpool", &[("01.png", b"PNGDATA-ONE")], &[]);
+        let src = ZipSource::new(&path).unwrap();
+        assert_eq!(
+            src.pool.lock().unwrap().len(),
+            1,
+            "build-time handle recycled into the pool"
+        );
+        assert_eq!(*src.read_page(0).unwrap(), b"PNGDATA-ONE");
+        assert_eq!(
+            src.pool.lock().unwrap().len(),
+            1,
+            "checkout/checkin round-trips the seeded handle"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
