@@ -323,8 +323,13 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                             if lin.len() < pix.len() * 2 {
                                 lin.resize(pix.len() * 2, 0);
                             }
-                            for (c, &s) in lin[..pix.len() * 2].chunks_exact_mut(2).zip(pix) {
-                                c.copy_from_slice(&to_lin[s as usize].to_ne_bytes());
+                            for (c, &s) in lin[..pix.len() * 2]
+                                .as_chunks_mut::<2>()
+                                .0
+                                .iter_mut()
+                                .zip(pix)
+                            {
+                                *c = to_lin[s as usize].to_ne_bytes();
                             }
                             &lin[..pix.len() * 2]
                         } else {
@@ -343,8 +348,8 @@ fn run(datas: &[Vec<u8>], n: usize, cfg: &Cfg, dec: Dec) -> (f64, f64, f64) {
                         if hq_gray {
                             // Re-encode 16-bit linear -> 8-bit device.
                             let mut acc = 0u64;
-                            for c in d.0.buffer().chunks_exact(2) {
-                                acc += enc[u16::from_ne_bytes([c[0], c[1]]) as usize] as u64;
+                            for c in d.0.buffer().as_chunks::<2>().0 {
+                                acc += enc[u16::from_ne_bytes(*c) as usize] as u64;
                             }
                             black_box(acc);
                         } else {

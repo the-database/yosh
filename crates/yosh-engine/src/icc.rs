@@ -97,8 +97,10 @@ fn parse_desc(tag: &[u8]) -> Option<String> {
             let off = be32(24)?;
             let raw = tag.get(off..off.checked_add(len)?)?;
             let u16s: Vec<u16> = raw
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_be_bytes(*c))
                 .collect();
             let s = String::from_utf16_lossy(&u16s);
             let s = s.trim_matches(|c: char| c == '\0' || c.is_whitespace()).to_string();
