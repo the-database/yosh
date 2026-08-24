@@ -162,9 +162,20 @@ const WATCH_QUIET: Duration = Duration::from_millis(250);
 const WATCH_MAX_WAIT: Duration = Duration::from_millis(1000);
 
 pub struct App {
-    initial_path: Option<PathBuf>,
     start_index: usize,
     state: Option<State>,
+    /// Background-open channel, created before the event loop so a CLI-arg open
+    /// can be spawned in `App::new` (pre-window, pre-GPU). `State` adopts both
+    /// ends in `resumed`; every later `open()` reuses the same channel.
+    open_tx: std::sync::mpsc::Sender<(u64, Built)>,
+    open_rx: Option<std::sync::mpsc::Receiver<(u64, Built)>>,
+    /// Some(path) when a CLI open is already in flight as generation 1.
+    cli_open: Option<PathBuf>,
+    /// Waker slot the pre-spawned open thread fires; filled by `resumed` the
+    /// moment the window exists.
+    early_waker: Arc<std::sync::OnceLock<Waker>>,
+    /// Instrumentation stamp for the CLI open (handed to `State::open_t0`).
+    open_t0: Option<Instant>,
 }
 
 /// Playback state for the animation (GIF/WebP) currently in view (BandiView-style
@@ -330,6 +341,9 @@ struct State {
     opening_key: Option<PathBuf>,
     open_tx: std::sync::mpsc::Sender<(u64, Built)>,
     open_rx: std::sync::mpsc::Receiver<(u64, Built)>,
+    /// Instrumentation: when the in-flight open was initiated (debug logging only;
+    /// cleared when the first page of the new volume is drawn or the open fails).
+    open_t0: Option<Instant>,
     /// Startup resume scan: which recent still exists on disk is decided on a
     /// background thread (a stale network share or a spun-down HDD can make
     /// `Path::exists` take seconds, and this runs before the first frame). Some
@@ -363,6 +377,12 @@ struct State {
     watch_filter: Option<PathBuf>,
     watch_tx: std::sync::mpsc::Sender<notify::Result<notify::Event>>,
     watch_rx: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    /// Finished off-thread watcher installs (`install_folder_watch` spawns them —
+    /// `is_dir`/`canonicalize`/`watch()` are filesystem calls that can stall for
+    /// seconds on a network share, and they used to run inside `set_source` on the
+    /// main thread). Drained in `poll_background`, generation-tagged like `open_rx`.
+    watch_install_tx: std::sync::mpsc::Sender<WatchInstall>,
+    watch_install_rx: std::sync::mpsc::Receiver<WatchInstall>,
     watch_dirty: Option<Instant>,
     /// When the current burst of change events began (a folder copy or a streaming
     /// archive write fires many). `watch_dirty` (last event) drives the settle delay;
@@ -376,6 +396,11 @@ struct State {
 /// Result of constructing a page source: `(source, volume-key path, explicit
 /// start index)`, or an error message. Built off-thread by `build_source`.
 type Built = Result<(Arc<dyn PageSource>, PathBuf, Option<usize>), String>;
+
+/// One finished off-thread watcher install: the open generation it was built
+/// for, and the registered watcher + archive-path filter (None = this volume
+/// isn't watchable, or notify failed — the feature is simply inactive).
+type WatchInstall = (u64, Option<(notify::RecommendedWatcher, Option<PathBuf>)>);
 
 /// One off-thread info-overlay result: the open generation, the visible-pages key
 /// it was gathered for, and one `(page index, rows)` block per visible page. The
@@ -508,27 +533,32 @@ fn bank_notches(bank: &mut f32, dy: f32) -> i32 {
     steps as i32
 }
 
+/// System CJK fallback fonts, in preference order — the first that reads wins.
+/// At module scope so the (tens-of-MB) read can be started on a background thread
+/// before `install_fonts` is reached; see the `cjk_font` spawn in `resumed`.
+const CJK_FONT_CANDIDATES: &[&str] = &[
+    r"C:\Windows\Fonts\YuGothR.ttc",
+    r"C:\Windows\Fonts\meiryo.ttc",
+    r"C:\Windows\Fonts\msgothic.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
+    "/Library/Fonts/Hiragino Sans GB.ttc",
+];
+
 /// Install the egui chrome fonts: the Phosphor icon set (for the library section
-/// carets) is added unconditionally, and a best-effort system CJK font is appended
-/// as a fallback so Japanese/Chinese/Korean text (paths, filenames, library
-/// titles) renders. Both are *fallbacks* layered after the default fonts, so Latin
-/// keeps its default look. A single `set_fonts` applies the lot.
-fn install_fonts(ctx: &egui::Context) {
+/// carets) is added unconditionally, and a best-effort system CJK font — read
+/// ahead of time and passed in as `cjk` — is appended as a fallback so
+/// Japanese/Chinese/Korean text (paths, filenames, library titles) renders. Both
+/// are *fallbacks* layered after the default fonts, so Latin keeps its default
+/// look. A single `set_fonts` applies the lot.
+fn install_fonts(ctx: &egui::Context, cjk: Option<Vec<u8>>) {
     let mut fonts = egui::FontDefinitions::default();
     // Phosphor carets etc. — pure-Rust glyph set, always available (matches the
     // Android shell, so the library headers never fall back to tofu boxes).
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
 
-    const CANDIDATES: &[&str] = &[
-        r"C:\Windows\Fonts\YuGothR.ttc",
-        r"C:\Windows\Fonts\meiryo.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
-        "/Library/Fonts/Hiragino Sans GB.ttc",
-    ];
-    if let Some(bytes) = CANDIDATES.iter().find_map(|p| std::fs::read(p).ok()) {
+    if let Some(bytes) = cjk {
         fonts.font_data.insert(
             "cjk".to_owned(),
             // The CJK fallback's glyphs render above the Latin baseline; nudge them
@@ -659,10 +689,43 @@ fn reveal_in_explorer(path: &std::path::Path) {
 
 impl App {
     pub fn new(initial_path: Option<PathBuf>, start_index: usize) -> Self {
+        // A CLI / file-association open is known before the event loop even starts,
+        // so start reading the disk *here* — the listing then overlaps window
+        // creation, `Gpu::new` (the dominant startup term) and the CJK font read
+        // instead of queuing behind them. `State` adopts this channel wholesale in
+        // `resumed`, so the result arrives on the same path as any later open; the
+        // pre-spawn is hardcoded generation 1 and `State` starts at `open_gen: 1`.
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        // The waker needs a `Window`, which doesn't exist yet: `resumed` fills this
+        // slot the moment it does. Both race orders deliver — see the spawn below.
+        let early_waker: Arc<std::sync::OnceLock<Waker>> = Arc::new(std::sync::OnceLock::new());
+        let mut open_t0 = None;
+        if let Some(path) = initial_path.clone() {
+            open_t0 = Some(Instant::now());
+            if cfg!(debug_assertions) {
+                eprintln!("[open] initiated (cli): {}", path.display());
+            }
+            let tx = open_tx.clone();
+            let waker = early_waker.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((1, build_source(&path)));
+                // Send-then-wake, as every producer does — except there may be no
+                // window to wake yet. If the slot is still empty the result simply
+                // waits in the channel and is drained by the first `render()`,
+                // which `resumed`'s unconditional `request_redraw` guarantees.
+                if let Some(wake) = waker.get() {
+                    wake();
+                }
+            });
+        }
         Self {
-            initial_path,
             start_index,
             state: None,
+            open_tx,
+            open_rx: Some(open_rx),
+            cli_open: initial_path,
+            early_waker,
+            open_t0,
         }
     }
 }
@@ -690,6 +753,13 @@ impl ApplicationHandler for App {
             return;
         }
         let mut settings = config::load();
+        // The CJK fallback font is a tens-of-MB .ttc; read it while the adapter/device
+        // request runs instead of after it. Joined (not polled) at install time.
+        let cjk_font = std::thread::spawn(|| {
+            CJK_FONT_CANDIDATES
+                .iter()
+                .find_map(|p| std::fs::read(p).ok())
+        });
         let attrs = Window::default_attributes()
             .with_title("yosh")
             .with_window_icon(window_icon());
@@ -715,6 +785,11 @@ impl ApplicationHandler for App {
             attrs.with_taskbar_icon(window_icon())
         };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // A CLI open spawned back in `App::new` may still be running: hand it a real
+        // waker the instant a window exists, so a listing that finishes during the
+        // GPU/font work below still schedules its own frame. Filled here rather than
+        // later because everything after this point can block for a while.
+        let _ = self.early_waker.set(frame_waker(&window));
         // Override winit's PNG-derived icon with the exe's square embedded .ico so
         // the taskbar (ICON_BIG) shows the logo instead of the generic app icon.
         #[cfg(windows)]
@@ -722,7 +797,9 @@ impl ApplicationHandler for App {
         let gpu = Gpu::new(window.clone());
 
         let egui_ctx = egui::Context::default();
-        install_fonts(&egui_ctx);
+        // A panicked reader thread degrades to "no CJK fallback" — already the
+        // behavior on a system with none of the candidate fonts installed.
+        install_fonts(&egui_ctx, cjk_font.join().unwrap_or(None));
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -762,10 +839,11 @@ impl ApplicationHandler for App {
         // off-thread — they hit the filesystem, and a dead network share or sleeping
         // HDD would otherwise delay the *window itself* by seconds. The answer is
         // picked up in `poll_background`.
+        // A CLI open is already in flight (spawned in `App::new` as generation 1),
+        // so it needs no `pending_open` — only the resume scan is decided here.
+        let cli_open = self.cli_open.take();
         let mut resume_rx = None;
-        if let Some(p) = self.initial_path.take() {
-            ui.pending_open = Some(p);
-        } else if settings.resume_on_startup && !settings.recents.is_empty() {
+        if cli_open.is_none() && settings.resume_on_startup && !settings.recents.is_empty() {
             let (tx, rx) = std::sync::mpsc::channel();
             let recents = settings.recents.clone();
             let wake = frame_waker(&window);
@@ -790,7 +868,7 @@ impl ApplicationHandler for App {
         // A pending resume scan counts as "something is opening": start on the reader
         // background (with the spinner, via `opening` below) rather than flashing the
         // library grid for the frames the scan takes.
-        let library_view = ui.pending_open.is_none() && resume_rx.is_none();
+        let library_view = cli_open.is_none() && ui.pending_open.is_none() && resume_rx.is_none();
         // Show the keys overlay once, on the first launch ever, then persist so it
         // never auto-opens again (F1 / "? Help" reopen it on demand).
         if !settings.help_seen {
@@ -809,14 +887,19 @@ impl ApplicationHandler for App {
                 wake(); // send-then-wake (nothing to show when already current)
             }
         });
-        // Channels for background archive opens, sibling-volume prescans, and the
-        // off-thread Tab info overlay.
-        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        // Adopt the open channel built in `App::new` (a pre-spawned CLI open may
+        // already have sent on it, or still be running). Taking the receiver is safe:
+        // the `state.as_mut()` early-return above handles a re-entered `resumed`, and
+        // the desktop shell builds `State` exactly once.
+        let open_tx = self.open_tx.clone();
+        let open_rx = self.open_rx.take().expect("desktop resumed builds State once");
+        // Channels for sibling-volume prescans and the off-thread Tab info overlay.
         let (sib_tx, sib_rx) = std::sync::mpsc::channel();
         let (info_tx, info_rx) = std::sync::mpsc::channel();
         // Channels for the live-folder-refresh watcher: raw notify events in, and
         // off-thread `FolderSource` rebuilds out.
         let (watch_tx, watch_rx) = std::sync::mpsc::channel();
+        let (watch_install_tx, watch_install_rx) = std::sync::mpsc::channel();
         let (rescan_tx, rescan_rx) = std::sync::mpsc::channel();
         // Off-thread library scan + cover decode.
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
@@ -920,11 +1003,17 @@ impl ApplicationHandler for App {
             update_apply_rx: None,
             updating: false,
             update_error: None,
-            open_gen: 0,
-            opening: resume_rx.is_some(), // spinner while the resume scan runs
-            opening_key: None,
+            // The pre-spawned CLI open is generation 1, so `State` must start there
+            // or its result would be discarded as stale by the drain in `render`.
+            open_gen: if cli_open.is_some() { 1 } else { 0 },
+            // Spinner while the resume scan — or the pre-spawned CLI open — runs.
+            opening: resume_rx.is_some() || cli_open.is_some(),
+            // Keeps rapid `[`/`]` advancing from the pending CLI target rather than
+            // from nothing, exactly as a `State::open`-initiated open would.
+            opening_key: cli_open,
             open_tx,
             open_rx,
+            open_t0: self.open_t0.take(),
             resume_rx,
             sib_cache: None,
             sib_tx,
@@ -934,6 +1023,8 @@ impl ApplicationHandler for App {
             watch_filter: None,
             watch_tx,
             watch_rx,
+            watch_install_tx,
+            watch_install_rx,
             watch_dirty: None,
             watch_dirty_since: None,
             rescanning: false,
@@ -1991,6 +2082,10 @@ impl State {
     /// in `render`. Each call bumps `open_gen`; only the newest result is applied,
     /// so rapid `[`/`]` supersede in-flight opens instead of queuing stale swaps.
     fn open(&mut self, path: &Path) {
+        self.open_t0 = Some(Instant::now());
+        if cfg!(debug_assertions) {
+            eprintln!("[open] initiated: {}", path.display());
+        }
         self.open_gen = self.open_gen.wrapping_add(1);
         let generation = self.open_gen;
         let tx = self.open_tx.clone();
@@ -2068,45 +2163,64 @@ impl State {
     /// "opened one image, then siblings appear") or a still-being-written **`.cbz`/`.zip`**
     /// file (recovered via `ZipSource`'s local-header scan). RAR/7z/complete files aren't
     /// watched. A `notify` failure is non-fatal — the feature is simply inactive for that volume.
+    ///
+    /// Only the *reset* runs here: picking the target (`is_dir`, `canonicalize`) and
+    /// registering the watch are filesystem calls that can stall for seconds on a
+    /// network share, and this sits on `set_source`'s main-thread path — right where
+    /// the first page is trying to reach the screen. So the install runs on a worker
+    /// and is adopted in `poll_background`, tagged with the open generation so a
+    /// volume switch during the gap discards it. The few unwatched milliseconds cost
+    /// nothing: the feature is already debounced/best-effort, and the listing
+    /// `build_source` just produced is by definition current.
     fn install_folder_watch(&mut self, path: &Path) {
         // Reset any pending refresh carried over from the previous volume, and drop
-        // the old watch (dropping the watcher unregisters it).
+        // the old watch (dropping the watcher unregisters it). Synchronous: it must
+        // be true the moment the volume changes, whatever the install thread does.
         self.watch_dirty = None;
         self.watch_dirty_since = None;
         self.rescanning = false;
         self.watcher = None;
         self.watch_filter = None;
-        // Pick what to watch: a folder directly, or — for a growing archive — its parent
-        // directory (notify's Windows backend watches directories; a lone-file watch is
-        // unreliable, especially for a writer holding the file open and appending). For the
-        // archive case we keep the file path to filter the dir's events down to it.
-        let (target, filter): (PathBuf, Option<PathBuf>) = if path.is_dir() {
-            (path.to_path_buf(), None)
-        } else if is_growable_archive(path) {
-            // Canonicalize so the parent dir resolves even for a relative/bare-filename
-            // path (whose `parent()` would be ""); fall back to the path as given.
-            let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            match abs.parent() {
-                Some(parent) => (parent.to_path_buf(), Some(abs.clone())),
-                None => return, // no parent dir to watch
-            }
-        } else {
-            return; // RAR/7z/complete file: can't grow, not watched
-        };
-        // notify calls the handler from its own thread, so the event only reaches
-        // the debounce in `poll_folder_watch` when a frame runs: send-then-wake.
-        let tx = self.watch_tx.clone();
+        // Everything captured here is cheap; the filesystem work is all inside the
+        // thread. `watch_tx`'s handler waker and the install waker are separate
+        // clones — the handler outlives this call, held by the watcher itself.
+        let generation = self.open_gen;
+        let install_tx = self.watch_install_tx.clone();
+        let event_tx = self.watch_tx.clone();
         let wake = frame_waker(&self.window);
-        let handler = move |res| {
-            let _ = tx.send(res);
-            wake();
-        };
-        if let Ok(mut w) = notify::recommended_watcher(handler)
-            && w.watch(&target, notify::RecursiveMode::NonRecursive).is_ok()
-        {
-            self.watcher = Some(w);
-            self.watch_filter = filter;
-        }
+        let path = path.to_path_buf();
+        std::thread::spawn(move || {
+            let handler_wake = wake.clone();
+            let built = (|| {
+                // Pick what to watch: a folder directly, or — for a growing archive — its
+                // parent directory (notify's Windows backend watches directories; a lone-file
+                // watch is unreliable, especially for a writer holding the file open and
+                // appending). For the archive case we keep the file path to filter the dir's
+                // events down to it.
+                let (target, filter): (PathBuf, Option<PathBuf>) = if path.is_dir() {
+                    (path.clone(), None)
+                } else if is_growable_archive(&path) {
+                    // Canonicalize so the parent dir resolves even for a relative/bare-filename
+                    // path (whose `parent()` would be ""); fall back to the path as given.
+                    let abs = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    let parent = abs.parent()?.to_path_buf(); // no parent dir to watch
+                    (parent, Some(abs))
+                } else {
+                    return None; // RAR/7z/complete file: can't grow, not watched
+                };
+                // notify calls the handler from its own thread, so the event only reaches
+                // the debounce in `poll_folder_watch` when a frame runs: send-then-wake.
+                let handler = move |res| {
+                    let _ = event_tx.send(res);
+                    handler_wake();
+                };
+                let mut w = notify::recommended_watcher(handler).ok()?;
+                w.watch(&target, notify::RecursiveMode::NonRecursive).ok()?;
+                Some((w, filter))
+            })();
+            let _ = install_tx.send((generation, built));
+            wake(); // send-then-wake (adopted by `poll_background`)
+        });
     }
 
     /// Drive the live-refresh watcher each frame: coalesce filesystem-change events into
@@ -2365,6 +2479,20 @@ impl State {
                         }
                     }
                 }
+            }
+        }
+        // Adopt a finished off-thread watcher install — newest generation only; a
+        // stale one (volume already switched) is dropped here, which unregisters it.
+        // No `changed` flag: an installed watcher isn't user-visible, and until it
+        // lands `poll_folder_watch`'s rebuild gate and `watch_deadline` both see
+        // `watcher: None` and stay quiescent — so no deadline is armed that the
+        // frame it buys couldn't consume.
+        while let Ok((generation, built)) = self.watch_install_rx.try_recv() {
+            if generation == self.open_gen
+                && let Some((w, filter)) = built
+            {
+                self.watcher = Some(w);
+                self.watch_filter = filter;
             }
         }
         // Sibling-volume scans only warm the `[`/`]` cache — nothing to show.
@@ -2726,6 +2854,9 @@ impl State {
         // Drain finished decodes into the right cache (full-res → cache, LQ-tier
         // thumbnails → lq_cache) and record failures.
         self.reader.drain_pool();
+        // Was the centered spinner on screen last frame? `ui.loading` isn't recomputed
+        // until later this frame, so it still holds the previous frame's answer.
+        let spinner_was_visible = self.ui.loading;
         // Apply finished background opens, newest generation only — a later
         // `[`/`]` bumps `open_gen`, so a stale in-flight result is discarded.
         while let Ok((generation, built)) = self.open_rx.try_recv() {
@@ -2734,17 +2865,44 @@ impl State {
             }
             self.opening = false;
             self.opening_key = None;
+            if let Some(t0) = self.open_t0
+                && cfg!(debug_assertions)
+            {
+                eprintln!("[open] source ready in {:?}", t0.elapsed());
+            }
             match built {
                 Ok((source, key, start)) if !source.is_empty() => {
                     let partial = source.is_partial();
                     let n = source.len();
                     self.set_source(source, &key, start);
+                    // Carry the opening spinner straight into the first-page grace
+                    // instead of restarting it: `opening` has just gone false, so the
+                    // per-page block below would stamp `loading_pending` fresh and blank
+                    // the spinner for LOADING_INDICATOR_DELAY before bringing it back.
+                    // Backdating the stamp keeps it continuously on screen until the
+                    // first page actually lands.
+                    if spinner_was_visible {
+                        let anchor = self.reader.visible_pages().0;
+                        if !self.reader.cache.contains(anchor) {
+                            let now = Instant::now();
+                            let backdated = now.checked_sub(LOADING_INDICATOR_DELAY).unwrap_or(now);
+                            self.loading_pending = Some((anchor, backdated));
+                        }
+                    }
                     if partial {
                         self.toast(format!("Partial archive — {n} pages recovered"));
                     }
                 }
-                Ok(_) => self.ui.status = "no images found".into(),
-                Err(e) => self.ui.status = format!("open failed: {e}"),
+                // A failed open never draws a first page, so drop the stamp here —
+                // a stale one would mislabel a later cache-hit on the old volume.
+                Ok(_) => {
+                    self.ui.status = "no images found".into();
+                    self.open_t0 = None;
+                }
+                Err(e) => {
+                    self.ui.status = format!("open failed: {e}");
+                    self.open_t0 = None;
+                }
             }
         }
         // Background channels (sibling scans, folder watch, update check). Their
@@ -2942,6 +3100,15 @@ impl State {
             let loading = !in_cache && !failed;
             if in_cache {
                 self.reader.last_drawn = Some(anchor);
+                if let Some(t0) = self.open_t0.take()
+                    && cfg!(debug_assertions)
+                {
+                    eprintln!(
+                        "[open] first page drawn in {:?} (page {})",
+                        t0.elapsed(),
+                        anchor + 1
+                    );
+                }
             }
             // Count from the visible anchor (and span the pair), so the status line
             // agrees with the window title instead of drifting by one in spread mode.
