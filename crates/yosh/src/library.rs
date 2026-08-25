@@ -20,6 +20,9 @@ pub enum VolKind {
 pub struct Volume {
     pub path: PathBuf,
     pub name: String,
+    /// Tile caption: `name` minus its archive extension and (within a series) the
+    /// prefix every sibling volume repeats. Computed once, by the scan.
+    pub caption: String,
     pub kind: VolKind,
     pub thumb: Option<egui::TextureId>,
     /// Keeps the thumbnail texture/view alive while egui references it.
@@ -33,6 +36,7 @@ impl Volume {
     fn new(path: PathBuf, name: String, kind: VolKind) -> Self {
         Self {
             path,
+            caption: yosh_engine::caption::display_stem(&name).to_string(),
             name,
             kind,
             thumb: None,
@@ -138,6 +142,13 @@ fn walk_series(dir: &Path, depth: usize, out: &mut Vec<Series>) -> bool {
     }
     if !volumes.is_empty() {
         volumes.sort_by(|a, b| natord::compare(&a.name.to_lowercase(), &b.name.to_lowercase()));
+        // Captions drop the head the whole series repeats, so they're a per-series
+        // computation — done here, on the scan thread, never per frame.
+        let names: Vec<&str> = volumes.iter().map(|v| v.name.as_str()).collect();
+        let captions = yosh_engine::caption::series_captions(&names);
+        for (v, c) in volumes.iter_mut().zip(captions) {
+            v.caption = c;
+        }
         out.push(Series {
             name: name_of(dir),
             dir: dir.to_path_buf(),
@@ -369,6 +380,19 @@ mod tests {
         // The root folder holds `loose.cbz` directly → it's a series too.
         let root_name = tmp.file_name().unwrap().to_str().unwrap();
         assert_eq!(by_name.get(root_name), Some(&1));
+
+        // Captions drop the extension; "v1"/"v2" share no separator in their
+        // common prefix, so nothing more is stripped.
+        let a_captions: Vec<&str> = lib
+            .series
+            .iter()
+            .find(|s| s.name == "SeriesA")
+            .unwrap()
+            .volumes
+            .iter()
+            .map(|v| v.caption.as_str())
+            .collect();
+        assert_eq!(a_captions, ["v1", "v2"]);
 
         // Smoke-check the read-state helpers don't choke on the scanned set.
         let progress = HashMap::new();
