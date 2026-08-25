@@ -421,7 +421,14 @@ fn push_recent(settings: &mut config::Settings, key: &str) {
 /// I/O, touches no app state, so it runs on a background thread — a slow
 /// (e.g. network-share) open never blocks the UI. The result is handed back to
 /// the main thread and applied via `set_source`.
-fn build_source(path: &Path) -> Built {
+///
+/// `resume` is where reading is *expected* to start (a saved position or a CLI
+/// start index). Only the sequential archives use it, and only to order their
+/// extraction so the resume page comes out first — see `RarSource::with_start` /
+/// `SevenzSource::with_start`. It is advisory: `set_source` re-resolves the real
+/// start index authoritatively at apply time, and a mismatch costs extraction
+/// order, never correctness. The random-access formats ignore it entirely.
+fn build_source(path: &Path, resume: Option<usize>) -> Built {
     if path.is_dir() {
         return FolderSource::new(path)
             .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
@@ -435,10 +442,10 @@ fn build_source(path: &Path) -> Built {
         Some("cbz") | Some("zip") => ZipSource::new(path)
             .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
             .map_err(|e| e.to_string()),
-        Some("cbr") | Some("rar") => RarSource::new(path)
+        Some("cbr") | Some("rar") => RarSource::with_start(path, resume)
             .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
             .map_err(|e| e.to_string()),
-        Some("7z") | Some("cb7") => SevenzSource::new(path)
+        Some("7z") | Some("cb7") => SevenzSource::with_start(path, resume)
             .map(|s| (Arc::new(s) as Arc<dyn PageSource>, path.to_path_buf(), None))
             .map_err(|e| e.to_string()),
         // A single image opens its containing folder, positioned at that image,
@@ -708,7 +715,21 @@ impl App {
             let tx = open_tx.clone();
             let waker = early_waker.clone();
             std::thread::spawn(move || {
-                let _ = tx.send((1, build_source(&path)));
+                // Resume hint, resolved here rather than passed in: `config::load()` is a
+                // small local JSON read that overlaps the archive open on this same
+                // thread, so it costs nothing at startup, and `resumed` loads the
+                // settings again for real (idempotent). Mirrors `set_source`'s
+                // precedence — an explicit CLI page beats the saved position.
+                let hint = if start_index > 0 {
+                    Some(start_index)
+                } else {
+                    config::load()
+                        .last_pages
+                        .get(path.to_string_lossy().as_ref())
+                        .copied()
+                        .filter(|&i| i > 0)
+                };
+                let _ = tx.send((1, build_source(&path, hint)));
                 // Send-then-wake, as every producer does — except there may be no
                 // window to wake yet. If the slot is still empty the result simply
                 // waits in the channel and is drained by the first `render()`,
@@ -2093,8 +2114,22 @@ impl State {
         self.opening = true;
         self.opening_key = Some(path.clone());
         let wake = frame_waker(&self.window);
+        // Where reading will most likely resume, mirroring `set_source`'s precedence
+        // (a pending CLI start index beats the saved position). Computed here because
+        // the closure can't touch `self`. Advisory only — `set_source` re-resolves it
+        // authoritatively when the source lands, so a mismatch costs extraction order,
+        // never correctness.
+        let hint = if self.reader.start_index > 0 {
+            Some(self.reader.start_index)
+        } else {
+            self.settings
+                .last_pages
+                .get(path.to_string_lossy().as_ref())
+                .copied()
+                .filter(|&i| i > 0)
+        };
         std::thread::spawn(move || {
-            let _ = tx.send((generation, build_source(&path)));
+            let _ = tx.send((generation, build_source(&path, hint)));
             wake(); // send-then-wake (the drain for this one lives in `render`)
         });
     }
@@ -2275,7 +2310,9 @@ impl State {
                 // transient error (mid-write, no complete pages yet) it sends `None` and
                 // the next debounced refresh retries; `apply_refreshed_source` also no-ops
                 // on an empty listing.
-                let built = build_source(&path).ok().map(|(src, _, _)| src);
+                // No resume hint: only folders and still-growing zips are watched, and
+                // neither is a sequential archive, so nothing would read it.
+                let built = build_source(&path, None).ok().map(|(src, _, _)| src);
                 // Always send (even on error) so `rescanning` clears.
                 let _ = tx.send((generation, built));
                 wake(); // send-then-wake

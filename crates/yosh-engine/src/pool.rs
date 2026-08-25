@@ -303,6 +303,21 @@ impl DecodePool {
                     // would block that page from ever being decoded again (`set_jobs`
                     // filters in-flight indices). `None` = abandoned as stale.
                     let body = std::panic::AssertUnwindSafe(|| -> Option<Msg> {
+                        // A job can sit queued through a navigation or a pool teardown; bail
+                        // before the *read*, not just after it, because on a sequential source
+                        // (rar / 7z) `read_page` **blocks** until the extractor reaches that
+                        // entry — a check placed only after it would be reached minutes late.
+                        // `stale` releases the right in-flight marker itself, and `None` is the
+                        // existing "abandoned mid-pipeline" path.
+                        //
+                        // The residual race is bounded and deliberate: a cancel that lands
+                        // between this check and `read_page`'s epoch snapshot is missed, so the
+                        // worker still parks until the extractor produces that page or gives up
+                        // (`done`), and then exits on the failed send. Bounded staleness, never
+                        // a deadlock — the extractor always terminates.
+                        if stale(index, thumb) {
+                            return None;
+                        }
                         let bytes = match source.read_page(index) {
                             Ok(bytes) => bytes,
                             Err(e) => {
@@ -552,6 +567,18 @@ impl DecodePool {
 /// clones of everything it touches, and the results `Receiver` drops with the pool,
 /// so its `tx.send` fails and it exits. The channel — never the join — was always
 /// the guarantee.
+///
+/// The stale checks only fire at *yield points*, though, and a worker parked inside a
+/// sequential source's `read_page` (rar / 7z: the entry hasn't been extracted yet) has
+/// no yield point to reach — it would sit there until the extractor had walked the
+/// whole archive, pinning the source `Arc` alive that entire time. So teardown also
+/// cancels the source's waiters ([`PageSource::cancel_waits`]), which starts this
+/// chain: the cancelled `read_page` errors, the worker sends `Msg::Failed`, the send
+/// fails (the `Receiver` died with this pool), the worker returns, its
+/// `Arc<dyn PageSource>` clone drops, `RarSource`/`SevenzSource::Drop` sets `abort`,
+/// and the extractor thread stops. A volume switch therefore quiesces the old
+/// archive's CPU within about a wakeup, instead of decompressing to the end of a file
+/// nobody is reading any more.
 impl Drop for DecodePool {
     fn drop(&mut self) {
         let (m, cv) = &*self.shared;
@@ -567,8 +594,15 @@ impl Drop for DecodePool {
         // must not keep the shell's (possibly already-replaced) window alive through
         // the closure, and its `tx.send` fails anyway, so it would never wake.
         st.waker = None;
+        let source = st.source.clone();
         drop(st);
         cv.notify_all();
+        // **Outside the pool lock, on purpose.** `cancel_waits` takes the source's own
+        // ready mutex (its lost-wakeup fence), so holding the pool lock across this
+        // call would create a pool-lock → source-lock order that a worker — which
+        // takes them the other way round — could deadlock against. Still signal-only:
+        // an atomic bump, a momentary lock, a notify. Never a join.
+        source.cancel_waits();
     }
 }
 
@@ -858,5 +892,93 @@ mod tests {
             h.join().unwrap();
         }
         assert_eq!(woke.load(Ordering::Relaxed), 1, "exactly one wake per burst");
+    }
+
+    /// A `PageSource` that blocks inside `read_page` the way the sequential archives
+    /// do — parked on a condvar until something cancels the wait — so pool teardown
+    /// can be exercised with no archive, no decode and no GPU work. `entered` /
+    /// `unblocked` are the two moments the test needs to observe.
+    #[derive(Default)]
+    struct BlockingSource {
+        /// The cancel epoch, and the mutex `read_page` holds across its snapshot →
+        /// `wait` window. Same shape as `RarSource`/`SevenzSource`, deliberately: this
+        /// test is only meaningful if the stub reproduces their lost-wakeup fence.
+        epoch: Mutex<u64>,
+        cv: Condvar,
+        entered: std::sync::atomic::AtomicUsize,
+        unblocked: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PageSource for BlockingSource {
+        fn len(&self) -> usize {
+            1
+        }
+        fn name(&self, _index: usize) -> &str {
+            "blocking"
+        }
+        fn read_page(&self, _index: usize) -> std::io::Result<Arc<Vec<u8>>> {
+            let mut g = self.epoch.lock().unwrap();
+            // Flagged *under the lock*, after which the snapshot below can't miss a
+            // cancel: a cancel that observes `entered` must first take this mutex,
+            // which this thread holds until it is parked in `wait`.
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            let epoch = *g;
+            while *g == epoch {
+                g = self.cv.wait(g).unwrap();
+            }
+            drop(g);
+            self.unblocked.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other("blocking source: read cancelled"))
+        }
+        fn cancel_waits(&self) {
+            let mut g = self.epoch.lock().unwrap();
+            *g += 1;
+            drop(g);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Poll `cond` to a generous deadline. A condvar handshake here would just
+    /// re-implement the mechanism under test; 5s is orders of magnitude more than the
+    /// single wakeup this needs, so it can only fire on a genuine hang.
+    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !cond() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Teardown must reach a worker that is *inside* `read_page`. Its stale checks
+    /// only fire at yield points, and a worker parked on a sequential source has none
+    /// — before `Drop` learned to `cancel_waits`, it sat there until the extractor had
+    /// walked the entire archive, pinning the source alive across volume switches.
+    ///
+    /// The only test that builds a real `DecodePool`; wgpu's `noop` backend supplies a
+    /// genuine `Device`/`Queue` with no GPU behind them, which is enough because the
+    /// read always errors and no decode or upload is ever reached.
+    #[test]
+    fn dropping_the_pool_unblocks_a_worker_stuck_in_read_page() {
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let source = Arc::new(BlockingSource::default());
+        let pool = DecodePool::new(
+            source.clone(),
+            Arc::new(device),
+            Arc::new(queue),
+            Arc::new(TexturePool::with_max_total(4)),
+            2,
+        );
+        pool.set_jobs(vec![(0, 100, false, false)]);
+        wait_until("a worker to block in read_page", || {
+            source.entered.load(Ordering::SeqCst) >= 1
+        });
+
+        drop(pool);
+        wait_until("the blocked worker to be released", || {
+            source.unblocked.load(Ordering::SeqCst) >= 1
+        });
     }
 }
