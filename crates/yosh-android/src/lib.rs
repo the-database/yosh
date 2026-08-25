@@ -483,6 +483,9 @@ struct Series {
     dir: PathBuf,
     name: String,
     volumes: Vec<PathBuf>,
+    /// Tile caption per volume, parallel to `volumes`: the filename minus its
+    /// archive extension and the prefix the whole series repeats.
+    captions: Vec<String>,
 }
 
 /// A volume's read state, derived from the shell's progress/positions maps.
@@ -542,6 +545,7 @@ fn spawn_library_scan(root: PathBuf, tx: std::sync::mpsc::Sender<Vec<Series>>, w
             // The root itself is an image-folder comic: a one-volume "series".
             out.push(Series {
                 name: name_of(&root),
+                captions: vec![yosh_engine::caption::display_stem(&name_of(&root)).to_string()],
                 volumes: vec![root.clone()],
                 dir: root,
             });
@@ -586,10 +590,16 @@ fn walk_series(dir: &Path, depth: usize, out: &mut Vec<Series>) -> bool {
     }
     if !volumes.is_empty() {
         volumes.sort_by(|a, b| natord::compare(&name_of(a).to_lowercase(), &name_of(b).to_lowercase()));
+        // Captions drop the head the whole series repeats, so they're a per-series
+        // computation — done here, on the scan thread, never per frame.
+        let names: Vec<String> = volumes.iter().map(|p| name_of(p)).collect();
+        let refs: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
+        let captions = yosh_engine::caption::series_captions(&refs);
         out.push(Series {
             name: name_of(dir),
             dir: dir.to_path_buf(),
             volumes,
+            captions,
         });
     }
     false
@@ -2727,7 +2737,9 @@ const EDGE_ZONE: f32 = 0.20;
 fn volume_cell(ui: &mut egui::Ui, v: &VolCell, reqs: &mut FrameReqs, close_lib: &mut bool) {
     const CELL_W: f32 = 140.0;
     const COVER_H: f32 = 186.0;
-    ui.allocate_ui(egui::vec2(CELL_W, COVER_H + 38.0), |ui| {
+    // The caption strip under the cover: two 12pt rows.
+    const CAPTION_H: f32 = 34.0;
+    ui.allocate_ui(egui::vec2(CELL_W, COVER_H + CAPTION_H + 8.0), |ui| {
         ui.vertical(|ui| {
             let finished = v.state == VolState::Finished;
             let r = if let Some(t) = &v.thumb {
@@ -2763,11 +2775,27 @@ fn volume_cell(ui: &mut egui::Ui, v: &VolCell, reqs: &mut FrameReqs, close_lib: 
                     egui::Stroke::new(3.0, accent),
                 );
             }
-            let mut label = egui::RichText::new(v.label.as_str()).size(12.0);
-            if finished {
-                label = label.weak();
-            }
-            ui.add_sized([CELL_W, 30.0], egui::Label::new(label).truncate());
+            // Wrapped to two rows, then ellipsized. Not `add_sized`: that justifies
+            // the label, and epaint stretches every row but the last.
+            let color = if finished {
+                ui.visuals().weak_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+            let mut job = egui::text::LayoutJob::simple(
+                v.label.clone(),
+                egui::FontId::proportional(12.0),
+                color,
+                CELL_W,
+            );
+            job.wrap.max_rows = 2;
+            ui.allocate_ui_with_layout(
+                egui::vec2(CELL_W, CAPTION_H),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Label::new(job).wrap().show_tooltip_when_elided(false));
+                },
+            );
             if r.clicked() {
                 reqs.open = Some(v.path.clone());
                 *close_lib = true;
@@ -3816,9 +3844,10 @@ impl App {
                     let volumes = if expanded {
                         s.volumes
                             .iter()
+                            .zip(&s.captions)
                             .zip(&states)
-                            .map(|(v, st)| VolCell {
-                                label: name_of(v),
+                            .map(|((v, caption), st)| VolCell {
+                                label: caption.clone(),
                                 thumb: self.thumbs.get(v).cloned(),
                                 state: *st,
                                 is_current: lib.current_key
@@ -3854,7 +3883,9 @@ impl App {
                 .map(|k| {
                     let path = PathBuf::from(k);
                     VolCell {
-                        label: name_of(&path),
+                        // No series header over this shelf to carry the series name,
+                        // so the label keeps it — only the extension goes.
+                        label: yosh_engine::caption::display_stem(&name_of(&path)).to_string(),
                         thumb: self.thumbs.get(&path).cloned(),
                         state: vol_state(lib.progress, lib.positions, k.as_str()),
                         is_current: lib.current_key == Some(k.as_str()),

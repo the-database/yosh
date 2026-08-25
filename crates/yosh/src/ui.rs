@@ -190,16 +190,6 @@ pub enum SeekbarStyle {
          // Thumbnails, // YACReader-style — future
 }
 
-fn elide(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    }
-}
-
 /// Draw a translucent navigation chevron in a non-interactable, foreground Area
 /// anchored to a window edge. Painted with line segments over a soft backdrop so
 /// it stays visible on any page and doesn't depend on font glyph coverage.
@@ -1190,9 +1180,11 @@ fn decode_logo() -> Option<egui::ColorImage> {
     ))
 }
 
-/// Width of a cover cell and its image in the sectioned library row.
+/// Width of a cover cell and its image in the sectioned library row, plus the
+/// caption strip under it (two 12pt rows).
 const CELL_W: f32 = 150.0;
 const COVER_H: f32 = 210.0;
+const CAPTION_H: f32 = 34.0;
 
 /// How many covers the "Recently read" shelf shows at most (newest first).
 const RECENTS_SHELF: usize = 12;
@@ -1330,7 +1322,16 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
                             for (v, state) in series.volumes.iter().zip(&states) {
                                 let is_current = libctx.current_key
                                     == Some(v.path.to_string_lossy().as_ref());
-                                volume_cell(ui, st, &v.name, v.path.clone(), v.thumb, *state, is_current);
+                                volume_cell(
+                                    ui,
+                                    st,
+                                    &v.caption,
+                                    &v.name,
+                                    v.path.clone(),
+                                    v.thumb,
+                                    *state,
+                                    is_current,
+                                );
                             }
                         });
                     });
@@ -1385,7 +1386,18 @@ fn recents_row(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibC
                     // Recents may belong to a collapsed or off-screen series; queue
                     // their covers so the shelf isn't left blank.
                     st.visible_covers.push(v.path.clone());
-                    volume_cell(ui, st, &v.name, v.path.clone(), v.thumb, state, is_current);
+                    // No series header over this shelf to carry the series name,
+                    // so the caption keeps it — only the extension goes.
+                    volume_cell(
+                        ui,
+                        st,
+                        yosh_engine::caption::display_stem(&v.name),
+                        &v.name,
+                        v.path.clone(),
+                        v.thumb,
+                        state,
+                        is_current,
+                    );
                 }
             });
         });
@@ -1394,19 +1406,22 @@ fn recents_row(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibC
 }
 
 /// One volume in a series row: cover (faded when finished, thin progress bar when
-/// started, highlight stroke when currently open) + truncated name. Clicking sets
+/// started, highlight stroke when currently open) + `caption` wrapped to two rows.
+/// `full_name` is the untrimmed filename, shown on hover. Clicking sets
 /// `pending_open` so the app opens it next frame.
 #[allow(deprecated)] // egui ImageButton — matches the rest of this module
+#[allow(clippy::too_many_arguments)]
 fn volume_cell(
     ui: &mut egui::Ui,
     st: &mut UiState,
-    name: &str,
+    caption: &str,
+    full_name: &str,
     path: PathBuf,
     thumb: Option<egui::TextureId>,
     state: VolState,
     is_current: bool,
 ) {
-    ui.allocate_ui(egui::vec2(CELL_W, COVER_H + 40.0), |ui| {
+    ui.allocate_ui(egui::vec2(CELL_W, COVER_H + CAPTION_H + 8.0), |ui| {
         ui.vertical(|ui| {
             let finished = state == VolState::Finished;
             let r = match thumb {
@@ -1426,6 +1441,7 @@ fn volume_cell(
                     egui::Button::new(egui::RichText::new("…").size(24.0)),
                 ),
             };
+            let r = r.on_hover_text(full_name);
             let accent = ui.visuals().selection.bg_fill;
             if is_current {
                 ui.painter().rect_stroke(
@@ -1446,11 +1462,30 @@ fn volume_cell(
                     egui::Stroke::new(3.0_f32, accent),
                 );
             }
-            let mut label = egui::RichText::new(elide(name, 22)).size(12.0);
-            if finished {
-                label = label.weak();
-            }
-            ui.add_sized([CELL_W, 32.0], egui::Label::new(label).truncate());
+            // Wrapped to two rows, then ellipsized. Not `add_sized`: that justifies
+            // the label, and epaint stretches every row but the last.
+            let color = if finished {
+                ui.visuals().weak_text_color()
+            } else {
+                ui.visuals().text_color()
+            };
+            let mut job = egui::text::LayoutJob::simple(
+                caption.to_owned(),
+                egui::FontId::proportional(12.0),
+                color,
+                CELL_W,
+            );
+            job.wrap.max_rows = 2;
+            ui.allocate_ui_with_layout(
+                egui::vec2(CELL_W, CAPTION_H),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    // The built-in elision tooltip would only repeat the trimmed
+                    // caption; hover wants the full filename.
+                    ui.add(egui::Label::new(job).wrap().show_tooltip_when_elided(false))
+                        .on_hover_text(full_name);
+                },
+            );
             if r.clicked() {
                 st.pending_open = Some(path);
             }
