@@ -52,6 +52,17 @@ pub trait PageSource: Send + Sync {
     fn is_partial(&self) -> bool {
         false
     }
+    /// Ask the source to fail any `read_page` calls currently blocked waiting for
+    /// data (the sequential sources: rar / 7z, where a page isn't readable until
+    /// the extractor thread has walked to it). Reads started *later* are
+    /// unaffected — this cancels the waiters that exist right now, it does not put
+    /// the source into a permanently-failing state.
+    ///
+    /// Called by `DecodePool::Drop`, so a torn-down pool's workers stop parking on
+    /// an archive nobody is reading any more and can exit; see that impl for the
+    /// full chain. Default: a no-op — the random-access sources (folder / zip)
+    /// never block, so they have no waiters to cancel.
+    fn cancel_waits(&self) {}
 }
 
 /// Format a UNIX-epoch second count as `YYYY-MM-DD HH:MM UTC` (no time-zone
