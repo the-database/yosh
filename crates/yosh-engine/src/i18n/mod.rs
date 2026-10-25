@@ -164,6 +164,16 @@ pub fn set_lang(lang: Lang) {
     CURRENT.store(lang as u8, Ordering::Relaxed);
 }
 
+/// What the language picker shows for a preference (`None` = follow the OS):
+/// the language's own name, or "System (日本語)" — naming what the OS resolved
+/// to, so following the system never hides which language you actually got.
+pub fn lang_pref_label(pref: Option<Lang>) -> String {
+    match pref {
+        Some(l) => l.native_name().to_string(),
+        None => format!("{} ({})", tr().lang_system, lang().native_name()),
+    }
+}
+
 /// The active UI language.
 pub fn lang() -> Lang {
     let v = CURRENT.load(Ordering::Relaxed);

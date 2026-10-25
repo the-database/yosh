@@ -1037,19 +1037,22 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 }
             });
 
-            // Each language is listed in its own script, so it's findable whatever
-            // the UI is currently showing.
+            // A dropdown, not a row of buttons: the list only grows. Each language is
+            // listed in its own script, so it's findable whatever the UI is showing.
             ui.label(egui::RichText::new(t.language).strong());
-            ui.horizontal_wrapped(|ui| {
-                if ui.selectable_label(st.lang_pref.is_none(), t.lang_system).clicked() {
-                    st.req_set_lang = Some(None);
-                }
-                for l in yosh_engine::i18n::Lang::ALL {
-                    if ui.selectable_label(st.lang_pref == Some(l), l.native_name()).clicked() {
-                        st.req_set_lang = Some(Some(l));
+            egui::ComboBox::from_id_salt("language")
+                .selected_text(yosh_engine::i18n::lang_pref_label(st.lang_pref))
+                .width(200.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(st.lang_pref.is_none(), t.lang_system).clicked() {
+                        st.req_set_lang = Some(None);
                     }
-                }
-            });
+                    for l in yosh_engine::i18n::Lang::ALL {
+                        if ui.selectable_label(st.lang_pref == Some(l), l.native_name()).clicked() {
+                            st.req_set_lang = Some(Some(l));
+                        }
+                    }
+                });
 
             ui.label(egui::RichText::new(t.theme).strong());
             ui.horizontal(|ui| {

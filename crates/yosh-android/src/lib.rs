@@ -3391,25 +3391,27 @@ fn options_popup(
                             .color(egui::Color32::from_white_alpha(150)),
                     );
 
-                    // Each language is listed in its own script, so it's findable
-                    // whatever the UI is currently showing.
+                    // A dropdown, not a row of buttons: the list only grows. Each
+                    // language is listed in its own script, so it's findable whatever
+                    // the UI is currently showing. Rows are padded for touch.
                     ui.label(egui::RichText::new(t.language).strong());
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .selectable_label(lang_pref.is_none(), egui::RichText::new(t.lang_system).size(16.0))
-                            .clicked()
-                        {
-                            *set_lang = Some(None);
-                        }
-                        for l in Lang::ALL {
-                            if ui
-                                .selectable_label(lang_pref == Some(l), egui::RichText::new(l.native_name()).size(16.0))
-                                .clicked()
-                            {
-                                *set_lang = Some(Some(l));
+                    egui::ComboBox::from_id_salt("language")
+                        .selected_text(
+                            egui::RichText::new(i18n::lang_pref_label(lang_pref)).size(16.0),
+                        )
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(16.0, 12.0);
+                            let item = |text: &str| egui::RichText::new(text).size(18.0);
+                            if ui.selectable_label(lang_pref.is_none(), item(t.lang_system)).clicked() {
+                                *set_lang = Some(None);
                             }
-                        }
-                    });
+                            for l in Lang::ALL {
+                                if ui.selectable_label(lang_pref == Some(l), item(l.native_name())).clicked() {
+                                    *set_lang = Some(Some(l));
+                                }
+                            }
+                        });
 
                     ui.label(egui::RichText::new(t.theme).strong());
                     ui.horizontal(|ui| {
