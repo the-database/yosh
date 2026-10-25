@@ -590,7 +590,8 @@ fn load_cjk_fonts(lang: Lang) -> Vec<CjkFont> {
         Lang::ZhHans => &[r"C:\Windows\Fonts\msyh.ttc", "/Library/Fonts/Hiragino Sans GB.ttc"],
         Lang::ZhHant => &[r"C:\Windows\Fonts\msjh.ttc"],
         Lang::Ko => &[r"C:\Windows\Fonts\malgun.ttf", "/Library/Fonts/AppleSDGothicNeo.ttc"],
-        Lang::En | Lang::Ja => &[],
+        // Latin / Cyrillic UIs: egui's own font draws the UI; CJK is file names only.
+        _ => &[],
     };
     let mut out = Vec::new();
     if let Some(b) = own.iter().find_map(|p| read(p)) {
@@ -606,10 +607,15 @@ fn load_cjk_fonts(lang: Lang) -> Vec<CjkFont> {
     out
 }
 
-/// Fonts are chosen per language, but English and Japanese use the same set — a
-/// switch between them needn't reload anything.
+/// Fonts are chosen per language, but only Chinese and Korean need their own CJK
+/// font — every other language uses the Japanese set, so a switch among those
+/// needn't reload anything.
 fn same_fonts(a: Lang, b: Lang) -> bool {
-    a == b || matches!((a, b), (Lang::En | Lang::Ja, Lang::En | Lang::Ja))
+    let group = |l: Lang| match l {
+        Lang::ZhHans | Lang::ZhHant | Lang::Ko => Some(l),
+        _ => None,
+    };
+    group(a) == group(b)
 }
 
 /// The OS display language, mapped to the closest supported UI language.

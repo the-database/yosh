@@ -17,9 +17,14 @@ use crate::layout::Layout;
 use crate::page::FitMode;
 use crate::reader::Direction;
 
+mod de;
 mod en;
+mod es;
+mod fr;
 mod ja;
 mod ko;
+mod pt;
+mod ru;
 mod zh_hans;
 mod zh_hant;
 
@@ -28,6 +33,11 @@ mod zh_hant;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
     En,
+    Es,
+    Pt,
+    Fr,
+    De,
+    Ru,
     Ja,
     ZhHans,
     ZhHant,
@@ -36,12 +46,28 @@ pub enum Lang {
 
 impl Lang {
     /// Picker order.
-    pub const ALL: [Lang; 5] = [Lang::En, Lang::Ja, Lang::ZhHans, Lang::ZhHant, Lang::Ko];
+    pub const ALL: [Lang; 10] = [
+        Lang::En,
+        Lang::Es,
+        Lang::Pt,
+        Lang::Fr,
+        Lang::De,
+        Lang::Ru,
+        Lang::Ja,
+        Lang::ZhHans,
+        Lang::ZhHant,
+        Lang::Ko,
+    ];
 
     /// The language's own name — what the picker shows, whatever the UI language.
     pub fn native_name(self) -> &'static str {
         match self {
             Lang::En => "English",
+            Lang::Es => "Español",
+            Lang::Pt => "Português",
+            Lang::Fr => "Français",
+            Lang::De => "Deutsch",
+            Lang::Ru => "Русский",
             Lang::Ja => "日本語",
             Lang::ZhHans => "简体中文",
             Lang::ZhHant => "繁體中文",
@@ -53,6 +79,11 @@ impl Lang {
     pub fn token(self) -> &'static str {
         match self {
             Lang::En => "en",
+            Lang::Es => "es",
+            Lang::Pt => "pt",
+            Lang::Fr => "fr",
+            Lang::De => "de",
+            Lang::Ru => "ru",
             Lang::Ja => "ja",
             Lang::ZhHans => "zh-Hans",
             Lang::ZhHant => "zh-Hant",
@@ -74,6 +105,11 @@ impl Lang {
         let tag = tag.split(['.', '@']).next().unwrap_or("").replace('_', "-");
         let mut parts = tag.split('-').map(|p| p.to_ascii_lowercase());
         match parts.next().as_deref() {
+            Some("es") => Lang::Es,
+            Some("pt") => Lang::Pt,
+            Some("fr") => Lang::Fr,
+            Some("de") => Lang::De,
+            Some("ru") => Lang::Ru,
             Some("ja") => Lang::Ja,
             Some("ko") => Lang::Ko,
             Some("zh") => {
@@ -91,10 +127,10 @@ impl Lang {
 
     /// Face of the system Noto Sans CJK collection (`NotoSansCJK-Regular.ttc`) that
     /// draws this language's glyph forms — the same index Android's fonts.xml uses.
-    /// English shows CJK only in file names, which are most often Japanese.
+    /// The non-CJK languages show CJK only in file names, most often Japanese.
     pub fn cjk_face(self) -> u32 {
         match self {
-            Lang::En | Lang::Ja => 0,
+            Lang::En | Lang::Es | Lang::Pt | Lang::Fr | Lang::De | Lang::Ru | Lang::Ja => 0,
             Lang::Ko => 1,
             Lang::ZhHans => 2,
             Lang::ZhHant => 3,
@@ -104,6 +140,11 @@ impl Lang {
     fn strings(self) -> &'static Strings {
         match self {
             Lang::En => &en::EN,
+            Lang::Es => &es::ES,
+            Lang::Pt => &pt::PT,
+            Lang::Fr => &fr::FR,
+            Lang::De => &de::DE,
+            Lang::Ru => &ru::RU,
             Lang::Ja => &ja::JA,
             Lang::ZhHans => &zh_hans::ZH_HANS,
             Lang::ZhHant => &zh_hant::ZH_HANT,
@@ -444,8 +485,17 @@ mod tests {
             ("zh_TW.UTF-8", Lang::ZhHant),
             ("zh_CN.UTF-8", Lang::ZhHans),
             ("ja_JP.eucJP@x", Lang::Ja),
+            ("es-ES", Lang::Es),
+            ("es-419", Lang::Es),
+            ("pt-BR", Lang::Pt),
+            ("pt_PT.UTF-8", Lang::Pt),
+            ("fr-FR", Lang::Fr),
+            ("fr-CA", Lang::Fr),
+            ("de-DE", Lang::De),
+            ("de-AT", Lang::De),
+            ("ru-RU", Lang::Ru),
             ("en-US", Lang::En),
-            ("fr-FR", Lang::En),
+            ("it-IT", Lang::En),
             ("C", Lang::En),
             ("", Lang::En),
         ] {

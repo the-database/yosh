@@ -65,14 +65,16 @@ the spine shadow (book-gutter shading on un-joined two-page spreads, in ⚙ Sett
 persisted.
 
 ## Languages
-The UI is available in English, 日本語, 简体中文, 繁體中文 and 한국어. It follows the system
+The UI is available in English, Español, Português, Français, Deutsch, Русский, 日本語,
+简体中文, 繁體中文 and 한국어. It follows the system
 language by default; pick another under ⚙ Settings → Language (desktop) or the options
 popup (Android).
 
 The non-English translations are first drafts and haven't been reviewed by native
 speakers yet — corrections are very welcome. Each language is one file in
-[`crates/yosh-engine/src/i18n/`](crates/yosh-engine/src/i18n/) (`ja.rs`, `zh_hans.rs`,
-`zh_hant.rs`, `ko.rs`): edit the strings, keep the `{…}` placeholders, and open a pull
+[`crates/yosh-engine/src/i18n/`](crates/yosh-engine/src/i18n/) (`es.rs`, `pt.rs`, `fr.rs`,
+`de.rs`, `ru.rs`, `ja.rs`, `zh_hans.rs`, `zh_hant.rs`, `ko.rs`): edit the strings, keep the
+`{…}` placeholders, and open a pull
 request. To add a language, copy `en.rs`; the compiler will flag any string you missed.
 
 ## AVIF (optional)
