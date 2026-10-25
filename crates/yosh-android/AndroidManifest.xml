@@ -26,7 +26,7 @@
         <activity
             android:name="com.thedatabase.yosh.YoshActivity"
             android:exported="true"
-            android:configChanges="orientation|keyboardHidden|screenSize|screenLayout|density|uiMode">
+            android:configChanges="orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|density|uiMode">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="yosh_android" />

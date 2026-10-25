@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
 use winit::application::ApplicationHandler;
-use winit::event::{Touch, TouchPhase, WindowEvent};
+use winit::event::{ElementState, KeyEvent, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::android::activity::AndroidApp;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
@@ -101,9 +102,14 @@ fn android_main(app: AndroidApp) {
             false,
             DEFAULT_SPINE_STRENGTH,
             false,
+            false,
         ));
+    // Volume keys are delivered to us (winit's default hands them straight to the
+    // OS): with the "Volume keys turn pages" option on they flip while reading.
+    // Every other press is passed back to the system via `adjust_volume`.
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
+        .handle_volume_keys()
         .build()
         .expect("build event loop");
     let (open_tx, open_rx) = std::sync::mpsc::channel();
@@ -446,6 +452,9 @@ struct App {
     layout_mode: LayoutMode,
     /// Reopen the last book on launch (persisted in view.txt; toggled in options).
     resume_on_startup: bool,
+    /// Volume Down/Up flip next/previous page while reading (persisted in
+    /// view.txt; toggled in options). Off ⇒ they adjust the volume as usual.
+    vol_keys: bool,
     /// Book-gutter shading on un-joined two-page spreads, and its peak darkening
     /// (persisted in view.txt; toggled in options). The reader takes the product.
     spine_shadow_on: bool,
@@ -999,6 +1008,7 @@ impl ApplicationHandler for Shell {
             libroot_dirty: false,
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
+            vol_keys: self.init_view.11,
             spine_shadow_on: self.init_view.8,
             spine_shadow_strength: self.init_view.9,
             theme: self.init_view.6,
@@ -1164,6 +1174,7 @@ impl ApplicationHandler for Shell {
                 id,
                 ..
             }) => self.handle_touch(phase, id, location.x, location.y, egui_consumed),
+            WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event, egui_consumed),
             WindowEvent::RedrawRequested => {
                 // A picker result may have landed while we were backgrounded.
                 if self.picker_pending {
@@ -1341,6 +1352,68 @@ impl Shell {
         } else if self.app.as_ref().is_some_and(|a| a.reader.at_edge(dir)) {
             self.boundary_hit(dir);
         }
+    }
+
+    /// Hardware keys: an external keyboard, a Bluetooth page-turner remote (most
+    /// send arrows, PageUp/PageDown or media next/previous; camera-shutter style
+    /// ones send the volume keys) or the device's own volume rocker. Mirrors the
+    /// desktop keymap: Down/PageDown/Space = forward, Up/PageUp = back,
+    /// Left/Right follow the reading direction (page-flip only). Volume keys are
+    /// always delivered here (`handle_volume_keys`), so any press that doesn't
+    /// turn a page is handed back to the system volume.
+    fn handle_key(&mut self, ev: &KeyEvent, egui_consumed: bool) {
+        if ev.state != ElementState::Pressed {
+            return;
+        }
+        let PhysicalKey::Code(code) = ev.physical_key else { return };
+        let Some(app) = self.app.as_ref() else {
+            // No reader yet: still let the rocker work.
+            if let Some(adj) = volume_adjust(code) {
+                adjust_volume(&self.android_app, adj);
+            }
+            return;
+        };
+        let reading = !egui_consumed && self.current_key.is_some() && !app.library_view;
+        let scroll = app.reader.scroll_mode;
+        let rtl = app.reader.direction == Direction::Rtl;
+        // `dir` is in story order (+1 = next page), like `flip`.
+        let dir = match code {
+            KeyCode::AudioVolumeDown | KeyCode::AudioVolumeUp if !(reading && app.vol_keys) => None,
+            KeyCode::AudioVolumeDown => Some(1),
+            KeyCode::AudioVolumeUp => Some(-1),
+            KeyCode::ArrowDown | KeyCode::PageDown | KeyCode::Space | KeyCode::MediaTrackNext => {
+                Some(1)
+            }
+            KeyCode::ArrowUp | KeyCode::PageUp | KeyCode::MediaTrackPrevious => Some(-1),
+            KeyCode::ArrowRight if !scroll => Some(if rtl { -1 } else { 1 }),
+            KeyCode::ArrowLeft if !scroll => Some(if rtl { 1 } else { -1 }),
+            _ => None,
+        };
+        let Some(dir) = dir.filter(|_| reading) else {
+            if let Some(adj) = volume_adjust(code) {
+                adjust_volume(&self.android_app, adj);
+            }
+            return;
+        };
+        if scroll {
+            if let Some(app) = self.app.as_mut() {
+                let vh = app.reader.viewport.h as f32;
+                app.reader.scroll_by(dir as f32 * vh * 0.9);
+                app.window.request_redraw();
+            }
+            return;
+        }
+        // An armed next/prev-book prompt is modal, as for taps: the same direction
+        // goes through `flip` (which runs into the edge and confirms it); any other
+        // key just dismisses it.
+        if let Some(app) = self.app.as_mut()
+            && app.book_prompt.as_ref().is_some_and(|p| p.dir != dir)
+        {
+            app.book_prompt = None;
+            app.window.request_redraw();
+            return;
+        }
+        self.flip(dir);
     }
 
     /// Post-flip bookkeeping shared by tap flips and committed drags (the step
@@ -1909,6 +1982,7 @@ impl Shell {
                 app.spine_shadow_on,
                 app.spine_shadow_strength,
                 app.reader.fit_no_upscale,
+                app.vol_keys,
             );
         }
         if std::mem::take(&mut self.dirty_libroot)
@@ -2034,7 +2108,7 @@ fn attach_source(
 /// The persisted viewing options, in `view.txt`'s positional order: direction,
 /// layout mode, fit, page-turn animation, scroll mode, resume-on-startup, chrome
 /// theme, performance profile, spine shadow on/off, spine-shadow strength,
-/// no-upscale fit.
+/// no-upscale fit, volume keys turn pages.
 type InitView = (
     Direction,
     LayoutMode,
@@ -2046,6 +2120,7 @@ type InitView = (
     PerfPref,
     bool,
     f32,
+    bool,
     bool,
 );
 
@@ -2065,6 +2140,7 @@ fn load_view(path: &Path) -> InitView {
     );
     let (mut spine, mut spine_strength) = (false, DEFAULT_SPINE_STRENGTH);
     let mut no_upscale = false;
+    let mut vol_keys = false;
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -2102,12 +2178,14 @@ fn load_view(path: &Path) -> InitView {
             .unwrap_or(DEFAULT_SPINE_STRENGTH);
         // 11th slot: no-upscale fit; absent (older files) ⇒ off (stretch to fit).
         no_upscale = t.get(10) == Some(&"noupscale");
+        // 12th slot: volume keys turn pages; absent (older files) ⇒ off.
+        vol_keys = t.get(11) == Some(&"volkeys");
     }
-    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale)
+    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale, vol_keys)
 }
 
 /// Persist viewing options as
-/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale".
+/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale,vol_keys".
 #[allow(clippy::too_many_arguments)]
 fn save_view(
     path: &Path,
@@ -2122,6 +2200,7 @@ fn save_view(
     spine: bool,
     spine_strength: f32,
     no_upscale: bool,
+    vol_keys: bool,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -2139,7 +2218,8 @@ fn save_view(
     let sp = if spine { "spine" } else { "nospine" };
     let ss = (spine_strength.clamp(0.0, 1.0) * 100.0).round() as i32;
     let nu = if no_upscale { "noupscale" } else { "stretch" };
-    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu}"));
+    let vk = if vol_keys { "volkeys" } else { "novolkeys" };
+    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu},{vk}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -2993,6 +3073,7 @@ fn options_popup(
     spine_on: bool,
     spine_strength: f32,
     resume_on: bool,
+    vol_keys_on: bool,
     scroll_on: bool,
     theme: ThemePref,
     perf: PerfPref,
@@ -3006,6 +3087,7 @@ fn options_popup(
     set_spine_on: &mut Option<bool>,
     set_spine_strength: &mut Option<f32>,
     set_resume: &mut Option<bool>,
+    set_vol_keys: &mut Option<bool>,
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
     set_perf: &mut Option<PerfPref>,
@@ -3200,6 +3282,30 @@ fn options_popup(
                     }
                 });
 
+                // Hardware page turning (issue #16). Arrow / PageUp / PageDown /
+                // media keys always flip; the volume rocker is opt-in because
+                // it takes the buttons away from the volume while a book is open.
+                ui.label(egui::RichText::new("Volume keys turn pages").strong());
+                ui.horizontal(|ui| {
+                    if ui
+                        .selectable_label(vol_keys_on, egui::RichText::new("On").size(16.0))
+                        .clicked()
+                    {
+                        *set_vol_keys = Some(true);
+                    }
+                    if ui
+                        .selectable_label(!vol_keys_on, egui::RichText::new("Off").size(16.0))
+                        .clicked()
+                    {
+                        *set_vol_keys = Some(false);
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Volume Down = next page, Volume Up = previous. The library keeps normal volume.")
+                        .size(12.0)
+                        .color(egui::Color32::from_white_alpha(150)),
+                );
+
                 ui.label(egui::RichText::new("Theme").strong());
                 ui.horizontal(|ui| {
                     for (t, text) in [
@@ -3326,6 +3432,26 @@ fn open_fd(app: &AndroidApp, uri: &str) -> i32 {
 fn set_keep_screen_on(app: &AndroidApp, on: bool) {
     let _ = with_env(app, |env, activity| {
         env.call_method(activity, "setKeepScreenOn", "(Z)V", &[JValue::Bool(on as u8)])?;
+        Ok(())
+    });
+}
+
+/// `AudioManager.ADJUST_*` for a volume key: raise, lower, toggle mute.
+fn volume_adjust(code: KeyCode) -> Option<i32> {
+    match code {
+        KeyCode::AudioVolumeUp => Some(1),
+        KeyCode::AudioVolumeDown => Some(-1),
+        KeyCode::AudioVolumeMute => Some(101),
+        _ => None,
+    }
+}
+
+/// Do what the system would have done with a volume key we received but didn't
+/// use for paging (`handle_volume_keys` routes every press to us): adjust the
+/// active stream and show the volume panel.
+fn adjust_volume(app: &AndroidApp, adj: i32) {
+    let _ = with_env(app, |env, activity| {
+        env.call_method(activity, "adjustVolume", "(I)V", &[JValue::Int(adj)])?;
         Ok(())
     });
 }
@@ -3797,6 +3923,7 @@ impl App {
         let cur_spine_on = self.spine_shadow_on;
         let cur_spine_strength = self.spine_shadow_strength;
         let cur_resume = self.resume_on_startup;
+        let cur_vol_keys = self.vol_keys;
         let cur_scroll = self.reader.scroll_mode;
         let cur_theme = self.theme;
         let cur_perf = self.perf;
@@ -3938,6 +4065,7 @@ impl App {
         let mut set_spine_on: Option<bool> = None;
         let mut set_spine_strength: Option<f32> = None;
         let mut set_resume: Option<bool> = None;
+        let mut set_vol_keys: Option<bool> = None;
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
         let mut set_perf: Option<PerfPref> = None;
@@ -4211,6 +4339,7 @@ impl App {
                         cur_spine_on,
                         cur_spine_strength,
                         cur_resume,
+                        cur_vol_keys,
                         cur_scroll,
                         cur_theme,
                         cur_perf,
@@ -4223,6 +4352,7 @@ impl App {
                         &mut set_spine_on,
                         &mut set_spine_strength,
                         &mut set_resume,
+                        &mut set_vol_keys,
                         &mut set_scroll,
                         &mut set_theme,
                         &mut set_perf,
@@ -4388,6 +4518,10 @@ impl App {
         }
         if let Some(v) = set_resume {
             self.resume_on_startup = v;
+            self.persist_view();
+        }
+        if let Some(v) = set_vol_keys {
+            self.vol_keys = v;
             self.persist_view();
         }
         if let Some(v) = set_scroll {

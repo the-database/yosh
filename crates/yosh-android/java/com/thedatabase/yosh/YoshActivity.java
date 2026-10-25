@@ -5,6 +5,7 @@ import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -150,6 +151,19 @@ public class YoshActivity extends NativeActivity {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
         });
+    }
+
+    /** Adjust the volume the way the system does for a volume key (direction is an
+     *  AudioManager.ADJUST_* constant). Called from native: the native side asks
+     *  winit to deliver volume keys so they can turn pages, which also means the OS
+     *  no longer sees them, so a press that doesn't turn a page is handed back here.
+     *  The suggested (default) stream is the one the system would pick itself. */
+    public void adjustVolume(int direction) {
+        AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (am != null) {
+            am.adjustSuggestedStreamVolume(
+                direction, AudioManager.USE_DEFAULT_STREAM_TYPE, AudioManager.FLAG_SHOW_UI);
+        }
     }
 
     /** Status-bar height in px (0 if unknown). A constant from the platform
