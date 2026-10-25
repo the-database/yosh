@@ -14,6 +14,7 @@ pub mod caption;
 pub mod decode;
 pub mod gesture;
 pub mod gpu;
+pub mod i18n;
 pub mod icc;
 pub mod layout;
 pub mod meta;

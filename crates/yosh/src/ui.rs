@@ -4,6 +4,8 @@
 
 use std::path::PathBuf;
 
+use yosh_engine::i18n::tr;
+
 use crate::library::{series_status, vol_state, LibCtx, Library, VolState};
 
 #[derive(Default)]
@@ -441,11 +443,11 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
                                     ));
                                 }
                             }
-                            if btn.on_hover_text(if st.anim_playing { "Pause" } else { "Play" }).clicked() {
+                            if btn.on_hover_text(if st.anim_playing { tr().pause } else { tr().play }).clicked() {
                                 st.anim_req_toggle_play = true;
                             }
                         }
-                        if ui.button("<").on_hover_text("Previous frame").clicked() {
+                        if ui.button("<").on_hover_text(tr().prev_frame).clicked() {
                             st.anim_req_step = -1;
                         }
                         ui.label(
@@ -453,7 +455,7 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
                                 .monospace()
                                 .color(egui::Color32::WHITE),
                         );
-                        if ui.button(">").on_hover_text("Next frame").clicked() {
+                        if ui.button(">").on_hover_text(tr().next_frame).clicked() {
                             st.anim_req_step = 1;
                         }
 
@@ -484,7 +486,7 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
                             st.anim_req_seek = Some((t * last).round() as usize);
                         }
 
-                        if ui.button("×").on_hover_text("Hide (G)").clicked() {
+                        if ui.button("×").on_hover_text(tr().hide_anim).clicked() {
                             st.anim_req_hide = true;
                         }
                     });
@@ -503,16 +505,16 @@ pub fn chrome(
     let show_bar = st.show_bar;
     let bar = egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
         ui.horizontal(|ui| {
-            if ui.button("Open folder…").clicked()
-                && let Some(p) = rfd::FileDialog::new().set_title("Open page folder").pick_folder()
+            if ui.button(tr().open_folder).clicked()
+                && let Some(p) = rfd::FileDialog::new().set_title(tr().dlg_open_folder).pick_folder()
             {
                 st.pending_open = Some(p);
             }
-            if ui.button("Open file…").clicked()
+            if ui.button(tr().open_file).clicked()
                 && let Some(p) = rfd::FileDialog::new()
-                    .set_title("Open comic archive or image")
+                    .set_title(tr().dlg_open_file)
                     .add_filter(
-                        "Comics & images",
+                        tr().dlg_filter,
                         &[
                             "cbz", "cbr", "zip", "rar", "7z", "cb7", "png", "jpg", "jpeg", "webp",
                             "gif", "bmp", "avif", "jxl", "psd", "ico",
@@ -526,7 +528,7 @@ pub fn chrome(
             // is the descriptive "Resume <book>" button on the right (added below),
             // mirroring the Android shell. (Setting the library lives in the library
             // view's "Change library…", not here — it's rare.)
-            if st.reader_open && !library_view && ui.button("Library").clicked() {
+            if st.reader_open && !library_view && ui.button(tr().library).clicked() {
                 st.req_toggle_library = true;
             }
             ui.separator();
@@ -534,46 +536,44 @@ pub fn chrome(
             // set-and-forget options (theme / resume / page-turn / …) live behind ⚙ Settings.
             // They act on the open book, so they're hidden on the library grid.
             if !library_view {
-                if ui.button(format!("Dir: {}", st.dir_label)).clicked() {
+                if ui.button((tr().dir_button)(st.dir_label)).clicked() {
                     st.req_toggle_dir = true;
                 }
-                if ui.button(format!("Fit: {}", st.fit_label)).clicked() {
+                if ui.button((tr().fit_button)(st.fit_label)).clicked() {
                     st.req_cycle_fit = true;
                 }
-                if ui.button(format!("Layout: {}", st.layout_label)).clicked() {
+                if ui.button((tr().layout_button)(st.layout_label)).clicked() {
                     st.req_toggle_layout = true;
                 }
             }
             if ui
-                .button("⚙ Settings")
-                .on_hover_text(
-                    "Reading mode, direction, layout, fit, rotation, page-turn, spine shadow, resume, theme, performance",
-                )
+                .button(tr().settings)
+                .on_hover_text(tr().settings_tip)
                 .clicked()
             {
                 st.settings_open = !st.settings_open;
             }
-            if ui.button("? Help").clicked() {
+            if ui.button(tr().help).clicked() {
                 st.help_open = !st.help_open;
             }
             if let Some(v) = st.update_version.clone() {
                 if st.updating {
                     ui.label(
-                        egui::RichText::new("Updating…")
+                        egui::RichText::new(tr().updating)
                             .color(egui::Color32::from_rgb(130, 200, 130)),
                     );
                 } else if st.update_failed {
                     ui.label(
-                        egui::RichText::new("Update failed")
+                        egui::RichText::new(tr().update_failed)
                             .color(egui::Color32::from_rgb(220, 130, 130)),
                     )
-                    .on_hover_text("Couldn't install the update — grab it from the releases page.");
+                    .on_hover_text(tr().update_failed_tip);
                 } else if ui
                     .button(
-                        egui::RichText::new(format!("Update to v{v}"))
+                        egui::RichText::new((tr().update_to)(&v))
                             .color(egui::Color32::from_rgb(140, 225, 140)),
                     )
-                    .on_hover_text(format!("Download yosh v{v} and restart"))
+                    .on_hover_text((tr().update_tip)(&v))
                     .clicked()
                 {
                     st.req_update = true;
@@ -597,9 +597,9 @@ pub fn chrome(
                             let total = name.chars().count();
                             let clip: String = name.chars().take(24).collect();
                             let clip = if total > 24 { format!("{clip}…") } else { clip };
-                            format!("{}  Resume {clip}", egui_phosphor::fill::BOOK_OPEN)
+                            format!("{}  {}", egui_phosphor::fill::BOOK_OPEN, (tr().resume_book)(&clip))
                         }
-                        None => format!("{}  Resume", egui_phosphor::fill::BOOK_OPEN),
+                        None => format!("{}  {}", egui_phosphor::fill::BOOK_OPEN, tr().resume),
                     };
                     if ui.button(label).clicked() {
                         st.req_toggle_library = true;
@@ -618,7 +618,7 @@ pub fn chrome(
                             .unwrap_or_else(|| p.to_str().unwrap_or(""));
                         ui.label(short)
                     }
-                    None => ui.label("no volume open"),
+                    None => ui.label(tr().no_volume_open),
                 };
             }
         });
@@ -631,7 +631,10 @@ pub fn chrome(
     st.bar_px = bar.map_or(0.0, |b| b.response.rect.height() * ctx.pixels_per_point());
 
     if st.help_open {
-        egui::Window::new("yosh — keys")
+        let t = tr();
+        // Fixed id: egui keys a window by its title, which changes with the language.
+        egui::Window::new(t.help_title)
+            .id(egui::Id::new("help_window"))
             .collapsible(false)
             .resizable(false)
             .open(&mut st.help_open)
@@ -640,41 +643,22 @@ pub fn chrome(
                     egui::RichText::new(concat!("yosh ", env!("CARGO_PKG_VERSION")))
                         .color(egui::Color32::from_gray(140)),
                 );
-                ui.heading("Navigate");
-                ui.label("← →   flip (reading-direction aware)");
-                ui.label("↑ ↓ / Space / PgUp PgDn   flip");
-                ui.label("Home / End   first / last page");
-                ui.label("[  ]   previous / next book (folder or archive)");
-                ui.label("click left/right edge — flip;   wheel — flip or pan");
-                ui.label("double-click the middle — fullscreen");
-                ui.separator();
-                ui.heading("View presets");
-                ui.label("9  fit window      8  fit width      0  100% (1:1)");
-                ui.label("7  two-page  L→R   6  two-page  R→L (manga)");
-                ui.separator();
-                ui.heading("Layout / direction");
-                ui.label("S   single ↔ two-page spread");
-                ui.label("D   reading direction  RTL ↔ LTR");
-                ui.label("C   continuous vertical scroll");
-                ui.label("O   shift spread pairing (fix wrong pairing)");
-                ui.separator();
-                ui.heading("View");
-                ui.label("+ / −   zoom;   drag — pan;   a preset key resets zoom");
-                ui.label("Ctrl+wheel   zoom at the cursor (same steps as + / −)");
-                ui.label("Z   stretch small pages (off: fit stops at 100% native)");
-                ui.label("R   rotate 90° (clockwise)");
-                ui.label("I   show image info overlay");
-                ui.label("B   toggle bottom seekbar");
-                ui.label("T   page-turn transition (slide + fade on flip)");
-                ui.label("spine shadow on two-page spreads — ⚙ Settings (no key)");
-                ui.label("G   show/hide the animation panel (animated GIF / WebP)");
-                ui.label("F11   fullscreen      Esc   quit");
-                ui.separator();
-                ui.heading("Files");
-                ui.label("E   show in Explorer (open the folder & select the file)");
-                ui.label("Open folder / Open file;  Library ↔ Reader;  ⚙ Settings");
-                ui.label("drag a folder, archive, or image onto the window");
-                ui.label("F1   toggle this help");
+                for (i, sec) in t.help_sections.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    ui.heading(sec.title);
+                    egui::Grid::new(("help_grid", i)).num_columns(2).spacing([18.0, 4.0]).show(
+                        ui,
+                        |ui| {
+                            for (keys, what) in sec.rows {
+                                ui.label(egui::RichText::new(*keys).strong());
+                                ui.label(*what);
+                                ui.end_row();
+                            }
+                        },
+                    );
+                }
             });
     }
 
@@ -719,7 +703,7 @@ pub fn chrome(
                                 }
                                 // Live view state (refreshed every frame, not cached with the page).
                                 ui.label(
-                                    egui::RichText::new("Zoom").color(egui::Color32::from_gray(150)),
+                                    egui::RichText::new(tr().info_zoom).color(egui::Color32::from_gray(150)),
                                 );
                                 ui.label(
                                     egui::RichText::new(format!("{:.2}%", st.zoom_pct))
@@ -729,7 +713,7 @@ pub fn chrome(
                                 ui.end_row();
                                 if let Some((vy, glide)) = st.touch_fling {
                                     ui.label(
-                                        egui::RichText::new("Touch")
+                                        egui::RichText::new(tr().info_touch)
                                             .color(egui::Color32::from_gray(150)),
                                     );
                                     ui.label(
@@ -743,7 +727,7 @@ pub fn chrome(
                                 }
                                 if !st.resize_path.is_empty() {
                                     ui.label(
-                                        egui::RichText::new("Resize")
+                                        egui::RichText::new(tr().info_resize)
                                             .color(egui::Color32::from_gray(150)),
                                     );
                                     ui.label(
@@ -775,7 +759,7 @@ pub fn chrome(
                             ui.add(egui::Spinner::new().size(22.0));
                             ui.add_space(8.0);
                             ui.label(
-                                egui::RichText::new("Loading…")
+                                egui::RichText::new(tr().loading)
                                     .color(egui::Color32::WHITE)
                                     .size(15.0),
                             );
@@ -801,7 +785,7 @@ pub fn chrome(
                     .show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("Couldn't open {name}"))
+                                egui::RichText::new((tr().couldnt_open)(name))
                                     .color(egui::Color32::WHITE)
                                     .size(15.0),
                             );
@@ -887,19 +871,22 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
         return;
     }
     let mut open = true;
-    egui::Window::new("⚙ Settings")
+    let t = tr();
+    // Fixed id: egui keys a window by its title, which changes with the language.
+    egui::Window::new(t.settings)
+        .id(egui::Id::new("settings_window"))
         .collapsible(false)
         .resizable(false)
         .open(&mut open)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
 
-            ui.label(egui::RichText::new("Reading mode").strong());
+            ui.label(egui::RichText::new(t.reading_mode).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(!st.scroll_on, "Page-flip").clicked() && st.scroll_on {
+                if ui.selectable_label(!st.scroll_on, t.page_flip).clicked() && st.scroll_on {
                     st.req_toggle_scroll = true;
                 }
-                if ui.selectable_label(st.scroll_on, "Scroll").clicked() && !st.scroll_on {
+                if ui.selectable_label(st.scroll_on, t.scroll).clicked() && !st.scroll_on {
                     st.req_toggle_scroll = true;
                 }
             });
@@ -910,7 +897,7 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
             let r = ui.add(
                 egui::Slider::new(&mut speed, 0.25..=3.0)
                     .custom_formatter(|v, _| format!("{v:.2}×"))
-                    .text("scroll speed"),
+                    .text(t.scroll_speed),
             );
             if r.changed() {
                 st.req_scroll_speed = Some(speed);
@@ -922,43 +909,43 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 st.req_scroll_speed_save = true;
             }
             ui.label(
-                egui::RichText::new("Mouse-wheel scrolling speed (scroll mode)")
+                egui::RichText::new(t.scroll_speed_hint)
                     .weak()
                     .small(),
             );
 
-            ui.label(egui::RichText::new("Reading direction").strong());
+            ui.label(egui::RichText::new(t.reading_direction).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(!st.dir_rtl, "→ LTR").clicked() && st.dir_rtl {
+                if ui.selectable_label(!st.dir_rtl, t.dir_ltr).clicked() && st.dir_rtl {
                     st.req_toggle_dir = true;
                 }
-                if ui.selectable_label(st.dir_rtl, "← RTL").clicked() && !st.dir_rtl {
+                if ui.selectable_label(st.dir_rtl, t.dir_rtl).clicked() && !st.dir_rtl {
                     st.req_toggle_dir = true;
                 }
             });
 
-            ui.label(egui::RichText::new("Page layout").strong());
+            ui.label(egui::RichText::new(t.page_layout).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(!st.layout_spread, "Single").clicked() && st.layout_spread {
+                if ui.selectable_label(!st.layout_spread, t.single).clicked() && st.layout_spread {
                     st.req_toggle_layout = true;
                 }
-                if ui.selectable_label(st.layout_spread, "Two-page").clicked() && !st.layout_spread {
+                if ui.selectable_label(st.layout_spread, t.two_page).clicked() && !st.layout_spread {
                     st.req_toggle_layout = true;
                 }
             });
             // Pairing parity only matters in a spread.
             if st.layout_spread
                 && ui
-                    .button("Shift page pairing")
-                    .on_hover_text("Fix a mis-paired spread (key O)")
+                    .button(t.shift_page_pairing)
+                    .on_hover_text(t.pairing_tip)
                     .clicked()
             {
                 st.req_toggle_pairing = true;
             }
 
-            ui.label(egui::RichText::new("Fit").strong());
+            ui.label(egui::RichText::new(t.fit).strong());
             ui.horizontal(|ui| {
-                for (i, text) in ["Window", "Width", "Height", "1:1"].iter().enumerate() {
+                for (i, text) in [t.fit_window_opt, t.fit_width_opt, t.fit_height_opt, "1:1"].iter().enumerate() {
                     if ui.selectable_label(st.fit_mode == i as u8, *text).clicked() {
                         st.req_set_fit = Some(i as u8);
                     }
@@ -967,24 +954,24 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
 
             // Sits directly under the fit radios because it *modifies* them: it
             // bounds every fit at 100% native rather than being a mode of its own.
-            ui.label(egui::RichText::new("Stretch small pages").strong());
+            ui.label(egui::RichText::new(t.stretch_small_pages).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(st.stretch_on, "On").clicked() && !st.stretch_on {
+                if ui.selectable_label(st.stretch_on, t.on).clicked() && !st.stretch_on {
                     st.req_toggle_stretch = true;
                 }
-                if ui.selectable_label(!st.stretch_on, "Off").clicked() && st.stretch_on {
+                if ui.selectable_label(!st.stretch_on, t.off).clicked() && st.stretch_on {
                     st.req_toggle_stretch = true;
                 }
             });
             ui.label(
-                egui::RichText::new("Off: fit never scales past 100% native (zoom still can) — Z")
+                egui::RichText::new(t.stretch_hint_key)
                     .weak()
                     .small(),
             );
 
-            ui.label(egui::RichText::new("Rotation").strong());
+            ui.label(egui::RichText::new(t.rotation).strong());
             if ui
-                .button(format!("Rotate 90° ⟳  ·  now {}°", st.rotation as u32 * 90))
+                .button((t.rotate_now)(st.rotation as u32 * 90))
                 .clicked()
             {
                 st.req_rotate = true;
@@ -992,27 +979,27 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
 
             ui.separator();
 
-            ui.label(egui::RichText::new("Page-turn animation").strong());
+            ui.label(egui::RichText::new(t.page_turn_animation).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(st.transition_on, "On").clicked() && !st.transition_on {
+                if ui.selectable_label(st.transition_on, t.on).clicked() && !st.transition_on {
                     st.req_toggle_transition = true;
                 }
-                if ui.selectable_label(!st.transition_on, "Off").clicked() && st.transition_on {
+                if ui.selectable_label(!st.transition_on, t.off).clicked() && st.transition_on {
                     st.req_toggle_transition = true;
                 }
             });
 
-            ui.label(egui::RichText::new("Spine shadow (two-page)").strong());
+            ui.label(egui::RichText::new(t.spine_shadow_two_page).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(st.spine_shadow_on, "On").clicked() && !st.spine_shadow_on {
+                if ui.selectable_label(st.spine_shadow_on, t.on).clicked() && !st.spine_shadow_on {
                     st.req_spine_toggle = true;
                 }
-                if ui.selectable_label(!st.spine_shadow_on, "Off").clicked() && st.spine_shadow_on {
+                if ui.selectable_label(!st.spine_shadow_on, t.off).clicked() && st.spine_shadow_on {
                     st.req_spine_toggle = true;
                 }
             });
             ui.label(
-                egui::RichText::new("Book-gutter shading on un-joined spreads")
+                egui::RichText::new(t.spine_hint)
                     .weak()
                     .small(),
             );
@@ -1025,7 +1012,7 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 st.spine_shadow_on,
                 egui::Slider::new(&mut strength, 0.0..=1.0)
                     .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                    .text("strength"),
+                    .text(t.strength),
             );
             if r.changed() {
                 st.req_spine_strength = Some(strength);
@@ -1037,22 +1024,22 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 st.req_spine_save = true;
             }
 
-            ui.label(egui::RichText::new("Resume on startup").strong());
+            ui.label(egui::RichText::new(t.resume_on_startup).strong());
             ui.horizontal(|ui| {
-                if ui.selectable_label(st.resume_on_startup, "On").clicked() && !st.resume_on_startup {
+                if ui.selectable_label(st.resume_on_startup, t.on).clicked() && !st.resume_on_startup {
                     st.req_toggle_resume = true;
                 }
-                if ui.selectable_label(!st.resume_on_startup, "Off").clicked() && st.resume_on_startup {
+                if ui.selectable_label(!st.resume_on_startup, t.off).clicked() && st.resume_on_startup {
                     st.req_toggle_resume = true;
                 }
             });
 
-            ui.label(egui::RichText::new("Theme").strong());
+            ui.label(egui::RichText::new(t.theme).strong());
             ui.horizontal(|ui| {
                 for (t, text) in [
-                    (crate::config::ThemePref::System, "System"),
-                    (crate::config::ThemePref::Light, "Light"),
-                    (crate::config::ThemePref::Dark, "Dark"),
+                    (crate::config::ThemePref::System, t.theme_system),
+                    (crate::config::ThemePref::Light, t.theme_light),
+                    (crate::config::ThemePref::Dark, t.theme_dark),
                 ] {
                     if ui.selectable_label(st.theme == t, text).clicked() {
                         st.req_set_theme = Some(t);
@@ -1063,13 +1050,13 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
             // How hard the decode pipeline is allowed to work. `Auto` follows the
             // power source (full budget on mains, throttled on battery); the rest
             // pin a tier. Same four choices and wording as the Android shell.
-            ui.label(egui::RichText::new("Performance").strong());
+            ui.label(egui::RichText::new(t.performance).strong());
             ui.horizontal(|ui| {
                 for (p, text) in [
-                    (crate::config::PerfPref::Auto, "Auto"),
-                    (crate::config::PerfPref::Low, "Battery saver"),
-                    (crate::config::PerfPref::Mid, "Balanced"),
-                    (crate::config::PerfPref::High, "Performance"),
+                    (crate::config::PerfPref::Auto, t.perf_auto),
+                    (crate::config::PerfPref::Low, t.perf_low),
+                    (crate::config::PerfPref::Mid, t.perf_mid),
+                    (crate::config::PerfPref::High, t.perf_high),
                 ] {
                     if ui.selectable_label(st.perf == p, text).clicked() {
                         st.req_set_perf = Some(p);
@@ -1111,9 +1098,9 @@ fn onboarding(ui: &mut egui::Ui, st: &mut UiState) {
         } else {
             ui.label(egui::RichText::new("📖").size(56.0));
         }
-        ui.label(egui::RichText::new("No comic open").strong().size(22.0));
+        ui.label(egui::RichText::new(tr().no_comic_open).strong().size(22.0));
         ui.label(
-            egui::RichText::new("Set up your library, or open a file to start reading.")
+            egui::RichText::new(tr().onboarding_sub)
                 .size(14.0)
                 .color(egui::Color32::from_white_alpha(160)),
         );
@@ -1121,23 +1108,23 @@ fn onboarding(ui: &mut egui::Ui, st: &mut UiState) {
         ui.spacing_mut().button_padding = egui::vec2(18.0, 10.0);
         if ui
             .add(egui::Button::new(
-                egui::RichText::new("📚 Pick your comics folder…").size(18.0),
+                egui::RichText::new(tr().pick_comics_folder).size(18.0),
             ))
-            .on_hover_text("Choose a folder of comics to browse as a library")
+            .on_hover_text(tr().pick_comics_folder_tip)
             .clicked()
             && let Some(p) = rfd::FileDialog::new()
-                .set_title("Choose a library folder")
+                .set_title(tr().dlg_library)
                 .pick_folder()
         {
             st.pending_library = Some(p);
         }
         if ui
-            .add(egui::Button::new(egui::RichText::new("Open file…").size(18.0)))
+            .add(egui::Button::new(egui::RichText::new(tr().open_file).size(18.0)))
             .clicked()
             && let Some(p) = rfd::FileDialog::new()
-                .set_title("Open comic archive or image")
+                .set_title(tr().dlg_open_file)
                 .add_filter(
-                    "Comics & images",
+                    tr().dlg_filter,
                     &[
                         "cbz", "cbr", "zip", "rar", "7z", "cb7", "png", "jpg", "jpeg", "webp",
                         "gif", "bmp", "avif", "jxl", "psd", "ico",
@@ -1148,17 +1135,17 @@ fn onboarding(ui: &mut egui::Ui, st: &mut UiState) {
             st.pending_open = Some(p);
         }
         if ui
-            .add(egui::Button::new(egui::RichText::new("Open folder…").size(18.0)))
+            .add(egui::Button::new(egui::RichText::new(tr().open_folder).size(18.0)))
             .clicked()
             && let Some(p) = rfd::FileDialog::new()
-                .set_title("Open page folder")
+                .set_title(tr().dlg_open_folder)
                 .pick_folder()
         {
             st.pending_open = Some(p);
         }
         ui.add_space(2.0);
         ui.label(
-            egui::RichText::new("Press F1 for keys.")
+            egui::RichText::new(tr().press_f1)
                 .size(12.0)
                 .color(egui::Color32::from_white_alpha(140)),
         );
@@ -1211,14 +1198,14 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
     ui.spacing_mut().scroll.fade.strength = 0.0;
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.button("⟳ Rescan").on_hover_text("Re-scan the library folder").clicked() {
+        if ui.button(tr().rescan).on_hover_text(tr().rescan_tip).clicked() {
             st.rescan = true;
         }
         // Set/change the library root lives here (rare action), not in the top bar —
         // mirrors the Android library's "Change library…".
-        if ui.button("📂 Change library…").on_hover_text("Pick a different comics folder").clicked()
+        if ui.button(tr().change_library).on_hover_text(tr().change_library_tip).clicked()
             && let Some(p) = rfd::FileDialog::new()
-                .set_title("Choose a library folder")
+                .set_title(tr().dlg_library)
                 .pick_folder()
         {
             st.pending_library = Some(p);
@@ -1234,9 +1221,9 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
         ui.vertical_centered(|ui| {
             if st.scanning {
                 ui.add(egui::Spinner::new());
-                ui.label("Scanning library…");
+                ui.label(tr().scanning_library);
             } else {
-                ui.label("No comics found here — use “Library…” to pick your comics folder.");
+                ui.label(tr().no_comics_found);
             }
         });
         return;
@@ -1369,7 +1356,7 @@ fn recents_row(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibC
         return;
     }
     ui.add_space(4.0);
-    ui.label(egui::RichText::new("Recently read").size(18.0).strong());
+    ui.label(egui::RichText::new(tr().recently_read).size(18.0).strong());
     egui::ScrollArea::horizontal()
         .id_salt("recents_row")
         .scroll_source(egui::scroll_area::ScrollSource {

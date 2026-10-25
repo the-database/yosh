@@ -23,6 +23,7 @@ use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
+use yosh_engine::i18n::{self, tr};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
@@ -1350,13 +1351,13 @@ fn page_info(src: &dyn PageSource, index: usize) -> Vec<(String, String)> {
     };
     let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
     vec![
-        ("File".to_string(), name),
-        ("Page".to_string(), format!("{} / {}", index + 1, src.len())),
-        ("Size".to_string(), size),
-        ("Modified".to_string(), modified),
-        ("Resolution".to_string(), res),
-        ("Format".to_string(), fmt),
-        ("Color".to_string(), color),
+        (tr().info_file.to_string(), name),
+        (tr().info_page.to_string(), format!("{} / {}", index + 1, src.len())),
+        (tr().info_size.to_string(), size),
+        (tr().info_modified.to_string(), modified),
+        (tr().info_resolution.to_string(), res),
+        (tr().info_format.to_string(), fmt),
+        (tr().info_color.to_string(), color),
     ]
 }
 
@@ -1432,7 +1433,7 @@ impl State {
                 };
                 self.settings.direction_rtl = self.reader.direction == Direction::Rtl;
                 config::save(&self.settings);
-                self.toast(format!("Direction: {}", self.reader.direction.label()));
+                self.toast((tr().toast_direction)(i18n::dir_short(self.reader.direction)));
             }
             Action::ToggleLayout => {
                 self.reader.layout = self.reader.layout.toggled();
@@ -1442,7 +1443,7 @@ impl State {
                 self.settings.layout_spread = self.reader.layout == Layout::Spread;
                 config::save(&self.settings);
                 self.reader.prefetch();
-                self.toast(format!("Layout: {}", self.reader.layout.label()));
+                self.toast((tr().toast_layout)(i18n::layout_short(self.reader.layout)));
             }
             Action::ToggleScroll => {
                 self.reader.scroll_mode = !self.reader.scroll_mode;
@@ -1451,9 +1452,9 @@ impl State {
                 config::save(&self.settings);
                 self.reader.prefetch();
                 self.toast(if self.reader.scroll_mode {
-                    "Scroll mode"
+                    tr().toast_scroll_mode
                 } else {
-                    "Page-flip mode"
+                    tr().toast_page_flip_mode
                 });
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
@@ -1467,9 +1468,9 @@ impl State {
                 // Announce the change like the other toggles — a silent flip left
                 // the seekbar disabled with no clue it had been turned off.
                 self.toast(if self.settings.seekbar_enabled {
-                    "Seekbar: on"
+                    tr().toast_seekbar_on
                 } else {
-                    "Seekbar: off"
+                    tr().toast_seekbar_off
                 });
             }
             Action::TogglePageTransition => {
@@ -1477,9 +1478,9 @@ impl State {
                 self.reader.transition_enabled = self.settings.page_transition_enabled;
                 config::save(&self.settings);
                 self.toast(if self.settings.page_transition_enabled {
-                    "Page transition: on"
+                    tr().toast_transition_on
                 } else {
-                    "Page transition: off"
+                    tr().toast_transition_off
                 });
             }
             Action::ToggleStretch => self.toggle_stretch(),
@@ -1502,7 +1503,7 @@ impl State {
                 // Re-anchor so the current view re-pairs with the new parity.
                 self.reader.snap_to_view_start();
                 self.reader.prefetch();
-                self.toast(format!("Spread offset: {}", self.reader.spread_offset));
+                self.toast((tr().toast_spread_offset)(self.reader.spread_offset));
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
@@ -1513,7 +1514,7 @@ impl State {
                 self.reader.pan_x = 0.0;
                 self.reader.pan_y = 0.0;
                 self.reader.prefetch(); // re-decode at the rotation-aware target (1:1)
-                self.toast(format!("Rotation: {}\u{00b0}", self.reader.rotation as u32 * 90));
+                self.toast((tr().toast_rotation)(self.reader.rotation as u32 * 90));
             }
             Action::ShowInExplorer => self.reveal_current(),
             // Esc → quit is intercepted in `window_event` (needs the event loop),
@@ -1550,9 +1551,9 @@ impl State {
         // Phrased as the user-facing setting (stretching is the default), so the
         // toast matches the panel row rather than inverting it.
         self.toast(if self.settings.no_stretch {
-            "Stretch small pages: off"
+            tr().toast_stretch_off
         } else {
-            "Stretch small pages: on"
+            tr().toast_stretch_on
         });
     }
 
@@ -1561,7 +1562,7 @@ impl State {
     /// page's image file; for an archive it's the archive file itself.
     fn reveal_current(&mut self) {
         let Some(key) = self.volume_key.clone() else {
-            self.toast("Nothing open");
+            self.toast(tr().toast_nothing_open);
             return;
         };
         let base = PathBuf::from(&key);
@@ -1576,7 +1577,7 @@ impl State {
             base // archive (or single file): select it in its folder
         };
         reveal_in_explorer(&target);
-        self.toast("Shown in Explorer");
+        self.toast(tr().toast_shown_in_explorer);
     }
 
     /// Open the previous (`delta < 0`) or next (`delta > 0`) sibling volume of
@@ -1617,13 +1618,13 @@ impl State {
         };
         let target = idx as i64 + delta;
         if target < 0 {
-            self.toast("First book");
+            self.toast(tr().toast_first_book);
             return;
         }
         let next = sibs.get(target as usize).cloned();
         match next {
             Some(path) => self.open(&path),
-            None => self.toast("Last book"),
+            None => self.toast(tr().toast_last_book),
         }
     }
 
@@ -2606,7 +2607,7 @@ impl State {
                     "—"
                 };
                 rows.push((
-                    "LQ tier".to_string(),
+                    tr().info_lq_tier.to_string(),
                     format!("{}/{} · {}", self.reader.lq_cache.len(), len, showing),
                 ));
             }
@@ -2688,16 +2689,17 @@ impl State {
         self.reader.prefetch();
         // Tell the user what the preset just switched to (presets change fit +
         // layout + maybe direction at once, so summarize the resulting view).
+        let t = tr();
         let view_label = if spread {
-            format!("Spread, {}", self.reader.direction.label())
+            (t.toast_spread)(i18n::dir_short(self.reader.direction))
         } else {
             let f = match fit {
-                FitMode::Window => "Fit window",
-                FitMode::Width => "Fit width",
-                FitMode::Height => "Fit height",
+                FitMode::Window => t.fit_window,
+                FitMode::Width => t.fit_width,
+                FitMode::Height => t.fit_height,
                 FitMode::Actual => "1:1",
             };
-            format!("{f} (single)")
+            (t.toast_single)(f)
         };
         self.toast(view_label);
     }
@@ -2796,7 +2798,7 @@ impl State {
     /// `Library - yosh` in the grid, plain `yosh` when nothing is open.
     fn title(&self) -> String {
         if self.library_view {
-            return "Library - yosh".to_string();
+            return tr().title_library.to_string();
         }
         let Some(src) = &self.reader.source else {
             return "yosh".to_string();
@@ -2927,17 +2929,17 @@ impl State {
                         }
                     }
                     if partial {
-                        self.toast(format!("Partial archive — {n} pages recovered"));
+                        self.toast((tr().toast_partial_archive)(n));
                     }
                 }
                 // A failed open never draws a first page, so drop the stamp here —
                 // a stale one would mislabel a later cache-hit on the old volume.
                 Ok(_) => {
-                    self.ui.status = "no images found".into();
+                    self.ui.status = tr().no_images_found.into();
                     self.open_t0 = None;
                 }
                 Err(e) => {
-                    self.ui.status = format!("open failed: {e}");
+                    self.ui.status = (tr().open_failed)(&e.to_string());
                     self.open_t0 = None;
                 }
             }
@@ -2960,9 +2962,9 @@ impl State {
                 // Auto only ever moves between High (mains) and Mid (battery), so
                 // the power source names the direction.
                 self.toast(if self.on_battery {
-                    "Battery saver"
+                    tr().perf_low
                 } else {
-                    "Performance restored"
+                    tr().toast_performance_restored
                 });
             }
         }
@@ -2993,12 +2995,12 @@ impl State {
         } else {
             self.reader.build_quads()
         };
-        self.ui.dir_label = self.reader.direction.label();
-        self.ui.fit_label = self.reader.fit.label();
+        self.ui.dir_label = i18n::dir_short(self.reader.direction);
+        self.ui.fit_label = i18n::fit_short(self.reader.fit);
         self.ui.layout_label = if self.reader.scroll_mode {
-            "scroll"
+            tr().layout_short_scroll
         } else {
-            self.reader.layout.label()
+            i18n::layout_short(self.reader.layout)
         };
         self.ui.transition_on = self.settings.page_transition_enabled;
         // Shown inverted in the panel: the row is "Stretch small pages".
@@ -3017,18 +3019,14 @@ impl State {
         self.ui.perf = self.settings.perf;
         // What `Auto` currently resolves to, so the picker shows the live answer
         // instead of leaving the user to guess.
-        self.ui.perf_auto = format!(
-            "Auto — currently {} ({})",
+        let t = tr();
+        self.ui.perf_auto = (t.perf_auto_now)(
             match self.effective_tier() {
-                DeviceTier::Low => "Battery saver",
-                DeviceTier::Mid => "Balanced",
-                DeviceTier::High => "Performance",
+                DeviceTier::Low => t.perf_low,
+                DeviceTier::Mid => t.perf_mid,
+                DeviceTier::High => t.perf_high,
             },
-            if self.on_battery {
-                "on battery"
-            } else {
-                "plugged in"
-            }
+            self.on_battery,
         );
         // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
         // library grid; `ui.opened` is sticky once set, so it can't.
@@ -3051,8 +3049,8 @@ impl State {
                     // `poll_background` swaps the full rows in when they land.
                     let head = |i: usize| {
                         vec![
-                            ("File".to_string(), src.name(i).to_string()),
-                            ("Page".to_string(), format!("{} / {}", i + 1, src.len())),
+                            (tr().info_file.to_string(), src.name(i).to_string()),
+                            (tr().info_page.to_string(), format!("{} / {}", i + 1, src.len())),
                         ]
                     };
                     let mut rows = head(a);
@@ -3153,12 +3151,13 @@ impl State {
                 Some(b) => format!("{}-{}", anchor + 1, b + 1),
                 None => format!("{}", anchor + 1),
             };
+            let failed_suffix = format!("  {}", tr().status_failed);
             self.ui.status = format!(
                 "{}/{}{}",
                 shown,
                 len,
                 if failed {
-                    "  [failed]"
+                    failed_suffix.as_str()
                 } else if loading {
                     "  …"
                 } else {
@@ -3391,9 +3390,9 @@ impl State {
             self.reader.spine_strength = effective_spine(&self.settings);
             config::save(&self.settings);
             self.toast(if self.settings.spine_shadow_enabled {
-                "Spine shadow: on"
+                tr().toast_spine_on
             } else {
-                "Spine shadow: off"
+                tr().toast_spine_off
             });
             ui_acted = true;
         }
