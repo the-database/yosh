@@ -3132,6 +3132,8 @@ fn options_popup(
     set_perf: &mut Option<PerfPref>,
     toggle_offset: &mut bool,
     rotate: &mut bool,
+    // Status-bar height in points (the bars show while the popup is up).
+    top_inset: f32,
 ) {
     egui::Area::new(egui::Id::new("view_options"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
@@ -3140,253 +3142,260 @@ fn options_popup(
                 ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
 
-                ui.label(egui::RichText::new("Reading mode").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(!scroll_on, egui::RichText::new("Page-flip").size(16.0))
-                        .clicked()
-                    {
-                        *set_scroll = Some(false);
-                    }
-                    if ui
-                        .selectable_label(scroll_on, egui::RichText::new("Scroll").size(16.0))
-                        .clicked()
-                    {
-                        *set_scroll = Some(true);
-                    }
-                });
-
-                ui.label(egui::RichText::new("Reading direction").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(dir == Direction::Ltr, egui::RichText::new("→ LTR").size(16.0))
-                        .clicked()
-                    {
-                        *set_dir = Some(Direction::Ltr);
-                    }
-                    if ui
-                        .selectable_label(dir == Direction::Rtl, egui::RichText::new("← RTL").size(16.0))
-                        .clicked()
-                    {
-                        *set_dir = Some(Direction::Rtl);
-                    }
-                });
-
-                ui.label(egui::RichText::new("Page layout").strong());
-                ui.horizontal(|ui| {
-                    for (m, text) in [
-                        (LayoutMode::Single, "Single"),
-                        (LayoutMode::Spread, "Two-page"),
-                        (LayoutMode::Auto, "Auto"),
-                    ] {
+                // Cap the height and scroll the rest: in landscape on a tablet the
+                // full list is taller than the screen, and an unscrolled Area just
+                // runs off both edges (the top rows were unreachable). The cap keeps
+                // the card clear of the status bar given the -40pt anchor offset.
+                let max_h = ctx.viewport_rect().height() - 80.0 - 2.0 * (top_inset + 16.0);
+                egui::ScrollArea::vertical().max_height(max_h.max(160.0)).show(ui, |ui| {
+                    ui.label(egui::RichText::new("Reading mode").strong());
+                    ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(layout == m, egui::RichText::new(text).size(16.0))
+                            .selectable_label(!scroll_on, egui::RichText::new("Page-flip").size(16.0))
                             .clicked()
                         {
-                            *set_layout = Some(m);
+                            *set_scroll = Some(false);
                         }
+                        if ui
+                            .selectable_label(scroll_on, egui::RichText::new("Scroll").size(16.0))
+                            .clicked()
+                        {
+                            *set_scroll = Some(true);
+                        }
+                    });
+
+                    ui.label(egui::RichText::new("Reading direction").strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(dir == Direction::Ltr, egui::RichText::new("→ LTR").size(16.0))
+                            .clicked()
+                        {
+                            *set_dir = Some(Direction::Ltr);
+                        }
+                        if ui
+                            .selectable_label(dir == Direction::Rtl, egui::RichText::new("← RTL").size(16.0))
+                            .clicked()
+                        {
+                            *set_dir = Some(Direction::Rtl);
+                        }
+                    });
+
+                    ui.label(egui::RichText::new("Page layout").strong());
+                    ui.horizontal(|ui| {
+                        for (m, text) in [
+                            (LayoutMode::Single, "Single"),
+                            (LayoutMode::Spread, "Two-page"),
+                            (LayoutMode::Auto, "Auto"),
+                        ] {
+                            if ui
+                                .selectable_label(layout == m, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_layout = Some(m);
+                            }
+                        }
+                    });
+                    // Auto resolves to single in portrait and two-page in landscape.
+                    if layout == LayoutMode::Auto {
+                        ui.label(
+                            egui::RichText::new("Single in portrait, two-page in landscape — rotate to switch.")
+                                .size(12.0)
+                                .color(egui::Color32::from_white_alpha(150)),
+                        );
                     }
-                });
-                // Auto resolves to single in portrait and two-page in landscape.
-                if layout == LayoutMode::Auto {
+                    // Shift which pages are paired together (e.g. so a cover sits alone).
+                    // Shown whenever the *effective* layout is a spread (incl. Auto-landscape).
+                    if effective_spread
+                        && ui
+                            .button(egui::RichText::new("Shift page pairing").size(16.0))
+                            .clicked()
+                    {
+                        *toggle_offset = true;
+                    }
+
+                    ui.label(egui::RichText::new("Fit").strong());
+                    ui.horizontal(|ui| {
+                        for (f, text) in [
+                            (FitMode::Window, "Window"),
+                            (FitMode::Width, "Width"),
+                            (FitMode::Height, "Height"),
+                            (FitMode::Actual, "1:1"),
+                        ] {
+                            if ui
+                                .selectable_label(fit == f, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_fit = Some(f);
+                            }
+                        }
+                    });
+
+                    // Sits directly under the fit choices because it *modifies* them:
+                    // it bounds every fit at 100% native rather than being a fit of its
+                    // own (issue #13). Same row and wording as the desktop panel.
+                    ui.label(egui::RichText::new("Stretch small pages").strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(stretch_on, egui::RichText::new("On").size(16.0))
+                            .clicked()
+                        {
+                            *set_no_upscale = Some(false);
+                        }
+                        if ui
+                            .selectable_label(!stretch_on, egui::RichText::new("Off").size(16.0))
+                            .clicked()
+                        {
+                            *set_no_upscale = Some(true);
+                        }
+                    });
                     ui.label(
-                        egui::RichText::new("Single in portrait, two-page in landscape — rotate to switch.")
+                        egui::RichText::new("Off: fit never scales past 100% native (zoom still can).")
                             .size(12.0)
                             .color(egui::Color32::from_white_alpha(150)),
                     );
-                }
-                // Shift which pages are paired together (e.g. so a cover sits alone).
-                // Shown whenever the *effective* layout is a spread (incl. Auto-landscape).
-                if effective_spread
-                    && ui
-                        .button(egui::RichText::new("Shift page pairing").size(16.0))
-                        .clicked()
-                {
-                    *toggle_offset = true;
-                }
 
-                ui.label(egui::RichText::new("Fit").strong());
-                ui.horizontal(|ui| {
-                    for (f, text) in [
-                        (FitMode::Window, "Window"),
-                        (FitMode::Width, "Width"),
-                        (FitMode::Height, "Height"),
-                        (FitMode::Actual, "1:1"),
-                    ] {
-                        if ui
-                            .selectable_label(fit == f, egui::RichText::new(text).size(16.0))
-                            .clicked()
-                        {
-                            *set_fit = Some(f);
-                        }
-                    }
-                });
-
-                // Sits directly under the fit choices because it *modifies* them:
-                // it bounds every fit at 100% native rather than being a fit of its
-                // own (issue #13). Same row and wording as the desktop panel.
-                ui.label(egui::RichText::new("Stretch small pages").strong());
-                ui.horizontal(|ui| {
+                    // Manual page rotation (single-page draws only — the engine ignores
+                    // it for spreads). Per-comic and transient: not persisted, reset to
+                    // upright on the next open, exactly like the desktop `R` key.
+                    ui.label(egui::RichText::new("Rotation").strong());
                     if ui
-                        .selectable_label(stretch_on, egui::RichText::new("On").size(16.0))
+                        .button(egui::RichText::new(format!("Rotate 90° ⟳  ·  now {}°", rotation as u32 * 90)).size(16.0))
                         .clicked()
                     {
-                        *set_no_upscale = Some(false);
+                        *rotate = true;
                     }
-                    if ui
-                        .selectable_label(!stretch_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_no_upscale = Some(true);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("Off: fit never scales past 100% native (zoom still can).")
-                        .size(12.0)
-                        .color(egui::Color32::from_white_alpha(150)),
-                );
 
-                // Manual page rotation (single-page draws only — the engine ignores
-                // it for spreads). Per-comic and transient: not persisted, reset to
-                // upright on the next open, exactly like the desktop `R` key.
-                ui.label(egui::RichText::new("Rotation").strong());
-                if ui
-                    .button(egui::RichText::new(format!("Rotate 90° ⟳  ·  now {}°", rotation as u32 * 90)).size(16.0))
-                    .clicked()
-                {
-                    *rotate = true;
-                }
-
-                ui.label(egui::RichText::new("Page-turn animation").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(transition_on, egui::RichText::new("On").size(16.0))
-                        .clicked()
-                    {
-                        *set_transition = Some(true);
-                    }
-                    if ui
-                        .selectable_label(!transition_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_transition = Some(false);
-                    }
-                });
-
-                // Book-gutter shading only means anything on an un-joined pair, so
-                // show it with the other spread-only controls' gate.
-                if effective_spread {
-                    ui.label(egui::RichText::new("Spine shadow").strong());
+                    ui.label(egui::RichText::new("Page-turn animation").strong());
                     ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(spine_on, egui::RichText::new("On").size(16.0))
+                            .selectable_label(transition_on, egui::RichText::new("On").size(16.0))
                             .clicked()
                         {
-                            *set_spine_on = Some(true);
+                            *set_transition = Some(true);
                         }
                         if ui
-                            .selectable_label(!spine_on, egui::RichText::new("Off").size(16.0))
+                            .selectable_label(!transition_on, egui::RichText::new("Off").size(16.0))
                             .clicked()
                         {
-                            *set_spine_on = Some(false);
+                            *set_transition = Some(false);
                         }
                     });
-                    let mut strength = spine_strength;
-                    if ui
-                        .add_enabled(
-                            spine_on,
-                            egui::Slider::new(&mut strength, 0.0..=1.0)
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                                .text("strength"),
-                        )
-                        .changed()
-                    {
-                        *set_spine_strength = Some(strength);
-                    }
-                }
 
-                ui.label(egui::RichText::new("Resume on startup").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(resume_on, egui::RichText::new("On").size(16.0))
-                        .clicked()
-                    {
-                        *set_resume = Some(true);
-                    }
-                    if ui
-                        .selectable_label(!resume_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_resume = Some(false);
-                    }
-                });
-
-                // Hardware page turning (issue #16). Arrow / PageUp / PageDown /
-                // media keys always flip; the volume rocker is opt-in because
-                // it takes the buttons away from the volume while a book is open.
-                ui.label(egui::RichText::new("Volume keys turn pages").strong());
-                ui.horizontal(|ui| {
-                    for (v, text) in [
-                        (VolKeys::Off, "Off"),
-                        (VolKeys::DownNext, "Down = next"),
-                        (VolKeys::UpNext, "Up = next"),
-                    ] {
+                    // Book-gutter shading only means anything on an un-joined pair, so
+                    // show it with the other spread-only controls' gate.
+                    if effective_spread {
+                        ui.label(egui::RichText::new("Spine shadow").strong());
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(spine_on, egui::RichText::new("On").size(16.0))
+                                .clicked()
+                            {
+                                *set_spine_on = Some(true);
+                            }
+                            if ui
+                                .selectable_label(!spine_on, egui::RichText::new("Off").size(16.0))
+                                .clicked()
+                            {
+                                *set_spine_on = Some(false);
+                            }
+                        });
+                        let mut strength = spine_strength;
                         if ui
-                            .selectable_label(vol_keys == v, egui::RichText::new(text).size(16.0))
-                            .clicked()
+                            .add_enabled(
+                                spine_on,
+                                egui::Slider::new(&mut strength, 0.0..=1.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .text("strength"),
+                            )
+                            .changed()
                         {
-                            *set_vol_keys = Some(v);
+                            *set_spine_strength = Some(strength);
                         }
                     }
-                });
-                ui.label(
-                    egui::RichText::new("Only while a book is open; the library keeps normal volume.")
+
+                    ui.label(egui::RichText::new("Resume on startup").strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(resume_on, egui::RichText::new("On").size(16.0))
+                            .clicked()
+                        {
+                            *set_resume = Some(true);
+                        }
+                        if ui
+                            .selectable_label(!resume_on, egui::RichText::new("Off").size(16.0))
+                            .clicked()
+                        {
+                            *set_resume = Some(false);
+                        }
+                    });
+
+                    // Hardware page turning (issue #16). Arrow / PageUp / PageDown /
+                    // media keys always flip; the volume rocker is opt-in because
+                    // it takes the buttons away from the volume while a book is open.
+                    ui.label(egui::RichText::new("Volume keys turn pages").strong());
+                    ui.horizontal(|ui| {
+                        for (v, text) in [
+                            (VolKeys::Off, "Off"),
+                            (VolKeys::DownNext, "Down = next"),
+                            (VolKeys::UpNext, "Up = next"),
+                        ] {
+                            if ui
+                                .selectable_label(vol_keys == v, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_vol_keys = Some(v);
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new("Only while a book is open; the library keeps normal volume.")
+                            .size(12.0)
+                            .color(egui::Color32::from_white_alpha(150)),
+                    );
+
+                    ui.label(egui::RichText::new("Theme").strong());
+                    ui.horizontal(|ui| {
+                        for (t, text) in [
+                            (ThemePref::System, "System"),
+                            (ThemePref::Light, "Light"),
+                            (ThemePref::Dark, "Dark"),
+                        ] {
+                            if ui
+                                .selectable_label(theme == t, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_theme = Some(t);
+                            }
+                        }
+                    });
+
+                    // One profile, not individual knobs: the budget's fields are
+                    // interdependent. Auto = the hardware probe; the rest pin a tier
+                    // (Performance = no ceilings, i.e. the desktop configuration).
+                    ui.label(egui::RichText::new("Performance").strong());
+                    ui.horizontal(|ui| {
+                        for (p, text) in [
+                            (PerfPref::Auto, "Auto"),
+                            (PerfPref::Low, "Battery saver"),
+                            (PerfPref::Mid, "Balanced"),
+                            (PerfPref::High, "Performance"),
+                        ] {
+                            if ui
+                                .selectable_label(perf == p, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_perf = Some(p);
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(
+                            "Auto matches your device. Lower settings decode fewer pages ahead and use less memory and battery.",
+                        )
                         .size(12.0)
                         .color(egui::Color32::from_white_alpha(150)),
-                );
-
-                ui.label(egui::RichText::new("Theme").strong());
-                ui.horizontal(|ui| {
-                    for (t, text) in [
-                        (ThemePref::System, "System"),
-                        (ThemePref::Light, "Light"),
-                        (ThemePref::Dark, "Dark"),
-                    ] {
-                        if ui
-                            .selectable_label(theme == t, egui::RichText::new(text).size(16.0))
-                            .clicked()
-                        {
-                            *set_theme = Some(t);
-                        }
-                    }
+                    );
                 });
-
-                // One profile, not individual knobs: the budget's fields are
-                // interdependent. Auto = the hardware probe; the rest pin a tier
-                // (Performance = no ceilings, i.e. the desktop configuration).
-                ui.label(egui::RichText::new("Performance").strong());
-                ui.horizontal(|ui| {
-                    for (p, text) in [
-                        (PerfPref::Auto, "Auto"),
-                        (PerfPref::Low, "Battery saver"),
-                        (PerfPref::Mid, "Balanced"),
-                        (PerfPref::High, "Performance"),
-                    ] {
-                        if ui
-                            .selectable_label(perf == p, egui::RichText::new(text).size(16.0))
-                            .clicked()
-                        {
-                            *set_perf = Some(p);
-                        }
-                    }
-                });
-                ui.label(
-                    egui::RichText::new(
-                        "Auto matches your device. Lower settings decode fewer pages ahead and use less memory and battery.",
-                    )
-                    .size(12.0)
-                    .color(egui::Color32::from_white_alpha(150)),
-                );
             });
         });
 }
@@ -4397,6 +4406,7 @@ impl App {
                         &mut set_perf,
                         &mut toggle_offset,
                         &mut rotate,
+                        top_inset_pt,
                     );
                 }
                 if show_info {
