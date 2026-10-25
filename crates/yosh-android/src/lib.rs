@@ -24,14 +24,16 @@ use std::time::{Duration, Instant};
 use jni::objects::{JObject, JString, JValue};
 use jni::JavaVM;
 use winit::application::ApplicationHandler;
-use winit::event::{Touch, TouchPhase, WindowEvent};
+use winit::event::{ElementState, KeyEvent, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::platform::android::activity::AndroidApp;
 use winit::platform::android::EventLoopBuilderExtAndroid;
 use winit::window::{Window, WindowId};
 
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
 use yosh_engine::gpu::GpuContext;
+use yosh_engine::i18n::{self, tr, Lang};
 use yosh_engine::layout::Layout;
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
@@ -101,9 +103,15 @@ fn android_main(app: AndroidApp) {
             false,
             DEFAULT_SPINE_STRENGTH,
             false,
+            VolKeys::Off,
+            None,
         ));
+    // Volume keys are delivered to us (winit's default hands them straight to the
+    // OS): with the "Volume keys turn pages" option on they flip while reading.
+    // Every other press is passed back to the system via `adjust_volume`.
     let event_loop = EventLoop::builder()
         .with_android_app(app.clone())
+        .handle_volume_keys()
         .build()
         .expect("build event loop");
     let (open_tx, open_rx) = std::sync::mpsc::channel();
@@ -446,6 +454,13 @@ struct App {
     layout_mode: LayoutMode,
     /// Reopen the last book on launch (persisted in view.txt; toggled in options).
     resume_on_startup: bool,
+    /// Whether/which way the volume rocker flips pages while reading (persisted
+    /// in view.txt; picked in options). Off ⇒ it adjusts the volume as usual.
+    vol_keys: VolKeys,
+    /// UI language picked in options (persisted in view.txt); `None` follows the
+    /// OS, whose language (`system_lang`) is read once per App build.
+    lang_pref: Option<Lang>,
+    system_lang: Lang,
     /// Book-gutter shading on un-joined two-page spreads, and its peak darkening
     /// (persisted in view.txt; toggled in options). The reader takes the product.
     spine_shadow_on: bool,
@@ -521,14 +536,14 @@ fn series_status(states: &[VolState]) -> String {
     let reading = states.iter().any(|s| matches!(s, VolState::InProgress(_)));
     if reading {
         if unread > 0 {
-            format!("Reading · {unread} unread")
+            (tr().reading_unread)(unread)
         } else {
-            "Reading".to_string()
+            tr().reading.to_string()
         }
     } else if unread > 0 {
-        format!("{unread} unread")
+        (tr().unread)(unread)
     } else {
-        "Finished".to_string()
+        tr().finished.to_string()
     }
 }
 
@@ -714,6 +729,37 @@ impl ThemePref {
     }
 }
 
+/// Whether (and which way) the volume rocker turns pages while a book is open.
+/// Off by default: it takes the buttons away from the volume. Both directions are
+/// offered because "down = forward" and "up = forward" each feel natural to
+/// someone (and depend on which way the device is held).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolKeys {
+    Off,
+    /// Volume Down = next page, Volume Up = previous.
+    DownNext,
+    /// Volume Up = next page, Volume Down = previous.
+    UpNext,
+}
+
+impl VolKeys {
+    /// Persistence token (view.txt slot 12).
+    fn label(self) -> &'static str {
+        match self {
+            VolKeys::Off => "novolkeys",
+            VolKeys::DownNext => "volkeys",
+            VolKeys::UpNext => "volkeysup",
+        }
+    }
+    fn parse(tok: Option<&&str>) -> Self {
+        match tok {
+            Some(&"volkeys") => VolKeys::DownNext,
+            Some(&"volkeysup") => VolKeys::UpNext,
+            _ => VolKeys::Off,
+        }
+    }
+}
+
 /// Performance profile: how hard the reader is allowed to work this device.
 /// A single picker rather than individual knobs — the `Budget` fields are
 /// interdependent (a wider prefetch window with a small cache just evicts itself),
@@ -883,15 +929,11 @@ impl ApplicationHandler for Shell {
         // Phosphor is installed unconditionally; egui's bundled fonts have no CJK
         // glyphs, so add the system Noto Sans CJK as a fallback when present so
         // Japanese comic / file names render instead of tofu squares.
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
-        if let Some(cjk) = cjk_font() {
-            fonts.font_data.insert("cjk".to_owned(), cjk);
-            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.entry(fam).or_default().push("cjk".to_owned());
-            }
-        }
-        egui_ctx.set_fonts(fonts);
+        // The UI language is resolved first: it picks the CJK face (Japanese vs.
+        // Korean vs. Simplified/Traditional Chinese glyph forms).
+        let system_lang = Lang::from_tag(&locale_tag(&self.android_app));
+        i18n::set_lang(self.init_view.12.unwrap_or(system_lang));
+        install_fonts(&egui_ctx, i18n::lang().cjk_face());
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -999,6 +1041,9 @@ impl ApplicationHandler for Shell {
             libroot_dirty: false,
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
+            vol_keys: self.init_view.11,
+            lang_pref: self.init_view.12,
+            system_lang,
             spine_shadow_on: self.init_view.8,
             spine_shadow_strength: self.init_view.9,
             theme: self.init_view.6,
@@ -1164,6 +1209,7 @@ impl ApplicationHandler for Shell {
                 id,
                 ..
             }) => self.handle_touch(phase, id, location.x, location.y, egui_consumed),
+            WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event, egui_consumed),
             WindowEvent::RedrawRequested => {
                 // A picker result may have landed while we were backgrounded.
                 if self.picker_pending {
@@ -1341,6 +1387,76 @@ impl Shell {
         } else if self.app.as_ref().is_some_and(|a| a.reader.at_edge(dir)) {
             self.boundary_hit(dir);
         }
+    }
+
+    /// Hardware keys: an external keyboard, a Bluetooth page-turner remote (most
+    /// send arrows, PageUp/PageDown or media next/previous; camera-shutter style
+    /// ones send the volume keys) or the device's own volume rocker. Mirrors the
+    /// desktop keymap: Down/PageDown/Space = forward, Up/PageUp = back,
+    /// Left/Right follow the reading direction (page-flip only). Volume keys are
+    /// always delivered here (`handle_volume_keys`), so any press that doesn't
+    /// turn a page is handed back to the system volume.
+    fn handle_key(&mut self, ev: &KeyEvent, egui_consumed: bool) {
+        if ev.state != ElementState::Pressed {
+            return;
+        }
+        let PhysicalKey::Code(code) = ev.physical_key else { return };
+        let Some(app) = self.app.as_ref() else {
+            // No reader yet: still let the rocker work.
+            if let Some(adj) = volume_adjust(code) {
+                adjust_volume(&self.android_app, adj);
+            }
+            return;
+        };
+        let reading = !egui_consumed && self.current_key.is_some() && !app.library_view;
+        let scroll = app.reader.scroll_mode;
+        let rtl = app.reader.direction == Direction::Rtl;
+        // `dir` is in story order (+1 = next page), like `flip`.
+        let dir = match code {
+            KeyCode::AudioVolumeDown | KeyCode::AudioVolumeUp if !reading => None,
+            KeyCode::AudioVolumeDown => match app.vol_keys {
+                VolKeys::Off => None,
+                VolKeys::DownNext => Some(1),
+                VolKeys::UpNext => Some(-1),
+            },
+            KeyCode::AudioVolumeUp => match app.vol_keys {
+                VolKeys::Off => None,
+                VolKeys::DownNext => Some(-1),
+                VolKeys::UpNext => Some(1),
+            },
+            KeyCode::ArrowDown | KeyCode::PageDown | KeyCode::Space | KeyCode::MediaTrackNext => {
+                Some(1)
+            }
+            KeyCode::ArrowUp | KeyCode::PageUp | KeyCode::MediaTrackPrevious => Some(-1),
+            KeyCode::ArrowRight if !scroll => Some(if rtl { -1 } else { 1 }),
+            KeyCode::ArrowLeft if !scroll => Some(if rtl { 1 } else { -1 }),
+            _ => None,
+        };
+        let Some(dir) = dir.filter(|_| reading) else {
+            if let Some(adj) = volume_adjust(code) {
+                adjust_volume(&self.android_app, adj);
+            }
+            return;
+        };
+        if scroll {
+            if let Some(app) = self.app.as_mut() {
+                let vh = app.reader.viewport.h as f32;
+                app.reader.scroll_by(dir as f32 * vh * 0.9);
+                app.window.request_redraw();
+            }
+            return;
+        }
+        // An armed next/prev-book prompt is modal, as for taps: the same direction
+        // goes through `flip` (which runs into the edge and confirms it); any other
+        // key just dismisses it.
+        if let Some(app) = self.app.as_mut()
+            && app.book_prompt.as_ref().is_some_and(|p| p.dir != dir)
+        {
+            app.book_prompt = None;
+            app.window.request_redraw();
+            return;
+        }
+        self.flip(dir);
     }
 
     /// Post-flip bookkeeping shared by tap flips and committed drags (the step
@@ -1909,6 +2025,8 @@ impl Shell {
                 app.spine_shadow_on,
                 app.spine_shadow_strength,
                 app.reader.fit_no_upscale,
+                app.vol_keys,
+                app.lang_pref,
             );
         }
         if std::mem::take(&mut self.dirty_libroot)
@@ -2034,7 +2152,7 @@ fn attach_source(
 /// The persisted viewing options, in `view.txt`'s positional order: direction,
 /// layout mode, fit, page-turn animation, scroll mode, resume-on-startup, chrome
 /// theme, performance profile, spine shadow on/off, spine-shadow strength,
-/// no-upscale fit.
+/// no-upscale fit, volume keys turn pages.
 type InitView = (
     Direction,
     LayoutMode,
@@ -2047,6 +2165,8 @@ type InitView = (
     bool,
     f32,
     bool,
+    VolKeys,
+    Option<Lang>,
 );
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
@@ -2065,6 +2185,8 @@ fn load_view(path: &Path) -> InitView {
     );
     let (mut spine, mut spine_strength) = (false, DEFAULT_SPINE_STRENGTH);
     let mut no_upscale = false;
+    let mut vol_keys = VolKeys::Off;
+    let mut lang = None;
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -2102,12 +2224,16 @@ fn load_view(path: &Path) -> InitView {
             .unwrap_or(DEFAULT_SPINE_STRENGTH);
         // 11th slot: no-upscale fit; absent (older files) ⇒ off (stretch to fit).
         no_upscale = t.get(10) == Some(&"noupscale");
+        // 12th slot: volume keys turn pages (and which way); absent (older files) ⇒ off.
+        vol_keys = VolKeys::parse(t.get(11));
+        // 13th slot: UI language token; absent or "system" ⇒ follow the OS.
+        lang = t.get(12).and_then(|tok| Lang::from_token(tok));
     }
-    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale)
+    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale, vol_keys, lang)
 }
 
 /// Persist viewing options as
-/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale".
+/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale,vol_keys,lang".
 #[allow(clippy::too_many_arguments)]
 fn save_view(
     path: &Path,
@@ -2122,6 +2248,8 @@ fn save_view(
     spine: bool,
     spine_strength: f32,
     no_upscale: bool,
+    vol_keys: VolKeys,
+    lang: Option<Lang>,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -2139,7 +2267,9 @@ fn save_view(
     let sp = if spine { "spine" } else { "nospine" };
     let ss = (spine_strength.clamp(0.0, 1.0) * 100.0).round() as i32;
     let nu = if no_upscale { "noupscale" } else { "stretch" };
-    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu}"));
+    let vk = vol_keys.label();
+    let lg = lang.map_or("system", Lang::token);
+    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu},{vk},{lg}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -2200,15 +2330,37 @@ fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
 /// immutable and egui takes it behind an `Arc`, so every egui context this process
 /// builds can be handed the same one. `None` ⇒ the device has no such font (older /
 /// non-CJK builds), and the fallback is simply not installed.
-fn cjk_font() -> Option<Arc<egui::FontData>> {
-    static CJK_FONT: std::sync::OnceLock<Option<Arc<egui::FontData>>> = std::sync::OnceLock::new();
-    CJK_FONT
-        .get_or_init(|| {
-            let bytes = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()?;
-            log::info!("loaded CJK fallback font ({} KB)", bytes.len() / 1024);
-            Some(Arc::new(egui::FontData::from_owned(bytes)))
-        })
-        .clone()
+///
+/// The bytes are leaked once (process lifetime anyway) so each egui context — and
+/// each language switch — can borrow them as a `FontData` for whichever face of
+/// the collection the UI language wants, with no 31 MB copy.
+fn cjk_font(face: u32) -> Option<Arc<egui::FontData>> {
+    static CJK_BYTES: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+    let bytes = (*CJK_BYTES.get_or_init(|| {
+        let bytes = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()?;
+        log::info!("loaded CJK fallback font ({} KB)", bytes.len() / 1024);
+        Some(&*Box::leak(bytes.into_boxed_slice()))
+    }))?;
+    let mut data = egui::FontData::from_static(bytes);
+    data.index = face;
+    Some(Arc::new(data))
+}
+
+/// Install the chrome fonts: Phosphor icon glyphs (seekbar buttons) plus the CJK
+/// fallback in face `cjk_face`. Phosphor is installed unconditionally; egui's
+/// bundled fonts have no CJK glyphs, so the system Noto Sans CJK goes in as a
+/// fallback when present, for the UI's own CJK text and Japanese comic / file
+/// names. Re-run on a language switch that changes the face.
+fn install_fonts(ctx: &egui::Context, cjk_face: u32) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
+    if let Some(cjk) = cjk_font(cjk_face) {
+        fonts.font_data.insert("cjk".to_owned(), cjk);
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(fam).or_default().push("cjk".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Read one `/proc/meminfo` field in MB (the values are in kB).
@@ -2308,7 +2460,7 @@ fn info_popup(ctx: &egui::Context, lines: &[(String, String)], close: &mut bool)
         .show(ctx, |ui| {
             translucent_popup(ui.style()).show(ui, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
-                ui.label(egui::RichText::new("Info").strong().size(18.0));
+                ui.label(egui::RichText::new(tr().info).strong().size(18.0));
                 egui::Grid::new("info_grid")
                     .num_columns(2)
                     .spacing([18.0, 6.0])
@@ -2323,7 +2475,7 @@ fn info_popup(ctx: &egui::Context, lines: &[(String, String)], close: &mut bool)
                 if ui
                     .add_sized(
                         [120.0, 40.0],
-                        egui::Button::new(egui::RichText::new("× Close").size(16.0)),
+                        egui::Button::new(egui::RichText::new(tr().close).size(16.0)),
                     )
                     .clicked()
                 {
@@ -2661,9 +2813,9 @@ fn empty_state(
                     } else {
                         ui.label(egui::RichText::new("📖").size(56.0));
                     }
-                    ui.label(egui::RichText::new("No comic open").strong().size(22.0));
+                    ui.label(egui::RichText::new(tr().no_comic_open).strong().size(22.0));
                     ui.label(
-                        egui::RichText::new("Open a comic to start reading.")
+                        egui::RichText::new(tr().open_comic_to_start)
                             .size(15.0)
                             .color(weak),
                     );
@@ -2672,8 +2824,9 @@ fn empty_state(
                     if ui
                         .add(egui::Button::new(
                             egui::RichText::new(format!(
-                                "{}  Browse library",
-                                egui_phosphor::fill::BOOKS
+                                "{}  {}",
+                                egui_phosphor::fill::BOOKS,
+                                tr().browse_library
                             ))
                             .size(18.0),
                         ))
@@ -2682,14 +2835,14 @@ fn empty_state(
                         *open_library = true;
                     }
                     if ui
-                        .add(egui::Button::new(egui::RichText::new("Open file…").size(18.0)))
+                        .add(egui::Button::new(egui::RichText::new(tr().open_file).size(18.0)))
                         .clicked()
                     {
                         *open_picker = true;
                     }
                     ui.add_space(2.0);
                     ui.label(
-                        egui::RichText::new("Tip: tap the top of the screen any time to open your library.")
+                        egui::RichText::new(tr().tap_top_tip)
                             .size(12.0)
                             .color(weak),
                     );
@@ -2710,7 +2863,7 @@ fn opening_card(ctx: &egui::Context, name: &str) {
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
                     ui.add(egui::Spinner::new().size(40.0));
-                    ui.label(egui::RichText::new("Opening…").strong().size(18.0));
+                    ui.label(egui::RichText::new(tr().opening).strong().size(18.0));
                     if !name.is_empty() {
                         ui.add(
                             egui::Label::new(
@@ -2834,14 +2987,14 @@ fn book_prompt_card(
                 ui.vertical_centered(|ui| {
                     if !has_sibling {
                         ui.label(
-                            egui::RichText::new(if dir > 0 { "Last page" } else { "First page" })
+                            egui::RichText::new(if dir > 0 { tr().last_page } else { tr().first_page })
                                 .size(18.0)
                                 .strong(),
                         );
                         return;
                     }
                     ui.label(
-                        egui::RichText::new(if dir > 0 { "Next book" } else { "Previous book" })
+                        egui::RichText::new(if dir > 0 { tr().next_book } else { tr().previous_book })
                             .size(18.0)
                             .strong(),
                     );
@@ -2864,7 +3017,7 @@ fn book_prompt_card(
                     ui.add(
                         egui::Label::new(egui::RichText::new(title).size(14.0)).truncate(),
                     );
-                    ui.label(egui::RichText::new("tap again to open").size(12.0).weak());
+                    ui.label(egui::RichText::new(tr().tap_again_to_open).size(12.0).weak());
                     if clicked {
                         *book_nav = dir;
                     }
@@ -2958,11 +3111,12 @@ fn zone_hints(ctx: &egui::Context, rtl: bool, scroll: bool) {
     draw(
         egui::pos2(rect.center().x, rect.top() + 56.0),
         egui::Align2::CENTER_CENTER,
-        &format!("{}  Library", egui_phosphor::fill::BOOKS),
+        &format!("{}  {}", egui_phosphor::fill::BOOKS, tr().library),
     );
     // Side flip labels only in page-flip.
     if !scroll {
-        let (left, right) = if rtl { ("Next ›", "‹ Prev") } else { ("‹ Prev", "Next ›") };
+        let (next, prev) = (tr().zone_next, tr().zone_prev);
+        let (left, right) = if rtl { (next, prev) } else { (prev, next) };
         draw(
             egui::pos2(rect.left() + 40.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
@@ -2993,6 +3147,8 @@ fn options_popup(
     spine_on: bool,
     spine_strength: f32,
     resume_on: bool,
+    vol_keys: VolKeys,
+    lang_pref: Option<Lang>,
     scroll_on: bool,
     theme: ThemePref,
     perf: PerfPref,
@@ -3006,12 +3162,17 @@ fn options_popup(
     set_spine_on: &mut Option<bool>,
     set_spine_strength: &mut Option<f32>,
     set_resume: &mut Option<bool>,
+    set_vol_keys: &mut Option<VolKeys>,
+    set_lang: &mut Option<Option<Lang>>,
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
     set_perf: &mut Option<PerfPref>,
     toggle_offset: &mut bool,
     rotate: &mut bool,
+    // Status-bar height in points (the bars show while the popup is up).
+    top_inset: f32,
 ) {
+    let t = tr();
     egui::Area::new(egui::Id::new("view_options"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
         .show(ctx, |ui| {
@@ -3019,229 +3180,280 @@ fn options_popup(
                 ui.spacing_mut().button_padding = egui::vec2(16.0, 10.0);
                 ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
 
-                ui.label(egui::RichText::new("Reading mode").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(!scroll_on, egui::RichText::new("Page-flip").size(16.0))
-                        .clicked()
-                    {
-                        *set_scroll = Some(false);
-                    }
-                    if ui
-                        .selectable_label(scroll_on, egui::RichText::new("Scroll").size(16.0))
-                        .clicked()
-                    {
-                        *set_scroll = Some(true);
-                    }
-                });
-
-                ui.label(egui::RichText::new("Reading direction").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(dir == Direction::Ltr, egui::RichText::new("→ LTR").size(16.0))
-                        .clicked()
-                    {
-                        *set_dir = Some(Direction::Ltr);
-                    }
-                    if ui
-                        .selectable_label(dir == Direction::Rtl, egui::RichText::new("← RTL").size(16.0))
-                        .clicked()
-                    {
-                        *set_dir = Some(Direction::Rtl);
-                    }
-                });
-
-                ui.label(egui::RichText::new("Page layout").strong());
-                ui.horizontal(|ui| {
-                    for (m, text) in [
-                        (LayoutMode::Single, "Single"),
-                        (LayoutMode::Spread, "Two-page"),
-                        (LayoutMode::Auto, "Auto"),
-                    ] {
+                // Cap the height and scroll the rest: in landscape on a tablet the
+                // full list is taller than the screen, and an unscrolled Area just
+                // runs off both edges (the top rows were unreachable). The cap keeps
+                // the card clear of the status bar given the -40pt anchor offset.
+                let max_h = ctx.viewport_rect().height() - 80.0 - 2.0 * (top_inset + 16.0);
+                egui::ScrollArea::vertical().max_height(max_h.max(160.0)).show(ui, |ui| {
+                    ui.label(egui::RichText::new(t.reading_mode).strong());
+                    ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(layout == m, egui::RichText::new(text).size(16.0))
+                            .selectable_label(!scroll_on, egui::RichText::new(t.page_flip).size(16.0))
                             .clicked()
                         {
-                            *set_layout = Some(m);
+                            *set_scroll = Some(false);
                         }
+                        if ui
+                            .selectable_label(scroll_on, egui::RichText::new(t.scroll).size(16.0))
+                            .clicked()
+                        {
+                            *set_scroll = Some(true);
+                        }
+                    });
+
+                    ui.label(egui::RichText::new(t.reading_direction).strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(dir == Direction::Ltr, egui::RichText::new(t.dir_ltr).size(16.0))
+                            .clicked()
+                        {
+                            *set_dir = Some(Direction::Ltr);
+                        }
+                        if ui
+                            .selectable_label(dir == Direction::Rtl, egui::RichText::new(t.dir_rtl).size(16.0))
+                            .clicked()
+                        {
+                            *set_dir = Some(Direction::Rtl);
+                        }
+                    });
+
+                    ui.label(egui::RichText::new(t.page_layout).strong());
+                    ui.horizontal(|ui| {
+                        for (m, text) in [
+                            (LayoutMode::Single, t.single),
+                            (LayoutMode::Spread, t.two_page),
+                            (LayoutMode::Auto, t.auto),
+                        ] {
+                            if ui
+                                .selectable_label(layout == m, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_layout = Some(m);
+                            }
+                        }
+                    });
+                    // Auto resolves to single in portrait and two-page in landscape.
+                    if layout == LayoutMode::Auto {
+                        ui.label(
+                            egui::RichText::new(t.layout_auto_hint)
+                                .size(12.0)
+                                .color(egui::Color32::from_white_alpha(150)),
+                        );
                     }
-                });
-                // Auto resolves to single in portrait and two-page in landscape.
-                if layout == LayoutMode::Auto {
+                    // Shift which pages are paired together (e.g. so a cover sits alone).
+                    // Shown whenever the *effective* layout is a spread (incl. Auto-landscape).
+                    if effective_spread
+                        && ui
+                            .button(egui::RichText::new(t.shift_page_pairing).size(16.0))
+                            .clicked()
+                    {
+                        *toggle_offset = true;
+                    }
+
+                    ui.label(egui::RichText::new(t.fit).strong());
+                    ui.horizontal(|ui| {
+                        for (f, text) in [
+                            (FitMode::Window, t.fit_window_opt),
+                            (FitMode::Width, t.fit_width_opt),
+                            (FitMode::Height, t.fit_height_opt),
+                            (FitMode::Actual, "1:1"),
+                        ] {
+                            if ui
+                                .selectable_label(fit == f, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_fit = Some(f);
+                            }
+                        }
+                    });
+
+                    // Sits directly under the fit choices because it *modifies* them:
+                    // it bounds every fit at 100% native rather than being a fit of its
+                    // own (issue #13). Same row and wording as the desktop panel.
+                    ui.label(egui::RichText::new(t.stretch_small_pages).strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(stretch_on, egui::RichText::new(t.on).size(16.0))
+                            .clicked()
+                        {
+                            *set_no_upscale = Some(false);
+                        }
+                        if ui
+                            .selectable_label(!stretch_on, egui::RichText::new(t.off).size(16.0))
+                            .clicked()
+                        {
+                            *set_no_upscale = Some(true);
+                        }
+                    });
                     ui.label(
-                        egui::RichText::new("Single in portrait, two-page in landscape — rotate to switch.")
+                        egui::RichText::new(t.stretch_hint)
                             .size(12.0)
                             .color(egui::Color32::from_white_alpha(150)),
                     );
-                }
-                // Shift which pages are paired together (e.g. so a cover sits alone).
-                // Shown whenever the *effective* layout is a spread (incl. Auto-landscape).
-                if effective_spread
-                    && ui
-                        .button(egui::RichText::new("Shift page pairing").size(16.0))
-                        .clicked()
-                {
-                    *toggle_offset = true;
-                }
 
-                ui.label(egui::RichText::new("Fit").strong());
-                ui.horizontal(|ui| {
-                    for (f, text) in [
-                        (FitMode::Window, "Window"),
-                        (FitMode::Width, "Width"),
-                        (FitMode::Height, "Height"),
-                        (FitMode::Actual, "1:1"),
-                    ] {
-                        if ui
-                            .selectable_label(fit == f, egui::RichText::new(text).size(16.0))
-                            .clicked()
-                        {
-                            *set_fit = Some(f);
-                        }
-                    }
-                });
-
-                // Sits directly under the fit choices because it *modifies* them:
-                // it bounds every fit at 100% native rather than being a fit of its
-                // own (issue #13). Same row and wording as the desktop panel.
-                ui.label(egui::RichText::new("Stretch small pages").strong());
-                ui.horizontal(|ui| {
+                    // Manual page rotation (single-page draws only — the engine ignores
+                    // it for spreads). Per-comic and transient: not persisted, reset to
+                    // upright on the next open, exactly like the desktop `R` key.
+                    ui.label(egui::RichText::new(t.rotation).strong());
                     if ui
-                        .selectable_label(stretch_on, egui::RichText::new("On").size(16.0))
+                        .button(egui::RichText::new((t.rotate_now)(rotation as u32 * 90)).size(16.0))
                         .clicked()
                     {
-                        *set_no_upscale = Some(false);
+                        *rotate = true;
                     }
-                    if ui
-                        .selectable_label(!stretch_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_no_upscale = Some(true);
-                    }
-                });
-                ui.label(
-                    egui::RichText::new("Off: fit never scales past 100% native (zoom still can).")
-                        .size(12.0)
-                        .color(egui::Color32::from_white_alpha(150)),
-                );
 
-                // Manual page rotation (single-page draws only — the engine ignores
-                // it for spreads). Per-comic and transient: not persisted, reset to
-                // upright on the next open, exactly like the desktop `R` key.
-                ui.label(egui::RichText::new("Rotation").strong());
-                if ui
-                    .button(egui::RichText::new(format!("Rotate 90° ⟳  ·  now {}°", rotation as u32 * 90)).size(16.0))
-                    .clicked()
-                {
-                    *rotate = true;
-                }
-
-                ui.label(egui::RichText::new("Page-turn animation").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(transition_on, egui::RichText::new("On").size(16.0))
-                        .clicked()
-                    {
-                        *set_transition = Some(true);
-                    }
-                    if ui
-                        .selectable_label(!transition_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_transition = Some(false);
-                    }
-                });
-
-                // Book-gutter shading only means anything on an un-joined pair, so
-                // show it with the other spread-only controls' gate.
-                if effective_spread {
-                    ui.label(egui::RichText::new("Spine shadow").strong());
+                    ui.label(egui::RichText::new(t.page_turn_animation).strong());
                     ui.horizontal(|ui| {
                         if ui
-                            .selectable_label(spine_on, egui::RichText::new("On").size(16.0))
+                            .selectable_label(transition_on, egui::RichText::new(t.on).size(16.0))
                             .clicked()
                         {
-                            *set_spine_on = Some(true);
+                            *set_transition = Some(true);
                         }
                         if ui
-                            .selectable_label(!spine_on, egui::RichText::new("Off").size(16.0))
+                            .selectable_label(!transition_on, egui::RichText::new(t.off).size(16.0))
                             .clicked()
                         {
-                            *set_spine_on = Some(false);
+                            *set_transition = Some(false);
                         }
                     });
-                    let mut strength = spine_strength;
-                    if ui
-                        .add_enabled(
-                            spine_on,
-                            egui::Slider::new(&mut strength, 0.0..=1.0)
-                                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                                .text("strength"),
+
+                    // Book-gutter shading only means anything on an un-joined pair, so
+                    // show it with the other spread-only controls' gate.
+                    if effective_spread {
+                        ui.label(egui::RichText::new(t.spine_shadow).strong());
+                        ui.horizontal(|ui| {
+                            if ui
+                                .selectable_label(spine_on, egui::RichText::new(t.on).size(16.0))
+                                .clicked()
+                            {
+                                *set_spine_on = Some(true);
+                            }
+                            if ui
+                                .selectable_label(!spine_on, egui::RichText::new(t.off).size(16.0))
+                                .clicked()
+                            {
+                                *set_spine_on = Some(false);
+                            }
+                        });
+                        let mut strength = spine_strength;
+                        if ui
+                            .add_enabled(
+                                spine_on,
+                                egui::Slider::new(&mut strength, 0.0..=1.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .text(t.strength),
+                            )
+                            .changed()
+                        {
+                            *set_spine_strength = Some(strength);
+                        }
+                    }
+
+                    ui.label(egui::RichText::new(t.resume_on_startup).strong());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(resume_on, egui::RichText::new(t.on).size(16.0))
+                            .clicked()
+                        {
+                            *set_resume = Some(true);
+                        }
+                        if ui
+                            .selectable_label(!resume_on, egui::RichText::new(t.off).size(16.0))
+                            .clicked()
+                        {
+                            *set_resume = Some(false);
+                        }
+                    });
+
+                    // Hardware page turning (issue #16). Arrow / PageUp / PageDown /
+                    // media keys always flip; the volume rocker is opt-in because
+                    // it takes the buttons away from the volume while a book is open.
+                    ui.label(egui::RichText::new(t.vol_keys).strong());
+                    ui.horizontal(|ui| {
+                        for (v, text) in [
+                            (VolKeys::Off, t.off),
+                            (VolKeys::DownNext, t.vol_down_next),
+                            (VolKeys::UpNext, t.vol_up_next),
+                        ] {
+                            if ui
+                                .selectable_label(vol_keys == v, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_vol_keys = Some(v);
+                            }
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(t.vol_keys_hint)
+                            .size(12.0)
+                            .color(egui::Color32::from_white_alpha(150)),
+                    );
+
+                    // A dropdown, not a row of buttons: the list only grows. Each
+                    // language is listed in its own script, so it's findable whatever
+                    // the UI is currently showing. Rows are padded for touch.
+                    ui.label(egui::RichText::new(t.language).strong());
+                    egui::ComboBox::from_id_salt("language")
+                        .selected_text(
+                            egui::RichText::new(i18n::lang_pref_label(lang_pref)).size(16.0),
                         )
-                        .changed()
-                    {
-                        *set_spine_strength = Some(strength);
-                    }
-                }
+                        .width(260.0)
+                        .show_ui(ui, |ui| {
+                            ui.spacing_mut().button_padding = egui::vec2(16.0, 12.0);
+                            let item = |text: &str| egui::RichText::new(text).size(18.0);
+                            if ui.selectable_label(lang_pref.is_none(), item(t.lang_system)).clicked() {
+                                *set_lang = Some(None);
+                            }
+                            for l in Lang::ALL {
+                                if ui.selectable_label(lang_pref == Some(l), item(l.native_name())).clicked() {
+                                    *set_lang = Some(Some(l));
+                                }
+                            }
+                        });
 
-                ui.label(egui::RichText::new("Resume on startup").strong());
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(resume_on, egui::RichText::new("On").size(16.0))
-                        .clicked()
-                    {
-                        *set_resume = Some(true);
-                    }
-                    if ui
-                        .selectable_label(!resume_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_resume = Some(false);
-                    }
-                });
-
-                ui.label(egui::RichText::new("Theme").strong());
-                ui.horizontal(|ui| {
-                    for (t, text) in [
-                        (ThemePref::System, "System"),
-                        (ThemePref::Light, "Light"),
-                        (ThemePref::Dark, "Dark"),
-                    ] {
-                        if ui
-                            .selectable_label(theme == t, egui::RichText::new(text).size(16.0))
-                            .clicked()
-                        {
-                            *set_theme = Some(t);
+                    ui.label(egui::RichText::new(t.theme).strong());
+                    ui.horizontal(|ui| {
+                        for (t, text) in [
+                            (ThemePref::System, t.theme_system),
+                            (ThemePref::Light, t.theme_light),
+                            (ThemePref::Dark, t.theme_dark),
+                        ] {
+                            if ui
+                                .selectable_label(theme == t, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_theme = Some(t);
+                            }
                         }
-                    }
-                });
+                    });
 
-                // One profile, not individual knobs: the budget's fields are
-                // interdependent. Auto = the hardware probe; the rest pin a tier
-                // (Performance = no ceilings, i.e. the desktop configuration).
-                ui.label(egui::RichText::new("Performance").strong());
-                ui.horizontal(|ui| {
-                    for (p, text) in [
-                        (PerfPref::Auto, "Auto"),
-                        (PerfPref::Low, "Battery saver"),
-                        (PerfPref::Mid, "Balanced"),
-                        (PerfPref::High, "Performance"),
-                    ] {
-                        if ui
-                            .selectable_label(perf == p, egui::RichText::new(text).size(16.0))
-                            .clicked()
-                        {
-                            *set_perf = Some(p);
+                    // One profile, not individual knobs: the budget's fields are
+                    // interdependent. Auto = the hardware probe; the rest pin a tier
+                    // (Performance = no ceilings, i.e. the desktop configuration).
+                    ui.label(egui::RichText::new(t.performance).strong());
+                    ui.horizontal(|ui| {
+                        for (p, text) in [
+                            (PerfPref::Auto, t.perf_auto),
+                            (PerfPref::Low, t.perf_low),
+                            (PerfPref::Mid, t.perf_mid),
+                            (PerfPref::High, t.perf_high),
+                        ] {
+                            if ui
+                                .selectable_label(perf == p, egui::RichText::new(text).size(16.0))
+                                .clicked()
+                            {
+                                *set_perf = Some(p);
+                            }
                         }
-                    }
+                    });
+                    ui.label(
+                        egui::RichText::new(t.perf_hint)
+                        .size(12.0)
+                        .color(egui::Color32::from_white_alpha(150)),
+                    );
                 });
-                ui.label(
-                    egui::RichText::new(
-                        "Auto matches your device. Lower settings decode fewer pages ahead and use less memory and battery.",
-                    )
-                    .size(12.0)
-                    .color(egui::Color32::from_white_alpha(150)),
-                );
             });
         });
 }
@@ -3330,6 +3542,37 @@ fn set_keep_screen_on(app: &AndroidApp, on: bool) {
     });
 }
 
+/// `AudioManager.ADJUST_*` for a volume key: raise, lower, toggle mute.
+fn volume_adjust(code: KeyCode) -> Option<i32> {
+    match code {
+        KeyCode::AudioVolumeUp => Some(1),
+        KeyCode::AudioVolumeDown => Some(-1),
+        KeyCode::AudioVolumeMute => Some(101),
+        _ => None,
+    }
+}
+
+/// Do what the system would have done with a volume key we received but didn't
+/// use for paging (`handle_volume_keys` routes every press to us): adjust the
+/// active stream and show the volume panel.
+fn adjust_volume(app: &AndroidApp, adj: i32) {
+    let _ = with_env(app, |env, activity| {
+        env.call_method(activity, "adjustVolume", "(I)V", &[JValue::Int(adj)])?;
+        Ok(())
+    });
+}
+
+/// The UI locale's BCP-47 tag (per-app language if set, else the system's) — ""
+/// if the bridge fails, which resolves to English.
+fn locale_tag(app: &AndroidApp) -> String {
+    with_env(app, |env, activity| {
+        let s = env.call_method(activity, "localeTag", "()Ljava/lang/String;", &[])?.l()?;
+        let s = JString::from(s);
+        Ok(env.get_string(&s)?.into())
+    })
+    .unwrap_or_default()
+}
+
 /// Hide (true) / show (false) the Android status + navigation bars. The window
 /// stays edge-to-edge; chrome is inset by `status_bar_height` while bars show.
 fn set_immersive(app: &AndroidApp, immersive: bool) {
@@ -3388,10 +3631,10 @@ fn page_meta(src: &dyn PageSource, index: usize) -> Vec<(String, String)> {
         None => ("—".to_string(), "—".to_string(), "—".to_string()),
     };
     vec![
-        ("Format".to_string(), fmt),
-        ("Color".to_string(), color),
-        ("Size".to_string(), size),
-        ("Modified".to_string(), modified),
+        (tr().info_format.to_string(), fmt),
+        (tr().info_color.to_string(), color),
+        (tr().info_size.to_string(), size),
+        (tr().info_modified.to_string(), modified),
     ]
 }
 
@@ -3447,7 +3690,8 @@ impl App {
             return;
         }
         self.info_for = Some(idx);
-        self.info_meta = ["Format", "Color", "Size", "Modified"]
+        let t = tr();
+        self.info_meta = [t.info_format, t.info_color, t.info_size, t.info_modified]
             .into_iter()
             .map(|k| (k.to_string(), "…".to_string()))
             .collect();
@@ -3471,12 +3715,13 @@ impl App {
         };
         let len = src.len();
         let idx = self.reader.visible_pages().0;
+        let t = tr();
         let mut lines = vec![
-            ("Book".to_string(), self.book_title.clone()),
-            ("File".to_string(), src.name(idx).to_string()),
-            ("Page".to_string(), format!("{} / {}", idx + 1, len)),
+            (t.info_book.to_string(), self.book_title.clone()),
+            (t.info_file.to_string(), src.name(idx).to_string()),
+            (t.info_page.to_string(), format!("{} / {}", idx + 1, len)),
             (
-                "Screen".to_string(),
+                t.info_screen.to_string(),
                 format!("{} × {}", self.config.width, self.config.height),
             ),
         ];
@@ -3484,10 +3729,10 @@ impl App {
         // only on a page change (see `refresh_info_meta`) so this stays per-frame cheap.
         lines.extend(self.info_meta.iter().cloned());
         if let Some(p) = self.reader.cache.get(idx) {
-            lines.push(("Source".to_string(), format!("{} × {}", p.src_w, p.src_h)));
-            lines.push(("Decoded".to_string(), format!("{} × {}", p.w, p.h)));
+            lines.push((t.info_source.to_string(), format!("{} × {}", p.src_w, p.src_h)));
+            lines.push((t.info_decoded.to_string(), format!("{} × {}", p.w, p.h)));
             lines.push((
-                "Resize".to_string(),
+                t.info_resize.to_string(),
                 if p.lq {
                     "LQ (fast bilinear)".to_string()
                 } else {
@@ -3500,23 +3745,23 @@ impl App {
                 std::cmp::Ordering::Greater => "↑ upscale",
                 std::cmp::Ordering::Less => "↓ downscale",
             };
-            lines.push(("GPU".to_string(), gpu.to_string()));
+            lines.push((t.info_gpu.to_string(), gpu.to_string()));
         } else {
-            lines.push(("Decoded".to_string(), "decoding…".to_string()));
+            lines.push((t.info_decoded.to_string(), "decoding…".to_string()));
         }
         lines.push((
-            "Zoom".to_string(),
+            t.info_zoom.to_string(),
             format!("{:.0}%", self.reader.effective_zoom_pct()),
         ));
-        lines.push(("Fit".to_string(), self.reader.fit.label().to_string()));
+        lines.push((t.fit.to_string(), self.reader.fit.label().to_string()));
         // For Auto, show the resolved layout too (e.g. "auto · spread").
         let layout_str = match self.layout_mode {
             LayoutMode::Auto => format!("auto · {}", self.reader.layout.label()),
             m => m.label().to_string(),
         };
-        lines.push(("Layout".to_string(), layout_str));
+        lines.push((t.info_layout.to_string(), layout_str));
         lines.push((
-            "Direction".to_string(),
+            t.info_direction.to_string(),
             self.reader.direction.label().to_string(),
         ));
         // LQ preview tier: fill progress + what's on screen for this page.
@@ -3528,7 +3773,7 @@ impl App {
             "—"
         };
         lines.push((
-            "LQ tier".to_string(),
+            t.info_lq_tier.to_string(),
             format!("{}/{} · {}", self.reader.lq_cache.len(), len, showing),
         ));
         lines
@@ -3797,6 +4042,8 @@ impl App {
         let cur_spine_on = self.spine_shadow_on;
         let cur_spine_strength = self.spine_shadow_strength;
         let cur_resume = self.resume_on_startup;
+        let cur_vol_keys = self.vol_keys;
+        let cur_lang = self.lang_pref;
         let cur_scroll = self.reader.scroll_mode;
         let cur_theme = self.theme;
         let cur_perf = self.perf;
@@ -3938,6 +4185,8 @@ impl App {
         let mut set_spine_on: Option<bool> = None;
         let mut set_spine_strength: Option<f32> = None;
         let mut set_resume: Option<bool> = None;
+        let mut set_vol_keys: Option<VolKeys> = None;
+        let mut set_lang: Option<Option<Lang>> = None;
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
         let mut set_perf: Option<PerfPref> = None;
@@ -3957,10 +4206,8 @@ impl App {
         // book so it hints the destination; clip the title (by char count, since titles
         // are often CJK) so a long name can't push the other header buttons off-screen.
         let resume_label = (len > 0).then(|| {
-            let total = self.book_title.chars().count();
-            let t: String = self.book_title.chars().take(14).collect();
-            let t = if total > 14 { format!("{t}…") } else { t };
-            format!("{}  Resume {t}", egui_phosphor::fill::BOOK_OPEN)
+            let t = i18n::truncate_cols(&self.book_title, 14);
+            format!("{}  {}", egui_phosphor::fill::BOOK_OPEN, (tr().resume_book)(&t))
         });
         // While the bars are shown the window is still full-bleed (NativeActivity
         // ignores fitSystemWindows), so inset the library's top chrome by the
@@ -3991,24 +4238,24 @@ impl App {
                     ui.spacing_mut().scroll.fade.strength = 0.0;
                     if !has_files {
                         ui.add_space(40.0);
-                        ui.label("Grant access to your files to browse your comics:");
-                        if ui.button("Grant all-files access").clicked() {
+                        ui.label(tr().grant_prompt);
+                        if ui.button(tr().grant_button).clicked() {
                             reqs.grant = true;
                         }
                     } else if browse {
                         // Choose-a-library-root folder browser (folders only).
                         ui.horizontal(|ui| {
                             ui.spacing_mut().button_padding = egui::vec2(14.0, 10.0);
-                            if ui.button(egui::RichText::new("← Back").size(18.0)).clicked() {
+                            if ui.button(egui::RichText::new(tr().back).size(18.0)).clicked() {
                                 leave_browse = true;
                             }
                             if !at_root
-                                && ui.button(egui::RichText::new("⬆ Up").size(18.0)).clicked()
+                                && ui.button(egui::RichText::new(tr().up).size(18.0)).clicked()
                             {
                                 go_up = true;
                             }
                             if ui
-                                .button(egui::RichText::new("📌 Set as library").size(18.0))
+                                .button(egui::RichText::new(tr().set_as_library).size(18.0))
                                 .clicked()
                             {
                                 set_root = true;
@@ -4033,9 +4280,9 @@ impl App {
                             if entries.is_empty() {
                                 ui.label(
                                     egui::RichText::new(if browse_pending {
-                                        "Scanning…"
+                                        tr().scanning
                                     } else {
-                                        "(no sub-folders)"
+                                        tr().no_subfolders
                                     })
                                     .weak(),
                                 );
@@ -4052,12 +4299,12 @@ impl App {
                                 close_lib = true;
                             }
                             if ui
-                                .button(egui::RichText::new("📂 Change library…").size(18.0))
+                                .button(egui::RichText::new(tr().change_library).size(18.0))
                                 .clicked()
                             {
                                 enter_browse = true;
                             }
-                            if ui.button(egui::RichText::new("Open file…").size(18.0)).clicked() {
+                            if ui.button(egui::RichText::new(tr().open_file).size(18.0)).clicked() {
                                 reqs.open_picker = true;
                             }
                             if ui.button(egui::RichText::new("⟳").size(18.0)).clicked() {
@@ -4070,9 +4317,9 @@ impl App {
                             ui.add_space(40.0);
                             ui.vertical_centered(|ui| {
                                 ui.label(if series_pending {
-                                    "Scanning library…"
+                                    tr().scanning_library
                                 } else {
-                                    "No comics found here — use “Change library…” to pick your comics folder."
+                                    tr().no_comics_found
                                 });
                             });
                         }
@@ -4081,7 +4328,7 @@ impl App {
                             if !recents_cells.is_empty() {
                                 ui.add_space(4.0);
                                 ui.label(
-                                    egui::RichText::new("Recently read").size(18.0).strong(),
+                                    egui::RichText::new(tr().recently_read).size(18.0).strong(),
                                 );
                                 visible_covers
                                     .extend(recents_cells.iter().map(|v| v.path.clone()));
@@ -4211,6 +4458,8 @@ impl App {
                         cur_spine_on,
                         cur_spine_strength,
                         cur_resume,
+                        cur_vol_keys,
+                        cur_lang,
                         cur_scroll,
                         cur_theme,
                         cur_perf,
@@ -4223,11 +4472,14 @@ impl App {
                         &mut set_spine_on,
                         &mut set_spine_strength,
                         &mut set_resume,
+                        &mut set_vol_keys,
+                        &mut set_lang,
                         &mut set_scroll,
                         &mut set_theme,
                         &mut set_perf,
                         &mut toggle_offset,
                         &mut rotate,
+                        top_inset_pt,
                     );
                 }
                 if show_info {
@@ -4389,6 +4641,24 @@ impl App {
         if let Some(v) = set_resume {
             self.resume_on_startup = v;
             self.persist_view();
+        }
+        if let Some(v) = set_vol_keys {
+            self.vol_keys = v;
+            self.persist_view();
+        }
+        if let Some(v) = set_lang {
+            // Live: per-frame text follows `set_lang` at once; the fonts change only
+            // when the new language wants another face of the CJK collection, and
+            // the cached info overlay is rebuilt.
+            self.lang_pref = v;
+            let lang = v.unwrap_or(self.system_lang);
+            if lang.cjk_face() != i18n::lang().cjk_face() {
+                install_fonts(&self.egui_ctx, lang.cjk_face());
+            }
+            i18n::set_lang(lang);
+            self.info_for = None;
+            self.persist_view();
+            self.window.request_redraw();
         }
         if let Some(v) = set_scroll {
             self.reader.scroll_mode = v;

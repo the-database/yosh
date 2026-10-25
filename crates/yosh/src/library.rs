@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use yosh_engine::i18n::tr;
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, ZipSource};
 use yosh_engine::page::PageTexture;
 
@@ -200,14 +201,14 @@ pub fn series_status(states: &[VolState]) -> String {
     let reading = states.iter().any(|s| matches!(s, VolState::InProgress(_)));
     if reading {
         if unread > 0 {
-            format!("Reading · {unread} unread")
+            (tr().reading_unread)(unread)
         } else {
-            "Reading".to_string()
+            tr().reading.to_string()
         }
     } else if unread > 0 {
         format!("{unread} unread")
     } else {
-        "Finished".to_string()
+        tr().finished.to_string()
     }
 }
 

@@ -23,6 +23,7 @@ use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
+use yosh_engine::i18n::{self, tr, Lang};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
@@ -271,6 +272,10 @@ struct State {
     /// skip the work when the effective tier hasn't actually moved (re-clicking the
     /// selected option, or a power re-check that found no change).
     applied_tier: DeviceTier,
+    /// The language the installed CJK fallback fonts were chosen for, and a
+    /// language switch's font read still in flight (installed when it lands).
+    font_lang: Lang,
+    font_load: Option<std::thread::JoinHandle<Vec<CjkFont>>>,
     volume_key: Option<String>,
     /// Visible page(s) the Tab info overlay text was built for, as
     /// `Reader::visible_pages` reports them (None = rebuild needed).
@@ -540,43 +545,144 @@ fn bank_notches(bank: &mut f32, dy: f32) -> i32 {
     steps as i32
 }
 
-/// System CJK fallback fonts, in preference order — the first that reads wins.
-/// At module scope so the (tens-of-MB) read can be started on a background thread
-/// before `install_fonts` is reached; see the `cjk_font` spawn in `resumed`.
-const CJK_FONT_CANDIDATES: &[&str] = &[
+/// The system Noto Sans CJK collections (Linux). One file covers all four CJK
+/// languages; `Lang::cjk_face` picks the face with the right glyph forms.
+const NOTO_CJK_TTC: &[&str] = &[
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+];
+
+/// Japanese system fonts, in preference order — the fallback for file names
+/// (most often Japanese) whatever the UI language.
+const JP_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\YuGothR.ttc",
     r"C:\Windows\Fonts\meiryo.ttc",
     r"C:\Windows\Fonts\msgothic.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
     "/Library/Fonts/Hiragino Sans GB.ttc",
 ];
 
+/// A loaded fallback font file, the face to use if it's a collection, and its
+/// baseline nudge (`FontTweak::y_offset_factor`). The nudge is per font: each
+/// sits at its own height against egui's Latin font, and a mixed line (a Korean
+/// UI label next to a Japanese file name) needs every fallback on one baseline.
+type CjkFont = (Vec<u8>, u32, f32);
+
+/// Baseline nudge for the Japanese / Noto CJK fonts, whose glyphs otherwise ride
+/// above the Latin baseline.
+const JP_Y_OFFSET: f32 = 0.18;
+/// Baseline nudge for the Chinese / Korean system fonts (YaHei, JhengHei, Malgun).
+const OWN_Y_OFFSET: f32 = 0.0;
+
+/// Read the CJK fallback font(s) for `lang` — tens of MB, so callers run this on
+/// a background thread (see `resumed` and `set_language`). The Japanese fonts
+/// can't draw simplified-only Hanzi or any Hangul, so Chinese and Korean UIs
+/// lead with their own system font; Korean also keeps a Japanese font after
+/// Malgun Gothic (which lacks many kanji, e.g. 様 / 巻) so Japanese file names
+/// still render in full.
+/// A Noto CJK collection covers everything on its own.
+fn load_cjk_fonts(lang: Lang) -> Vec<CjkFont> {
+    let read = |p: &str| std::fs::read(p).ok();
+    if let Some(b) = NOTO_CJK_TTC.iter().find_map(|p| read(p)) {
+        return vec![(b, lang.cjk_face(), JP_Y_OFFSET)];
+    }
+    let own: &[&str] = match lang {
+        Lang::ZhHans => &[r"C:\Windows\Fonts\msyh.ttc", "/Library/Fonts/Hiragino Sans GB.ttc"],
+        Lang::ZhHant => &[r"C:\Windows\Fonts\msjh.ttc"],
+        Lang::Ko => &[r"C:\Windows\Fonts\malgun.ttf", "/Library/Fonts/AppleSDGothicNeo.ttc"],
+        // Latin / Cyrillic UIs: egui's own font draws the UI; CJK is file names only.
+        _ => &[],
+    };
+    let mut out = Vec::new();
+    if let Some(b) = own.iter().find_map(|p| read(p)) {
+        out.push((b, 0, OWN_Y_OFFSET));
+        // YaHei / JhengHei cover Japanese names too; Malgun's kanji are partial.
+        if lang != Lang::Ko {
+            return out;
+        }
+    }
+    if let Some(b) = JP_FONT_CANDIDATES.iter().find_map(|p| read(p)) {
+        out.push((b, 0, JP_Y_OFFSET));
+    }
+    out
+}
+
+/// Fonts are chosen per language, but only Chinese and Korean need their own CJK
+/// font — every other language uses the Japanese set, so a switch among those
+/// needn't reload anything.
+fn same_fonts(a: Lang, b: Lang) -> bool {
+    let group = |l: Lang| match l {
+        Lang::ZhHans | Lang::ZhHant | Lang::Ko => Some(l),
+        _ => None,
+    };
+    group(a) == group(b)
+}
+
+/// The OS display language, mapped to the closest supported UI language.
+fn system_lang() -> Lang {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
+        // A double-NUL-terminated list of BCP-47 names, most preferred first.
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        let mut count = 0u32;
+        // SAFETY: `buf` holds `len` u16s; the call writes at most that many.
+        let ok = unsafe {
+            GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, buf.as_mut_ptr(), &mut len)
+        };
+        if ok != 0 && count > 0 {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+            return Lang::from_tag(&String::from_utf16_lossy(&buf[..end]));
+        }
+        Lang::En
+    }
+    #[cfg(not(windows))]
+    {
+        ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .find(|v| !v.is_empty())
+            .map_or(Lang::En, |v| Lang::from_tag(&v))
+    }
+}
+
+/// The language the settings ask for: the pinned one, or the OS's.
+fn resolve_lang(settings: &config::Settings) -> Lang {
+    settings
+        .language
+        .as_deref()
+        .and_then(Lang::from_token)
+        .unwrap_or_else(system_lang)
+}
+
 /// Install the egui chrome fonts: the Phosphor icon set (for the library section
-/// carets) is added unconditionally, and a best-effort system CJK font — read
-/// ahead of time and passed in as `cjk` — is appended as a fallback so
-/// Japanese/Chinese/Korean text (paths, filenames, library titles) renders. Both
-/// are *fallbacks* layered after the default fonts, so Latin keeps its default
-/// look. A single `set_fonts` applies the lot.
-fn install_fonts(ctx: &egui::Context, cjk: Option<Vec<u8>>) {
+/// carets) is added unconditionally, and the best-effort system CJK font(s) — read
+/// ahead of time by `load_cjk_fonts` — are appended as fallbacks so
+/// Japanese/Chinese/Korean text (the UI itself, paths, filenames, library titles)
+/// renders. All are *fallbacks* layered after the default fonts, so Latin keeps
+/// its default look. A single `set_fonts` applies the lot.
+fn install_fonts(ctx: &egui::Context, cjk: Vec<CjkFont>) {
     let mut fonts = egui::FontDefinitions::default();
     // Phosphor carets etc. — pure-Rust glyph set, always available (matches the
     // Android shell, so the library headers never fall back to tofu boxes).
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
 
-    if let Some(bytes) = cjk {
+    for (i, (bytes, face, y_offset)) in cjk.into_iter().enumerate() {
+        let name = format!("cjk{i}");
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = face;
         fonts.font_data.insert(
-            "cjk".to_owned(),
-            // The CJK fallback's glyphs render above the Latin baseline; nudge them
-            // down so mixed JP/EN lines (top bar, info overlay, titles) line up.
-            std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
-                y_offset_factor: 0.18,
+            name.clone(),
+            // Nudge each fallback onto the Latin baseline so mixed CJK/EN lines
+            // (top bar, info overlay, titles) line up.
+            std::sync::Arc::new(data.tweak(egui::FontTweak {
+                y_offset_factor: y_offset,
                 ..Default::default()
             })),
         );
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".to_owned());
+            fonts.families.entry(family).or_default().push(name.clone());
         }
     }
     ctx.set_fonts(fonts);
@@ -774,13 +880,11 @@ impl ApplicationHandler for App {
             return;
         }
         let mut settings = config::load();
+        let lang = resolve_lang(&settings);
+        i18n::set_lang(lang);
         // The CJK fallback font is a tens-of-MB .ttc; read it while the adapter/device
         // request runs instead of after it. Joined (not polled) at install time.
-        let cjk_font = std::thread::spawn(|| {
-            CJK_FONT_CANDIDATES
-                .iter()
-                .find_map(|p| std::fs::read(p).ok())
-        });
+        let cjk_font = std::thread::spawn(move || load_cjk_fonts(lang));
         let attrs = Window::default_attributes()
             .with_title("yosh")
             .with_window_icon(window_icon());
@@ -820,7 +924,7 @@ impl ApplicationHandler for App {
         let egui_ctx = egui::Context::default();
         // A panicked reader thread degrades to "no CJK fallback" — already the
         // behavior on a system with none of the candidate fonts installed.
-        install_fonts(&egui_ctx, cjk_font.join().unwrap_or(None));
+        install_fonts(&egui_ctx, cjk_font.join().unwrap_or_default());
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -972,6 +1076,8 @@ impl ApplicationHandler for App {
             .map(|t| t == winit::window::Theme::Dark)
             .unwrap_or(true);
         self.state = Some(State {
+            font_lang: lang,
+            font_load: None,
             window,
             gpu,
             reader,
@@ -1350,13 +1456,13 @@ fn page_info(src: &dyn PageSource, index: usize) -> Vec<(String, String)> {
     };
     let modified = src.modified(index).unwrap_or_else(|| "—".to_string());
     vec![
-        ("File".to_string(), name),
-        ("Page".to_string(), format!("{} / {}", index + 1, src.len())),
-        ("Size".to_string(), size),
-        ("Modified".to_string(), modified),
-        ("Resolution".to_string(), res),
-        ("Format".to_string(), fmt),
-        ("Color".to_string(), color),
+        (tr().info_file.to_string(), name),
+        (tr().info_page.to_string(), format!("{} / {}", index + 1, src.len())),
+        (tr().info_size.to_string(), size),
+        (tr().info_modified.to_string(), modified),
+        (tr().info_resolution.to_string(), res),
+        (tr().info_format.to_string(), fmt),
+        (tr().info_color.to_string(), color),
     ]
 }
 
@@ -1432,7 +1538,7 @@ impl State {
                 };
                 self.settings.direction_rtl = self.reader.direction == Direction::Rtl;
                 config::save(&self.settings);
-                self.toast(format!("Direction: {}", self.reader.direction.label()));
+                self.toast((tr().toast_direction)(i18n::dir_short(self.reader.direction)));
             }
             Action::ToggleLayout => {
                 self.reader.layout = self.reader.layout.toggled();
@@ -1442,7 +1548,7 @@ impl State {
                 self.settings.layout_spread = self.reader.layout == Layout::Spread;
                 config::save(&self.settings);
                 self.reader.prefetch();
-                self.toast(format!("Layout: {}", self.reader.layout.label()));
+                self.toast((tr().toast_layout)(i18n::layout_short(self.reader.layout)));
             }
             Action::ToggleScroll => {
                 self.reader.scroll_mode = !self.reader.scroll_mode;
@@ -1451,9 +1557,9 @@ impl State {
                 config::save(&self.settings);
                 self.reader.prefetch();
                 self.toast(if self.reader.scroll_mode {
-                    "Scroll mode"
+                    tr().toast_scroll_mode
                 } else {
-                    "Page-flip mode"
+                    tr().toast_page_flip_mode
                 });
             }
             Action::ToggleHelp => self.ui.help_open = !self.ui.help_open,
@@ -1467,9 +1573,9 @@ impl State {
                 // Announce the change like the other toggles — a silent flip left
                 // the seekbar disabled with no clue it had been turned off.
                 self.toast(if self.settings.seekbar_enabled {
-                    "Seekbar: on"
+                    tr().toast_seekbar_on
                 } else {
-                    "Seekbar: off"
+                    tr().toast_seekbar_off
                 });
             }
             Action::TogglePageTransition => {
@@ -1477,9 +1583,9 @@ impl State {
                 self.reader.transition_enabled = self.settings.page_transition_enabled;
                 config::save(&self.settings);
                 self.toast(if self.settings.page_transition_enabled {
-                    "Page transition: on"
+                    tr().toast_transition_on
                 } else {
-                    "Page transition: off"
+                    tr().toast_transition_off
                 });
             }
             Action::ToggleStretch => self.toggle_stretch(),
@@ -1502,7 +1608,7 @@ impl State {
                 // Re-anchor so the current view re-pairs with the new parity.
                 self.reader.snap_to_view_start();
                 self.reader.prefetch();
-                self.toast(format!("Spread offset: {}", self.reader.spread_offset));
+                self.toast((tr().toast_spread_offset)(self.reader.spread_offset));
             }
             Action::PrevVolume => self.jump_volume(-1),
             Action::NextVolume => self.jump_volume(1),
@@ -1513,13 +1619,32 @@ impl State {
                 self.reader.pan_x = 0.0;
                 self.reader.pan_y = 0.0;
                 self.reader.prefetch(); // re-decode at the rotation-aware target (1:1)
-                self.toast(format!("Rotation: {}\u{00b0}", self.reader.rotation as u32 * 90));
+                self.toast((tr().toast_rotation)(self.reader.rotation as u32 * 90));
             }
             Action::ShowInExplorer => self.reveal_current(),
             // Esc → quit is intercepted in `window_event` (needs the event loop),
             // so it never reaches here.
             Action::Quit => {}
         }
+    }
+
+    /// Switch the UI language live. Everything drawn per frame follows on its own;
+    /// the cached info overlay is rebuilt, and when the new language needs other
+    /// CJK glyph forms the fallback fonts are re-read off-thread (installed by
+    /// `render` when the read lands, which wakes the loop).
+    fn set_language(&mut self, lang: Lang) {
+        i18n::set_lang(lang);
+        self.info_for = None;
+        if !same_fonts(lang, self.font_lang) {
+            self.font_lang = lang;
+            let window = self.window.clone();
+            self.font_load = Some(std::thread::spawn(move || {
+                let fonts = load_cjk_fonts(lang);
+                window.request_redraw();
+                fonts
+            }));
+        }
+        self.window.request_redraw();
     }
 
     /// Raise a transient on-screen toast (boundary reached, zoom level).
@@ -1550,9 +1675,9 @@ impl State {
         // Phrased as the user-facing setting (stretching is the default), so the
         // toast matches the panel row rather than inverting it.
         self.toast(if self.settings.no_stretch {
-            "Stretch small pages: off"
+            tr().toast_stretch_off
         } else {
-            "Stretch small pages: on"
+            tr().toast_stretch_on
         });
     }
 
@@ -1561,7 +1686,7 @@ impl State {
     /// page's image file; for an archive it's the archive file itself.
     fn reveal_current(&mut self) {
         let Some(key) = self.volume_key.clone() else {
-            self.toast("Nothing open");
+            self.toast(tr().toast_nothing_open);
             return;
         };
         let base = PathBuf::from(&key);
@@ -1576,7 +1701,7 @@ impl State {
             base // archive (or single file): select it in its folder
         };
         reveal_in_explorer(&target);
-        self.toast("Shown in Explorer");
+        self.toast(tr().toast_shown_in_explorer);
     }
 
     /// Open the previous (`delta < 0`) or next (`delta > 0`) sibling volume of
@@ -1617,13 +1742,13 @@ impl State {
         };
         let target = idx as i64 + delta;
         if target < 0 {
-            self.toast("First book");
+            self.toast(tr().toast_first_book);
             return;
         }
         let next = sibs.get(target as usize).cloned();
         match next {
             Some(path) => self.open(&path),
-            None => self.toast("Last book"),
+            None => self.toast(tr().toast_last_book),
         }
     }
 
@@ -2606,7 +2731,7 @@ impl State {
                     "—"
                 };
                 rows.push((
-                    "LQ tier".to_string(),
+                    tr().info_lq_tier.to_string(),
                     format!("{}/{} · {}", self.reader.lq_cache.len(), len, showing),
                 ));
             }
@@ -2688,16 +2813,17 @@ impl State {
         self.reader.prefetch();
         // Tell the user what the preset just switched to (presets change fit +
         // layout + maybe direction at once, so summarize the resulting view).
+        let t = tr();
         let view_label = if spread {
-            format!("Spread, {}", self.reader.direction.label())
+            (t.toast_spread)(i18n::dir_short(self.reader.direction))
         } else {
             let f = match fit {
-                FitMode::Window => "Fit window",
-                FitMode::Width => "Fit width",
-                FitMode::Height => "Fit height",
+                FitMode::Window => t.fit_window,
+                FitMode::Width => t.fit_width,
+                FitMode::Height => t.fit_height,
                 FitMode::Actual => "1:1",
             };
-            format!("{f} (single)")
+            (t.toast_single)(f)
         };
         self.toast(view_label);
     }
@@ -2796,7 +2922,7 @@ impl State {
     /// `Library - yosh` in the grid, plain `yosh` when nothing is open.
     fn title(&self) -> String {
         if self.library_view {
-            return "Library - yosh".to_string();
+            return tr().title_library.to_string();
         }
         let Some(src) = &self.reader.source else {
             return "yosh".to_string();
@@ -2927,17 +3053,17 @@ impl State {
                         }
                     }
                     if partial {
-                        self.toast(format!("Partial archive — {n} pages recovered"));
+                        self.toast((tr().toast_partial_archive)(n));
                     }
                 }
                 // A failed open never draws a first page, so drop the stamp here —
                 // a stale one would mislabel a later cache-hit on the old volume.
                 Ok(_) => {
-                    self.ui.status = "no images found".into();
+                    self.ui.status = tr().no_images_found.into();
                     self.open_t0 = None;
                 }
                 Err(e) => {
-                    self.ui.status = format!("open failed: {e}");
+                    self.ui.status = (tr().open_failed)(&e.to_string());
                     self.open_t0 = None;
                 }
             }
@@ -2960,9 +3086,9 @@ impl State {
                 // Auto only ever moves between High (mains) and Mid (battery), so
                 // the power source names the direction.
                 self.toast(if self.on_battery {
-                    "Battery saver"
+                    tr().perf_low
                 } else {
-                    "Performance restored"
+                    tr().toast_performance_restored
                 });
             }
         }
@@ -2993,12 +3119,12 @@ impl State {
         } else {
             self.reader.build_quads()
         };
-        self.ui.dir_label = self.reader.direction.label();
-        self.ui.fit_label = self.reader.fit.label();
+        self.ui.dir_label = i18n::dir_short(self.reader.direction);
+        self.ui.fit_label = i18n::fit_short(self.reader.fit);
         self.ui.layout_label = if self.reader.scroll_mode {
-            "scroll"
+            tr().layout_short_scroll
         } else {
-            self.reader.layout.label()
+            i18n::layout_short(self.reader.layout)
         };
         self.ui.transition_on = self.settings.page_transition_enabled;
         // Shown inverted in the panel: the row is "Stretch small pages".
@@ -3015,20 +3141,17 @@ impl State {
         self.ui.rotation = self.reader.rotation;
         self.ui.theme = self.settings.theme;
         self.ui.perf = self.settings.perf;
+        self.ui.lang_pref = self.settings.language.as_deref().and_then(Lang::from_token);
         // What `Auto` currently resolves to, so the picker shows the live answer
         // instead of leaving the user to guess.
-        self.ui.perf_auto = format!(
-            "Auto — currently {} ({})",
+        let t = tr();
+        self.ui.perf_auto = (t.perf_auto_now)(
             match self.effective_tier() {
-                DeviceTier::Low => "Battery saver",
-                DeviceTier::Mid => "Balanced",
-                DeviceTier::High => "Performance",
+                DeviceTier::Low => t.perf_low,
+                DeviceTier::Mid => t.perf_mid,
+                DeviceTier::High => t.perf_high,
             },
-            if self.on_battery {
-                "on battery"
-            } else {
-                "plugged in"
-            }
+            self.on_battery,
         );
         // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
         // library grid; `ui.opened` is sticky once set, so it can't.
@@ -3051,8 +3174,8 @@ impl State {
                     // `poll_background` swaps the full rows in when they land.
                     let head = |i: usize| {
                         vec![
-                            ("File".to_string(), src.name(i).to_string()),
-                            ("Page".to_string(), format!("{} / {}", i + 1, src.len())),
+                            (tr().info_file.to_string(), src.name(i).to_string()),
+                            (tr().info_page.to_string(), format!("{} / {}", i + 1, src.len())),
                         ]
                     };
                     let mut rows = head(a);
@@ -3153,12 +3276,13 @@ impl State {
                 Some(b) => format!("{}-{}", anchor + 1, b + 1),
                 None => format!("{}", anchor + 1),
             };
+            let failed_suffix = format!("  {}", tr().status_failed);
             self.ui.status = format!(
                 "{}/{}{}",
                 shown,
                 len,
                 if failed {
-                    "  [failed]"
+                    failed_suffix.as_str()
                 } else if loading {
                     "  …"
                 } else {
@@ -3336,8 +3460,15 @@ impl State {
             current_key: self.volume_key.as_deref(),
             recents: &self.settings.recents,
         };
+        // A language switch's font read landed: install it before this frame lays out.
+        if self.font_load.as_ref().is_some_and(|h| h.is_finished())
+            && let Some(h) = self.font_load.take()
+        {
+            install_fonts(&self.egui_ctx, h.join().unwrap_or_default());
+        }
         // Theme the egui chrome (top bar, library grid, help/info windows) to match
-        // the page letterbox. Fonts are installed once at init and untouched by this.
+        // the page letterbox. Fonts are installed at init (and on a language switch)
+        // and untouched by this.
         self.egui_ctx.set_visuals(if dark {
             egui::Visuals::dark()
         } else {
@@ -3391,9 +3522,9 @@ impl State {
             self.reader.spine_strength = effective_spine(&self.settings);
             config::save(&self.settings);
             self.toast(if self.settings.spine_shadow_enabled {
-                "Spine shadow: on"
+                tr().toast_spine_on
             } else {
-                "Spine shadow: off"
+                tr().toast_spine_off
             });
             ui_acted = true;
         }
@@ -3450,6 +3581,12 @@ impl State {
             self.settings.theme = t;
             config::save(&self.settings);
             self.window.request_redraw(); // repaint chrome + letterbox under the new theme
+            ui_acted = true;
+        }
+        if let Some(l) = self.ui.req_set_lang.take() {
+            self.settings.language = l.map(|l| l.token().to_string());
+            config::save(&self.settings);
+            self.set_language(resolve_lang(&self.settings));
             ui_acted = true;
         }
         if let Some(p) = self.ui.req_set_perf.take() {

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::PageCache;
 use crate::decode::MAX_TEX_DIM;
+use crate::i18n::tr;
 use crate::layout::{Grid, Layout, WideSet};
 use crate::page::{fit_scale, FitMode, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg, Waker};
@@ -3050,7 +3051,7 @@ impl Reader {
             true
         } else {
             // Nowhere to go — let the reader know why seeking did nothing.
-            self.toast(if dir > 0 { "Last page" } else { "First page" });
+            self.toast(if dir > 0 { tr().last_page } else { tr().first_page });
             false
         }
     }
@@ -3239,9 +3240,9 @@ impl Reader {
             if !self.scroll_mode {
                 let near = |p: Option<f32>| p.is_some_and(|p| (p - target).abs() <= target * 1e-3);
                 if near(self.fit_native_pct(FitMode::Window)) {
-                    label = Some("Fit window");
+                    label = Some(tr().fit_window);
                 } else if near(self.fit_native_pct(FitMode::Width)) {
-                    label = Some("Fit width");
+                    label = Some(tr().fit_width);
                 }
             }
             self.zoom *= target / cur; // rescale the fit-multiplier to hit target %
@@ -3265,12 +3266,9 @@ impl Reader {
         }
         self.clamp_pan();
         let pct = self.effective_zoom_pct();
-        match label {
-            // Fit label on its own line so the "Zoom %" line stays centered
-            // (the toast is center-aligned), aligned across zoom levels.
-            Some(l) => self.toast(format!("Zoom {pct:.2}%\n({l})")),
-            None => self.toast(format!("Zoom {pct:.2}%")),
-        }
+        // Fit label on its own line so the "Zoom %" line stays centered
+        // (the toast is center-aligned), aligned across zoom levels.
+        self.toast((tr().zoom_toast)(pct, label));
     }
 
     pub fn scroll_by(&mut self, dy: f32) {
@@ -3287,9 +3285,9 @@ impl Reader {
         } else if dy.abs() > 0.5 && (self.top_offset - before_off).abs() < 0.5 {
             // The strip didn't move despite a scroll — clamped at an end.
             if dy < 0.0 && self.index == 0 && self.top_offset <= 0.5 {
-                self.toast("First page");
+                self.toast(tr().first_page);
             } else if dy > 0.0 && self.index + 1 >= len {
-                self.toast("Last page");
+                self.toast(tr().last_page);
             }
         }
         self.prefetch();

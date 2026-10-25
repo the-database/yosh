@@ -5,6 +5,7 @@ import android.app.NativeActivity;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -82,6 +83,14 @@ public class YoshActivity extends NativeActivity {
         return mode == Configuration.UI_MODE_NIGHT_YES;
     }
 
+    /** The UI locale as a BCP-47 tag ("ja-JP", "zh-Hant-TW", …): the app's own
+     *  per-app language if one is set (Android 13+ Settings → App languages), else
+     *  the system's. Called from native to resolve the "System" language choice;
+     *  getLocales() is API 24, the app's minSdk. */
+    public String localeTag() {
+        return getResources().getConfiguration().getLocales().get(0).toLanguageTag();
+    }
+
     /** Launch the SAF document picker. Called from native via JNI. */
     public void openDocument() {
         // startActivityForResult must run on the UI thread.
@@ -150,6 +159,19 @@ public class YoshActivity extends NativeActivity {
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
             }
         });
+    }
+
+    /** Adjust the volume the way the system does for a volume key (direction is an
+     *  AudioManager.ADJUST_* constant). Called from native: the native side asks
+     *  winit to deliver volume keys so they can turn pages, which also means the OS
+     *  no longer sees them, so a press that doesn't turn a page is handed back here.
+     *  The suggested (default) stream is the one the system would pick itself. */
+    public void adjustVolume(int direction) {
+        AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+        if (am != null) {
+            am.adjustSuggestedStreamVolume(
+                direction, AudioManager.USE_DEFAULT_STREAM_TYPE, AudioManager.FLAG_SHOW_UI);
+        }
     }
 
     /** Status-bar height in px (0 if unknown). A constant from the platform
