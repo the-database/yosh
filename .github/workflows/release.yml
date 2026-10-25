@@ -54,12 +54,43 @@ jobs:
       # cached — GitHub caches are ref-scoped, so a tag run can't reuse them).
       # Recipe mirrors dav1d-rs's own CI, plus static + (Windows) /MT to match
       # the +crt-static Rust build. ---
+      # MSVC env + nasm are plain shell steps: the ilammy actions that used to do
+      # this only ship node20 builds, which GitHub has deprecated.
       - name: Set up MSVC env (Windows)
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Install nasm
-        uses: ilammy/setup-nasm@v1
-      - uses: actions/setup-python@v5
+        shell: pwsh
+        run: |
+          # Run vcvars64 and hand what it changed (INCLUDE, LIB, the tool PATH
+          # entries, …) to the later steps, so meson finds cl.exe / link.exe for
+          # dav1d. Only changed variables are exported; new PATH entries go via
+          # GITHUB_PATH (which prepends) in reverse, so MSVC's own order survives
+          # and its link.exe stays ahead of Git Bash's /usr/bin/link.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs) { throw "no Visual Studio with the x64 C++ tools found" }
+          $oldPath = $env:Path -split ';'
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { return }
+            $name, $value = $Matches[1], $Matches[2]
+            if ($name -eq 'Path') {
+              $new = @($value -split ';' | Where-Object { $_ -and ($oldPath -notcontains $_) })
+              [array]::Reverse($new)
+              $new | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+            } elseif ([Environment]::GetEnvironmentVariable($name) -ne $value) {
+              "$name=$value" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+      - name: Install nasm (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Install nasm (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y nasm
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install meson + ninja
