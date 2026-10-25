@@ -144,6 +144,9 @@ pub struct Settings {
     pub theme: ThemePref,
     /// Performance profile (Auto = full budget on AC, throttled on battery).
     pub perf: PerfPref,
+    /// UI language as a `yosh_engine::i18n::Lang` token ("ja", "zh-Hant", …), or
+    /// `None` to follow the OS display language.
+    pub language: Option<String>,
     /// Last window geometry (size/position/maximized). None until first saved.
     pub window: Option<WindowState>,
 }
@@ -174,6 +177,7 @@ impl Default for Settings {
             // Android shell, which defaults to System so e-ink panels get Light.
             theme: ThemePref::Dark,
             perf: PerfPref::Auto,
+            language: None,
             window: None,
         }
     }

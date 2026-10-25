@@ -22,11 +22,12 @@
         android:icon="@mipmap/ic_launcher"
         android:allowBackup="true"
         android:extractNativeLibs="true"
-        android:requestLegacyExternalStorage="true">
+        android:requestLegacyExternalStorage="true"
+        android:localeConfig="@xml/locales_config">
         <activity
             android:name="com.thedatabase.yosh.YoshActivity"
             android:exported="true"
-            android:configChanges="orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|density|uiMode">
+            android:configChanges="orientation|keyboard|keyboardHidden|navigation|screenSize|screenLayout|density|uiMode|locale|layoutDirection">
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="yosh_android" />

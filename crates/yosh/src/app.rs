@@ -23,7 +23,7 @@ use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
-use yosh_engine::i18n::{self, tr};
+use yosh_engine::i18n::{self, tr, Lang};
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
 use yosh_engine::source::{is_image_ext, FolderSource, PageSource, RarSource, SevenzSource, ZipSource};
@@ -272,6 +272,10 @@ struct State {
     /// skip the work when the effective tier hasn't actually moved (re-clicking the
     /// selected option, or a power re-check that found no change).
     applied_tier: DeviceTier,
+    /// The language the installed CJK fallback fonts were chosen for, and a
+    /// language switch's font read still in flight (installed when it lands).
+    font_lang: Lang,
+    font_load: Option<std::thread::JoinHandle<Vec<CjkFont>>>,
     volume_key: Option<String>,
     /// Visible page(s) the Tab info overlay text was built for, as
     /// `Reader::visible_pages` reports them (None = rebuild needed).
@@ -541,43 +545,138 @@ fn bank_notches(bank: &mut f32, dy: f32) -> i32 {
     steps as i32
 }
 
-/// System CJK fallback fonts, in preference order — the first that reads wins.
-/// At module scope so the (tens-of-MB) read can be started on a background thread
-/// before `install_fonts` is reached; see the `cjk_font` spawn in `resumed`.
-const CJK_FONT_CANDIDATES: &[&str] = &[
+/// The system Noto Sans CJK collections (Linux). One file covers all four CJK
+/// languages; `Lang::cjk_face` picks the face with the right glyph forms.
+const NOTO_CJK_TTC: &[&str] = &[
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+];
+
+/// Japanese system fonts, in preference order — the fallback for file names
+/// (most often Japanese) whatever the UI language.
+const JP_FONT_CANDIDATES: &[&str] = &[
     r"C:\Windows\Fonts\YuGothR.ttc",
     r"C:\Windows\Fonts\meiryo.ttc",
     r"C:\Windows\Fonts\msgothic.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJKjp-Regular.otf",
     "/Library/Fonts/Hiragino Sans GB.ttc",
 ];
 
+/// A loaded fallback font file, the face to use if it's a collection, and its
+/// baseline nudge (`FontTweak::y_offset_factor`). The nudge is per font: each
+/// sits at its own height against egui's Latin font, and a mixed line (a Korean
+/// UI label next to a Japanese file name) needs every fallback on one baseline.
+type CjkFont = (Vec<u8>, u32, f32);
+
+/// Baseline nudge for the Japanese / Noto CJK fonts, whose glyphs otherwise ride
+/// above the Latin baseline.
+const JP_Y_OFFSET: f32 = 0.18;
+/// Baseline nudge for the Chinese / Korean system fonts (YaHei, JhengHei, Malgun).
+const OWN_Y_OFFSET: f32 = 0.0;
+
+/// Read the CJK fallback font(s) for `lang` — tens of MB, so callers run this on
+/// a background thread (see `resumed` and `set_language`). The Japanese fonts
+/// can't draw simplified-only Hanzi or any Hangul, so Chinese and Korean UIs
+/// lead with their own system font; Korean also keeps a Japanese font after
+/// Malgun Gothic (which lacks many kanji, e.g. 様 / 巻) so Japanese file names
+/// still render in full.
+/// A Noto CJK collection covers everything on its own.
+fn load_cjk_fonts(lang: Lang) -> Vec<CjkFont> {
+    let read = |p: &str| std::fs::read(p).ok();
+    if let Some(b) = NOTO_CJK_TTC.iter().find_map(|p| read(p)) {
+        return vec![(b, lang.cjk_face(), JP_Y_OFFSET)];
+    }
+    let own: &[&str] = match lang {
+        Lang::ZhHans => &[r"C:\Windows\Fonts\msyh.ttc", "/Library/Fonts/Hiragino Sans GB.ttc"],
+        Lang::ZhHant => &[r"C:\Windows\Fonts\msjh.ttc"],
+        Lang::Ko => &[r"C:\Windows\Fonts\malgun.ttf", "/Library/Fonts/AppleSDGothicNeo.ttc"],
+        Lang::En | Lang::Ja => &[],
+    };
+    let mut out = Vec::new();
+    if let Some(b) = own.iter().find_map(|p| read(p)) {
+        out.push((b, 0, OWN_Y_OFFSET));
+        // YaHei / JhengHei cover Japanese names too; Malgun's kanji are partial.
+        if lang != Lang::Ko {
+            return out;
+        }
+    }
+    if let Some(b) = JP_FONT_CANDIDATES.iter().find_map(|p| read(p)) {
+        out.push((b, 0, JP_Y_OFFSET));
+    }
+    out
+}
+
+/// Fonts are chosen per language, but English and Japanese use the same set — a
+/// switch between them needn't reload anything.
+fn same_fonts(a: Lang, b: Lang) -> bool {
+    a == b || matches!((a, b), (Lang::En | Lang::Ja, Lang::En | Lang::Ja))
+}
+
+/// The OS display language, mapped to the closest supported UI language.
+fn system_lang() -> Lang {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
+        // A double-NUL-terminated list of BCP-47 names, most preferred first.
+        let mut buf = [0u16; 256];
+        let mut len = buf.len() as u32;
+        let mut count = 0u32;
+        // SAFETY: `buf` holds `len` u16s; the call writes at most that many.
+        let ok = unsafe {
+            GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, buf.as_mut_ptr(), &mut len)
+        };
+        if ok != 0 && count > 0 {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+            return Lang::from_tag(&String::from_utf16_lossy(&buf[..end]));
+        }
+        Lang::En
+    }
+    #[cfg(not(windows))]
+    {
+        ["LC_ALL", "LC_MESSAGES", "LANG"]
+            .iter()
+            .filter_map(|v| std::env::var(v).ok())
+            .find(|v| !v.is_empty())
+            .map_or(Lang::En, |v| Lang::from_tag(&v))
+    }
+}
+
+/// The language the settings ask for: the pinned one, or the OS's.
+fn resolve_lang(settings: &config::Settings) -> Lang {
+    settings
+        .language
+        .as_deref()
+        .and_then(Lang::from_token)
+        .unwrap_or_else(system_lang)
+}
+
 /// Install the egui chrome fonts: the Phosphor icon set (for the library section
-/// carets) is added unconditionally, and a best-effort system CJK font — read
-/// ahead of time and passed in as `cjk` — is appended as a fallback so
-/// Japanese/Chinese/Korean text (paths, filenames, library titles) renders. Both
-/// are *fallbacks* layered after the default fonts, so Latin keeps its default
-/// look. A single `set_fonts` applies the lot.
-fn install_fonts(ctx: &egui::Context, cjk: Option<Vec<u8>>) {
+/// carets) is added unconditionally, and the best-effort system CJK font(s) — read
+/// ahead of time by `load_cjk_fonts` — are appended as fallbacks so
+/// Japanese/Chinese/Korean text (the UI itself, paths, filenames, library titles)
+/// renders. All are *fallbacks* layered after the default fonts, so Latin keeps
+/// its default look. A single `set_fonts` applies the lot.
+fn install_fonts(ctx: &egui::Context, cjk: Vec<CjkFont>) {
     let mut fonts = egui::FontDefinitions::default();
     // Phosphor carets etc. — pure-Rust glyph set, always available (matches the
     // Android shell, so the library headers never fall back to tofu boxes).
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
 
-    if let Some(bytes) = cjk {
+    for (i, (bytes, face, y_offset)) in cjk.into_iter().enumerate() {
+        let name = format!("cjk{i}");
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = face;
         fonts.font_data.insert(
-            "cjk".to_owned(),
-            // The CJK fallback's glyphs render above the Latin baseline; nudge them
-            // down so mixed JP/EN lines (top bar, info overlay, titles) line up.
-            std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(egui::FontTweak {
-                y_offset_factor: 0.18,
+            name.clone(),
+            // Nudge each fallback onto the Latin baseline so mixed CJK/EN lines
+            // (top bar, info overlay, titles) line up.
+            std::sync::Arc::new(data.tweak(egui::FontTweak {
+                y_offset_factor: y_offset,
                 ..Default::default()
             })),
         );
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            fonts.families.entry(family).or_default().push("cjk".to_owned());
+            fonts.families.entry(family).or_default().push(name.clone());
         }
     }
     ctx.set_fonts(fonts);
@@ -775,13 +874,11 @@ impl ApplicationHandler for App {
             return;
         }
         let mut settings = config::load();
+        let lang = resolve_lang(&settings);
+        i18n::set_lang(lang);
         // The CJK fallback font is a tens-of-MB .ttc; read it while the adapter/device
         // request runs instead of after it. Joined (not polled) at install time.
-        let cjk_font = std::thread::spawn(|| {
-            CJK_FONT_CANDIDATES
-                .iter()
-                .find_map(|p| std::fs::read(p).ok())
-        });
+        let cjk_font = std::thread::spawn(move || load_cjk_fonts(lang));
         let attrs = Window::default_attributes()
             .with_title("yosh")
             .with_window_icon(window_icon());
@@ -821,7 +918,7 @@ impl ApplicationHandler for App {
         let egui_ctx = egui::Context::default();
         // A panicked reader thread degrades to "no CJK fallback" — already the
         // behavior on a system with none of the candidate fonts installed.
-        install_fonts(&egui_ctx, cjk_font.join().unwrap_or(None));
+        install_fonts(&egui_ctx, cjk_font.join().unwrap_or_default());
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -973,6 +1070,8 @@ impl ApplicationHandler for App {
             .map(|t| t == winit::window::Theme::Dark)
             .unwrap_or(true);
         self.state = Some(State {
+            font_lang: lang,
+            font_load: None,
             window,
             gpu,
             reader,
@@ -1521,6 +1620,25 @@ impl State {
             // so it never reaches here.
             Action::Quit => {}
         }
+    }
+
+    /// Switch the UI language live. Everything drawn per frame follows on its own;
+    /// the cached info overlay is rebuilt, and when the new language needs other
+    /// CJK glyph forms the fallback fonts are re-read off-thread (installed by
+    /// `render` when the read lands, which wakes the loop).
+    fn set_language(&mut self, lang: Lang) {
+        i18n::set_lang(lang);
+        self.info_for = None;
+        if !same_fonts(lang, self.font_lang) {
+            self.font_lang = lang;
+            let window = self.window.clone();
+            self.font_load = Some(std::thread::spawn(move || {
+                let fonts = load_cjk_fonts(lang);
+                window.request_redraw();
+                fonts
+            }));
+        }
+        self.window.request_redraw();
     }
 
     /// Raise a transient on-screen toast (boundary reached, zoom level).
@@ -3017,6 +3135,7 @@ impl State {
         self.ui.rotation = self.reader.rotation;
         self.ui.theme = self.settings.theme;
         self.ui.perf = self.settings.perf;
+        self.ui.lang_pref = self.settings.language.as_deref().and_then(Lang::from_token);
         // What `Auto` currently resolves to, so the picker shows the live answer
         // instead of leaving the user to guess.
         let t = tr();
@@ -3335,8 +3454,15 @@ impl State {
             current_key: self.volume_key.as_deref(),
             recents: &self.settings.recents,
         };
+        // A language switch's font read landed: install it before this frame lays out.
+        if self.font_load.as_ref().is_some_and(|h| h.is_finished())
+            && let Some(h) = self.font_load.take()
+        {
+            install_fonts(&self.egui_ctx, h.join().unwrap_or_default());
+        }
         // Theme the egui chrome (top bar, library grid, help/info windows) to match
-        // the page letterbox. Fonts are installed once at init and untouched by this.
+        // the page letterbox. Fonts are installed at init (and on a language switch)
+        // and untouched by this.
         self.egui_ctx.set_visuals(if dark {
             egui::Visuals::dark()
         } else {
@@ -3449,6 +3575,12 @@ impl State {
             self.settings.theme = t;
             config::save(&self.settings);
             self.window.request_redraw(); // repaint chrome + letterbox under the new theme
+            ui_acted = true;
+        }
+        if let Some(l) = self.ui.req_set_lang.take() {
+            self.settings.language = l.map(|l| l.token().to_string());
+            config::save(&self.settings);
+            self.set_language(resolve_lang(&self.settings));
             ui_acted = true;
         }
         if let Some(p) = self.ui.req_set_perf.take() {

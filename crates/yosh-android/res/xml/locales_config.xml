@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The UI languages yosh ships (yosh_engine::i18n::Lang). Lets Android 13+ list
+     yosh under Settings → App languages; the pick reaches the app through
+     YoshActivity.localeTag(), which the in-app "System" language follows. -->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en" />
+    <locale android:name="ja" />
+    <locale android:name="zh-Hans" />
+    <locale android:name="zh-Hant" />
+    <locale android:name="ko" />
+</locale-config>

@@ -51,6 +51,8 @@ pub struct UiState {
     /// by the app each frame.
     pub perf: crate::config::PerfPref,
     pub perf_auto: String,
+    /// The language picker's selection: `None` = follow the OS. Set each frame.
+    pub lang_pref: Option<yosh_engine::i18n::Lang>,
     /// Whether a volume is currently loaded. Distinguishes the onboarding panel
     /// (nothing open) from the library grid; set by the app each frame.
     pub reader_open: bool,
@@ -89,6 +91,8 @@ pub struct UiState {
     pub req_set_theme: Option<crate::config::ThemePref>,
     /// Direct performance-profile selection from the panel's radio group.
     pub req_set_perf: Option<crate::config::PerfPref>,
+    /// Language picked in the panel (`Some(None)` = back to following the OS).
+    pub req_set_lang: Option<Option<yosh_engine::i18n::Lang>>,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
     pub rescan: bool,
     /// Series whose section the user clicked to expand/collapse this frame
@@ -592,11 +596,10 @@ pub fn chrome(
                                 .file_name()
                                 .and_then(|s| s.to_str())
                                 .unwrap_or_else(|| p.to_str().unwrap_or(""));
-                            // Clip by char count (titles are often CJK) so a long name
-                            // can't push the other header buttons off-screen.
-                            let total = name.chars().count();
-                            let clip: String = name.chars().take(24).collect();
-                            let clip = if total > 24 { format!("{clip}…") } else { clip };
+                            // Clip by display width (titles are often CJK, twice as
+                            // wide) so a long name can't push the other header
+                            // buttons off-screen.
+                            let clip = yosh_engine::i18n::truncate_cols(name, 24);
                             format!("{}  {}", egui_phosphor::fill::BOOK_OPEN, (tr().resume_book)(&clip))
                         }
                         None => format!("{}  {}", egui_phosphor::fill::BOOK_OPEN, tr().resume),
@@ -1031,6 +1034,20 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 }
                 if ui.selectable_label(!st.resume_on_startup, t.off).clicked() && st.resume_on_startup {
                     st.req_toggle_resume = true;
+                }
+            });
+
+            // Each language is listed in its own script, so it's findable whatever
+            // the UI is currently showing.
+            ui.label(egui::RichText::new(t.language).strong());
+            ui.horizontal_wrapped(|ui| {
+                if ui.selectable_label(st.lang_pref.is_none(), t.lang_system).clicked() {
+                    st.req_set_lang = Some(None);
+                }
+                for l in yosh_engine::i18n::Lang::ALL {
+                    if ui.selectable_label(st.lang_pref == Some(l), l.native_name()).clicked() {
+                        st.req_set_lang = Some(Some(l));
+                    }
                 }
             });
 

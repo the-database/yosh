@@ -33,7 +33,7 @@ use winit::window::{Window, WindowId};
 
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
 use yosh_engine::gpu::GpuContext;
-use yosh_engine::i18n::tr;
+use yosh_engine::i18n::{self, tr, Lang};
 use yosh_engine::layout::Layout;
 use yosh_engine::page::{FitMode, PagePipeline};
 use yosh_engine::pool::{DecodePool, Waker};
@@ -104,6 +104,7 @@ fn android_main(app: AndroidApp) {
             DEFAULT_SPINE_STRENGTH,
             false,
             VolKeys::Off,
+            None,
         ));
     // Volume keys are delivered to us (winit's default hands them straight to the
     // OS): with the "Volume keys turn pages" option on they flip while reading.
@@ -456,6 +457,10 @@ struct App {
     /// Whether/which way the volume rocker flips pages while reading (persisted
     /// in view.txt; picked in options). Off ⇒ it adjusts the volume as usual.
     vol_keys: VolKeys,
+    /// UI language picked in options (persisted in view.txt); `None` follows the
+    /// OS, whose language (`system_lang`) is read once per App build.
+    lang_pref: Option<Lang>,
+    system_lang: Lang,
     /// Book-gutter shading on un-joined two-page spreads, and its peak darkening
     /// (persisted in view.txt; toggled in options). The reader takes the product.
     spine_shadow_on: bool,
@@ -924,15 +929,11 @@ impl ApplicationHandler for Shell {
         // Phosphor is installed unconditionally; egui's bundled fonts have no CJK
         // glyphs, so add the system Noto Sans CJK as a fallback when present so
         // Japanese comic / file names render instead of tofu squares.
-        let mut fonts = egui::FontDefinitions::default();
-        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
-        if let Some(cjk) = cjk_font() {
-            fonts.font_data.insert("cjk".to_owned(), cjk);
-            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts.families.entry(fam).or_default().push("cjk".to_owned());
-            }
-        }
-        egui_ctx.set_fonts(fonts);
+        // The UI language is resolved first: it picks the CJK face (Japanese vs.
+        // Korean vs. Simplified/Traditional Chinese glyph forms).
+        let system_lang = Lang::from_tag(&locale_tag(&self.android_app));
+        i18n::set_lang(self.init_view.12.unwrap_or(system_lang));
+        install_fonts(&egui_ctx, i18n::lang().cjk_face());
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -1041,6 +1042,8 @@ impl ApplicationHandler for Shell {
             layout_mode: self.init_view.1,
             resume_on_startup: self.init_view.5,
             vol_keys: self.init_view.11,
+            lang_pref: self.init_view.12,
+            system_lang,
             spine_shadow_on: self.init_view.8,
             spine_shadow_strength: self.init_view.9,
             theme: self.init_view.6,
@@ -2023,6 +2026,7 @@ impl Shell {
                 app.spine_shadow_strength,
                 app.reader.fit_no_upscale,
                 app.vol_keys,
+                app.lang_pref,
             );
         }
         if std::mem::take(&mut self.dirty_libroot)
@@ -2162,6 +2166,7 @@ type InitView = (
     f32,
     bool,
     VolKeys,
+    Option<Lang>,
 );
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
@@ -2181,6 +2186,7 @@ fn load_view(path: &Path) -> InitView {
     let (mut spine, mut spine_strength) = (false, DEFAULT_SPINE_STRENGTH);
     let mut no_upscale = false;
     let mut vol_keys = VolKeys::Off;
+    let mut lang = None;
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -2220,12 +2226,14 @@ fn load_view(path: &Path) -> InitView {
         no_upscale = t.get(10) == Some(&"noupscale");
         // 12th slot: volume keys turn pages (and which way); absent (older files) ⇒ off.
         vol_keys = VolKeys::parse(t.get(11));
+        // 13th slot: UI language token; absent or "system" ⇒ follow the OS.
+        lang = t.get(12).and_then(|tok| Lang::from_token(tok));
     }
-    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale, vol_keys)
+    (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale, vol_keys, lang)
 }
 
 /// Persist viewing options as
-/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale,vol_keys".
+/// "dir,layout,fit,anim,scroll,resume,theme,perf,spine,spine_strength,no_upscale,vol_keys,lang".
 #[allow(clippy::too_many_arguments)]
 fn save_view(
     path: &Path,
@@ -2241,6 +2249,7 @@ fn save_view(
     spine_strength: f32,
     no_upscale: bool,
     vol_keys: VolKeys,
+    lang: Option<Lang>,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -2259,7 +2268,8 @@ fn save_view(
     let ss = (spine_strength.clamp(0.0, 1.0) * 100.0).round() as i32;
     let nu = if no_upscale { "noupscale" } else { "stretch" };
     let vk = vol_keys.label();
-    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu},{vk}"));
+    let lg = lang.map_or("system", Lang::token);
+    write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu},{vk},{lg}"));
 }
 
 fn load_progress(path: &std::path::Path) -> HashMap<String, (u32, u32)> {
@@ -2320,15 +2330,37 @@ fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
 /// immutable and egui takes it behind an `Arc`, so every egui context this process
 /// builds can be handed the same one. `None` ⇒ the device has no such font (older /
 /// non-CJK builds), and the fallback is simply not installed.
-fn cjk_font() -> Option<Arc<egui::FontData>> {
-    static CJK_FONT: std::sync::OnceLock<Option<Arc<egui::FontData>>> = std::sync::OnceLock::new();
-    CJK_FONT
-        .get_or_init(|| {
-            let bytes = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()?;
-            log::info!("loaded CJK fallback font ({} KB)", bytes.len() / 1024);
-            Some(Arc::new(egui::FontData::from_owned(bytes)))
-        })
-        .clone()
+///
+/// The bytes are leaked once (process lifetime anyway) so each egui context — and
+/// each language switch — can borrow them as a `FontData` for whichever face of
+/// the collection the UI language wants, with no 31 MB copy.
+fn cjk_font(face: u32) -> Option<Arc<egui::FontData>> {
+    static CJK_BYTES: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
+    let bytes = (*CJK_BYTES.get_or_init(|| {
+        let bytes = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()?;
+        log::info!("loaded CJK fallback font ({} KB)", bytes.len() / 1024);
+        Some(&*Box::leak(bytes.into_boxed_slice()))
+    }))?;
+    let mut data = egui::FontData::from_static(bytes);
+    data.index = face;
+    Some(Arc::new(data))
+}
+
+/// Install the chrome fonts: Phosphor icon glyphs (seekbar buttons) plus the CJK
+/// fallback in face `cjk_face`. Phosphor is installed unconditionally; egui's
+/// bundled fonts have no CJK glyphs, so the system Noto Sans CJK goes in as a
+/// fallback when present, for the UI's own CJK text and Japanese comic / file
+/// names. Re-run on a language switch that changes the face.
+fn install_fonts(ctx: &egui::Context, cjk_face: u32) {
+    let mut fonts = egui::FontDefinitions::default();
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
+    if let Some(cjk) = cjk_font(cjk_face) {
+        fonts.font_data.insert("cjk".to_owned(), cjk);
+        for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            fonts.families.entry(fam).or_default().push("cjk".to_owned());
+        }
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Read one `/proc/meminfo` field in MB (the values are in kB).
@@ -3116,6 +3148,7 @@ fn options_popup(
     spine_strength: f32,
     resume_on: bool,
     vol_keys: VolKeys,
+    lang_pref: Option<Lang>,
     scroll_on: bool,
     theme: ThemePref,
     perf: PerfPref,
@@ -3130,6 +3163,7 @@ fn options_popup(
     set_spine_strength: &mut Option<f32>,
     set_resume: &mut Option<bool>,
     set_vol_keys: &mut Option<VolKeys>,
+    set_lang: &mut Option<Option<Lang>>,
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
     set_perf: &mut Option<PerfPref>,
@@ -3357,6 +3391,26 @@ fn options_popup(
                             .color(egui::Color32::from_white_alpha(150)),
                     );
 
+                    // Each language is listed in its own script, so it's findable
+                    // whatever the UI is currently showing.
+                    ui.label(egui::RichText::new(t.language).strong());
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .selectable_label(lang_pref.is_none(), egui::RichText::new(t.lang_system).size(16.0))
+                            .clicked()
+                        {
+                            *set_lang = Some(None);
+                        }
+                        for l in Lang::ALL {
+                            if ui
+                                .selectable_label(lang_pref == Some(l), egui::RichText::new(l.native_name()).size(16.0))
+                                .clicked()
+                            {
+                                *set_lang = Some(Some(l));
+                            }
+                        }
+                    });
+
                     ui.label(egui::RichText::new(t.theme).strong());
                     ui.horizontal(|ui| {
                         for (t, text) in [
@@ -3504,6 +3558,17 @@ fn adjust_volume(app: &AndroidApp, adj: i32) {
         env.call_method(activity, "adjustVolume", "(I)V", &[JValue::Int(adj)])?;
         Ok(())
     });
+}
+
+/// The UI locale's BCP-47 tag (per-app language if set, else the system's) — ""
+/// if the bridge fails, which resolves to English.
+fn locale_tag(app: &AndroidApp) -> String {
+    with_env(app, |env, activity| {
+        let s = env.call_method(activity, "localeTag", "()Ljava/lang/String;", &[])?.l()?;
+        let s = JString::from(s);
+        Ok(env.get_string(&s)?.into())
+    })
+    .unwrap_or_default()
 }
 
 /// Hide (true) / show (false) the Android status + navigation bars. The window
@@ -3976,6 +4041,7 @@ impl App {
         let cur_spine_strength = self.spine_shadow_strength;
         let cur_resume = self.resume_on_startup;
         let cur_vol_keys = self.vol_keys;
+        let cur_lang = self.lang_pref;
         let cur_scroll = self.reader.scroll_mode;
         let cur_theme = self.theme;
         let cur_perf = self.perf;
@@ -4118,6 +4184,7 @@ impl App {
         let mut set_spine_strength: Option<f32> = None;
         let mut set_resume: Option<bool> = None;
         let mut set_vol_keys: Option<VolKeys> = None;
+        let mut set_lang: Option<Option<Lang>> = None;
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
         let mut set_perf: Option<PerfPref> = None;
@@ -4137,9 +4204,7 @@ impl App {
         // book so it hints the destination; clip the title (by char count, since titles
         // are often CJK) so a long name can't push the other header buttons off-screen.
         let resume_label = (len > 0).then(|| {
-            let total = self.book_title.chars().count();
-            let t: String = self.book_title.chars().take(14).collect();
-            let t = if total > 14 { format!("{t}…") } else { t };
+            let t = i18n::truncate_cols(&self.book_title, 14);
             format!("{}  {}", egui_phosphor::fill::BOOK_OPEN, (tr().resume_book)(&t))
         });
         // While the bars are shown the window is still full-bleed (NativeActivity
@@ -4392,6 +4457,7 @@ impl App {
                         cur_spine_strength,
                         cur_resume,
                         cur_vol_keys,
+                        cur_lang,
                         cur_scroll,
                         cur_theme,
                         cur_perf,
@@ -4405,6 +4471,7 @@ impl App {
                         &mut set_spine_strength,
                         &mut set_resume,
                         &mut set_vol_keys,
+                        &mut set_lang,
                         &mut set_scroll,
                         &mut set_theme,
                         &mut set_perf,
@@ -4576,6 +4643,20 @@ impl App {
         if let Some(v) = set_vol_keys {
             self.vol_keys = v;
             self.persist_view();
+        }
+        if let Some(v) = set_lang {
+            // Live: per-frame text follows `set_lang` at once; the fonts change only
+            // when the new language wants another face of the CJK collection, and
+            // the cached info overlay is rebuilt.
+            self.lang_pref = v;
+            let lang = v.unwrap_or(self.system_lang);
+            if lang.cjk_face() != i18n::lang().cjk_face() {
+                install_fonts(&self.egui_ctx, lang.cjk_face());
+            }
+            i18n::set_lang(lang);
+            self.info_for = None;
+            self.persist_view();
+            self.window.request_redraw();
         }
         if let Some(v) = set_scroll {
             self.reader.scroll_mode = v;

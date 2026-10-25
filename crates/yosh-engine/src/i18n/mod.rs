@@ -11,11 +11,123 @@
 //! plurals too). Persistence tokens (`FitMode::label()` and friends) are *not*
 //! UI text and stay English; display code goes through [`tr`] instead.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use crate::layout::Layout;
 use crate::page::FitMode;
 use crate::reader::Direction;
 
 mod en;
+mod ja;
+mod ko;
+mod zh_hans;
+mod zh_hant;
+
+/// A UI language. `En` is the reference; the rest are community-correctable
+/// drafts (see the header of each language file).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lang {
+    En,
+    Ja,
+    ZhHans,
+    ZhHant,
+    Ko,
+}
+
+impl Lang {
+    /// Picker order.
+    pub const ALL: [Lang; 5] = [Lang::En, Lang::Ja, Lang::ZhHans, Lang::ZhHant, Lang::Ko];
+
+    /// The language's own name — what the picker shows, whatever the UI language.
+    pub fn native_name(self) -> &'static str {
+        match self {
+            Lang::En => "English",
+            Lang::Ja => "日本語",
+            Lang::ZhHans => "简体中文",
+            Lang::ZhHant => "繁體中文",
+            Lang::Ko => "한국어",
+        }
+    }
+
+    /// Persistence token (a BCP-47 tag).
+    pub fn token(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Ja => "ja",
+            Lang::ZhHans => "zh-Hans",
+            Lang::ZhHant => "zh-Hant",
+            Lang::Ko => "ko",
+        }
+    }
+
+    /// Inverse of [`token`](Self::token); `None` for anything else (e.g. "system").
+    pub fn from_token(tok: &str) -> Option<Lang> {
+        Lang::ALL.into_iter().find(|l| l.token() == tok)
+    }
+
+    /// Best supported language for an OS locale tag, BCP-47 (`zh-Hant-TW`,
+    /// `ja-JP`) or POSIX (`zh_TW.UTF-8`). Chinese splits on script, else region:
+    /// Hant for an explicit `Hant` script or TW/HK/MO, Hans otherwise. Anything
+    /// unsupported is English.
+    pub fn from_tag(tag: &str) -> Lang {
+        // POSIX → BCP-47-ish: drop the codeset/modifier, `_` → `-`.
+        let tag = tag.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+        let mut parts = tag.split('-').map(|p| p.to_ascii_lowercase());
+        match parts.next().as_deref() {
+            Some("ja") => Lang::Ja,
+            Some("ko") => Lang::Ko,
+            Some("zh") => {
+                let rest: Vec<String> = parts.collect();
+                let has = |x: &str| rest.iter().any(|p| p == x);
+                if has("hant") || (!has("hans") && (has("tw") || has("hk") || has("mo"))) {
+                    Lang::ZhHant
+                } else {
+                    Lang::ZhHans
+                }
+            }
+            _ => Lang::En,
+        }
+    }
+
+    /// Face of the system Noto Sans CJK collection (`NotoSansCJK-Regular.ttc`) that
+    /// draws this language's glyph forms — the same index Android's fonts.xml uses.
+    /// English shows CJK only in file names, which are most often Japanese.
+    pub fn cjk_face(self) -> u32 {
+        match self {
+            Lang::En | Lang::Ja => 0,
+            Lang::Ko => 1,
+            Lang::ZhHans => 2,
+            Lang::ZhHant => 3,
+        }
+    }
+
+    fn strings(self) -> &'static Strings {
+        match self {
+            Lang::En => &en::EN,
+            Lang::Ja => &ja::JA,
+            Lang::ZhHans => &zh_hans::ZH_HANS,
+            Lang::ZhHant => &zh_hant::ZH_HANT,
+            Lang::Ko => &ko::KO,
+        }
+    }
+}
+
+/// The active language, as `Lang as u8`. A global because every corner of both
+/// shells (and the engine's toasts, raised deep in the reader) draws text.
+static CURRENT: AtomicU8 = AtomicU8::new(Lang::En as u8);
+
+/// Switch the UI language. Takes effect on the next string lookup — text drawn
+/// every frame follows immediately; text a shell caches (e.g. an info overlay)
+/// is the shell's to rebuild.
+pub fn set_lang(lang: Lang) {
+    CURRENT.store(lang as u8, Ordering::Relaxed);
+}
+
+/// The active UI language.
+pub fn lang() -> Lang {
+    let v = CURRENT.load(Ordering::Relaxed);
+    Lang::ALL.into_iter().find(|l| *l as u8 == v).unwrap_or(Lang::En)
+}
 
 /// One section of the F1 key help: a heading and its `(keys, what it does)` rows.
 pub struct HelpSection {
@@ -226,12 +338,60 @@ pub struct Strings {
     pub info_gpu: &'static str,
     pub info_layout: &'static str,
     pub info_direction: &'static str,
+
+    // --- language picker (both shells) ---
+    pub language: &'static str,
+    /// The "follow the OS language" choice.
+    pub lang_system: &'static str,
 }
 
 /// The active language's strings.
 #[inline]
 pub fn tr() -> &'static Strings {
-    &en::EN
+    lang().strings()
+}
+
+/// Display columns of a char: 2 for East Asian wide/fullwidth (CJK, kana, Hangul,
+/// fullwidth forms), else 1. An approximation of UAX #11 that covers what shows
+/// up in comic titles.
+fn char_cols(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+/// Clip `s` to at most `cols` display columns (wide chars count 2), appending
+/// "…" when anything was cut. Keeps a header button sized the same whether the
+/// title is Latin or CJK — a char count lets a CJK title run twice as wide.
+pub fn truncate_cols(s: &str, cols: usize) -> String {
+    let total: usize = s.chars().map(char_cols).sum();
+    if total <= cols {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = char_cols(c);
+        if used + w > cols {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
 }
 
 /// Short display name of a reading direction (top bar, toasts).
@@ -258,5 +418,80 @@ pub fn layout_short(l: Layout) -> &'static str {
     match l {
         Layout::Single => tr().layout_short_single,
         Layout::Spread => tr().layout_short_spread,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tags_map_to_languages() {
+        for (tag, want) in [
+            ("ja-JP", Lang::Ja),
+            ("ja", Lang::Ja),
+            ("ko-KR", Lang::Ko),
+            ("zh-CN", Lang::ZhHans),
+            ("zh", Lang::ZhHans),
+            ("zh-Hans-CN", Lang::ZhHans),
+            ("zh-SG", Lang::ZhHans),
+            ("zh-TW", Lang::ZhHant),
+            ("zh-HK", Lang::ZhHant),
+            ("zh-MO", Lang::ZhHant),
+            ("zh-Hant", Lang::ZhHant),
+            ("zh-Hant-HK", Lang::ZhHant),
+            ("zh-Hans-HK", Lang::ZhHans),
+            ("zh_TW.UTF-8", Lang::ZhHant),
+            ("zh_CN.UTF-8", Lang::ZhHans),
+            ("ja_JP.eucJP@x", Lang::Ja),
+            ("en-US", Lang::En),
+            ("fr-FR", Lang::En),
+            ("C", Lang::En),
+            ("", Lang::En),
+        ] {
+            assert_eq!(Lang::from_tag(tag), want, "{tag}");
+        }
+    }
+
+    #[test]
+    fn tokens_round_trip() {
+        for l in Lang::ALL {
+            assert_eq!(Lang::from_token(l.token()), Some(l));
+        }
+        assert_eq!(Lang::from_token("system"), None);
+    }
+
+    #[test]
+    fn every_language_interpolates_its_values() {
+        // Read each table directly (not via `tr()`), so this can't race other
+        // tests over the global language.
+        for l in Lang::ALL {
+            let t = l.strings();
+            assert!((t.unread)(7).contains('7'), "{l:?}");
+            assert!((t.reading_unread)(7).contains('7'), "{l:?}");
+            assert!((t.resume_book)("TITLE").contains("TITLE"), "{l:?}");
+            assert!((t.rotate_now)(270).contains("270"), "{l:?}");
+            assert!((t.toast_partial_archive)(42).contains("42"), "{l:?}");
+            assert!((t.couldnt_open)("x.png").contains("x.png"), "{l:?}");
+            assert!((t.update_to)("9.9.9").contains("9.9.9"), "{l:?}");
+            assert!((t.perf_auto_now)(t.perf_high, true).contains(t.perf_high), "{l:?}");
+            // The zoom toast keeps its line break: the toast layout counts it.
+            let z = (t.zoom_toast)(125.0, Some(t.fit_width));
+            assert!(z.contains("125.00") && z.contains('\n') && z.contains(t.fit_width), "{l:?}");
+            assert!(!(t.zoom_toast)(125.0, None).contains('\n'), "{l:?}");
+            // Same help shape as English, so no section silently goes missing.
+            assert_eq!(t.help_sections.len(), en::EN.help_sections.len(), "{l:?}");
+        }
+    }
+
+    #[test]
+    fn truncate_counts_wide_chars_double() {
+        assert_eq!(truncate_cols("short", 24), "short");
+        assert_eq!(truncate_cols("abcdefgh", 5), "abcde…");
+        // 6 CJK chars = 12 columns.
+        assert_eq!(truncate_cols("かぐや様は告らせたい", 12), "かぐや様は告…");
+        assert_eq!(truncate_cols("かぐや", 6), "かぐや");
+        // Mixed: "ab" (2) + "漫画" (4) = 6; the next wide char would make 8.
+        assert_eq!(truncate_cols("ab漫画です", 7), "ab漫画…");
     }
 }

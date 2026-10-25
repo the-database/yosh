@@ -256,4 +256,8 @@ pub static EN: Strings = Strings {
     info_gpu: "GPU",
     info_layout: "Layout",
     info_direction: "Direction",
+
+    // --- language picker ---
+    language: "Language",
+    lang_system: "System",
 };
