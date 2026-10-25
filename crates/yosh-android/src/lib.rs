@@ -102,7 +102,7 @@ fn android_main(app: AndroidApp) {
             false,
             DEFAULT_SPINE_STRENGTH,
             false,
-            false,
+            VolKeys::Off,
         ));
     // Volume keys are delivered to us (winit's default hands them straight to the
     // OS): with the "Volume keys turn pages" option on they flip while reading.
@@ -452,9 +452,9 @@ struct App {
     layout_mode: LayoutMode,
     /// Reopen the last book on launch (persisted in view.txt; toggled in options).
     resume_on_startup: bool,
-    /// Volume Down/Up flip next/previous page while reading (persisted in
-    /// view.txt; toggled in options). Off ⇒ they adjust the volume as usual.
-    vol_keys: bool,
+    /// Whether/which way the volume rocker flips pages while reading (persisted
+    /// in view.txt; picked in options). Off ⇒ it adjusts the volume as usual.
+    vol_keys: VolKeys,
     /// Book-gutter shading on un-joined two-page spreads, and its peak darkening
     /// (persisted in view.txt; toggled in options). The reader takes the product.
     spine_shadow_on: bool,
@@ -719,6 +719,37 @@ impl ThemePref {
             Some(&"light") => ThemePref::Light,
             Some(&"dark") => ThemePref::Dark,
             _ => ThemePref::System,
+        }
+    }
+}
+
+/// Whether (and which way) the volume rocker turns pages while a book is open.
+/// Off by default: it takes the buttons away from the volume. Both directions are
+/// offered because "down = forward" and "up = forward" each feel natural to
+/// someone (and depend on which way the device is held).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum VolKeys {
+    Off,
+    /// Volume Down = next page, Volume Up = previous.
+    DownNext,
+    /// Volume Up = next page, Volume Down = previous.
+    UpNext,
+}
+
+impl VolKeys {
+    /// Persistence token (view.txt slot 12).
+    fn label(self) -> &'static str {
+        match self {
+            VolKeys::Off => "novolkeys",
+            VolKeys::DownNext => "volkeys",
+            VolKeys::UpNext => "volkeysup",
+        }
+    }
+    fn parse(tok: Option<&&str>) -> Self {
+        match tok {
+            Some(&"volkeys") => VolKeys::DownNext,
+            Some(&"volkeysup") => VolKeys::UpNext,
+            _ => VolKeys::Off,
         }
     }
 }
@@ -1378,9 +1409,17 @@ impl Shell {
         let rtl = app.reader.direction == Direction::Rtl;
         // `dir` is in story order (+1 = next page), like `flip`.
         let dir = match code {
-            KeyCode::AudioVolumeDown | KeyCode::AudioVolumeUp if !(reading && app.vol_keys) => None,
-            KeyCode::AudioVolumeDown => Some(1),
-            KeyCode::AudioVolumeUp => Some(-1),
+            KeyCode::AudioVolumeDown | KeyCode::AudioVolumeUp if !reading => None,
+            KeyCode::AudioVolumeDown => match app.vol_keys {
+                VolKeys::Off => None,
+                VolKeys::DownNext => Some(1),
+                VolKeys::UpNext => Some(-1),
+            },
+            KeyCode::AudioVolumeUp => match app.vol_keys {
+                VolKeys::Off => None,
+                VolKeys::DownNext => Some(-1),
+                VolKeys::UpNext => Some(1),
+            },
             KeyCode::ArrowDown | KeyCode::PageDown | KeyCode::Space | KeyCode::MediaTrackNext => {
                 Some(1)
             }
@@ -2121,7 +2160,7 @@ type InitView = (
     bool,
     f32,
     bool,
-    bool,
+    VolKeys,
 );
 
 /// Load the persisted per-comic positions (one `index\tkey` line each).
@@ -2140,7 +2179,7 @@ fn load_view(path: &Path) -> InitView {
     );
     let (mut spine, mut spine_strength) = (false, DEFAULT_SPINE_STRENGTH);
     let mut no_upscale = false;
-    let mut vol_keys = false;
+    let mut vol_keys = VolKeys::Off;
     if let Ok(s) = std::fs::read_to_string(path) {
         let t: Vec<&str> = s.trim().split(',').collect();
         if t.first() == Some(&"ltr") {
@@ -2178,8 +2217,8 @@ fn load_view(path: &Path) -> InitView {
             .unwrap_or(DEFAULT_SPINE_STRENGTH);
         // 11th slot: no-upscale fit; absent (older files) ⇒ off (stretch to fit).
         no_upscale = t.get(10) == Some(&"noupscale");
-        // 12th slot: volume keys turn pages; absent (older files) ⇒ off.
-        vol_keys = t.get(11) == Some(&"volkeys");
+        // 12th slot: volume keys turn pages (and which way); absent (older files) ⇒ off.
+        vol_keys = VolKeys::parse(t.get(11));
     }
     (dir, lay, fit, anim, scroll, resume, theme, perf, spine, spine_strength, no_upscale, vol_keys)
 }
@@ -2200,7 +2239,7 @@ fn save_view(
     spine: bool,
     spine_strength: f32,
     no_upscale: bool,
-    vol_keys: bool,
+    vol_keys: VolKeys,
 ) {
     let d = if dir == Direction::Rtl { "rtl" } else { "ltr" };
     let l = lay.label();
@@ -2218,7 +2257,7 @@ fn save_view(
     let sp = if spine { "spine" } else { "nospine" };
     let ss = (spine_strength.clamp(0.0, 1.0) * 100.0).round() as i32;
     let nu = if no_upscale { "noupscale" } else { "stretch" };
-    let vk = if vol_keys { "volkeys" } else { "novolkeys" };
+    let vk = vol_keys.label();
     write_atomic(path, &format!("{d},{l},{f},{a},{s},{r},{t},{p},{sp},{ss},{nu},{vk}"));
 }
 
@@ -3073,7 +3112,7 @@ fn options_popup(
     spine_on: bool,
     spine_strength: f32,
     resume_on: bool,
-    vol_keys_on: bool,
+    vol_keys: VolKeys,
     scroll_on: bool,
     theme: ThemePref,
     perf: PerfPref,
@@ -3087,7 +3126,7 @@ fn options_popup(
     set_spine_on: &mut Option<bool>,
     set_spine_strength: &mut Option<f32>,
     set_resume: &mut Option<bool>,
-    set_vol_keys: &mut Option<bool>,
+    set_vol_keys: &mut Option<VolKeys>,
     set_scroll: &mut Option<bool>,
     set_theme: &mut Option<ThemePref>,
     set_perf: &mut Option<PerfPref>,
@@ -3287,21 +3326,21 @@ fn options_popup(
                 // it takes the buttons away from the volume while a book is open.
                 ui.label(egui::RichText::new("Volume keys turn pages").strong());
                 ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(vol_keys_on, egui::RichText::new("On").size(16.0))
-                        .clicked()
-                    {
-                        *set_vol_keys = Some(true);
-                    }
-                    if ui
-                        .selectable_label(!vol_keys_on, egui::RichText::new("Off").size(16.0))
-                        .clicked()
-                    {
-                        *set_vol_keys = Some(false);
+                    for (v, text) in [
+                        (VolKeys::Off, "Off"),
+                        (VolKeys::DownNext, "Down = next"),
+                        (VolKeys::UpNext, "Up = next"),
+                    ] {
+                        if ui
+                            .selectable_label(vol_keys == v, egui::RichText::new(text).size(16.0))
+                            .clicked()
+                        {
+                            *set_vol_keys = Some(v);
+                        }
                     }
                 });
                 ui.label(
-                    egui::RichText::new("Volume Down = next page, Volume Up = previous. The library keeps normal volume.")
+                    egui::RichText::new("Only while a book is open; the library keeps normal volume.")
                         .size(12.0)
                         .color(egui::Color32::from_white_alpha(150)),
                 );
@@ -4065,7 +4104,7 @@ impl App {
         let mut set_spine_on: Option<bool> = None;
         let mut set_spine_strength: Option<f32> = None;
         let mut set_resume: Option<bool> = None;
-        let mut set_vol_keys: Option<bool> = None;
+        let mut set_vol_keys: Option<VolKeys> = None;
         let mut set_scroll: Option<bool> = None;
         let mut set_theme: Option<ThemePref> = None;
         let mut set_perf: Option<PerfPref> = None;
