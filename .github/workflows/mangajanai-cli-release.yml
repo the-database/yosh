@@ -1,0 +1,108 @@
+name: mangajanai-cli release
+
+# MangaJaNaiConverterGui's upscaling backend (crates/mangajanai-cli), released on its own tags so it
+# isn't tied to yosh's versions. MangaJaNaiConverterGui's package builder downloads
+# mangajanai-cli-windows-x64.zip from the release whose tag it pins.
+on:
+  push:
+    tags: ['mangajanai-cli-v*']   # tag a version -> build + publish a Release
+  workflow_dispatch: {}            # manual run -> build the artifact only
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/mangajanai-cli-v')
+        shell: bash
+        run: |
+          cargo_ver=$(grep -m1 '^version' crates/mangajanai-cli/Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          tag_ver="${GITHUB_REF_NAME#mangajanai-cli-v}"
+          echo "Cargo.toml=$cargo_ver  tag=$tag_ver"
+          [ "$cargo_ver" = "$tag_ver" ] || { echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_ver — bump crates/mangajanai-cli/Cargo.toml"; exit 1; }
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # AVIF input decoding needs dav1d (C), built static from source exactly as build-release.yml
+      # does for yosh: MSVC env, nasm, meson + ninja, pkg-config, then dav1d with /MT to match the
+      # +crt-static Rust build.
+      - name: Set up MSVC env
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
+            -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vs) { throw "no Visual Studio with the x64 C++ tools found" }
+          $oldPath = $env:Path -split ';'
+          cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set" | ForEach-Object {
+            if ($_ -notmatch '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { return }
+            $name, $value = $Matches[1], $Matches[2]
+            if ($name -eq 'Path') {
+              $new = @($value -split ';' | Where-Object { $_ -and ($oldPath -notcontains $_) })
+              [array]::Reverse($new)
+              $new | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+            } elseif ([Environment]::GetEnvironmentVariable($name) -ne $value) {
+              "$name=$value" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+      - name: Install nasm
+        shell: pwsh
+        run: |
+          choco install nasm -y --no-progress
+          "C:\Program Files\NASM" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install meson + ninja
+        run: pip install -U meson ninja
+      - name: dav1d env
+        shell: bash
+        run: |
+          echo 'PKG_CONFIG=C:\build\bin\pkg-config.exe' >> "$GITHUB_ENV"
+          echo 'PKG_CONFIG_PATH=C:\build\lib\pkgconfig' >> "$GITHUB_ENV"
+          echo 'C:\build\bin' >> "$GITHUB_PATH"
+          echo 'SYSTEM_DEPS_DAV1D_LINK=static' >> "$GITHUB_ENV"
+      - name: Build pkg-config + dav1d static
+        run: |
+          git clone --branch meson-glib-subproject --depth 1 https://gitlab.freedesktop.org/tpm/pkg-config.git
+          cd pkg-config
+          meson setup build --prefix=C:\build --buildtype=release
+          ninja -C build install
+          cd ..
+          git clone --branch 1.5.0 --depth 1 https://code.videolan.org/videolan/dav1d.git
+          cd dav1d
+          meson setup build --prefix=C:\build -Ddefault_library=static -Denable_tools=false -Denable_examples=false -Db_vscrt=mt --buildtype=release
+          ninja -C build install
+
+      - name: Test
+        run: cargo test -p mangajanai-cli
+
+      - name: Build
+        run: cargo build --release -p mangajanai-cli --features avif
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item target/release/mangajanai_upscale.exe package/
+          Compress-Archive -Path package/* -DestinationPath mangajanai-cli-windows-x64.zip -Force
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: mangajanai-cli-windows-x64
+          path: mangajanai-cli-windows-x64.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/mangajanai-cli-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: mangajanai-cli-windows-x64.zip
