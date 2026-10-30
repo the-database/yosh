@@ -24,6 +24,14 @@ use std::thread::JoinHandle;
 
 use unrar::Archive;
 
+// The bundled UnRAR (`unrar_sys`) calls the registry and CryptoAPI (advapi32)
+// without declaring the import itself. Binaries that already pull advapi32 in
+// (the reader, through its GUI stack) hid that; this crate's own test binary
+// doesn't, so declare it here.
+#[cfg(windows)]
+#[link(name = "advapi32")]
+unsafe extern "system" {}
+
 use super::{is_image_name, PageSource};
 
 /// How many pages *before* the resume hint pass 1 also extracts, so paging

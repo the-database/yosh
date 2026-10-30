@@ -15,15 +15,16 @@ pub mod decode;
 pub mod gesture;
 pub mod gpu;
 pub mod i18n;
-pub mod icc;
 pub mod layout;
 pub mod meta;
 pub mod page;
 pub mod pool;
 pub mod prefetch;
 pub mod reader;
-pub mod source;
 pub mod sr;
 pub mod texpool;
 pub mod thumbcache;
-pub mod tone;
+
+// The GPU-free imaging core lives in `yosh-image` (shared with batch tools);
+// re-exported so `yosh_engine::{icc, source, tone}` keep their paths.
+pub use yosh_image::{icc, source, tone};

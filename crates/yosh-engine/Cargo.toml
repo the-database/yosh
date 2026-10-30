@@ -12,11 +12,11 @@ default = ["rar"]
 # UnRAR source uses `lutimes`, absent from Android's Bionic libc, so it can't
 # cross-compile to Android — an Android shell builds the engine with
 # `--no-default-features` to drop it (folder / CBZ / 7z still work).
-rar = ["dep:unrar"]
+rar = ["yosh-image/rar"]
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so the
 # standard build needs no C toolchain. The `yosh` app forwards its own `avif`
 # feature to this one. Enabling requires nasm + dav1d (see CI).
-avif = ["image/avif-native"]
+avif = ["yosh-image/avif"]
 # The AI-upscale add-on's runtime binding (`sr::aji`): loads libaji from the
 # add-on directory at runtime via libloading (pure Rust — no C toolchain, and no
 # inference runtime linked). The `Upscaler` trait and the SR lane are always
@@ -24,35 +24,20 @@ avif = ["image/avif-native"]
 sr = ["dep:libloading"]
 
 [dependencies]
+# The GPU-free imaging core: decoders, ICC, tone curves, HQ resize, page sources.
+# default-features off so the engine's own `rar` feature decides (Android drops it).
+yosh-image = { path = "../yosh-image", default-features = false }
 wgpu = "30"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
+# GIF/WebP animation frames, thumbnails, the info overlay's format probe.
 image = "0.25"
 png = "0.18"
-jpeg-decoder = "0.3"
-# Pure-Rust JPEG XL decoder (no C toolchain). default-features = false keeps out
-# the optional lcms2 (C) / image / rayon features — color is managed via qcms and
-# pages parallelize across the DecodePool, so JXL decodes single-threaded.
+# The info overlay names a JXL's pixel format (`meta.rs`).
 jxl-oxide = { version = "0.12", default-features = false }
-# Pure-Rust PSD parser (renders a PSD's flattened 8-bit RGB composite).
-psd = "0.3"
 fast_image_resize = "6"
-qcms = "0.3"
 # ICO container parsing (multi-image .ico → layered pages) and re-encoding.
 ico = "0.6"
-natord = "1"
-# Archive page sources: zip/cbz (parallel reads), rar/cbr + 7z/cb7 (sequential —
-# a reader thread decompresses into an in-memory map served to readers).
-zip = "9"
-unrar = { version = "0.5", optional = true }
-sevenz-rust2 = "0.24"
-# Legacy archive-entry-name decoding (both pure Rust, no C toolchain). Zip stores
-# names as raw bytes and only flags UTF-8 via general-purpose bit 11; Japanese and
-# Chinese CBZs are routinely written with that flag clear and Shift-JIS/GBK bytes,
-# which the zip crate renders as CP437 mojibake. `chardetng` sniffs the codepage
-# (same detector Firefox uses) and `encoding_rs` decodes it. See `source::decode_entry_name`.
-chardetng = "1"
-encoding_rs = "0.8"
 libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]

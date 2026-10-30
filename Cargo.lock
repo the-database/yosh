@@ -5248,24 +5248,36 @@ name = "yosh-engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "crc32fast",
+ "fast_image_resize",
+ "ico",
+ "image",
+ "jpeg-encoder",
+ "jxl-oxide",
+ "libloading",
+ "png",
+ "pollster 1.0.1",
+ "wgpu",
+ "yosh-image",
+]
+
+[[package]]
+name = "yosh-image"
+version = "0.1.0"
+dependencies = [
  "chardetng",
  "crc32fast",
  "encoding_rs",
  "fast_image_resize",
- "ico",
  "image",
  "jpeg-decoder",
- "jpeg-encoder",
  "jxl-oxide",
- "libloading",
  "natord",
  "png",
- "pollster 1.0.1",
  "psd",
  "qcms",
  "sevenz-rust2",
  "unrar",
- "wgpu",
  "zip",
 ]
 

@@ -1,0 +1,37 @@
+[package]
+name = "yosh-image"
+version = "0.1.0"
+edition = "2024"
+description = "GPU-free imaging core of yosh: decode, color management, screentone-safe resizing, archive/folder page sources"
+
+[lib]
+name = "yosh_image"
+
+[features]
+default = ["rar"]
+# RAR/CBR support via the `unrar` crate (bundled UnRAR C++). The UnRAR source
+# uses `lutimes`, absent from Android's Bionic libc, so Android builds without it.
+rar = ["dep:unrar"]
+# AVIF decode via the image crate's native (dav1d) backend; needs nasm + dav1d.
+avif = ["image/avif-native"]
+
+[dependencies]
+image = "0.25"
+png = "0.18"
+jpeg-decoder = "0.3"
+# Pure-Rust JPEG XL decoder (no C toolchain). default-features = false keeps out
+# the optional lcms2 (C) / image / rayon features.
+jxl-oxide = { version = "0.12", default-features = false }
+psd = "0.3"
+fast_image_resize = "6"
+qcms = "0.3"
+natord = "1"
+zip = "9"
+unrar = { version = "0.5", optional = true }
+sevenz-rust2 = "0.24"
+chardetng = "1"
+encoding_rs = "0.8"
+
+[dev-dependencies]
+# Hand-building zips with raw (non-UTF-8) entry names in tests needs real CRCs.
+crc32fast = "1"
