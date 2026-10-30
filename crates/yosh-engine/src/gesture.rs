@@ -327,6 +327,9 @@ impl TouchGestures {
                         resp.redraw = true;
                     }
                     if let Some((d, mx, my)) = self.two_finger_metrics() {
+                        // Hold re-decodes until the pinch ends: a pause mid-pinch
+                        // isn't a settled zoom.
+                        reader.view_hold = true;
                         self.pinch = Some(Pinch {
                             dist0: d,
                             zoom0: reader.zoom,
@@ -469,6 +472,7 @@ impl TouchGestures {
                 self.touches.remove(&id);
                 if self.touches.len() < 2 {
                     self.pinch = None;
+                    reader.view_hold = false;
                 }
                 if self.touches.is_empty() {
                     let was_drag = std::mem::take(&mut self.page_drag);
@@ -679,6 +683,26 @@ mod tests {
         let up = g.on_touch(&mut r, &c, Phase::End, 2, 505.0, 1004.0, ms(t0, 520));
         assert_eq!(up.events, vec![GestureEvent::Tap { x: 500.0, y: 1000.0 }]);
         assert!(!up.redraw, "a tap leaves the redraw to the shell's tap handler");
+    }
+
+    // A pinch holds the reader's decode view unsettled from the second finger
+    // down until a finger lifts — pauses mid-pinch must not re-decode.
+    #[test]
+    fn pinch_holds_the_decode_view_until_release() {
+        let mut r = test_reader(false, 5);
+        let mut g = TouchGestures::new();
+        let (c, t0) = (ctx(), Instant::now());
+
+        g.on_touch(&mut r, &c, Phase::Start, 1, 400.0, 1000.0, t0);
+        assert!(!r.view_hold, "one finger is not a pinch");
+        g.on_touch(&mut r, &c, Phase::Start, 2, 600.0, 1000.0, ms(t0, 5));
+        assert!(r.view_hold, "the second finger starts a pinch");
+        g.on_touch(&mut r, &c, Phase::Move, 2, 700.0, 1000.0, ms(t0, 20));
+        assert!(r.view_hold);
+        g.on_touch(&mut r, &c, Phase::End, 2, 700.0, 1000.0, ms(t0, 40));
+        assert!(!r.view_hold, "a lifted finger ends the pinch");
+        g.on_touch(&mut r, &c, Phase::End, 1, 400.0, 1000.0, ms(t0, 50));
+        assert!(!r.view_hold);
     }
 
     // --- 2. zoomed-scroll routing -------------------------------------------

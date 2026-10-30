@@ -705,6 +705,11 @@ pub struct Reader {
     /// view is "settled" and target-change re-decodes are allowed.
     pub pending_view: (u32, u32, f32),
     pub view_settled: bool,
+    /// When `pending_view` last changed (see [`Reader::update_decode_view`]).
+    view_changed_at: Instant,
+    /// A gesture is still changing the view (a pinch in progress): hold off
+    /// re-decoding until it ends. Set and cleared by the gesture tracker.
+    pub view_hold: bool,
     /// True while a "settled view is GPU-downscaling" warning has already fired for
     /// the current episode, so the tripwire logs once, not per frame.
     pub gpu_downscale_warned: bool,
@@ -767,6 +772,12 @@ pub struct Reader {
     /// `None` when the tail needs (re)building — see [`LQ_TAIL_RESTRIDE`].
     lq_tail_pivot: Option<usize>,
 }
+
+/// How long the decode view (viewport size, zoom) must hold still before cached
+/// pages re-decode at their new targets ([`Reader::update_decode_view`]). Long
+/// enough to ride over the gaps between touch samples, wheel notches and resize
+/// events; short enough that the sharp page follows a finished zoom promptly.
+pub const SETTLE: Duration = Duration::from_millis(150);
 
 /// Everything the `prefetch()` job list depends on. Cache/failed contents are
 /// captured via change counters (`PageCache::epoch`) rather than the sets
@@ -863,6 +874,8 @@ impl Reader {
             viewport: Viewport::default(),
             pending_view: (0, 0, 1.0),
             view_settled: false,
+            view_changed_at: Instant::now(),
+            view_hold: false,
             gpu_downscale_warned: false,
             pan_edge_at: None,
             pending_toasts: Vec::new(),
@@ -1891,15 +1904,30 @@ impl Reader {
     }
 
     /// Debounce the decode view. While the surface size or zoom is changing (a
-    /// resize/zoom drag) the view is "unsettled" and `prefetch` won't re-decode
-    /// cached pages for a target change — it just keeps showing the old textures.
-    /// Once the value holds for a frame the view settles and stale pages re-decode
+    /// resize/zoom drag, a pinch) the view is "unsettled" and `prefetch` won't
+    /// re-decode cached pages for a target change — it just keeps showing the old
+    /// textures. Once the value has held for [`SETTLE`] (and no pinch is in
+    /// progress, [`Reader::view_hold`]) the view settles and stale pages re-decode
     /// in place (no black frame). Page-flipping leaves the view settled, so it
     /// never re-decodes.
+    ///
+    /// Not "unchanged for one frame": the shells keep drawing while unsettled, so
+    /// the very next frame usually lands before the next touch sample and saw the
+    /// same zoom — every sample of a pinch then settled one frame later and
+    /// re-decoded the whole prefetch window at an intermediate zoom (measured on a
+    /// tablet with 17 MP pages: 632 full decodes, ~93 s of CPU, for one ~20 s
+    /// pinch in and out).
     pub fn update_decode_view(&mut self) {
+        self.update_decode_view_at(Instant::now());
+    }
+
+    fn update_decode_view_at(&mut self, now: Instant) {
         let desired = (self.viewport.w, self.viewport.h, self.zoom);
-        self.view_settled = desired == self.pending_view;
-        self.pending_view = desired;
+        if desired != self.pending_view {
+            self.pending_view = desired;
+            self.view_changed_at = now;
+        }
+        self.view_settled = !self.view_hold && now.duration_since(self.view_changed_at) >= SETTLE;
     }
 
     /// Recompute the prefetch window and hand it to the pool with each page's exact
@@ -3026,6 +3054,44 @@ mod tests {
         r.source = Some(Arc::new(NamesSource((0..pages).map(|i| format!("{i:03}.png")).collect())));
         r.viewport = Viewport { w: 1000, h: 1000 };
         r
+    }
+
+    /// The decode view settles only after [`super::SETTLE`] of stillness, never
+    /// while a pinch holds it. The old rule ("unchanged since last frame") settled
+    /// one frame after every touch sample of a pinch, because the shells keep
+    /// drawing while unsettled — re-decoding the whole window at each
+    /// intermediate zoom.
+    #[test]
+    fn decode_view_settles_after_a_quiet_period_and_not_mid_pinch() {
+        use std::time::Duration;
+        let mut r = spread_reader(crate::layout::Layout::Single, false, 4);
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let settle = super::SETTLE.as_millis() as u64;
+
+        r.update_decode_view_at(at(0)); // first sight of this view = a change
+        assert!(!r.view_settled);
+        r.update_decode_view_at(at(16)); // the next frame, nothing moved yet
+        assert!(!r.view_settled, "one still frame is not a settled view");
+        r.update_decode_view_at(at(settle));
+        assert!(r.view_settled, "still for SETTLE → settled");
+
+        // Pinch samples keep moving the zoom: each one restarts the clock.
+        r.zoom = 1.1;
+        r.update_decode_view_at(at(settle + 8));
+        assert!(!r.view_settled);
+        r.zoom = 1.2;
+        r.update_decode_view_at(at(2 * settle));
+        assert!(!r.view_settled, "zoom moved within the quiet period");
+
+        // Fingers resting mid-pinch: still, but held — not settled.
+        r.view_hold = true;
+        r.update_decode_view_at(at(10 * settle));
+        assert!(!r.view_settled, "a pinch in progress never settles");
+        // Lift-off: the zoom has been still all along, so it settles at once.
+        r.view_hold = false;
+        r.update_decode_view_at(at(10 * settle + 16));
+        assert!(r.view_settled);
     }
 
     /// Mark page `w` a joined spread and re-anchor exactly as `drain_pool` does
