@@ -16,6 +16,7 @@ use crate::i18n::tr;
 use crate::layout::{Grid, Layout, WideSet};
 use crate::page::{fit_scale, FitMode, PageTexture, MAX_QUADS};
 use crate::pool::{DecodePool, Msg, Waker};
+use crate::sr::{SrSkip, Upscaler};
 use crate::prefetch::desired_window;
 use crate::source::PageSource;
 use crate::texpool::TexturePool;
@@ -658,6 +659,22 @@ pub struct Reader {
     /// The shell's frame-wake callback, remembered so every pool the reader
     /// (re)builds gets it. Set once per window via [`Reader::set_waker`].
     pub waker: Option<Waker>,
+    /// The SR add-on's upscaler (see [`crate::sr`]), remembered like `waker` so every
+    /// pool the reader (re)builds gets it. `None` = no add-on: no SR lane, no SR
+    /// jobs, decoding exactly as without the feature.
+    pub upscaler: Option<Arc<dyn Upscaler>>,
+    /// Per-book AI-upscale switch (the shell's toggle key); only meaningful with an
+    /// upscaler installed. Off reverts upscaled pages to plain decodes in place.
+    sr_on: bool,
+    /// Pages the SR lane produced nothing for, with the target they were tried at
+    /// and why: not re-queued until their target changes or the upscaler's epoch
+    /// moves.
+    sr_skip: HashMap<usize, (u32, SrSkip)>,
+    /// The upscaler epoch `sr_skip` was collected under.
+    sr_skip_epoch: u64,
+    /// Bumped on every `Msg::SrSkipped`, so the job list is rebuilt even when a
+    /// re-skip only replaces an entry (the map's length wouldn't change).
+    sr_skip_gen: u64,
     /// Pages whose decode errored, mapped to the error message (shown to the user).
     pub failed: HashMap<usize, String>,
 
@@ -779,6 +796,38 @@ pub struct Reader {
 /// events; short enough that the sharp page follows a finished zoom promptly.
 pub const SETTLE: Duration = Duration::from_millis(150);
 
+/// AI upscaling's status for the page(s) in view ([`Reader::sr_view_state`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum SrViewState {
+    /// Queued or running: the upscaled page will swap in shortly.
+    Working,
+    /// Waiting for the model (a first-use TensorRT engine build).
+    Preparing,
+    /// The page on screen is the upscaled one (possibly being re-sized for a
+    /// new zoom, which is quick).
+    Done,
+    /// Shown at or below its native size (or an animation/transparent page):
+    /// nothing for a model to improve.
+    NotNeeded,
+    /// No model applies to this page.
+    NoModel,
+    /// The model or runtime failed.
+    Failed(String),
+}
+
+impl SrViewState {
+    /// For a spread, which page's state to report: activity first, then
+    /// problems, then results.
+    fn rank(&self) -> u8 {
+        match self {
+            SrViewState::Working | SrViewState::Preparing => 4,
+            SrViewState::Failed(_) | SrViewState::NoModel => 3,
+            SrViewState::Done => 2,
+            SrViewState::NotNeeded => 1,
+        }
+    }
+}
+
 /// Everything the `prefetch()` job list depends on. Cache/failed contents are
 /// captured via change counters (`PageCache::epoch`) rather than the sets
 /// themselves; `zoom` as bits so the key is `Eq`-comparable.
@@ -822,6 +871,9 @@ struct JobsKey {
     /// `cache_epoch`, and those pages would otherwise never be reconsidered.
     wide_epoch: u64,
     failed_len: usize,
+    /// AI upscale: active (an upscaler + the per-book switch), the upscaler's
+    /// epoch, and the skip generation — any change re-walks the SR queue.
+    sr: (bool, u64, u64),
 }
 
 impl Reader {
@@ -851,6 +903,11 @@ impl Reader {
             lq_thumb_h: budget.lq_thumb_h,
             lq_tier: budget.lq_tier,
             waker: None,
+            upscaler: None,
+            sr_on: true,
+            sr_skip: HashMap::new(),
+            sr_skip_epoch: 0,
+            sr_skip_gen: 0,
             failed: HashMap::new(),
             index: 0,
             start_index,
@@ -922,6 +979,104 @@ impl Reader {
         }
     }
 
+    /// Install (or remove) the SR add-on's upscaler: remembered on the reader and
+    /// pushed to the live pool, like [`Self::set_waker`] — every site that rebuilds
+    /// `self.pool` must re-apply `reader.upscaler` too. Removing it reverts any
+    /// upscaled pages to plain decodes in place.
+    pub fn set_upscaler(&mut self, up: Option<Arc<dyn Upscaler>>) {
+        self.upscaler = up;
+        self.sr_skip.clear();
+        if let Some(pool) = &self.pool {
+            pool.set_upscaler(self.upscaler.clone());
+        }
+    }
+
+    /// Whether pages are being AI-upscaled right now (an upscaler is installed and
+    /// the per-book switch is on).
+    pub fn sr_active(&self) -> bool {
+        self.upscaler.is_some() && self.sr_on
+    }
+
+    /// The per-book AI-upscale switch (see [`Self::sr_active`]).
+    pub fn sr_enabled(&self) -> bool {
+        self.sr_on
+    }
+
+    pub fn set_sr_enabled(&mut self, on: bool) {
+        self.sr_on = on;
+    }
+
+    /// What AI upscaling is doing for the page(s) in view, for the shell's status
+    /// indicator — `None` when it isn't active (no add-on, or switched off for this
+    /// book) or nothing in view is decoded yet. For a spread, the busier page wins.
+    pub fn sr_view_state(&self) -> Option<SrViewState> {
+        if !self.sr_active() || self.source.is_none() {
+            return None;
+        }
+        let (a, b) = if self.scroll_mode {
+            (self.index, None)
+        } else {
+            self.view_pages(self.index)
+        };
+        std::iter::once(a)
+            .chain(b)
+            .filter_map(|i| self.sr_page_state(i))
+            .max_by_key(SrViewState::rank)
+    }
+
+    /// The model(s) that upscaled the page(s) in view, for the info overlay
+    /// ("a / b" when a spread's pages differ); `None` when nothing in view is
+    /// upscaled.
+    pub fn sr_model_label(&self) -> Option<String> {
+        let (a, b) = if self.scroll_mode {
+            (self.index, None)
+        } else {
+            self.view_pages(self.index)
+        };
+        let mut models: Vec<&str> = std::iter::once(a)
+            .chain(b)
+            .filter_map(|i| self.cache.get(i)?.sr_model.as_deref())
+            .collect();
+        models.dedup();
+        (!models.is_empty()).then(|| models.join(" / "))
+    }
+
+    /// Whether the SR lane should produce page `i` at `want`: an opaque still
+    /// shown above its source size, not already skipped at this target.
+    fn sr_wants(&self, i: usize, p: &PageTexture, want: u32, sr_active: bool) -> bool {
+        sr_active
+            && !p.lq
+            && p.frame_count() == 1
+            && want > p.src_h
+            && self.sr_skip.get(&i).map(|(t, _)| *t) != Some(want)
+    }
+
+    fn sr_page_state(&self, i: usize) -> Option<SrViewState> {
+        let p = self.cache.get(i)?;
+        let want = self.page_target_h(i);
+        // Already showing an upscaled image. A size change (zoom, resize) only
+        // re-sizes the kept model output — quick, and nothing to wait on — so
+        // it reads as done, not "upscaling…". (If the new size wants a model
+        // that isn't ready, the skip below reports that instead.)
+        if p.sr && (p.target_h == want || self.sr_wants(i, p, want, true)) {
+            return Some(SrViewState::Done);
+        }
+        if p.frame_count() != 1 || want <= p.src_h {
+            return Some(SrViewState::NotNeeded);
+        }
+        Some(match self.sr_skip.get(&i) {
+            Some((t, r)) if *t == want => match r {
+                SrSkip::NotReady => SrViewState::Preparing,
+                SrSkip::Unsupported => SrViewState::NotNeeded,
+                SrSkip::NoModel => SrViewState::NoModel,
+                SrSkip::Failed(e) => SrViewState::Failed(e.clone()),
+            },
+            // Eligible and not yet upscaled: queued or running (or waiting for
+            // the view to settle, which is just as transient).
+            _ => SrViewState::Working,
+        })
+    }
+
     /// Drain finished decodes from the pool into the right cache — full-res pages to
     /// `cache`, whole-volume LQ thumbnails to `lq_cache` — and record failures. Both
     /// shells call this once per frame (replaces a duplicated poll loop).
@@ -955,6 +1110,13 @@ impl Reader {
                 }
                 Msg::Failed { index, error } => {
                     self.failed.insert(index, error);
+                }
+                Msg::SrSkipped { index, target_h, reason } => {
+                    // A not-ready model is retried when the upscaler's epoch moves
+                    // (`prefetch` clears the map then); anything else stays skipped
+                    // at this target.
+                    self.sr_skip.insert(index, (target_h, reason));
+                    self.sr_skip_gen += 1;
                 }
             }
         }
@@ -1941,6 +2103,15 @@ impl Reader {
             return;
         };
         let len = src.len();
+        let sr_active = self.sr_active();
+        if let Some(up) = &self.upscaler {
+            let e = up.epoch();
+            if e != self.sr_skip_epoch {
+                // A model became usable: retry the pages it was skipped on.
+                self.sr_skip.clear();
+                self.sr_skip_epoch = e;
+            }
+        }
         // Shells call this every frame; skip the whole job-list rebuild when none
         // of its inputs changed since the last call (the queued jobs are still the
         // right desired set — workers drain them in place). Cache/failed changes
@@ -1962,6 +2133,7 @@ impl Reader {
             no_upscale: self.fit_no_upscale,
             cache_epoch: self.cache.epoch(),
             failed_len: self.failed.len(),
+            sr: (sr_active, self.sr_skip_epoch, self.sr_skip_gen),
         };
         if self.last_jobs_key == Some(key) {
             return;
@@ -1986,13 +2158,45 @@ impl Reader {
                     Some(p) => {
                         let target_stale = settled && p.target_h != want;
                         let quality_stale = !lq && p.lq; // have LQ, now want HQ
-                        (target_stale || quality_stale).then_some((i, want, lq, false))
+                        // AI upscale switched off / removed: back to a plain decode,
+                        // in place (the upscaled texture shows until it lands).
+                        let sr_revert = p.sr && !sr_active;
+                        // An upscaled page whose size changed is refreshed by the SR
+                        // lane (from its kept model output when it can) — not by a
+                        // plain decode first, which would flash it soft. Falls back
+                        // to the plain decode once SR no longer applies at `want`.
+                        let sr_refresh = target_stale && p.sr && self.sr_wants(i, p, want, sr_active);
+                        ((target_stale && !sr_refresh) || quality_stale || sr_revert)
+                            .then_some((i, want, lq, false))
                     }
                 }
             })
             .collect();
         if let Some(pool) = &self.pool {
             pool.set_jobs(jobs);
+        }
+        // AI upscale (the SR add-on): pages the normal path already shows at their
+        // settled target but *above* their source size — where the GPU would
+        // magnify — go to the pool's SR lane, nearest-first, to be re-decoded
+        // through the model and swapped in place. Only once the view has settled,
+        // so a resize drag doesn't churn inference. No upscaler → empty, no lane.
+        if self.upscaler.is_some() && let Some(pool) = &self.pool {
+            let sr_jobs: Vec<(usize, u32)> = if sr_active && settled {
+                window
+                    .iter()
+                    .filter_map(|&i| {
+                        let p = self.cache.get(i)?;
+                        let want = self.page_target_h(i);
+                        // First upscale (a plain page at its settled size), or a
+                        // refresh of an upscaled page whose size changed.
+                        let due = (!p.sr && p.target_h == want) || (p.sr && p.target_h != want);
+                        (due && self.sr_wants(i, p, want, true)).then_some((i, want))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            pool.set_sr_jobs(sr_jobs);
         }
         // Whole-volume LQ tier: a lowest-priority queue of tiny thumbnail jobs for
         // every page not in the HQ window, not already full-res cached, and not
@@ -2162,6 +2366,7 @@ mod tests {
             cache_epoch,
             wide_epoch,
             failed_len: 0,
+            sr: (false, 0, 0),
         };
         // `Layout` has no `Debug`, so compare with `==` rather than assert_eq!.
         assert!(key(7, 1, 0) == key(7, 99, 0), "a landing thumbnail must not rebuild the job list");
@@ -3443,6 +3648,7 @@ impl Reader {
                 // The rebuilt pool starts wakerless — hand it the shell's callback
                 // or landings from here on would never schedule a frame.
                 pool.set_waker(self.waker.clone());
+                pool.set_upscaler(self.upscaler.clone());
                 self.pool = Some(pool);
                 self.source = Some(new);
                 // Re-pairing can move the anchor even though the file didn't.

@@ -23,6 +23,7 @@ pub mod pool;
 pub mod prefetch;
 pub mod reader;
 pub mod source;
+pub mod sr;
 pub mod texpool;
 pub mod thumbcache;
 pub mod tone;

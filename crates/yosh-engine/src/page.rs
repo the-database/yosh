@@ -192,6 +192,10 @@ pub struct PageTexture {
     pub target_h: u32,
     /// Decoded via the fast LQ (seeking) tier — re-decode to HQ once settled.
     pub lq: bool,
+    /// Produced by the AI-upscale lane (the SR add-on) rather than a plain decode.
+    pub sr: bool,
+    /// The model that upscaled it (for the info overlay); `None` unless `sr`.
+    pub sr_model: Option<std::sync::Arc<str>>,
     /// Extra frames/layers 1..N (frame 0 is `texture`/`view`). `None` for stills.
     /// Animation (GIF/WebP) frames share this page's size; `.ico` layers may each
     /// be a different size, so recycling keys off each texture's own dimensions.
@@ -274,6 +278,8 @@ impl PageTexture {
             path: _,
             target_h: _,
             lq: _,
+            sr: _,
+            sr_model: _,
             anim,
             frame0_delay_ms: _,
             anim_total_ms: _,
@@ -443,6 +449,8 @@ impl PagePipeline {
             path: img.path,
             target_h,
             lq: false,
+            sr: false,
+            sr_model: None,
             anim: None,
             frame0_delay_ms: 0,
             anim_total_ms: 0,

@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use yosh_engine::reader::SrViewState;
 use yosh_engine::i18n::tr;
 
 use crate::library::{series_status, vol_state, LibCtx, Library, VolState};
@@ -51,6 +52,18 @@ pub struct UiState {
     /// by the app each frame.
     pub perf: crate::config::PerfPref,
     pub perf_auto: String,
+    /// AI upscaling (the optional add-on): the setting, the backend choice, and the
+    /// add-on's status line ("Ready · <GPU>", "Add-on not installed", …). Set by
+    /// the app each frame.
+    pub upscale: bool,
+    pub upscale_backend: crate::config::UpscaleBackend,
+    pub upscale_status: String,
+    /// The reader's AI-upscaling chip: shown while an upscaler is running
+    /// (`sr_available`); `sr_book_on` is the per-book switch, and `sr_state` what
+    /// upscaling is doing for the page in view. Set by the app each frame.
+    pub sr_available: bool,
+    pub sr_book_on: bool,
+    pub sr_state: Option<yosh_engine::reader::SrViewState>,
     /// The language picker's selection: `None` = follow the OS. Set each frame.
     pub lang_pref: Option<yosh_engine::i18n::Lang>,
     /// Whether a volume is currently loaded. Distinguishes the onboarding panel
@@ -91,6 +104,13 @@ pub struct UiState {
     pub req_set_theme: Option<crate::config::ThemePref>,
     /// Direct performance-profile selection from the panel's radio group.
     pub req_set_perf: Option<crate::config::PerfPref>,
+    /// AI-upscaling panel requests: the on/off switch, a backend pick, and "open
+    /// the add-on folder".
+    pub req_set_upscale: Option<bool>,
+    pub req_set_upscale_backend: Option<crate::config::UpscaleBackend>,
+    pub req_open_addon_folder: bool,
+    /// The AI chip was clicked: flip upscaling for this book (same as key `U`).
+    pub req_toggle_upscale: bool,
     /// Language picked in the panel (`Some(None)` = back to following the OS).
     pub req_set_lang: Option<Option<yosh_engine::i18n::Lang>>,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
@@ -124,6 +144,9 @@ pub struct UiState {
     /// appended to the info overlay each frame so HQ vs. a stray GPU resize is
     /// always visible. Empty when nothing is decoded yet.
     pub resize_path: String,
+    /// The AI model(s) that upscaled the page(s) in view (info overlay); empty
+    /// when nothing in view is upscaled.
+    pub sr_model: String,
     /// Touch scroll physics readout `(last release velocity, live glide velocity)`
     /// in px/s, appended to the info overlay once a touch fling has happened —
     /// makes "no physics" reports diagnosable from a screenshot. None until then.
@@ -589,6 +612,9 @@ pub fn chrome(
             if ui.button(tr().help).clicked() {
                 st.help_open = !st.help_open;
             }
+            if !library_view && st.sr_available && st.reader_open {
+                sr_chip(ui, st);
+            }
             if let Some(v) = st.update_version.clone() {
                 if st.updating {
                     ui.label(
@@ -769,7 +795,45 @@ pub fn chrome(
                                     );
                                     ui.end_row();
                                 }
+                                if !st.sr_model.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(tr().info_ai_model)
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&st.sr_model)
+                                            .color(egui::Color32::WHITE)
+                                            .monospace(),
+                                    );
+                                    ui.end_row();
+                                }
                             });
+                    });
+            });
+    }
+
+    // AI upscaling at work on the page in view: a small corner spinner (not the
+    // centered loading overlay — the page is already on screen, this only says a
+    // sharper one is coming), so it reads the same in fullscreen with no top bar.
+    if !library_view
+        && st.sr_book_on
+        && let Some(s @ (SrViewState::Working | SrViewState::Preparing)) = &st.sr_state
+    {
+        let text = if *s == SrViewState::Working { tr().sr_working } else { tr().sr_preparing };
+        egui::Area::new(egui::Id::new("sr_busy"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-14.0, -14.0))
+            .order(egui::Order::Foreground)
+            .interactable(false)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_black_alpha(150))
+                    .inner_margin(egui::Margin::symmetric(10, 6))
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new().size(13.0).color(egui::Color32::WHITE));
+                            ui.label(egui::RichText::new(text).color(egui::Color32::WHITE).size(13.0));
+                        });
                     });
             });
     }
@@ -1117,8 +1181,76 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
             if st.perf == crate::config::PerfPref::Auto && !st.perf_auto.is_empty() {
                 ui.label(egui::RichText::new(&st.perf_auto).weak().small());
             }
+
+            // AI upscaling — an optional add-on, off by default. The status line
+            // says whether it's installed and what it runs on.
+            ui.label(egui::RichText::new(t.ai_upscaling).strong())
+                .on_hover_text(t.upscale_pages);
+            ui.horizontal(|ui| {
+                if ui.selectable_label(st.upscale, t.on).clicked() && !st.upscale {
+                    st.req_set_upscale = Some(true);
+                }
+                if ui.selectable_label(!st.upscale, t.off).clicked() && st.upscale {
+                    st.req_set_upscale = Some(false);
+                }
+                if st.upscale {
+                    use crate::config::UpscaleBackend as B;
+                    ui.separator();
+                    let choices: &[(B, &str)] = if cfg!(windows) {
+                        &[(B::Auto, t.auto), (B::DirectMl, "DirectML"), (B::TensorRt, "TensorRT")]
+                    } else {
+                        &[(B::Auto, t.auto), (B::TensorRt, "TensorRT")]
+                    };
+                    for &(b, text) in choices {
+                        if ui.selectable_label(st.upscale_backend == b, text).clicked() {
+                            st.req_set_upscale_backend = Some(b);
+                        }
+                    }
+                }
+            });
+            if st.upscale && !st.upscale_status.is_empty() {
+                ui.label(egui::RichText::new(&st.upscale_status).small());
+            }
+            ui.label(egui::RichText::new(t.upscale_hint).weak().small());
+            if ui.button(t.open_addon_folder).clicked() {
+                st.req_open_addon_folder = true;
+            }
         });
     st.settings_open = open;
+}
+
+/// The top bar's "AI" chip: what upscaling is doing for the page in view (spinner
+/// while it works, then ✔ / – / ⚠, detail on hover). Click = the per-book
+/// switch (key `U`), so it doubles as the way back on when a book has it off.
+fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
+    let t = tr();
+    let (mark, color, tip): (&str, egui::Color32, String) = match (&st.sr_state, st.sr_book_on) {
+        (_, false) => ("off", ui.visuals().weak_text_color(), t.sr_book_off.into()),
+        (None, true) => ("", ui.visuals().weak_text_color(), t.sr_working.into()),
+        (Some(SrViewState::Working), _) => ("", ui.visuals().text_color(), t.sr_working.into()),
+        (Some(SrViewState::Preparing), _) => ("", ui.visuals().text_color(), t.sr_preparing_tip.into()),
+        (Some(SrViewState::Done), _) => ("\u{2714}", egui::Color32::from_rgb(130, 200, 130), t.sr_done.into()),
+        (Some(SrViewState::NotNeeded), _) => ("\u{2013}", ui.visuals().weak_text_color(), t.sr_not_needed.into()),
+        (Some(SrViewState::NoModel), _) => ("\u{26a0}", egui::Color32::from_rgb(220, 180, 100), t.sr_no_model.into()),
+        (Some(SrViewState::Failed(e)), _) => {
+            ("\u{26a0}", egui::Color32::from_rgb(220, 130, 130), (t.sr_failed)(e))
+        }
+    };
+    let busy = st.sr_book_on
+        && matches!(st.sr_state, Some(SrViewState::Working | SrViewState::Preparing));
+    let r = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if busy {
+                ui.add(egui::Spinner::new().size(12.0));
+            }
+            let text = if mark.is_empty() { "AI".to_string() } else { format!("AI {mark}") };
+            ui.add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()))
+        })
+        .inner;
+    if r.on_hover_text(tip).clicked() {
+        st.req_toggle_upscale = true;
+    }
 }
 
 /// First-run onboarding, rendered *inside* the library view when no library folder

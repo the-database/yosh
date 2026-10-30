@@ -23,6 +23,7 @@ use image::codecs::webp::WebPDecoder;
 use image::{AnimationDecoder, ImageDecoder};
 
 use crate::icc;
+use crate::sr::{SrOutcome, SrSkip, Upscaler};
 use crate::tone;
 
 const PNG_SIG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
@@ -70,6 +71,11 @@ pub enum ResizePath {
     GrayFromColor,
     /// Color source: Lanczos3 in gamma space (ICC→sRGB first if the page was tagged).
     Color,
+    /// AI-upscaled by the given factor (the SR add-on), then brought to the target
+    /// by the gray linear-light path — the model replaces the GPU magnification.
+    SrGray(u8),
+    /// AI-upscaled by the given factor, then Lanczos3 to the target.
+    SrColor(u8),
 }
 
 impl ResizePath {
@@ -79,6 +85,12 @@ impl ResizePath {
             ResizePath::GrayLinear => "gray linear-light (Catmull-Rom + Dot Gain)",
             ResizePath::GrayFromColor => "gray-from-color (Catmull-Rom + Dot Gain)",
             ResizePath::Color => "color (Lanczos3)",
+            ResizePath::SrGray(2) => "AI 2\u{d7} + gray linear-light (Catmull-Rom + Dot Gain)",
+            ResizePath::SrGray(4) => "AI 4\u{d7} + gray linear-light (Catmull-Rom + Dot Gain)",
+            ResizePath::SrGray(_) => "AI + gray linear-light (Catmull-Rom + Dot Gain)",
+            ResizePath::SrColor(2) => "AI 2\u{d7} + color (Lanczos3)",
+            ResizePath::SrColor(4) => "AI 4\u{d7} + color (Lanczos3)",
+            ResizePath::SrColor(_) => "AI + color (Lanczos3)",
         }
     }
 }
@@ -388,6 +400,15 @@ fn rgba_is_grayscale(rgba: &[u8], threshold: i32) -> bool {
     ratio <= threshold as f64 / 12.0
 }
 
+/// Drop the alpha channel (an opaque page's RGBA → packed RGB, for the upscaler).
+fn rgba_to_rgb(rgba: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
+    for px in rgba.as_chunks::<4>().0 {
+        out.extend_from_slice(&px[..3]);
+    }
+    out
+}
+
 /// Collapse RGBA to a single luminance channel (ITU-R 601, matching cv2's
 /// `COLOR_BGR2GRAY`): `Y = 0.299R + 0.587G + 0.114B`.
 fn rgba_to_luma(rgba: &[u8]) -> Vec<u8> {
@@ -507,13 +528,19 @@ fn downscale_color_fast(
     Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, path: ResizePath::Color, pixels: dst.into_vec() })
 }
 
-/// Decode page bytes (any supported format) and downscale to `target_h` on CPU,
-/// picking the grayscale or color resize strategy.
-pub fn decode_and_downscale(
-    bytes: &[u8],
-    target_h: u32,
-    resizer: &mut Resizer,
-) -> Result<DecodedImage, String> {
+/// A still page decoded at full resolution and color-managed to sRGB, before any
+/// resize — the shared front half of the HQ ([`decode_and_downscale`]) and AI
+/// upscale ([`decode_sr`]) paths.
+struct Prepared {
+    w: u32,
+    h: u32,
+    /// Single-channel source (`full` is 1 byte per pixel); RGBA otherwise.
+    gray_by_channels: bool,
+    full: Vec<u8>,
+    opaque: bool,
+}
+
+fn prepare(bytes: &[u8]) -> Result<Prepared, String> {
     let (w, h, gray_by_channels, mut full, profile) = decode_raw(bytes)?;
     // Color-manage to sRGB before any resampling: a color page tagged with a
     // wider profile (e.g. Display P3) would otherwise render desaturated. The
@@ -531,15 +558,30 @@ pub fn decode_and_downscale(
             && !icc::is_srgb(p) && !icc::is_gray(p) && !icc::is_cmyk(p) {
                 icc::to_srgb_rgba(p, &mut full);
             }
+    // A color page may carry transparency; opaque pages (the manga norm) keep the
+    // unchanged fast path. Computed once and reused for the routing decisions.
+    let opaque = gray_by_channels || is_opaque(&full);
+    Ok(Prepared { w, h, gray_by_channels, full, opaque })
+}
+
+/// Decode page bytes (any supported format) and downscale to `target_h` on CPU,
+/// picking the grayscale or color resize strategy.
+pub fn decode_and_downscale(
+    bytes: &[u8],
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    finish(prepare(bytes)?, target_h, resizer)
+}
+
+/// The back half of [`decode_and_downscale`]: size a prepared page to `target_h`.
+fn finish(p: Prepared, target_h: u32, resizer: &mut Resizer) -> Result<DecodedImage, String> {
+    let Prepared { w, h, gray_by_channels, mut full, opaque } = p;
     // Decoded size = scale to the display height (never upscaling past the source).
     // A page bigger than one GPU texture is rejected (full res is preserved up to
     // the limit; we don't silently downscale a 16k-px image to a blurry one).
     let (tw, th) = target_dims(w, h, target_h);
     check_fits(tw, th)?;
-
-    // A color page may carry transparency; opaque pages (the manga norm) keep the
-    // unchanged fast path. Computed once and reused for the routing decisions.
-    let opaque = gray_by_channels || is_opaque(&full);
 
     // No downscale needed (source already fits the target and the GPU limit):
     // show the decoded pixels unaltered — no resampling, no tone remap.
@@ -565,6 +607,101 @@ pub fn decode_and_downscale(
         }
         downscale_color(&full, w, h, tw, th, resizer)
     }
+}
+
+/// A page's full-size model output: what the model made of the whole source,
+/// before the final resize. It doesn't depend on the display size, so a zoom or
+/// window resize only needs [`sr_from_master`] again — not the model.
+pub struct SrMaster {
+    pub model: std::sync::Arc<str>,
+    pub scale: u32,
+    /// The source page's size; `pixels` is `scale` times it on both axes.
+    pub src_w: u32,
+    pub src_h: u32,
+    /// One luma channel (`true`) or packed RGB.
+    pub gray: bool,
+    pub pixels: Vec<u8>,
+}
+
+/// Result of [`decode_sr`].
+pub enum SrDecode {
+    /// The AI-upscaled page, sized to the target like any HQ decode, and the
+    /// model output it was sized from (kept by the pool for re-sizing).
+    Page(DecodedImage, std::sync::Arc<SrMaster>),
+    /// No upscaled page, and why — the normal decode stays. (A model or runtime
+    /// failure is an `Err` instead, carrying its message.)
+    Skipped(SrSkip),
+    /// The caller cancelled mid-inference.
+    Cancelled,
+}
+
+/// The AI-upscale sibling of [`decode_and_downscale`], for the pool's SR lane:
+/// decode at full resolution, upscale through `up` (gray pages — stored gray or
+/// visually gray — as one luma channel, color as RGB), then bring the result to
+/// `target_h` through the same HQ resize as every other page. So the GPU samples
+/// it 1:1: the model takes over exactly the magnification the GPU would otherwise
+/// do, and the single-resize invariant holds. `src_w`/`src_h` stay the file's.
+pub fn decode_sr(
+    bytes: &[u8],
+    target_h: u32,
+    up: &dyn Upscaler,
+    cancel: &dyn Fn() -> bool,
+    resizer: &mut Resizer,
+) -> Result<SrDecode, String> {
+    if is_multi_image(bytes) {
+        return Ok(SrDecode::Skipped(SrSkip::Unsupported));
+    }
+    let p = prepare(bytes)?;
+    if target_h <= p.h || !p.opaque {
+        return Ok(SrDecode::Skipped(SrSkip::Unsupported));
+    }
+    let gray = p.gray_by_channels || rgba_is_grayscale(&p.full, GRAYSCALE_THRESHOLD);
+    let input = if p.gray_by_channels {
+        p.full
+    } else if gray {
+        rgba_to_luma(&p.full)
+    } else {
+        rgba_to_rgb(&p.full)
+    };
+    let ch = if gray { 1 } else { 3 };
+    let (scale, out, model) = match up.upscale(p.w, p.h, ch, &input, target_h as f32 / p.h as f32, cancel) {
+        SrOutcome::Done { scale, pixels, model } => (scale, pixels, model),
+        SrOutcome::Skip => return Ok(SrDecode::Skipped(SrSkip::NoModel)),
+        SrOutcome::NotReady => return Ok(SrDecode::Skipped(SrSkip::NotReady)),
+        SrOutcome::Cancelled => return Ok(SrDecode::Cancelled),
+        SrOutcome::Failed(e) => return Err(e),
+    };
+    let master = std::sync::Arc::new(SrMaster { model, scale, src_w: p.w, src_h: p.h, gray, pixels: out });
+    let img = sr_from_master(&master, target_h, resizer)?;
+    Ok(SrDecode::Page(img, master))
+}
+
+/// Size a kept model output to `target_h` through the same HQ resize as every
+/// other page (so the GPU samples it 1:1). The back half of [`decode_sr`], and
+/// all a zoom/resize of an upscaled page needs while its model is unchanged.
+pub fn sr_from_master(m: &SrMaster, target_h: u32, resizer: &mut Resizer) -> Result<DecodedImage, String> {
+    let (sw, sh) = (m.src_w * m.scale, m.src_h * m.scale);
+    let (tw, th) = target_dims(sw, sh, target_h);
+    check_fits(tw, th)?;
+    let mut img = if m.gray {
+        if tw == sw && th == sh {
+            DecodedImage { w: sw, h: sh, src_w: sw, src_h: sh, gray: true, path: ResizePath::None, pixels: m.pixels.clone() }
+        } else {
+            downscale_gray(&m.pixels, sw, sh, tw, th, resizer)?
+        }
+    } else {
+        let rgba = rgb_to_rgba(&m.pixels, sw, sh);
+        if tw == sw && th == sh {
+            DecodedImage { w: sw, h: sh, src_w: sw, src_h: sh, gray: false, path: ResizePath::None, pixels: rgba }
+        } else {
+            downscale_color(&rgba, sw, sh, tw, th, resizer)?
+        }
+    };
+    img.src_w = m.src_w;
+    img.src_h = m.src_h;
+    let s = m.scale.min(u8::MAX as u32) as u8;
+    img.path = if m.gray { ResizePath::SrGray(s) } else { ResizePath::SrColor(s) };
+    Ok(img)
 }
 
 /// LQ sibling of `decode_and_downscale`: decode + a cheap gamma-space Bilinear
@@ -693,6 +830,17 @@ fn decode_ico(bytes: &[u8]) -> Result<Vec<DecodedImage>, String> {
     // Largest first, so the default-shown layer is the highest resolution.
     out.sort_by_key(|i| std::cmp::Reverse((i.w as u64) * (i.h as u64)));
     Ok(out)
+}
+
+/// Pages [`decode_page`] decodes as more than one image: `.ico` (layers), GIF
+/// (always frame-decoded) and animated WebP. Same magic checks as `decode_page`.
+fn is_multi_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x00, 0x00, 0x01, 0x00])
+        || bytes.starts_with(b"GIF8")
+        || (bytes.len() >= 12
+            && &bytes[0..4] == b"RIFF"
+            && &bytes[8..12] == b"WEBP"
+            && WebPDecoder::new(std::io::Cursor::new(bytes)).is_ok_and(|d| d.has_animation()))
 }
 
 /// Decode a page to a still image, an animation (GIF/WebP), or layered (`.ico`).
@@ -1058,5 +1206,176 @@ mod tests {
                 _ => panic!("{fmt:?} should be a still"),
             }
         }
+    }
+
+    /// A stand-in model: nearest-neighbour by a fixed factor, recording what it
+    /// was handed (channel count, target scale).
+    struct FakeUpscaler {
+        scale: u32,
+        outcome: fn() -> Option<SrOutcome>,
+        seen: std::sync::Mutex<Vec<(u32, f32)>>,
+    }
+
+    impl FakeUpscaler {
+        fn new(scale: u32) -> Self {
+            Self { scale, outcome: || None, seen: Default::default() }
+        }
+    }
+
+    impl Upscaler for FakeUpscaler {
+        fn upscale(&self, w: u32, h: u32, ch: u32, px: &[u8], ts: f32, _: &dyn Fn() -> bool) -> SrOutcome {
+            self.seen.lock().unwrap().push((ch, ts));
+            if let Some(o) = (self.outcome)() {
+                return o;
+            }
+            let (s, c) = (self.scale, ch as usize);
+            let mut out = Vec::with_capacity(px.len() * (s * s) as usize);
+            for y in 0..h * s {
+                for x in 0..w * s {
+                    let i = ((y / s) * w + x / s) as usize * c;
+                    out.extend_from_slice(&px[i..i + c]);
+                }
+            }
+            SrOutcome::Done { scale: s, pixels: out, model: "fake".into() }
+        }
+        fn epoch(&self) -> u64 {
+            0
+        }
+        fn model_for(&self, _: u32, _: bool, _: f32) -> Option<std::sync::Arc<str>> {
+            Some("fake".into())
+        }
+    }
+
+    fn png_bytes(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut enc = png::Encoder::new(&mut bytes, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(data).unwrap();
+        bytes
+    }
+
+    fn sr(bytes: &[u8], target_h: u32, up: &FakeUpscaler) -> SrDecode {
+        decode_sr(bytes, target_h, up, &|| false, &mut Resizer::new()).unwrap()
+    }
+
+    /// The single-resize invariant on the SR path: the model's output is brought to
+    /// exactly the on-screen size by the HQ CPU resize (so the GPU samples it 1:1),
+    /// and the page still reports the *file's* dimensions for zoom/aspect math.
+    #[test]
+    fn sr_lands_exactly_at_the_target_with_source_dims() {
+        let gray: Vec<u8> = (0..100 * 150).map(|i| (i % 251) as u8).collect();
+        let bytes = png_bytes(100, 150, png::ColorType::Grayscale, &gray);
+        let up = FakeUpscaler::new(2);
+        let SrDecode::Page(img, _) = sr(&bytes, 240, &up) else { panic!("gray page upscales") };
+        assert_eq!((img.w, img.h), (160, 240), "decoded to the drawn size");
+        assert_eq!((img.src_w, img.src_h), (100, 150), "source dims are the file's");
+        assert!(img.gray && img.path == ResizePath::SrGray(2));
+        assert_eq!(img.pixels.len(), 160 * 240);
+        assert_eq!(up.seen.lock().unwrap()[0], (1, 1.6), "gray goes in as one channel");
+
+        // Exactly the model's size: no resample at all.
+        let SrDecode::Page(img, _) = sr(&bytes, 300, &up) else { panic!() };
+        assert_eq!((img.w, img.h), (200, 300));
+
+        // Beyond the model's reach the texture caps at its output; the GPU magnifies
+        // the rest (the one permitted GPU resample).
+        let SrDecode::Page(img, _) = sr(&bytes, 900, &up) else { panic!() };
+        assert_eq!((img.w, img.h), (200, 300));
+    }
+
+    #[test]
+    fn sr_routes_color_and_visually_gray_pages() {
+        // Saturated color → RGB in, color path out.
+        let rgb: Vec<u8> = (0..40 * 60).flat_map(|i| [(i % 200) as u8, 30, 220]).collect();
+        let up = FakeUpscaler::new(4);
+        let SrDecode::Page(img, _) = sr(&png_bytes(40, 60, png::ColorType::Rgb, &rgb), 200, &up) else {
+            panic!("color page upscales")
+        };
+        assert!(!img.gray && img.path == ResizePath::SrColor(4));
+        assert_eq!((img.w, img.h, img.pixels.len()), (133, 200, 133 * 200 * 4));
+        assert_eq!(up.seen.lock().unwrap()[0].0, 3, "color goes in as RGB");
+
+        // An RGB file that is visually gray takes the 1-channel gray route.
+        let g: Vec<u8> = (0..40 * 60).flat_map(|i| [(i % 250) as u8; 3]).collect();
+        let up = FakeUpscaler::new(2);
+        let SrDecode::Page(img, _) = sr(&png_bytes(40, 60, png::ColorType::Rgb, &g), 100, &up) else {
+            panic!()
+        };
+        assert!(img.gray && img.path == ResizePath::SrGray(2));
+        assert_eq!(up.seen.lock().unwrap()[0].0, 1);
+    }
+
+    #[test]
+    fn sr_skips_what_it_should_not_touch() {
+        let gray = vec![128u8; 50 * 80];
+        let bytes = png_bytes(50, 80, png::ColorType::Grayscale, &gray);
+        let up = FakeUpscaler::new(2);
+        let unsupported = |d: SrDecode| matches!(d, SrDecode::Skipped(SrSkip::Unsupported));
+        // Shown at or below source size: nothing for a model to do.
+        assert!(unsupported(sr(&bytes, 80, &up)));
+        assert!(unsupported(sr(&bytes, 40, &up)));
+        // Transparent pages keep their alpha on the normal path.
+        let rgba: Vec<u8> = (0..50 * 80).flat_map(|_| [10, 200, 30, 100]).collect();
+        assert!(unsupported(sr(&png_bytes(50, 80, png::ColorType::Rgba, &rgba), 200, &up)));
+        // Animations aren't stills.
+        let mut gif = Vec::new();
+        {
+            use image::codecs::gif::GifEncoder;
+            let mut enc = GifEncoder::new(&mut gif);
+            for _ in 0..2 {
+                enc.encode_frame(image::Frame::new(image::RgbaImage::new(4, 4))).unwrap();
+            }
+        }
+        assert!(unsupported(sr(&gif, 64, &up)));
+        assert!(up.seen.lock().unwrap().is_empty(), "the model was never called");
+
+        // The model's own verdicts pass through.
+        let mut up = FakeUpscaler::new(2);
+        up.outcome = || Some(SrOutcome::NotReady);
+        assert!(matches!(sr(&bytes, 200, &up), SrDecode::Skipped(SrSkip::NotReady)));
+        up.outcome = || Some(SrOutcome::Skip);
+        assert!(matches!(sr(&bytes, 200, &up), SrDecode::Skipped(SrSkip::NoModel)));
+        up.outcome = || Some(SrOutcome::Failed("boom".into()));
+        assert!(decode_sr(&bytes, 200, &up, &|| false, &mut Resizer::new()).is_err());
+    }
+
+    /// Re-sizing a kept model output gives exactly what a full decode → model →
+    /// resize gives at that size — so a zoom of an upscaled page can skip the
+    /// model (and the file) entirely.
+    #[test]
+    fn resizing_a_kept_model_output_matches_a_full_upscale() {
+        let gray: Vec<u8> = (0..90 * 130).map(|i| (i * 37 % 256) as u8).collect();
+        let bytes = png_bytes(90, 130, png::ColorType::Grayscale, &gray);
+        let up = FakeUpscaler::new(4);
+        let mut r = Resizer::new();
+        let SrDecode::Page(_, master) = decode_sr(&bytes, 260, &up, &|| false, &mut r).unwrap() else {
+            panic!()
+        };
+        assert_eq!((master.scale, master.src_w, master.src_h, master.pixels.len()), (4, 90, 130, 360 * 520));
+        for target in [273, 400, 520, 700] {
+            let SrDecode::Page(full, _) = decode_sr(&bytes, target, &up, &|| false, &mut r).unwrap() else {
+                panic!()
+            };
+            let resized = sr_from_master(&master, target, &mut r).unwrap();
+            assert_eq!((resized.w, resized.h), (full.w, full.h), "target {target}");
+            assert!(resized.pixels == full.pixels, "target {target}: same pixels");
+            assert_eq!((resized.src_w, resized.src_h, resized.path), (90, 130, full.path));
+        }
+    }
+
+    /// The HQ path is `prepare` + `finish` now; it must still produce exactly what
+    /// it did (a native-size page passes through untouched, a gray page takes the
+    /// linear-light path).
+    #[test]
+    fn hq_decode_is_unchanged_by_the_sr_split() {
+        let gray: Vec<u8> = (0..64 * 96).map(|i| (i * 7 % 256) as u8).collect();
+        let bytes = png_bytes(64, 96, png::ColorType::Grayscale, &gray);
+        let mut r = Resizer::new();
+        let native = decode_and_downscale(&bytes, 200, &mut r).unwrap();
+        assert_eq!((native.w, native.h, native.path), (64, 96, ResizePath::None));
+        assert_eq!(native.pixels, gray, "native pixels unaltered");
+        let small = decode_and_downscale(&bytes, 48, &mut r).unwrap();
+        assert_eq!((small.w, small.h, small.path), (32, 48, ResizePath::GrayLinear));
     }
 }

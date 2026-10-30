@@ -80,6 +80,19 @@ impl PerfPref {
     }
 }
 
+/// Inference backend for the AI-upscaling add-on. `Auto` = DirectML on Windows
+/// (any DirectX 12 GPU, no engine builds), TensorRT elsewhere.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum UpscaleBackend {
+    #[default]
+    Auto,
+    #[serde(rename = "directml")]
+    DirectMl,
+    #[serde(rename = "tensorrt")]
+    TensorRt,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct Settings {
@@ -144,6 +157,13 @@ pub struct Settings {
     pub theme: ThemePref,
     /// Performance profile (Auto = full budget on AC, throttled on battery).
     pub perf: PerfPref,
+    /// AI upscaling (the optional add-on): pages shown above their source size are
+    /// re-drawn by a model. Off by default, and inert until the add-on is installed.
+    pub upscale: bool,
+    pub upscale_backend: UpscaleBackend,
+    /// Volume paths where AI upscaling was switched off with the per-book toggle
+    /// (key `U`). Absent ⇒ on, so the default stores nothing.
+    pub upscale_off: HashSet<String>,
     /// UI language as a `yosh_engine::i18n::Lang` token ("ja", "zh-Hant", …), or
     /// `None` to follow the OS display language.
     pub language: Option<String>,
@@ -177,6 +197,9 @@ impl Default for Settings {
             // Android shell, which defaults to System so e-ink panels get Light.
             theme: ThemePref::Dark,
             perf: PerfPref::Auto,
+            upscale: false,
+            upscale_backend: UpscaleBackend::Auto,
+            upscale_off: HashSet::new(),
             language: None,
             window: None,
         }
@@ -202,6 +225,19 @@ fn config_file() -> Option<PathBuf> {
     }
     directories::ProjectDirs::from("", "the-database", "yosh")
         .map(|d| d.config_dir().join("state.json"))
+}
+
+/// The AI-upscaling add-on's directory (see `addon.rs`): beside the exe in portable
+/// mode, else under the per-OS local data dir. `None` if neither resolves.
+pub fn addon_dir() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+        && is_portable_dir(dir)
+    {
+        return Some(dir.join("yosh-addons").join("upscale"));
+    }
+    directories::ProjectDirs::from("", "the-database", "yosh")
+        .map(|d| d.data_local_dir().join("addons").join("upscale"))
 }
 
 /// Directory for the cover-thumbnail cache. Portable mode keeps it beside the exe
