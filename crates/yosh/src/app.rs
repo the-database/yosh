@@ -2662,6 +2662,8 @@ impl State {
         self.reader.actual_cap_vh = b.actual_cap_vh;
         self.reader.lq_thumb_h = b.lq_thumb_h;
         self.reader.lq_tier = b.lq_tier;
+        self.reader.sr_ahead = b.sr_ahead;
+        self.reader.sr_behind = b.sr_behind;
         self.reader.cache.set_cap(b.cache_cap, current);
         self.reader.lq_cache.set_cap(b.lq_cap, current);
         self.reader.tex_pool.set_max_total(b.texpool_max);

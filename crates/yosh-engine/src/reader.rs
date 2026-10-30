@@ -294,6 +294,11 @@ pub struct Budget {
     pub lq_thumb_h: u32,
     /// How much of the volume the thumbnail tier covers (see [`LqTier`]).
     pub lq_tier: LqTier,
+    /// AI-upscale lookahead (the SR add-on): pages beyond the ones in view that
+    /// the SR lane upscales in advance, ahead and behind — within the prefetch
+    /// window, which bounds it anyway. The pages in view are always upscaled.
+    pub sr_ahead: usize,
+    pub sr_behind: usize,
 }
 
 impl Budget {
@@ -319,6 +324,10 @@ impl Budget {
             actual_cap_vh: None,
             lq_thumb_h: LQ_THUMB_H,
             lq_tier: LqTier::Full,
+            // The whole prefetch window: every page that has a decode ahead of
+            // the reader gets its upscale ahead of the reader too.
+            sr_ahead: fwd_max,
+            sr_behind: back,
         }
     }
 
@@ -338,6 +347,14 @@ impl Budget {
                 DeviceTier::Mid => (6, 32, 16, 10, 24, 4, 512, Some(4), 540, LqTier::Full),
                 DeviceTier::High => return b,
             };
+        // AI upscaling is the costliest work per page (GPU inference): Mid
+        // (Auto on battery) upscales a short way ahead, Low only what's in view.
+        let (sr_ahead, sr_behind) = match tier {
+            DeviceTier::Low => (0, 0),
+            _ => (3, 1),
+        };
+        b.sr_ahead = b.sr_ahead.min(sr_ahead);
+        b.sr_behind = b.sr_behind.min(sr_behind);
         b.workers = b.workers.min(workers);
         b.cache_cap = b.cache_cap.min(cache_cap);
         b.texpool_max = b.texpool_max.min(texpool_max);
@@ -656,6 +673,9 @@ pub struct Reader {
     pub lq_thumb_h: u32,
     /// [`Budget::lq_tier`] — how much of the volume the thumbnail tier covers.
     pub lq_tier: LqTier,
+    /// [`Budget::sr_ahead`] / [`Budget::sr_behind`] — the AI-upscale lookahead.
+    pub sr_ahead: usize,
+    pub sr_behind: usize,
     /// The shell's frame-wake callback, remembered so every pool the reader
     /// (re)builds gets it. Set once per window via [`Reader::set_waker`].
     pub waker: Option<Waker>,
@@ -790,6 +810,12 @@ pub struct Reader {
     lq_tail_pivot: Option<usize>,
 }
 
+/// Whether page `i` is within AI-upscale reach of the pages in view `lo..=hi`:
+/// in view, or up to `ahead` pages after / `behind` pages before them.
+fn sr_in_reach(i: usize, lo: usize, hi: usize, ahead: usize, behind: usize) -> bool {
+    (lo..=hi).contains(&i) || (i > hi && i - hi <= ahead) || (i < lo && lo - i <= behind)
+}
+
 /// How long the decode view (viewport size, zoom) must hold still before cached
 /// pages re-decode at their new targets ([`Reader::update_decode_view`]). Long
 /// enough to ride over the gaps between touch samples, wheel notches and resize
@@ -902,6 +928,8 @@ impl Reader {
             actual_cap_vh: budget.actual_cap_vh,
             lq_thumb_h: budget.lq_thumb_h,
             lq_tier: budget.lq_tier,
+            sr_ahead: budget.sr_ahead,
+            sr_behind: budget.sr_behind,
             waker: None,
             upscaler: None,
             sr_on: true,
@@ -2182,8 +2210,18 @@ impl Reader {
         // so a resize drag doesn't churn inference. No upscaler → empty, no lane.
         if self.upscaler.is_some() && let Some(pool) = &self.pool {
             let sr_jobs: Vec<(usize, u32)> = if sr_active && settled {
+                // Within the window, only as far around the view as the
+                // performance tier allows (`Budget::sr_ahead`/`sr_behind`).
+                let (a, b) = if self.scroll_mode {
+                    (self.index, None)
+                } else {
+                    self.view_pages(self.index)
+                };
+                let (lo, hi) = (a.min(b.unwrap_or(a)), a.max(b.unwrap_or(a)));
+                let (ahead, behind) = (self.sr_ahead, self.sr_behind);
                 window
                     .iter()
+                    .filter(|&&i| sr_in_reach(i, lo, hi, ahead, behind))
                     .filter_map(|&i| {
                         let p = self.cache.get(i)?;
                         let want = self.page_target_h(i);
@@ -2438,6 +2476,12 @@ mod tests {
         assert_eq!(low.actual_cap_vh, Some(2));
         assert_eq!(low.lq_thumb_h, 360);
         assert_eq!(low.lq_tier, LqTier::Windowed(64));
+        // AI upscaling: desktop/High covers the window, Mid a short lookahead,
+        // Low only what's in view.
+        assert_eq!((desktop.sr_ahead, desktop.sr_behind), (desktop.fwd_max, desktop.back));
+        assert_eq!((low.sr_ahead, low.sr_behind), (0, 0));
+        let mid = Budget::for_tier(DeviceTier::Mid, 1024, 8);
+        assert_eq!((mid.sr_ahead, mid.sr_behind), (3, 1));
 
         let mid = Budget::for_tier(DeviceTier::Mid, 1024, 8);
         assert_eq!(
@@ -3259,6 +3303,20 @@ mod tests {
         r.source = Some(Arc::new(NamesSource((0..pages).map(|i| format!("{i:03}.png")).collect())));
         r.viewport = Viewport { w: 1000, h: 1000 };
         r
+    }
+
+    /// AI-upscale reach around the view: the view itself always, then `ahead`
+    /// pages after it and `behind` before it (a spread's two pages are one view).
+    #[test]
+    fn sr_reach_is_the_view_plus_the_tier_lookahead() {
+        use super::sr_in_reach;
+        let reach = |lo, hi, ahead, behind| -> Vec<usize> {
+            (0..20).filter(|&i| sr_in_reach(i, lo, hi, ahead, behind)).collect()
+        };
+        assert_eq!(reach(5, 5, 0, 0), vec![5], "Low: the page in view only");
+        assert_eq!(reach(6, 7, 0, 0), vec![6, 7], "a spread is both pages");
+        assert_eq!(reach(6, 7, 3, 1), vec![5, 6, 7, 8, 9, 10], "Mid");
+        assert_eq!(reach(0, 0, 3, 1), vec![0, 1, 2, 3], "nothing before page 0");
     }
 
     /// The decode view settles only after [`super::SETTLE`] of stillness, never
