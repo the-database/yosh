@@ -3482,11 +3482,11 @@ impl State {
         } else {
             self.reader.drag_seam()
         };
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            ui::chrome(ctx, ui_state, lib, &libctx, library_view);
+        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+            ui::chrome(ui, ui_state, lib, &libctx, library_view);
             // Page-flip drag drop shadow — over the page, under the chrome.
             if let Some((frac, si)) = drag_seam {
-                ui::drag_shadow(ctx, frac, si);
+                ui::drag_shadow(ui.ctx(), frac, si);
             }
         });
         self.egui_state
@@ -3683,9 +3683,12 @@ impl State {
             size_in_pixels: [self.gpu.config.width, self.gpu.config.height],
             pixels_per_point: ppp,
         };
-        for (id, delta) in &full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.gpu.device, &self.gpu.queue, *id, delta);
+        // egui 0.36 can queue several deltas per texture in one frame; apply in order.
+        for (id, deltas) in &full_output.textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.gpu.device, &self.gpu.queue, *id, delta);
+            }
         }
         let user_cmds = self.egui_renderer.update_buffers(
             &self.gpu.device,
@@ -3723,7 +3726,7 @@ impl State {
         self.gpu
             .queue
             .submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
-        frame.present();
+        self.gpu.queue.present(frame);
 
         // Queue/evict library covers *after* presenting, so eviction can never free
         // a texture this frame just drew. The decode itself runs off-thread; finished

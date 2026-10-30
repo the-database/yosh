@@ -52,6 +52,7 @@ impl Gpu {
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto, // wgpu's historical (sRGB) choice
         };
         surface.configure(&ctx.device, &config);
 

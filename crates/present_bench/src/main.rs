@@ -176,6 +176,7 @@ impl Gpu {
             power_preference: wgpu::PowerPreference::HighPerformance,
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
+            apply_limit_buckets: false,
         }))
         .expect("adapter");
         println!("adapter: {:?}", adapter.get_info());
@@ -216,6 +217,7 @@ impl Gpu {
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto, // wgpu's historical (sRGB) choice
         };
         surface.configure(&device, &config);
 
@@ -407,7 +409,7 @@ impl Gpu {
             rp.draw(0..3, 0..1);
         }
         self.queue.submit([enc.finish()]);
-        frame.present();
+        self.queue.present(frame);
 
         self.frames += 1;
         self.frame_idx += 1;
