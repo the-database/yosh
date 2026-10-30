@@ -1,0 +1,26 @@
+[package]
+name = "mangajanai-cli"
+version = "0.1.0"
+edition = "2024"
+description = "MangaJaNaiConverterGui's upscaling backend: batch manga/image upscaling on yosh-image + libaji"
+
+# The GUI ships and runs this as mangajanai_upscale.exe.
+[[bin]]
+name = "mangajanai_upscale"
+path = "src/main.rs"
+
+[dependencies]
+yosh-image = { version = "0.1.0", path = "../yosh-image", features = ["aji"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+zip = "9"
+# Encoders. libwebp (C, through the `webp` crate's bundled build) is the one C dependency here; it
+# stays out of the yosh reader, whose default build is C-free. AVIF goes through ravif/rav1e
+# without its assembly (no nasm needed).
+png = "0.18"
+jpeg-encoder = "0.7.1"
+webp = "0.3.1"
+ravif = { version = "0.13.0", default-features = false, features = ["threading"] }
+
+[build-dependencies]
+embed-manifest = "1.5.1"

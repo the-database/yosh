@@ -1017,6 +1017,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed-manifest"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba92c8f4591bf29f89716b45e5f5f56577adbb81426e5620c6e994da7c88bb7a"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1361,6 +1367,12 @@ dependencies = [
  "smallvec",
  "vello_common",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "glow"
@@ -2112,6 +2124,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libwebp-sys"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54cd30df7c7165ce74a456e4ca9732c603e8dc5e60784558c1c6dc047f876733"
+dependencies = [
+ "cc",
+ "glob",
+]
+
+[[package]]
 name = "linebender_resource_handle"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2172,6 +2194,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1c46f3fcd2e888afdb01a07efc071cb21300e07c68d32c3e8b01b5c8cb1fcaa"
 dependencies = [
  "sha2",
+]
+
+[[package]]
+name = "mangajanai-cli"
+version = "0.1.0"
+dependencies = [
+ "embed-manifest",
+ "jpeg-encoder",
+ "png",
+ "ravif",
+ "serde",
+ "serde_json",
+ "webp",
+ "yosh-image",
+ "zip",
 ]
 
 [[package]]
@@ -4586,6 +4623,16 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "url",
  "web-sys",
+]
+
+[[package]]
+name = "webp"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c071456adef4aca59bf6a583c46b90ff5eb0b4f758fc347cea81290288f37ce1"
+dependencies = [
+ "image",
+ "libwebp-sys",
 ]
 
 [[package]]
