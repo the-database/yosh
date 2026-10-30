@@ -46,9 +46,14 @@ impl FolderSource {
         Ok(Self { paths, names })
     }
 
-    /// Index of the entry with the given file name, if present.
+    /// Index of the entry with the given file name, if present. An exact match wins;
+    /// failing that, a case-insensitive one — Windows opens `PAGE01.JPG` for a file
+    /// listed as `page01.jpg`, and missing it would start on the saved page instead.
     pub fn index_of_name(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|n| n == name)
+        self.names.iter().position(|n| n == name).or_else(|| {
+            let lower = name.to_lowercase();
+            self.names.iter().position(|n| n.to_lowercase() == lower)
+        })
     }
 }
 
@@ -102,6 +107,17 @@ mod tests {
         assert_eq!(*src.read_page(1).unwrap(), b"JPGDATA-TWO");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_of_name_exact_then_case_insensitive() {
+        let src = FolderSource {
+            paths: Vec::new(),
+            names: ["01.png", "02.JPG", "03.png"].map(String::from).to_vec(),
+        };
+        assert_eq!(src.index_of_name("02.JPG"), Some(1));
+        assert_eq!(src.index_of_name("02.jpg"), Some(1), "case differs from the listing");
+        assert_eq!(src.index_of_name("04.png"), None);
     }
 
     #[test]
