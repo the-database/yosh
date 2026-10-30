@@ -86,5 +86,10 @@ cargo build --release -p yosh --features avif   # requires nasm + dav1d (or a ve
 ```
 
 ## Benchmarks
+- `cargo run --release -p yosh-engine --example seek_bench -- "<book>"` — engine page throughput
+  (read, decode, HQ resize, GPU upload) through the real decode pool.
+- `scripts/flipbench.ps1 -Base <ref> -Book "<book>"` — UI frame timing (egui pass, submit/present,
+  frame pacing) of a `--features flipbench` build, base commit vs working tree.
+
 `crates/decode_bench` and `crates/present_bench` are the throwaway spikes that validated the throughput
 ceiling; see `SPIKES_RESULTS.md`.

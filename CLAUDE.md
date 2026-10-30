@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The single defining feature is **zero-hitch page turning and continuous scrolling**: a parallel
 decode-ahead pipeline keeps display-ready GPU textures buffered ahead of the read position, so a page
 change is just a texture swap. Performance is the point — treat the decode/render hot path as
-load-bearing and don't regress seek throughput (target ≈ 83 pages/sec; HQ path measures ~110+ pps).
+load-bearing and don't regress seek throughput (target ≈ 83 pages/sec; the real pipeline measures ~300 pps
+gray / ~175 pps color at a 1440-px target with `seek_bench`, and page turns are display-capped at the refresh rate).
 
 Cargo workspace, three crates:
 - `crates/yosh` — the application (everything below lives here).
@@ -24,7 +25,20 @@ cargo build --release -p yosh                          # build the shipping bina
 cargo check -p yosh                                    # fast type-check while iterating
 cargo test  -p yosh                                    # unit tests (live in layout.rs: spread/RTL pairing math)
 cargo test  -p yosh spread                             # run a subset of tests by name substring (e.g. spread_navigation)
+
+# Performance — run these when touching the decode path, the frame loop, or egui/wgpu/winit versions:
+cargo run --release -p yosh-engine --example seek_bench -- "<book>" [target_h] [runs]   # engine pages/sec
+scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]                # UI frame timing, base vs working tree
 ```
+
+- `seek_bench` drives the real `DecodePool` (read → decode → HQ resize → GPU upload) on a book: *bulk*
+  (whole book queued) and *seek* (holding "next" through the reader's prefetch window) pages/sec.
+- `flipbench` is an off-by-default feature (`--features flipbench`; the shipped binary contains none of
+  it): `yosh --flipbench <report> [book]` flips through the book at full speed (or redraws the library
+  600 frames) and writes per-frame `pre`/`acquire`/`ui`/`post` timings + frame intervals. A flipbench run
+  is always portable (never reads/writes the user's settings). `scripts/flipbench.ps1` builds both
+  sides into `target/flipbench-*`, alternates runs, and prints a side-by-side table; `-Base` must
+  already contain the feature.
 
 - `<path>` = a folder of images, or a `.cbz/.zip`, `.cbr/.rar`, or `.7z/.cb7` archive. No arg → library grid / keys overlay.
 - **The default build needs no C toolchain** — all decoders are pure-Rust (`png`, `jpeg-decoder`,

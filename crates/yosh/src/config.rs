@@ -183,13 +183,20 @@ impl Default for Settings {
     }
 }
 
+/// Portable mode is on when a `yosh-portable.txt` marker sits next to the exe — or
+/// during a `--flipbench` run, which must neither read the user's settings (runs
+/// have to be reproducible) nor write them.
+fn is_portable_dir(dir: &std::path::Path) -> bool {
+    dir.join("yosh-portable.txt").exists() || crate::flipbench_active()
+}
+
 fn config_file() -> Option<PathBuf> {
     // Portable mode: a `yosh-portable.txt` marker next to the exe keeps config
     // beside the exe (travels with the app, leaves nothing in %APPDATA%). The
     // portable zip ships the marker; the installer does not.
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
-        && dir.join("yosh-portable.txt").exists()
+        && is_portable_dir(dir)
     {
         return Some(dir.join("yosh-state.json"));
     }
@@ -203,7 +210,7 @@ fn config_file() -> Option<PathBuf> {
 pub fn cache_dir() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
-        && dir.join("yosh-portable.txt").exists()
+        && is_portable_dir(dir)
     {
         return Some(dir.join("yosh-thumbs"));
     }
