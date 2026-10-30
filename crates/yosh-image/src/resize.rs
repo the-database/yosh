@@ -92,3 +92,28 @@ pub fn bilinear(
 ) -> Result<Vec<u8>, String> {
     convolve(src, channels, wh, twh, FilterType::Bilinear, resizer)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Any size, up or down, every channel layout; a flat image stays flat.
+    #[test]
+    fn resizes_to_any_size_up_or_down() {
+        let mut r = Resizer::new();
+        let gray = vec![128u8; 40 * 30];
+        for (tw, th) in [(17, 13), (40, 30), (97, 71)] {
+            let out = gray_linear(&gray, (40, 30), (tw, th), &mut r).unwrap();
+            assert_eq!(out.len(), (tw * th) as usize);
+            assert!(out.windows(2).all(|w| w[0] == w[1]), "flat stays flat");
+            for ch in [1u8, 3, 4] {
+                let src = vec![200u8; 40 * 30 * ch as usize];
+                let l = lanczos(&src, ch, (40, 30), (tw, th), &mut r).unwrap();
+                assert_eq!(l.len(), (tw * th) as usize * ch as usize);
+                assert!(l.iter().all(|&v| v == 200));
+                assert_eq!(bilinear(&src, ch, (40, 30), (tw, th), &mut r).unwrap().len(), l.len());
+            }
+        }
+        assert!(lanczos(&[0; 10], 5, (1, 2), (2, 2), &mut r).is_err());
+    }
+}

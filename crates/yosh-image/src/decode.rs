@@ -386,3 +386,38 @@ pub fn rgba_to_luma(rgba: &[u8]) -> Vec<u8> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut enc = png::Encoder::new(&mut bytes, w, h);
+        enc.set_color(color);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(data).unwrap();
+        bytes
+    }
+
+    /// `decode` keeps alpha (gray+alpha → straight RGBA), unlike the display
+    /// contract of `decode_raw` (which drops it); plain gray stays 1 channel.
+    #[test]
+    fn decode_keeps_gray_alpha_as_straight_rgba() {
+        let ga = [10u8, 255, 200, 0, 90, 128, 255, 64];
+        let bytes = png(2, 2, png::ColorType::GrayscaleAlpha, &ga);
+        let img = decode(&bytes).unwrap();
+        assert_eq!((img.w, img.h, img.channels), (2, 2, 4));
+        assert_eq!(img.pixels, [10, 10, 10, 255, 200, 200, 200, 0, 90, 90, 90, 128, 255, 255, 255, 64]);
+        let raw = decode_raw(&bytes).unwrap();
+        assert!(raw.2 && raw.3 == [10, 200, 90, 255], "decode_raw drops alpha (yosh)");
+
+        let gray = decode(&png(2, 1, png::ColorType::Grayscale, &[7, 8])).unwrap();
+        assert_eq!((gray.channels, gray.pixels.as_slice()), (1, [7u8, 8].as_slice()));
+        let rgb = decode(&png(1, 1, png::ColorType::Rgb, &[1, 2, 3])).unwrap();
+        assert_eq!((rgb.channels, rgb.pixels.as_slice()), (4, [1u8, 2, 3, 255].as_slice()));
+        assert!(is_opaque(&rgb.pixels));
+        assert_eq!(rgba_to_rgb(&rgb.pixels), [1, 2, 3]);
+        assert_eq!(rgb_to_luma(&[255, 255, 255, 0, 0, 0]), [255, 0]);
+    }
+}

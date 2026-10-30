@@ -14,6 +14,9 @@ default = ["rar"]
 rar = ["dep:unrar"]
 # AVIF decode via the image crate's native (dav1d) backend; needs nasm + dav1d.
 avif = ["image/avif-native"]
+# `aji`: bindings to libaji's still-image ABI (aji_image.h), loaded at runtime via
+# libloading — pure Rust, no inference runtime linked.
+aji = ["dep:libloading"]
 
 [dependencies]
 image = "0.25"
@@ -31,6 +34,7 @@ unrar = { version = "0.5", optional = true }
 sevenz-rust2 = "0.24"
 chardetng = "1"
 encoding_rs = "0.8"
+libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # Hand-building zips with raw (non-UTF-8) entry names in tests needs real CRCs.
