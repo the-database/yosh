@@ -59,6 +59,11 @@ windows-sys = { version = "0.61", features = [
 winresource = "0.1"
 
 [features]
+default = ["sr"]
+# The AI-upscaling add-on's runtime loader (engine `sr` feature: libloading, pure
+# Rust). ON by default but inert: the heavy part — libaji, its DirectML/TensorRT
+# runtimes and the models — is a separate download the user opts into.
+sr = ["yosh-engine/sr"]
 # AVIF decode via the image crate's native (dav1d) backend. OFF by default so
 # the standard `cargo build` needs no C toolchain. Enabling it requires nasm +
 # dav1d (or a vendored build): `cargo build --release -p yosh --features avif`.

@@ -19,6 +19,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use fast_image_resize::Resizer;
 use notify::Watcher as _; // brings the `.watch()` method into scope
 
+use crate::addon;
 use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
@@ -334,6 +335,11 @@ struct State {
     update_apply_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     updating: bool,
     update_error: Option<String>,
+
+    // AI upscaling add-on (see `addon.rs`): the background start's result, and the
+    // status line the Settings panel shows.
+    upscale_rx: Option<std::sync::mpsc::Receiver<addon::Started>>,
+    upscale_status: addon::Status,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
     // runs on a background thread so a slow network-share open never freezes the
@@ -1130,6 +1136,8 @@ impl ApplicationHandler for App {
             update_apply_rx: None,
             updating: false,
             update_error: None,
+            upscale_rx: None,
+            upscale_status: addon::Status::Off,
             // The pre-spawned CLI open is generation 1, so `State` must start there
             // or its result would be discarded as stale by the drain in `render`.
             open_gen: if cli_open.is_some() { 1 } else { 0 },
@@ -1158,6 +1166,9 @@ impl ApplicationHandler for App {
             rescan_tx,
             rescan_rx,
         });
+        if let Some(state) = self.state.as_mut() {
+            state.start_upscaler();
+        }
     }
 
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1361,6 +1372,7 @@ enum Action {
     ToggleSeekbar,
     TogglePageTransition,
     ToggleStretch,
+    ToggleUpscale,
     ToggleAnimBar,
     PrevVolume,
     NextVolume,
@@ -1388,6 +1400,7 @@ fn action_from(ev: &KeyEvent) -> Option<Action> {
             KeyCode::KeyB => return Some(Action::ToggleSeekbar),
             KeyCode::KeyT => return Some(Action::TogglePageTransition),
             KeyCode::KeyZ => return Some(Action::ToggleStretch),
+            KeyCode::KeyU => return Some(Action::ToggleUpscale),
             KeyCode::KeyG => return Some(Action::ToggleAnimBar),
             KeyCode::KeyE => return Some(Action::ShowInExplorer),
             KeyCode::KeyR => return Some(Action::Rotate),
@@ -1589,6 +1602,7 @@ impl State {
                 });
             }
             Action::ToggleStretch => self.toggle_stretch(),
+            Action::ToggleUpscale => self.toggle_upscale(),
             Action::ToggleAnimBar => self.playback.hidden = !self.playback.hidden,
             Action::ToggleFullscreen => {
                 let fs = match self.window.fullscreen() {
@@ -1679,6 +1693,47 @@ impl State {
         } else {
             tr().toast_stretch_on
         });
+    }
+
+    /// Per-book AI-upscale switch (key `U`). Remembered per volume; switching off
+    /// reverts the upscaled pages to plain decodes in place.
+    fn toggle_upscale(&mut self) {
+        if self.reader.upscaler.is_none() {
+            self.toast(tr().toast_upscale_unavailable);
+            return;
+        }
+        let on = !self.reader.sr_enabled();
+        self.reader.set_sr_enabled(on);
+        if let Some(k) = &self.volume_key {
+            if on {
+                self.settings.upscale_off.remove(k);
+            } else {
+                self.settings.upscale_off.insert(k.clone());
+            }
+            config::save(&self.settings);
+        }
+        self.reader.prefetch();
+        self.toast(if on { tr().toast_upscale_on } else { tr().toast_upscale_off });
+    }
+
+    /// (Re)start the AI-upscaling add-on from the settings. Any running upscaler is
+    /// dropped first (its pages revert to plain decodes in place); then, if the
+    /// setting is on and the add-on is installed, it starts in the background and
+    /// `poll_background` installs it on the reader.
+    fn start_upscaler(&mut self) {
+        self.reader.set_upscaler(None);
+        self.upscale_rx = None;
+        self.upscale_status = addon::Status::Off;
+        if !self.settings.upscale {
+            return;
+        }
+        let Some(dir) = config::addon_dir().filter(|d| addon::installed(d)) else {
+            self.upscale_status = addon::Status::NotInstalled;
+            return;
+        };
+        self.upscale_status = addon::Status::Starting;
+        self.upscale_rx =
+            Some(addon::start(dir, self.settings.upscale_backend, frame_waker(&self.window)));
     }
 
     /// "Show in Explorer" (key `E`): open the containing folder of the current
@@ -2266,6 +2321,7 @@ impl State {
         }
         let key = path.to_string_lossy().into_owned();
         self.reader.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
+        self.reader.set_sr_enabled(!self.settings.upscale_off.contains(&key));
         // Explicit start (e.g. a specific dropped image) wins; else CLI start
         // index; else the saved position.
         let idx = match start {
@@ -2290,8 +2346,9 @@ impl State {
         );
         // A fresh pool starts wakerless: hand it the window's frame waker (kept on
         // the reader) or this volume's decodes would land without scheduling the
-        // frame that draws them.
+        // frame that draws them. Same for the AI-upscale add-on, if one is running.
         pool.set_waker(self.reader.waker.clone());
+        pool.set_upscaler(self.reader.upscaler.clone());
         self.reader.pool = Some(pool);
         self.reader.reset_volume_state();
         self.info_for = None;
@@ -2625,6 +2682,7 @@ impl State {
         // tail (`JobsKey` doesn't capture budget fields, so the memoized key would
         // otherwise suppress the very prefetch that refills the new pool).
         pool.set_waker(self.reader.waker.clone());
+        pool.set_upscaler(self.reader.upscaler.clone());
         self.reader.pool = Some(pool);
         // A profile change while minimized must not un-park the reader.
         if self.parked
@@ -2776,6 +2834,25 @@ impl State {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => self.update_rx = Some(rx),
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some(rx) = self.upscale_rx.take() {
+            match rx.try_recv() {
+                Ok(Ok((up, device))) => {
+                    self.reader.set_upscaler(Some(up));
+                    self.upscale_status = addon::Status::Ready(device);
+                    changed = true;
+                }
+                Ok(Err(e)) => {
+                    eprintln!("yosh: AI upscaling unavailable: {e}");
+                    self.upscale_status = addon::Status::Error(e);
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.upscale_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.upscale_status = addon::Status::Error("start interrupted".into());
+                    changed = true;
+                }
             }
         }
         if let Some(rx) = self.update_apply_rx.take() {
@@ -3182,6 +3259,15 @@ impl State {
             },
             self.on_battery,
         );
+        self.ui.upscale = self.settings.upscale;
+        self.ui.upscale_backend = self.settings.upscale_backend;
+        self.ui.upscale_status = match &self.upscale_status {
+            addon::Status::Off => String::new(),
+            addon::Status::NotInstalled => t.upscale_not_installed.to_string(),
+            addon::Status::Starting => t.upscale_starting.to_string(),
+            addon::Status::Ready(d) => (t.upscale_ready)(d),
+            addon::Status::Error(e) => (t.upscale_error)(e),
+        };
         // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
         // library grid; `ui.opened` is sticky once set, so it can't.
         self.ui.reader_open = self.reader.source.is_some();
@@ -3239,6 +3325,10 @@ impl State {
         });
         self.reader.update_resize_readout();
         self.ui.resize_path = self.reader.resize_path_label();
+        self.ui.sr_available = self.reader.upscaler.is_some();
+        self.ui.sr_book_on = self.reader.sr_enabled();
+        self.ui.sr_state = self.reader.sr_view_state();
+        self.ui.sr_model = self.reader.sr_model_label().unwrap_or_default();
         // Drain transient messages the reader queued (boundary hit, zoom level)
         // into the shell's timed toast.
         let last_toast = self.reader.pending_toasts.pop();
@@ -3630,6 +3720,28 @@ impl State {
             // Re-tiers the live reader in place (no reopen); a no-op if the pick
             // resolves to the tier already running.
             self.apply_perf();
+            ui_acted = true;
+        }
+        if let Some(on) = self.ui.req_set_upscale.take() {
+            self.settings.upscale = on;
+            config::save(&self.settings);
+            self.start_upscaler();
+            ui_acted = true;
+        }
+        if let Some(b) = self.ui.req_set_upscale_backend.take() {
+            self.settings.upscale_backend = b;
+            config::save(&self.settings);
+            self.start_upscaler();
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_toggle_upscale) {
+            self.apply_action(Action::ToggleUpscale);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_open_addon_folder) {
+            if let Some(dir) = config::addon_dir() {
+                addon::open_folder(&dir);
+            }
             ui_acted = true;
         }
         // Seekbar jump: re-clamp against the live source, skip a redundant goto

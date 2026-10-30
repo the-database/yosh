@@ -114,6 +114,30 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
 > `yosh-engine/src/page.rs`. `crates/yosh/src/app.rs` is the *shell* — window, input, egui chrome — and
 > feeds the engine a `Viewport` each frame. (These moved out of `app.rs` in the engine extraction.)
 
+### AI upscaling add-on (optional)
+- **Opt-in and inert by default.** `yosh_engine::sr` defines the `Upscaler` trait; `sr::aji` (engine
+  feature `sr`, on via the `yosh` crate's default `sr` feature — `libloading` only, no C toolchain)
+  loads libaji's still-image ABI (`aji_image.h`, the-database/animejanai-inference >= v0.18.0) at
+  runtime from the add-on directory (`config::addon_dir()`: `%LOCALAPPDATA%\the-database\yosh\data\addons\upscale`,
+  or `yosh-addons\upscale` beside the exe in portable mode; `crates/yosh/src/addon.rs`). That directory
+  holds `aji.dll` + backends + their runtimes, `models/*.onnx`, an optional `rules.json`, and `cache/`
+  (TensorRT engines). Without an installed + enabled add-on there is no upscaler, no SR lane, and
+  decoding is bit-identical to a build without it.
+- **The SR lane** (`pool.rs`): one extra pool thread, spawned on the first `set_upscaler`, with its own
+  lowest-priority queue (`set_sr_jobs`) and condvar — never the decode window or thumbnails. The reader
+  queues the pages of the prefetch window (nearest-first) once the normal decode shows each at its
+  settled size **above** its source size (where the GPU would magnify); the upscaled texture then
+  swaps in place. The lane never reports `Msg::Failed` (that would hide a good page) — it sends
+  `Msg::SrSkipped { reason }` instead.
+- **Single-resize invariant holds:** `decode::decode_sr` runs the model on the whole page, then the same
+  HQ CPU resize (`sr_from_master`) to the exact target, so the GPU samples 1:1. The model's full-size
+  output (`SrMaster`) is kept per page (`MasterCache`, 256 MB LRU, per pool), so a zoom/resize of an
+  upscaled page only re-sizes it — no read, decode or inference — and skips the plain re-decode.
+- **Model choice is data:** `sr::rules` mirrors MangaJaNaiConverterGui's chain rules (first match on
+  source height, gray/color, target scale); `rules.json` in the add-on overrides the built-in defaults.
+- UI: Settings → AI upscaling (on/off, Auto = TensorRT then DirectML); top-bar "AI" chip +
+  corner spinner (`Reader::sr_view_state`); key `U` = per-book switch; info overlay "AI model" row.
+
 ### Central state and the frame loop
 - **`app.rs` — `State`** is the winit `ApplicationHandler` and owns the shell: gpu, egui, the `Reader`
   (which itself holds the `PageSource`, `DecodePool`, `PageCache`, and nav/layout/zoom/pan/scroll state),

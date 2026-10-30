@@ -6,16 +6,17 @@
 //! The job list is rebuilt by the scheduler each navigation (nearest-first), so
 //! workers always pick the highest-priority page relative to the latest position.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use fast_image_resize::Resizer;
 
-use crate::decode::{decode_page, DecodedPage};
+use crate::decode::{decode_page, decode_sr, sr_from_master, DecodedPage, SrDecode, SrMaster};
 use crate::source::PageSource;
 use crate::page::{PagePipeline, PageTexture};
+use crate::sr::{SrSkip, Upscaler};
 use crate::texpool::TexturePool;
 
 // `Done` (a full `PageTexture`) dwarfs `Failed` (a `String`); boxing it would buy
@@ -26,6 +27,12 @@ pub enum Msg {
     /// to the reader's `lq_cache`) from a normal window decode (routes to `cache`).
     Done { index: usize, page: PageTexture, thumb: bool },
     Failed { index: usize, error: String },
+    /// The SR lane produced nothing for `index` at `target_h`, for `reason` (a
+    /// not-ready model is retried once the upscaler's epoch moves). The page keeps
+    /// its normal decode; the reader stops re-queueing it until the target or the
+    /// epoch changes. (SR never reports `Failed`: that would hide a perfectly good
+    /// page.)
+    SrSkipped { index: usize, target_h: u32, reason: SrSkip },
 }
 
 /// A shell-supplied "there is something new to draw" callback, invoked from a
@@ -97,15 +104,99 @@ struct JobState {
     /// queues are deliberately *kept* — an unpark resumes the same work list.
     paused: bool,
     running: bool,
+    /// The SR add-on's upscaler, when one is installed ([`DecodePool::set_upscaler`]).
+    /// `None` keeps the SR lane idle (it is only spawned once one is set).
+    upscaler: Option<Arc<dyn Upscaler>>,
+    /// AI-upscale work for the SR lane as `(index, target_h)`, nearest-first —
+    /// pages already shown through a normal decode that are displayed above their
+    /// source size. Replaced wholesale by [`DecodePool::set_sr_jobs`].
+    sr_jobs: VecDeque<(usize, u32)>,
+    /// Indices the latest `set_sr_jobs` still wants (the SR lane's staleness set,
+    /// like `wanted` for the window).
+    sr_wanted: HashSet<usize>,
 }
 
 pub struct DecodePool {
     shared: Arc<(Mutex<JobState>, Condvar)>,
+    /// The SR lane's own wakeup, on the same mutex as `shared`: SR job changes
+    /// wake only that thread, never the decode workers.
+    sr_cv: Arc<Condvar>,
+    /// Kept to spawn the SR lane lazily (the first `set_upscaler`).
+    lane: LaneDeps,
+    /// The SR lane's kept model outputs (see [`MasterCache`]).
+    masters: Arc<Mutex<MasterCache>>,
     results: Receiver<Msg>,
     /// Set by the worker that wakes the shell, cleared by `poll()` before it
     /// drains. It coalesces a burst of landings into one wake — see the ordering
     /// invariant on `poll()`.
     wake_pending: Arc<AtomicBool>,
+}
+
+/// How many bytes of kept model outputs ([`MasterCache`]) a pool may hold: a
+/// 4x gray page from a 1200x1700 source is ~32 MB, a color one ~98 MB, so this
+/// covers the pages in view and their neighbours — where zooms happen.
+const SR_MASTER_BUDGET: usize = 256 << 20;
+
+/// The SR lane's kept model outputs by page, so an upscaled page whose display
+/// size changed is re-sized from its [`SrMaster`] instead of re-reading,
+/// re-decoding and re-running the model (the output doesn't depend on the
+/// display size). Least-recently-used out once over `budget` bytes; the newest
+/// entry always stays, however large. Lives with the pool, so it never outlives
+/// the volume its indices belong to.
+struct MasterCache {
+    map: HashMap<usize, (Arc<SrMaster>, u64)>,
+    bytes: usize,
+    tick: u64,
+    budget: usize,
+}
+
+impl MasterCache {
+    fn new(budget: usize) -> Self {
+        Self { map: HashMap::new(), bytes: 0, tick: 0, budget }
+    }
+
+    fn get(&mut self, index: usize) -> Option<Arc<SrMaster>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(&index).map(|e| {
+            e.1 = tick;
+            e.0.clone()
+        })
+    }
+
+    fn insert(&mut self, index: usize, m: Arc<SrMaster>) {
+        self.tick += 1;
+        self.bytes += m.pixels.len();
+        if let Some((old, _)) = self.map.insert(index, (m, self.tick)) {
+            self.bytes -= old.pixels.len();
+        }
+        while self.bytes > self.budget && self.map.len() > 1 {
+            let lru = self
+                .map
+                .iter()
+                .filter(|(i, _)| **i != index)
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(i, _)| *i);
+            let Some(lru) = lru else { break };
+            if let Some((old, _)) = self.map.remove(&lru) {
+                self.bytes -= old.pixels.len();
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+}
+
+/// What the lazily spawned SR lane needs that the workers capture at `new`.
+struct LaneDeps {
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
+    tex_pool: Arc<TexturePool>,
+    tx: Sender<Msg>,
+    spawned: AtomicBool,
 }
 
 /// Lock the job state, recovering from poisoning. The critical sections only
@@ -205,6 +296,23 @@ impl JobState {
             true
         }
     }
+
+    /// The SR lane's next job, or `None` (its wait condition). Parked pools and
+    /// pools without an upscaler claim nothing.
+    fn claim_sr(&mut self) -> Option<(usize, u32, Arc<dyn Upscaler>)> {
+        if self.paused {
+            return None;
+        }
+        let up = self.upscaler.clone()?;
+        let (i, h) = self.sr_jobs.pop_front()?;
+        Some((i, h, up))
+    }
+
+    /// Should the SR lane abandon `index`? Yes once parked, or once the reader no
+    /// longer lists it (navigated away, target changed, SR turned off).
+    fn sr_stale(&self, index: usize) -> bool {
+        self.paused || !self.running || !self.sr_wanted.contains(&index)
+    }
 }
 
 impl DecodePool {
@@ -228,11 +336,21 @@ impl DecodePool {
                 waker: None,
                 paused: false,
                 running: true,
+                upscaler: None,
+                sr_jobs: VecDeque::new(),
+                sr_wanted: HashSet::new(),
             }),
             Condvar::new(),
         ));
         let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
         let wake_pending = Arc::new(AtomicBool::new(false));
+        let lane = LaneDeps {
+            device: device.clone(),
+            queue: queue.clone(),
+            tex_pool: tex_pool.clone(),
+            tx: tx.clone(),
+            spawned: AtomicBool::new(false),
+        };
 
         for w in 0..workers {
             // Reserved non-thumb lane: worker 0 of a multi-worker pool only ever
@@ -407,7 +525,174 @@ impl DecodePool {
             });
         }
 
-        Self { shared, results: rx, wake_pending }
+        Self {
+            shared,
+            sr_cv: Arc::new(Condvar::new()),
+            lane,
+            masters: Arc::new(Mutex::new(MasterCache::new(SR_MASTER_BUDGET))),
+            results: rx,
+            wake_pending,
+        }
+    }
+
+    /// Install (or remove) the SR add-on's upscaler. The first install spawns the
+    /// SR lane: one extra, detached thread that only ever runs AI-upscale jobs
+    /// ([`Self::set_sr_jobs`]) — never the decode window or thumbnails, so the
+    /// zero-hitch path keeps every worker it had. Without an upscaler no lane
+    /// exists and decoding is exactly as before.
+    pub fn set_upscaler(&self, up: Option<Arc<dyn Upscaler>>) {
+        let (m, _) = &*self.shared;
+        let mut st = lock_jobs(m);
+        if up.is_none() {
+            st.sr_jobs.clear();
+            st.sr_wanted.clear();
+        }
+        st.upscaler = up;
+        let has = st.upscaler.is_some();
+        drop(st);
+        // Kept outputs belong to the old upscaler's models.
+        self.masters.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        if has && !self.lane.spawned.swap(true, Ordering::AcqRel) {
+            self.spawn_sr_lane();
+        }
+        self.sr_cv.notify_all();
+    }
+
+    /// Replace the SR lane's queue (`(index, target_h)`, nearest-first). Pages no
+    /// longer listed are abandoned mid-inference at the next tile.
+    pub fn set_sr_jobs(&self, jobs: Vec<(usize, u32)>) {
+        let (m, _) = &*self.shared;
+        let mut st = lock_jobs(m);
+        st.sr_wanted = jobs.iter().map(|(i, _)| *i).collect();
+        st.sr_jobs = jobs.into();
+        let any = !st.sr_jobs.is_empty();
+        drop(st);
+        if any {
+            self.sr_cv.notify_all();
+        }
+    }
+
+    fn spawn_sr_lane(&self) {
+        let shared = self.shared.clone();
+        let sr_cv = self.sr_cv.clone();
+        let device = self.lane.device.clone();
+        let queue = self.lane.queue.clone();
+        let tex_pool = self.lane.tex_pool.clone();
+        let tx = self.lane.tx.clone();
+        let wake_pending = self.wake_pending.clone();
+        let masters = self.masters.clone();
+        // Detached, like the decode workers (see `Drop`): it holds `Arc`s of all
+        // it touches, and exits on `running = false` or a failed send.
+        std::thread::spawn(move || {
+            let mut resizer = Resizer::new();
+            let stale = |index: usize| -> bool {
+                let (m, _) = &*shared;
+                lock_jobs(m).sr_stale(index)
+            };
+            loop {
+                let (index, th, up, source) = {
+                    let (m, _) = &*shared;
+                    let mut st = lock_jobs(m);
+                    loop {
+                        if !st.running {
+                            return;
+                        }
+                        if let Some((i, h, up)) = st.claim_sr() {
+                            let source = st.source.clone();
+                            break (i, h, up, source);
+                        }
+                        st = sr_cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
+                // Same shape as a decode worker's body, but nothing here may report
+                // `Failed` — the page already shows through its normal decode.
+                let body = std::panic::AssertUnwindSafe(|| -> Option<Msg> {
+                    if stale(index) {
+                        return None;
+                    }
+                    let skipped = |reason| Some(Msg::SrSkipped { index, target_h: th, reason });
+                    #[cfg(debug_assertions)]
+                    let t0 = std::time::Instant::now();
+                    // A kept output from the model the rules still pick at this size
+                    // only needs re-sizing: no read, no decode, no inference.
+                    let kept = masters.lock().unwrap_or_else(|e| e.into_inner()).get(index).filter(|m| {
+                        th > m.src_h
+                            && up.model_for(m.src_h, m.gray, th as f32 / m.src_h as f32).as_deref()
+                                == Some(&*m.model)
+                    });
+                    let reused = kept.is_some();
+                    let (img, model) = if let Some(m) = kept {
+                        match sr_from_master(&m, th, &mut resizer) {
+                            Ok(img) => (img, m.model.clone()),
+                            Err(e) => return skipped(SrSkip::Failed(e)),
+                        }
+                    } else {
+                        let bytes = match source.read_page(index) {
+                            Ok(b) => b,
+                            Err(e) => return skipped(SrSkip::Failed(format!("read failed: {e}"))),
+                        };
+                        if stale(index) {
+                            return None;
+                        }
+                        let cancel = || stale(index);
+                        match decode_sr(&bytes, th, up.as_ref(), &cancel, &mut resizer) {
+                            Ok(SrDecode::Page(img, master)) => {
+                                let model = master.model.clone();
+                                masters.lock().unwrap_or_else(|e| e.into_inner()).insert(index, master);
+                                (img, model)
+                            }
+                            Ok(SrDecode::Cancelled) => return None,
+                            Ok(SrDecode::Skipped(reason)) => return skipped(reason),
+                            Err(e) => {
+                                eprintln!("yosh: AI upscale skipped page {index}: {e}");
+                                return skipped(SrSkip::Failed(e));
+                            }
+                        }
+                    };
+                    #[cfg(not(debug_assertions))]
+                    let _ = reused;
+                    if stale(index) {
+                        return None;
+                    }
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "yosh: AI {} page {index} {}x{} -> {}x{} ({}) in {:.0} ms",
+                        if reused { "re-sized (kept model output)" } else { "upscaled" },
+                        img.src_w,
+                        img.src_h,
+                        img.w,
+                        img.h,
+                        img.path.label(),
+                        t0.elapsed().as_secs_f64() * 1000.0
+                    );
+                    let mut page = PagePipeline::upload(&device, &queue, &img, &tex_pool, th);
+                    page.sr = true;
+                    page.sr_model = Some(model);
+                    Some(Msg::Done { index, page, thumb: false })
+                });
+                let msg = match std::panic::catch_unwind(body) {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => continue,
+                    Err(_) => {
+                        resizer = Resizer::new();
+                        let reason = SrSkip::Failed("upscaler panicked".into());
+                        Msg::SrSkipped { index, target_h: th, reason }
+                    }
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+                if !wake_pending.swap(true, Ordering::AcqRel) {
+                    let w = {
+                        let (m, _) = &*shared;
+                        lock_jobs(m).waker.clone()
+                    };
+                    if let Some(w) = w {
+                        w();
+                    }
+                }
+            }
+        });
     }
 
     /// Replace the work list with `desired` (`(index, target_h)`, nearest-first),
@@ -505,6 +790,7 @@ impl DecodePool {
         st.paused = false;
         drop(st);
         cv.notify_all();
+        self.sr_cv.notify_all();
     }
 
     /// Swap the source the workers read from, without tearing down the thread pool.
@@ -590,6 +876,11 @@ impl Drop for DecodePool {
         // its current thumb can't go on to claim the whole rest of the volume.
         st.lq_tail.clear();
         st.lq_cancel.clear();
+        st.sr_jobs.clear();
+        st.sr_wanted.clear();
+        // Release the upscaler with the pool (the lane drops its own clone when
+        // it notices `running = false`; one mid-inference finishes its tile).
+        st.upscaler = None;
         // Drop the wake callback with the pool: a straggler still finishing a page
         // must not keep the shell's (possibly already-replaced) window alive through
         // the closure, and its `tx.send` fails anyway, so it would never wake.
@@ -597,6 +888,7 @@ impl Drop for DecodePool {
         let source = st.source.clone();
         drop(st);
         cv.notify_all();
+        self.sr_cv.notify_all();
         // **Outside the pool lock, on purpose.** `cancel_waits` takes the source's own
         // ready mutex (its lost-wakeup fence), so holding the pool lock across this
         // call would create a pool-lock → source-lock order that a worker — which
@@ -639,6 +931,9 @@ mod tests {
             waker: None,
             paused: false,
             running: true,
+            upscaler: None,
+            sr_jobs: VecDeque::new(),
+            sr_wanted: HashSet::new(),
         }
     }
 
@@ -850,6 +1145,86 @@ mod tests {
         assert!(st.inflight.contains(&5));
         assert!(!st.stale(40, true), "a thumb outlives any navigation");
         assert!(st.thumbs_inflight.contains(&40));
+    }
+
+    struct NoModel;
+    impl Upscaler for NoModel {
+        fn upscale(&self, _: u32, _: u32, _: u32, _: &[u8], _: f32, _: &dyn Fn() -> bool) -> crate::sr::SrOutcome {
+            crate::sr::SrOutcome::Skip
+        }
+        fn epoch(&self) -> u64 {
+            0
+        }
+        fn model_for(&self, _: u32, _: bool, _: f32) -> Option<Arc<str>> {
+            None
+        }
+    }
+
+    fn master(bytes: usize) -> Arc<SrMaster> {
+        Arc::new(SrMaster {
+            model: "m".into(),
+            scale: 2,
+            src_w: 1,
+            src_h: 1,
+            gray: true,
+            pixels: vec![0; bytes],
+        })
+    }
+
+    /// Kept model outputs stay within the byte budget, least-recently-used out
+    /// first — and the newest one always stays, even alone over budget.
+    #[test]
+    fn master_cache_evicts_least_recently_used_within_budget() {
+        let mut c = MasterCache::new(100);
+        c.insert(1, master(40));
+        c.insert(2, master(40));
+        assert!(c.get(1).is_some()); // 1 is now more recent than 2
+        c.insert(3, master(40)); // 120 > 100 → evict the LRU, page 2
+        assert!(c.get(2).is_none() && c.get(1).is_some() && c.get(3).is_some());
+        assert_eq!(c.bytes, 80);
+        c.insert(3, master(10)); // replacing an entry swaps its bytes
+        assert_eq!(c.bytes, 50);
+        c.insert(9, master(500)); // alone over budget: everything else goes, it stays
+        assert!(c.get(9).is_some() && c.get(1).is_none() && c.get(3).is_none());
+        assert_eq!(c.bytes, 500);
+        c.clear();
+        assert!(c.get(9).is_none() && c.bytes == 0);
+    }
+
+    /// The SR lane only ever sees its own queue: without an upscaler (no add-on)
+    /// nothing is claimable at all, a parked pool claims nothing, and SR work never
+    /// leaks into the decode workers' claim (window + thumbnail tiers).
+    #[test]
+    fn sr_jobs_are_claimed_only_by_the_sr_lane_with_an_upscaler() {
+        let mut st = job_state();
+        st.sr_jobs = VecDeque::from(vec![(3, 1800), (4, 1800)]);
+        assert!(st.claim_sr().is_none(), "no upscaler installed → the lane stays idle");
+
+        st.upscaler = Some(Arc::new(NoModel));
+        assert_eq!(st.claim(true), None, "decode workers never take SR work");
+        assert_eq!(st.sr_jobs.len(), 2);
+
+        st.paused = true;
+        assert!(st.claim_sr().is_none(), "parked → nothing");
+        st.paused = false;
+        let (i, h, _) = st.claim_sr().unwrap();
+        assert_eq!((i, h), (3, 1800), "nearest-first order kept");
+    }
+
+    /// An SR job is abandoned (mid-inference, between tiles) as soon as the reader
+    /// stops listing it — navigation, a target change, the switch going off — and
+    /// whenever the pool is parked or torn down.
+    #[test]
+    fn sr_jobs_go_stale_when_unlisted_parked_or_dropped() {
+        let mut st = job_state();
+        st.sr_wanted = HashSet::from([3]);
+        assert!(!st.sr_stale(3));
+        assert!(st.sr_stale(4), "not listed any more");
+        st.paused = true;
+        assert!(st.sr_stale(3), "parked");
+        st.paused = false;
+        st.running = false;
+        assert!(st.sr_stale(3), "pool dropped");
     }
 
     /// The `wake_pending` protocol, exercised on the flag alone: a real

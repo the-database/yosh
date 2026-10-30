@@ -5257,6 +5257,7 @@ dependencies = [
  "jpeg-decoder",
  "jpeg-encoder",
  "jxl-oxide",
+ "libloading",
  "natord",
  "png",
  "pollster 1.0.1",

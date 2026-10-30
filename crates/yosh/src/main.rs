@@ -6,6 +6,7 @@
 // stdout/stderr still work. Debug keeps a normal console for dev.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod addon;
 mod app;
 mod config;
 #[cfg(feature = "flipbench")]

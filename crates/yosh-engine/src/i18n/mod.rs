@@ -224,6 +224,28 @@ pub struct Strings {
     pub perf_low: &'static str,
     pub perf_mid: &'static str,
     pub perf_high: &'static str,
+    /// The SR add-on section of desktop Settings.
+    pub ai_upscaling: &'static str,
+    pub upscale_pages: &'static str,
+    pub upscale_hint: &'static str,
+    pub upscale_not_installed: &'static str,
+    pub upscale_starting: &'static str,
+    /// "Ready · {device}".
+    pub upscale_ready: fn(&str) -> String,
+    /// "Unavailable: {error}".
+    pub upscale_error: fn(&str) -> String,
+    pub open_addon_folder: &'static str,
+    /// The reader's "AI" status chip and busy indicator (what upscaling is doing
+    /// for the page in view).
+    pub sr_working: &'static str,
+    pub sr_preparing: &'static str,
+    pub sr_preparing_tip: &'static str,
+    pub sr_done: &'static str,
+    pub sr_not_needed: &'static str,
+    pub sr_no_model: &'static str,
+    /// "AI upscaling failed: {error}".
+    pub sr_failed: fn(&str) -> String,
+    pub sr_book_off: &'static str,
 
     // --- common: library, empty states, navigation ---
     pub open_file: &'static str,
@@ -262,6 +284,7 @@ pub struct Strings {
     pub info_color: &'static str,
     pub info_zoom: &'static str,
     pub info_resize: &'static str,
+    pub info_ai_model: &'static str,
     pub info_lq_tier: &'static str,
 
     // --- desktop: top bar ---
@@ -343,6 +366,9 @@ pub struct Strings {
     pub toast_rotation: fn(u32) -> String,
     pub toast_stretch_on: &'static str,
     pub toast_stretch_off: &'static str,
+    pub toast_upscale_on: &'static str,
+    pub toast_upscale_off: &'static str,
+    pub toast_upscale_unavailable: &'static str,
     pub toast_spine_on: &'static str,
     pub toast_spine_off: &'static str,
     pub toast_nothing_open: &'static str,
