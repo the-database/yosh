@@ -19,8 +19,8 @@ rar = ["dep:unrar"]
 avif = ["image/avif-native"]
 
 [dependencies]
-wgpu = "29.0.3"
-pollster = "0.4"
+wgpu = "30"
+pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
 image = "0.25"
 png = "0.18"
@@ -34,13 +34,13 @@ psd = "0.3"
 fast_image_resize = "6"
 qcms = "0.3"
 # ICO container parsing (multi-image .ico → layered pages) and re-encoding.
-ico = "0.5"
+ico = "0.6"
 natord = "1"
 # Archive page sources: zip/cbz (parallel reads), rar/cbr + 7z/cb7 (sequential —
 # a reader thread decompresses into an in-memory map served to readers).
-zip = "8"
+zip = "9"
 unrar = { version = "0.5", optional = true }
-sevenz-rust2 = "0.21"
+sevenz-rust2 = "0.24"
 # Legacy archive-entry-name decoding (both pure Rust, no C toolchain). Zip stores
 # names as raw bytes and only flags UTF-8 via general-purpose bit 11; Japanese and
 # Chinese CBZs are routinely written with that flag clear and Shift-JIS/GBK bytes,
@@ -57,4 +57,4 @@ jpeg-encoder = "0.7.1"
 # wgpu's stub backend (`Device::noop`), so `gesture.rs`'s tests can build a real
 # `Reader` — which needs a Device/Queue — with no GPU and no windowing. Resolver 2
 # keeps this feature out of every non-test build of the crate.
-wgpu = { version = "29.0.3", features = ["noop"] }
+wgpu = { version = "30", features = ["noop"] }

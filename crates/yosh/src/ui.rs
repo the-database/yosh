@@ -196,6 +196,30 @@ pub enum SeekbarStyle {
          // Thumbnails, // YACReader-style — future
 }
 
+/// A framed, clickable image — egui 0.34's `ImageButton` (removed in 0.36), ported
+/// so the cover cells keep their exact look: a `button_padding.x` border on every
+/// side, the interact-state fill and stroke, and the image at its own size.
+/// (`Button::new(image)` pads differently, and `Button::image` caps the image at
+/// the font height.)
+pub(crate) fn image_button(ui: &mut egui::Ui, image: egui::Image<'_>) -> egui::Response {
+    let padding = egui::Vec2::splat(ui.spacing().button_padding.x);
+    let avail = ui.available_size() - 2.0 * padding;
+    // Covers are already-uploaded `SizedTexture`s, so the size is known up front.
+    let size = image.calc_size(avail, image.size());
+    let (rect, response) = ui.allocate_exact_size(size + 2.0 * padding, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Button));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let frame = rect.expand(visuals.expansion);
+        let radius = image.image_options().corner_radius;
+        ui.painter().rect_filled(frame, radius, visuals.weak_bg_fill);
+        image.paint_at(ui, ui.layout().align_size_within_rect(size, rect.shrink2(padding)));
+        ui.painter()
+            .rect_stroke(frame, radius, visuals.bg_stroke, egui::StrokeKind::Inside);
+    }
+    response
+}
+
 /// Draw a translucent navigation chevron in a non-interactable, foreground Area
 /// anchored to a window edge. Painted with line segments over a soft backdrop so
 /// it stays visible on any page and doesn't depend on font glyph coverage.
@@ -500,14 +524,19 @@ fn anim_panel(ctx: &egui::Context, st: &mut UiState) {
 
 #[allow(deprecated)]
 pub fn chrome(
-    ctx: &egui::Context,
+    root: &mut egui::Ui,
     st: &mut UiState,
     lib: &Library,
     libctx: &LibCtx,
     library_view: bool,
 ) {
-    let show_bar = st.show_bar;
-    let bar = egui::TopBottomPanel::top("top_bar").show_animated(ctx, show_bar, |ui| {
+    // Panels go in the root `Ui` (egui 0.36); Areas and Windows still take the
+    // `Context`, which is a cheap shared handle.
+    let ctx = &root.ctx().clone();
+    // Not resizable, so `show_collapsible` never flips this (nor leaves a grab
+    // handle when collapsed) — it is the old `show_animated`.
+    let mut show_bar = st.show_bar;
+    let bar = egui::Panel::top("top_bar").show_collapsible(root, &mut show_bar, |ui| {
         ui.horizontal(|ui| {
             if ui.button(tr().open_folder).clicked()
                 && let Some(p) = rfd::FileDialog::new().set_title(tr().dlg_open_folder).pick_folder()
@@ -627,7 +656,7 @@ pub fn chrome(
         });
     });
     // Report the bar's measured height back to the app, which reserves that much
-    // space above the page. `show_animated` returns None while the panel is fully
+    // space above the page. `show_collapsible` returns None while the panel is fully
     // collapsed, and animates the height while it opens/closes — the app only
     // *uses* this when the bar is pinned (windowed), so the animating value never
     // reaches the decode target. Physical px: the reader's viewport is physical.
@@ -857,7 +886,7 @@ pub fn chrome(
     }
 
     if library_view {
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show(root, |ui| {
             library_sections(ui, st, lib, libctx);
         });
     }
@@ -1321,7 +1350,7 @@ fn library_sections(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: 
                     .id_salt(&series.dir)
                     .scroll_source(egui::scroll_area::ScrollSource {
                         scroll_bar: true,
-                        drag: true,
+                        drag: egui::scroll_area::DragScroll::Always,
                         mouse_wheel: false,
                     })
                     .show(ui, |ui| {
@@ -1381,7 +1410,7 @@ fn recents_row(ui: &mut egui::Ui, st: &mut UiState, lib: &Library, libctx: &LibC
         .id_salt("recents_row")
         .scroll_source(egui::scroll_area::ScrollSource {
             scroll_bar: true,
-            drag: true,
+            drag: egui::scroll_area::DragScroll::Always,
             mouse_wheel: false,
         })
         .show(ui, |ui| {
@@ -1441,7 +1470,7 @@ fn volume_cell(
                         // Read volumes fade out (Chunky-style).
                         img = img.tint(egui::Color32::from_white_alpha(72));
                     }
-                    ui.add(egui::ImageButton::new(img))
+                    image_button(ui, img)
                 }
                 None => ui.add_sized(
                     [CELL_W, COVER_H],

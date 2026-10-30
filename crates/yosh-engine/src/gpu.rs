@@ -57,6 +57,10 @@ impl GpuContext {
             power_preference: power,
             force_fallback_adapter: false,
             compatible_surface: compatible,
+            // Keep the adapter's *real* limits: `max_texture_dimension_2d` below (and
+            // `decode::MAX_TEX_DIM` from it) must be the true GPU ceiling, or decode
+            // targets get capped and the GPU upscales — the single-resize invariant.
+            apply_limit_buckets: false,
         }))
         .expect("request adapter");
         let adapter_info = adapter.get_info();

@@ -26,13 +26,18 @@ pub struct Update {
 /// call on a background thread. `None` on any error or when already current.
 pub fn check() -> Option<Update> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    // `read_to_string` caps the body at ureq's 10 MB default — the release JSON is a
+    // few KB. `timeout_global` bounds the whole call, body read included.
     let body = ureq::get(&url)
-        .set("User-Agent", UA)
-        .set("Accept", "application/vnd.github+json")
-        .timeout(Duration::from_secs(10))
+        .header("User-Agent", UA)
+        .header("Accept", "application/vnd.github+json")
+        .config()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
         .call()
         .ok()?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .ok()?;
     let json: serde_json::Value = serde_json::from_str(&body).ok()?;
     let latest = json["tag_name"].as_str()?.trim_start_matches('v').to_string();
@@ -51,11 +56,16 @@ pub fn check() -> Option<Update> {
 /// Download the new binary and replace the running exe in place. Blocking — call
 /// on a background thread. On success the caller relaunches the (new) exe.
 pub fn apply(update: &Update) -> Result<(), String> {
+    // `into_reader` is unlimited (unlike `read_to_string`), as the exe needs; the
+    // magic-byte check below is what guards against a wrong body.
     let mut reader = ureq::get(&update.download_url)
-        .set("User-Agent", UA)
-        .timeout(Duration::from_secs(300))
+        .header("User-Agent", UA)
+        .config()
+        .timeout_global(Some(Duration::from_secs(300)))
+        .build()
         .call()
         .map_err(|e| e.to_string())?
+        .into_body()
         .into_reader();
     let tmp = std::env::temp_dir().join("yosh-update.bin");
     {

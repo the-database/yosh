@@ -108,8 +108,8 @@ impl ZipSource {
 
     fn build(backend: Backend) -> io::Result<Self> {
         match ZipArchive::new(Self::fresh(&backend)?) {
-            Ok(mut zip) => {
-                let (names, idx) = Self::list_central(&mut zip);
+            Ok(zip) => {
+                let (names, idx) = Self::list_central(&zip);
                 Ok(Self {
                     backend,
                     names,
@@ -166,54 +166,39 @@ impl ZipSource {
     /// A dir entry's name ends in `/`, so `is_image_name` rejects it; the explicit `/`
     /// guard is belt-and-suspenders for an oddly-named dir.
     ///
-    /// For the *display* name we want the real characters, not the transliteration. That
-    /// same keyed-by-raw-bytes map gives us an exact, allocation-free test for which
-    /// names need help: `index_for_name(n)` hashes `n`'s UTF-8 bytes against the raw
-    /// keys, so a name that maps back to its own entry is already byte-exact (ASCII, or
-    /// a properly UTF-8-flagged name) and is kept as-is. Only a name that *fails* that
-    /// round-trip is a CP437 transliteration, and only for those do we re-read the raw
-    /// header bytes and decode them ourselves — so Shift-JIS/GBK pages display and sort
-    /// correctly. Both `file_names()` and the round-trip test read from the already-parsed
-    /// in-memory central directory, so ASCII and UTF-8-flagged archives (the overwhelming
-    /// majority, including Japanese ones written by modern zippers) pay nothing at all;
-    /// only a genuinely legacy-encoded archive pays a local-header seek per entry
-    /// (~1.5 ms for 500 entries).
-    fn list_central(zip: &mut ZipArchive<Reader>) -> (Vec<String>, Vec<usize>) {
-        let decoded: Vec<String> = zip.file_names().map(str::to_string).collect();
-        // Compare against `Some(i)`, not just `is_some()`: a pathological archive holding
-        // both the raw and the transliterated spelling of one name would otherwise let an
-        // entry validate against its neighbour.
-        let exact: Vec<bool> = decoded
-            .iter()
-            .enumerate()
-            .map(|(i, n)| zip.index_for_name(n) == Some(i))
+    /// For the *display* name we want the real characters, not the transliteration, so
+    /// we decode the raw header bytes ourselves rather than use `zip`'s decoded names
+    /// (which fall back to CP437). `file_names_raw()` reads them straight from the
+    /// already-parsed in-memory central directory — no I/O. Valid UTF-8 (ASCII, flagged,
+    /// or the common unflagged case) decodes as itself; everything else is a legacy
+    /// codepage, detected once for the whole archive — so Shift-JIS/GBK pages display
+    /// and sort correctly. (Don't swap this for an `index_for_name` round-trip test:
+    /// since zip 9 that falls back to matching *decoded* names, so a CP437
+    /// transliteration would validate as exact.)
+    fn list_central(zip: &ZipArchive<Reader>) -> (Vec<String>, Vec<usize>) {
+        // `file_names_raw` walks the parsed central directory in archive-index order,
+        // so position `i` here is the index `read_page` opens by.
+        let raws: Vec<&[u8]> = zip.file_names_raw().collect();
+        // Image filtering can run on a lossy view of the raw bytes: the extension is
+        // ASCII, which a lossy decode keeps intact, and no legacy trail byte is `.`
+        // (Shift-JIS trail bytes start at 0x40). Filtering first also keeps the
+        // encoding sniff below down to the pages we actually intend to show.
+        let keep: Vec<usize> = (0..raws.len())
+            .filter(|&i| !raws[i].ends_with(b"/") && is_image_name(&String::from_utf8_lossy(raws[i])))
             .collect();
-        // Image filtering can run on the transliterated name: CP437 maps ASCII to itself,
-        // and no legacy trail byte is `.` (Shift-JIS trail bytes start at 0x40), so the
-        // extension survives transliteration intact. Filtering first also keeps the raw
-        // re-read below down to the pages we actually intend to show.
-        let keep: Vec<usize> = (0..decoded.len())
-            .filter(|&i| !decoded[i].ends_with('/') && is_image_name(&decoded[i]))
-            .collect();
-
-        // Only names that failed the round-trip need their raw bytes re-read. A raw read
-        // that fails just leaves that entry on the crate's own decoding — one bad entry
-        // shouldn't cost us the rest of the archive.
-        let (idxs, raws): (Vec<usize>, Vec<Vec<u8>>) = keep
+        // Only names that aren't valid UTF-8 are legacy-codepage candidates (valid
+        // UTF-8 — flagged, unflagged, or plain ASCII — always decodes as itself), so
+        // only those feed the archive-wide detector.
+        let legacy: Vec<Vec<u8>> = keep
             .iter()
-            .copied()
-            .filter(|&i| !exact[i])
-            .filter_map(|i| zip.by_index_raw(i).ok().map(|e| (i, e.name_raw().to_vec())))
-            .unzip();
-        let enc = detect_legacy_encoding(&raws);
-        let mut legacy: Vec<Option<String>> = vec![None; decoded.len()];
-        for (i, raw) in idxs.into_iter().zip(&raws) {
-            legacy[i] = Some(decode_entry_name(raw, enc));
-        }
+            .filter(|&&i| std::str::from_utf8(raws[i]).is_err())
+            .map(|&i| raws[i].to_vec())
+            .collect();
+        let enc = detect_legacy_encoding(&legacy);
 
         let mut entries: Vec<(String, usize)> = keep
             .into_iter()
-            .map(|i| (legacy[i].take().unwrap_or_else(|| decoded[i].clone()), i))
+            .map(|i| (decode_entry_name(raws[i], enc), i))
             .collect();
         entries.sort_by(|a, b| natord::compare(&a.0, &b.0));
         entries.into_iter().unzip()
@@ -231,7 +216,9 @@ impl ZipSource {
         while let Ok(off) = reader.stream_position() {
             match zip::read::read_zipfile_from_stream(&mut reader) {
                 Ok(Some(mut file)) => {
-                    let name = file.name().to_string();
+                    // A name `zip` can't decode is simply not a page (empty → filtered
+                    // out below); the entry is still drained to reach the next header.
+                    let name = file.name().map(|n| n.into_owned()).unwrap_or_default();
                     let keep = !name.ends_with('/') && is_image_name(&name);
                     // Drain past the data to reach the next header; a truncated final
                     // entry errors here → stop without recording the incomplete page.

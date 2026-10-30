@@ -22,7 +22,7 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
 use jni::objects::{JObject, JString, JValue};
-use jni::JavaVM;
+use jni::{jni_sig, jni_str, JavaVM};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -920,6 +920,7 @@ impl ApplicationHandler for Shell {
             desired_maximum_frame_latency: 2,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
+            color_space: wgpu::SurfaceColorSpace::Auto, // wgpu's historical (sRGB) choice
         };
         surface.configure(&ctx.device, &config);
 
@@ -2454,6 +2455,29 @@ fn device_tier(total_mb: u64, max_khz: Option<u64>) -> DeviceTier {
 /// Hidden for a single-page source.
 /// Image-info overlay as a closable centered popup (Android take on the "I"
 /// overlay): check it, then ✕ to dismiss — not a persistent overlay.
+/// A framed, clickable image — egui 0.34's `ImageButton` (removed in 0.36), ported
+/// so the covers keep their exact look: a `button_padding.x` border on every side,
+/// the interact-state fill and stroke, and the image at its own size. Mirrors the
+/// desktop shell's `ui::image_button`.
+fn image_button(ui: &mut egui::Ui, image: egui::Image<'_>) -> egui::Response {
+    let padding = egui::Vec2::splat(ui.spacing().button_padding.x);
+    let avail = ui.available_size() - 2.0 * padding;
+    // Covers are already-uploaded `SizedTexture`s, so the size is known up front.
+    let size = image.calc_size(avail, image.size());
+    let (rect, response) = ui.allocate_exact_size(size + 2.0 * padding, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::Button));
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        let frame = rect.expand(visuals.expansion);
+        let radius = image.image_options().corner_radius;
+        ui.painter().rect_filled(frame, radius, visuals.weak_bg_fill);
+        image.paint_at(ui, ui.layout().align_size_within_rect(size, rect.shrink2(padding)));
+        ui.painter()
+            .rect_stroke(frame, radius, visuals.bg_stroke, egui::StrokeKind::Inside);
+    }
+    response
+}
+
 fn info_popup(ctx: &egui::Context, lines: &[(String, String)], close: &mut bool) {
     egui::Area::new(egui::Id::new("info_popup"))
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -20.0))
@@ -2512,13 +2536,13 @@ fn seekbar(
     }
     // A floating pill lifted off the bottom edge (the very edge collides with the
     // system gesture bar + is awkward to grab), fattened for touch.
-    let sw = ctx.screen_rect().width();
+    let sw = ctx.content_rect().width();
     // The seekbar hand-paints the slider/buttons (egui can't style them per-widget
     // here), so pick high-contrast tones for light/e-ink off the active theme.
-    let light = !ctx.style().visuals.dark_mode;
+    let light = !ctx.global_style().visuals.dark_mode;
     // Translucent panel so the page shows through behind the controls. Keep the
     // popup's color/stroke/rounding, just drop the fill's alpha.
-    let frame = translucent_popup(&ctx.style());
+    let frame = translucent_popup(&ctx.global_style());
     egui::Area::new(egui::Id::new("seekbar"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
         .show(ctx, |ui| {
@@ -2796,7 +2820,7 @@ fn empty_state(
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
-                ui.set_max_width((ctx.screen_rect().width() * 0.8).min(420.0));
+                ui.set_max_width((ctx.content_rect().width() * 0.8).min(420.0));
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 12.0);
                     // Secondary text color from the active theme (was a hardcoded
@@ -2859,7 +2883,7 @@ fn opening_card(ctx: &egui::Context, name: &str) {
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .show(ctx, |ui| {
             translucent_popup(ui.style()).show(ui, |ui| {
-                ui.set_max_width((ctx.screen_rect().width() * 0.8).min(360.0));
+                ui.set_max_width((ctx.content_rect().width() * 0.8).min(360.0));
                 ui.vertical_centered(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(0.0, 10.0);
                     ui.add(egui::Spinner::new().size(40.0));
@@ -2901,7 +2925,7 @@ fn volume_cell(ui: &mut egui::Ui, v: &VolCell, reqs: &mut FrameReqs, close_lib: 
                     // Read volumes fade out (Chunky-style).
                     img = img.tint(egui::Color32::from_white_alpha(72));
                 }
-                ui.add(egui::ImageButton::new(img))
+                image_button(ui, img)
             } else {
                 ui.add_sized(
                     [CELL_W, COVER_H],
@@ -3001,9 +3025,10 @@ fn book_prompt_card(
                     ui.add_space(8.0);
                     let cover_w = BOOK_PROMPT_W_PT - 24.0;
                     let clicked = if let Some(t) = thumb {
-                        ui.add(egui::ImageButton::new(
+                        image_button(
+                            ui,
                             egui::Image::new(t).fit_to_exact_size(egui::vec2(cover_w, 240.0)),
-                        ))
+                        )
                         .clicked()
                     } else {
                         // Cover still decoding: placeholder button, same action.
@@ -3048,7 +3073,7 @@ fn drag_shadow(ctx: &egui::Context, frac: f32, si: f32) {
         egui::Order::Background,
         egui::Id::new("drag_shadow"),
     ));
-    let rect = ctx.screen_rect();
+    let rect = ctx.content_rect();
     let seam_x = rect.left() + frac * rect.width();
     let w = 22.0;
     let far_x = if si > 0.0 { seam_x - w } else { seam_x + w };
@@ -3074,7 +3099,7 @@ fn zone_hints(ctx: &egui::Context, rtl: bool, scroll: bool) {
         egui::Order::Background,
         egui::Id::new("zone_hints"),
     ));
-    let rect = ctx.screen_rect();
+    let rect = ctx.content_rect();
     // Outline the tap zones. Two-tone — a dark stroke under a lighter one — so the
     // lines read on both white and dark manga pages.
     let dark = egui::Stroke::new(3.0, egui::Color32::from_black_alpha(120));
@@ -3463,7 +3488,7 @@ fn options_popup(
 /// Launch the SAF document picker via `YoshActivity.openDocument()`.
 fn launch_picker(app: &AndroidApp) {
     match with_env(app, |env, activity| {
-        env.call_method(activity, "openDocument", "()V", &[])?;
+        env.call_method(activity, jni_str!("openDocument"), jni_sig!("()V"), &[])?;
         Ok(())
     }) {
         Ok(()) => log::info!("launched document picker"),
@@ -3474,7 +3499,7 @@ fn launch_picker(app: &AndroidApp) {
 /// True if the app holds all-files access (can browse the library by path).
 fn has_all_files(app: &AndroidApp) -> bool {
     with_env(app, |env, activity| {
-        Ok(env.call_method(activity, "hasAllFiles", "()Z", &[])?.z()?)
+        env.call_method(activity, jni_str!("hasAllFiles"), jni_sig!("()Z"), &[])?.z()
     })
     .unwrap_or(false)
 }
@@ -3484,7 +3509,7 @@ fn has_all_files(app: &AndroidApp) -> bool {
 /// JNI (available since API 29). Defaults to dark on failure (the historical look).
 fn system_dark(app: &AndroidApp) -> bool {
     with_env(app, |env, activity| {
-        Ok(env.call_method(activity, "isSystemDark", "()Z", &[])?.z()?)
+        env.call_method(activity, jni_str!("isSystemDark"), jni_sig!("()Z"), &[])?.z()
     })
     .unwrap_or(true)
 }
@@ -3492,7 +3517,7 @@ fn system_dark(app: &AndroidApp) -> bool {
 /// Open Settings so the user can grant all-files access.
 fn request_all_files(app: &AndroidApp) {
     let _ = with_env(app, |env, activity| {
-        env.call_method(activity, "requestAllFiles", "()V", &[])?;
+        env.call_method(activity, jni_str!("requestAllFiles"), jni_sig!("()V"), &[])?;
         Ok(())
     });
 }
@@ -3500,13 +3525,12 @@ fn request_all_files(app: &AndroidApp) {
 /// Take the picked content:// URI (string) if one has arrived, else None.
 fn take_picked_uri(app: &AndroidApp) -> Option<String> {
     with_env(app, |env, activity| {
-        let res = env.call_method(activity, "takePickedUri", "()Ljava/lang/String;", &[])?;
+        let res = env.call_method(activity, jni_str!("takePickedUri"), jni_sig!("()Ljava/lang/String;"), &[])?;
         let obj = res.l()?;
         if obj.is_null() {
             return Ok(None);
         }
-        let s: String = env.get_string(&JString::from(obj))?.into();
-        Ok(Some(s))
+        Ok(Some(env.cast_local::<JString>(obj)?.try_to_string(env)?))
     })
     .ok()
     .flatten()
@@ -3518,11 +3542,11 @@ fn open_fd(app: &AndroidApp, uri: &str) -> i32 {
         let juri = env.new_string(uri)?;
         let res = env.call_method(
             activity,
-            "openFd",
-            "(Ljava/lang/String;)I",
+            jni_str!("openFd"),
+            jni_sig!("(Ljava/lang/String;)I"),
             &[JValue::Object(&juri)],
         )?;
-        Ok(res.i()?)
+        res.i()
     })
     .unwrap_or(-1)
 }
@@ -3537,7 +3561,7 @@ fn open_fd(app: &AndroidApp, uri: &str) -> i32 {
 /// flags call). The bridge just `runOnUiThread`s the flag change, fire-and-forget.
 fn set_keep_screen_on(app: &AndroidApp, on: bool) {
     let _ = with_env(app, |env, activity| {
-        env.call_method(activity, "setKeepScreenOn", "(Z)V", &[JValue::Bool(on as u8)])?;
+        env.call_method(activity, jni_str!("setKeepScreenOn"), jni_sig!("(Z)V"), &[JValue::Bool(on)])?;
         Ok(())
     });
 }
@@ -3557,7 +3581,7 @@ fn volume_adjust(code: KeyCode) -> Option<i32> {
 /// active stream and show the volume panel.
 fn adjust_volume(app: &AndroidApp, adj: i32) {
     let _ = with_env(app, |env, activity| {
-        env.call_method(activity, "adjustVolume", "(I)V", &[JValue::Int(adj)])?;
+        env.call_method(activity, jni_str!("adjustVolume"), jni_sig!("(I)V"), &[JValue::Int(adj)])?;
         Ok(())
     });
 }
@@ -3566,9 +3590,8 @@ fn adjust_volume(app: &AndroidApp, adj: i32) {
 /// if the bridge fails, which resolves to English.
 fn locale_tag(app: &AndroidApp) -> String {
     with_env(app, |env, activity| {
-        let s = env.call_method(activity, "localeTag", "()Ljava/lang/String;", &[])?.l()?;
-        let s = JString::from(s);
-        Ok(env.get_string(&s)?.into())
+        let s = env.call_method(activity, jni_str!("localeTag"), jni_sig!("()Ljava/lang/String;"), &[])?.l()?;
+        env.cast_local::<JString>(s)?.try_to_string(env)
     })
     .unwrap_or_default()
 }
@@ -3579,9 +3602,9 @@ fn set_immersive(app: &AndroidApp, immersive: bool) {
     let _ = with_env(app, |env, activity| {
         env.call_method(
             activity,
-            "setImmersive",
-            "(Z)V",
-            &[JValue::Bool(immersive as u8)],
+            jni_str!("setImmersive"),
+            jni_sig!("(Z)V"),
+            &[JValue::Bool(immersive)],
         )?;
         Ok(())
     });
@@ -3591,25 +3614,29 @@ fn set_immersive(app: &AndroidApp, immersive: bool) {
 /// library / empty-state chrome so the bars don't cover it.
 fn status_bar_height(app: &AndroidApp) -> i32 {
     with_env(app, |env, activity| {
-        Ok(env.call_method(activity, "statusBarHeight", "()I", &[])?.i()?)
+        env.call_method(activity, jni_str!("statusBarHeight"), jni_sig!("()I"), &[])?.i()
     })
     .unwrap_or(0)
 }
 
-/// Run a closure with an attached `JNIEnv` and the `YoshActivity` instance,
-/// clearing any pending Java exception afterwards.
+/// Run a closure with an attached JNI `Env` and the `YoshActivity` instance.
+///
+/// jni 0.22's `attach_current_thread` attaches permanently (so every call after the
+/// first is cheap), pushes a fresh local-reference frame around the closure, and
+/// catches any Java exception the closure leaves pending as
+/// `Error::CaughtJavaException` — the clear-after the 0.21 version did by hand.
 fn with_env<T>(
     app: &AndroidApp,
-    f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> jni::errors::Result<T>,
+    f: impl FnOnce(&mut jni::Env, &JObject) -> jni::errors::Result<T>,
 ) -> jni::errors::Result<T> {
-    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) }?;
-    let mut env = vm.attach_current_thread()?;
-    let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
-    let r = f(&mut env, &activity);
-    if env.exception_check().unwrap_or(false) {
-        let _ = env.exception_clear();
-    }
-    r
+    // SAFETY: android-activity hands us the process's live JavaVM pointer.
+    let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
+    vm.attach_current_thread(|env| {
+        // SAFETY: the activity pointer is a global ref owned by the glue; `JObject`
+        // has no `Drop`, so wrapping it here never deletes it.
+        let activity = unsafe { JObject::from_raw(env, app.activity_as_ptr().cast()) };
+        f(env, &activity)
+    })
 }
 
 /// Gather the info overlay's byte-derived metadata for page `index`: format,
@@ -4218,7 +4245,10 @@ impl App {
         // change) — not once per frame.
         let apply_visuals = self.applied_light != Some(light);
         self.applied_light = Some(light);
-        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+        let full_output = self.egui_ctx.run_ui(raw_input, |root| {
+            // Panels go in the root `Ui` (egui 0.36); Areas still take the `Context`,
+            // a cheap shared handle.
+            let ctx = &root.ctx().clone();
             // Theme the whole frame up front: standard widgets (library grid, popups,
             // empty-state card, series headers) follow this; the hand-painted chrome
             // (seekbar, letterbox) reads `dark_mode` back off the visuals.
@@ -4230,7 +4260,7 @@ impl App {
                 });
             }
             if library_view {
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root, |ui| {
                     ui.add_space(top_inset_pt);
                     // egui paints a fade-out gradient at scroll edges (default
                     // strength 0.5); on the cover grid it dims the thumbnails at the
@@ -4715,9 +4745,12 @@ impl App {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: ppp,
         };
-        for (id, delta) in &full_output.textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.ctx.device, &self.ctx.queue, *id, delta);
+        // egui 0.36 can queue several deltas per texture in one frame; apply in order.
+        for (id, deltas) in &full_output.textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.ctx.device, &self.ctx.queue, *id, delta);
+            }
         }
         let user_cmds = self.egui_renderer.update_buffers(
             &self.ctx.device,
@@ -4754,7 +4787,7 @@ impl App {
             .queue
             .submit(user_cmds.into_iter().chain(std::iter::once(enc.finish())));
         self.window.pre_present_notify();
-        frame.present();
+        self.ctx.queue.present(frame);
         // On-demand redraw: idle on a settled, decoded reading page. Pending work
         // no longer needs a leg here — everything that produces a result off-thread
         // (the decode pool, the cover worker, the series scan) sends and then calls
