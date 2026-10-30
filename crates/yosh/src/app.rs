@@ -2546,6 +2546,33 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// `--flipbench` (feature builds only): record this frame, then drive the run —
+    /// flip to the next page the moment the current one is drawn (holding "next" at
+    /// full speed), or keep the library redrawing — and write the report and exit
+    /// when it's done. Every frame requests the next, so the loop never idles.
+    #[cfg(feature = "flipbench")]
+    fn flipbench_tick(&mut self, frame: crate::flipbench::Frame) {
+        use crate::flipbench as fb;
+        if !fb::active() {
+            return;
+        }
+        fb::record(frame);
+        if fb::reader_mode() {
+            let reading = !self.library_view && self.reader.source.is_some();
+            if reading && self.reader.cache.contains(self.reader.visible_pages().0) {
+                if self.reader.at_edge(1) {
+                    fb::finish();
+                }
+                if self.reader.step(1) {
+                    fb::stepped();
+                }
+            }
+        } else if self.library_view && fb::frames() >= fb::LIBRARY_FRAMES {
+            fb::finish();
+        }
+        self.window.request_redraw();
+    }
+
     /// The tier this machine should be running at right now (the setting, or
     /// `Auto`'s power-source rule).
     fn effective_tier(&self) -> DeviceTier {
@@ -3002,6 +3029,8 @@ impl State {
 
     #[allow(deprecated)]
     fn render(&mut self) {
+        #[cfg(feature = "flipbench")]
+        let mut fb = crate::flipbench::Frame::start();
         // Mirror the live surface size into the reading viewport (the value the
         // reading math reads instead of `gpu.config`), less the top-bar inset so
         // the chrome never covers the page.
@@ -3370,6 +3399,8 @@ impl State {
             })
             .collect();
 
+        #[cfg(feature = "flipbench")]
+        fb.mark(crate::flipbench::Mark::AcquireStart);
         let frame = match self.gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
                 t
@@ -3385,6 +3416,8 @@ impl State {
                 return;
             }
         };
+        #[cfg(feature = "flipbench")]
+        fb.mark(crate::flipbench::Mark::AcquireEnd);
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -3482,6 +3515,8 @@ impl State {
         } else {
             self.reader.drag_seam()
         };
+        #[cfg(feature = "flipbench")]
+        fb.mark(crate::flipbench::Mark::UiStart);
         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
             ui::chrome(ui, ui_state, lib, &libctx, library_view);
             // Page-flip drag drop shadow — over the page, under the chrome.
@@ -3679,6 +3714,8 @@ impl State {
         // open buttons), so opening a volume from the grid flows through `open`.
         let ppp = self.egui_ctx.pixels_per_point();
         let primitives = self.egui_ctx.tessellate(full_output.shapes, ppp);
+        #[cfg(feature = "flipbench")]
+        fb.mark(crate::flipbench::Mark::UiEnd);
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.gpu.config.width, self.gpu.config.height],
             pixels_per_point: ppp,
@@ -3727,6 +3764,8 @@ impl State {
             .queue
             .submit(user_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         self.gpu.queue.present(frame);
+        #[cfg(feature = "flipbench")]
+        self.flipbench_tick(fb);
 
         // Queue/evict library covers *after* presenting, so eviction can never free
         // a texture this frame just drew. The decode itself runs off-thread; finished

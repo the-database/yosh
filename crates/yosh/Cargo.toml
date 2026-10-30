@@ -64,3 +64,7 @@ winresource = "0.1"
 # dav1d (or a vendored build): `cargo build --release -p yosh --features avif`.
 # Forwarded to the engine, which owns the decode path (image/avif-native).
 avif = ["yosh-engine/avif"]
+# Frame-timing harness (`--flipbench <report> [book]`, see src/flipbench.rs) for
+# measuring the UI/present path; run and compared by `scripts/flipbench.ps1`. OFF
+# by default, so the shipped binary contains none of it.
+flipbench = []

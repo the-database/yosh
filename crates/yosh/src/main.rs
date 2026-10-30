@@ -8,6 +8,8 @@
 
 mod app;
 mod config;
+#[cfg(feature = "flipbench")]
+mod flipbench;
 mod gpu;
 mod library;
 mod ui;
@@ -23,11 +25,12 @@ fn main() {
         return;
     }
 
-    let path = std::env::args().nth(1).map(std::path::PathBuf::from);
-    let start_index = std::env::args()
-        .nth(2)
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
+    #[allow(unused_mut)] // only the flipbench build edits the list
+    let mut args: Vec<String> = std::env::args().collect();
+    #[cfg(feature = "flipbench")]
+    flipbench::init(&mut args);
+    let path = args.get(1).map(std::path::PathBuf::from);
+    let start_index = args.get(2).and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
 
     let event_loop = EventLoop::new().expect("create event loop");
     // On-demand rendering: sleep until an event instead of free-running. Frames are
@@ -41,6 +44,15 @@ fn main() {
 
     let mut app = app::App::new(path, start_index);
     event_loop.run_app(&mut app).expect("run app");
+}
+
+/// Is a `--flipbench` run in progress? Always `false` (and compiled away) unless
+/// built with `--features flipbench`.
+pub(crate) fn flipbench_active() -> bool {
+    #[cfg(feature = "flipbench")]
+    return flipbench::active();
+    #[cfg(not(feature = "flipbench"))]
+    false
 }
 
 /// On Windows, when the GUI-subsystem exe is launched from a terminal, attach to
