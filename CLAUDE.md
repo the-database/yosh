@@ -16,8 +16,9 @@ Cargo workspace:
 - `crates/yosh-engine` — the reader engine: decode pool, page/texture/cache layer, reading math (also used
   by `crates/yosh-android`).
 - `crates/yosh-image` — the **GPU-free** imaging core the engine is built on: decoders, ICC, tone curves,
-  HQ resize, folder/archive page sources. No wgpu/winit/egui, so batch tools can depend on it too; the
-  engine re-exports `icc`, `source`, `tone`. **Its public API has other consumers** (a MangaJaNai
+  HQ resize, folder/archive page sources, whole-archive entry streaming (`archive`), and (feature `aji`)
+  safe runtime-loaded bindings to libaji's image ABI. No wgpu/winit/egui, so batch tools can depend on it
+  too; the engine re-exports `icc`, `source`, `tone`. **Its public API has other consumers** (a MangaJaNai
   converter backend in this workspace): change it deliberately, and keep its decode/resize output
   bit-identical for yosh (`decode_digest`, below).
 - `crates/decode_bench`, `crates/present_bench` — throwaway Phase-0 spikes that validated the
@@ -127,8 +128,9 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
 
 ### AI upscaling add-on (optional)
 - **Opt-in and inert by default.** `yosh_engine::sr` defines the `Upscaler` trait; `sr::aji` (engine
-  feature `sr`, on via the `yosh` crate's default `sr` feature — `libloading` only, no C toolchain)
-  loads libaji's still-image ABI (`aji_image.h`, the-database/animejanai-inference >= v0.18.0) at
+  feature `sr` = `yosh-image/aji`, on via the `yosh` crate's default `sr` feature — `libloading` only, no
+  C toolchain) is yosh's rules-driven upscaler over the low-level `yosh_image::aji` bindings, which load
+  libaji's still-image ABI (`aji_image.h`, the-database/animejanai-inference >= v0.18.0) at
   runtime from the add-on directory (`config::addon_dir()`: `%LOCALAPPDATA%\the-database\yosh\data\addons\upscale`,
   or `yosh-addons\upscale` beside the exe in portable mode; `crates/yosh/src/addon.rs`). That directory
   holds `aji.dll` + backends + their runtimes, `models/*.onnx`, an optional `rules.json`, and `cache/`

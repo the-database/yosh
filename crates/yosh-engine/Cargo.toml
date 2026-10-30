@@ -17,11 +17,11 @@ rar = ["yosh-image/rar"]
 # standard build needs no C toolchain. The `yosh` app forwards its own `avif`
 # feature to this one. Enabling requires nasm + dav1d (see CI).
 avif = ["yosh-image/avif"]
-# The AI-upscale add-on's runtime binding (`sr::aji`): loads libaji from the
-# add-on directory at runtime via libloading (pure Rust — no C toolchain, and no
-# inference runtime linked). The `Upscaler` trait and the SR lane are always
-# built; without an installed add-on they stay inert.
-sr = ["dep:libloading"]
+# The AI-upscale add-on's runtime binding (`sr::aji`, over `yosh_image::aji`):
+# loads libaji from the add-on directory at runtime via libloading (pure Rust —
+# no C toolchain, and no inference runtime linked). The `Upscaler` trait and the
+# SR lane are always built; without an installed add-on they stay inert.
+sr = ["yosh-image/aji"]
 
 [dependencies]
 # The GPU-free imaging core: decoders, ICC, tone curves, HQ resize, page sources.
@@ -38,7 +38,6 @@ jxl-oxide = { version = "0.12", default-features = false }
 fast_image_resize = "6"
 # ICO container parsing (multi-image .ico → layered pages) and re-encoding.
 ico = "0.6"
-libloading = { version = "0.8", optional = true }
 
 [dev-dependencies]
 # Hand-building zips with raw (non-UTF-8) entry names in tests needs real CRCs;
