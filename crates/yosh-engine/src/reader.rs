@@ -674,6 +674,12 @@ pub struct Reader {
     /// only way to drop it. Kept outside the caches deliberately: those evict, and
     /// un-learning a joined page would re-pair the volume under the reader.
     wide: WideSet,
+    /// The page the reader was explicitly sent to (an open, a `goto`), which a
+    /// re-pairing must keep on screen. `index` alone can't say: it is the view's
+    /// *lower* page, so once a re-anchor rewrites an opened second page `N` to `N-1`,
+    /// a later re-phase pairs `N-1` with `N-2` and the opened page is gone. Only
+    /// honoured while it is still in view — see [`Reader::reanchor_after_repair`].
+    focus: Option<usize>,
     pub rotation: u8,         // 90° CW steps (0..=3); single-page draws only
     pub zoom: f32,            // page-flip zoom factor (1.0 = fit)
     pub pan_x: f32,           // page-flip pan offset in screen px (from centered)
@@ -842,6 +848,7 @@ impl Reader {
             layout,
             spread_offset: 0,
             wide: WideSet::default(),
+            focus: None,
             rotation: 0,
             zoom: 1.0,
             pan_x: 0.0,
@@ -914,6 +921,8 @@ impl Reader {
         // re-pairs everything after it — so the read position has to be re-anchored
         // once the whole batch is in (see below).
         let mut repaired = false;
+        // The view the focused page has to be in, taken before the batch can re-pair it.
+        let before = self.focus.map(|_| self.view_pages(self.index));
         for msg in msgs {
             match msg {
                 Msg::Done { index, page, thumb } => {
@@ -942,7 +951,7 @@ impl Reader {
         // own via `JobsKey::wide_epoch`; `invalidate_jobs` here would also drop the
         // thumbnail-tail pivot and force a full O(volume log volume) rebuild.
         if repaired {
-            self.snap_to_view_start();
+            self.reanchor_after_repair(before);
         }
     }
 
@@ -1058,8 +1067,41 @@ impl Reader {
         self.lq_cache.clear();
         self.failed.clear();
         self.wide.clear();
+        self.focus = None;
         self.last_drawn = None;
         self.invalidate_jobs();
+    }
+
+    /// Start reading a freshly attached volume at `start` (clamped). The shells call
+    /// this instead of poking `index`, so the scroll offset and pan of the *previous*
+    /// volume can't carry over — a stale `top_offset` made `normalize` roll the
+    /// anchor past the page that was opened. `index` is left unsnapped, as before;
+    /// `focus` keeps `start` in view if a joined spread later re-pairs the volume.
+    pub fn open_at(&mut self, start: usize) {
+        let len = self.source.as_ref().map_or(0, |s| s.len());
+        self.index = start.min(len.saturating_sub(1));
+        self.focus = Some(self.index);
+        self.pan_x = 0.0;
+        self.pan_y = 0.0;
+        self.top_offset = 0.0;
+    }
+
+    /// Re-anchor after a landed batch taught the pairing a new joined spread.
+    /// `before` is the view as it stood *before* the batch, when a `focus` is set.
+    ///
+    /// The focused page wins only while it was actually on screen: any path that
+    /// moves `index` without `goto` (scroll, a layout toggle, a refresh) leaves it
+    /// behind, and the first re-pairing after that drops it rather than yanking the
+    /// reader back. Either way the result is a `view_start`, so it is a real anchor
+    /// and the grid's no-skip navigation is untouched — only *which* view is kept
+    /// changes. No-op in scroll mode, like `snap_to_view_start`.
+    fn reanchor_after_repair(&mut self, before: Option<(usize, Option<usize>)>) {
+        self.focus = self
+            .focus
+            .filter(|&f| before.is_some_and(|(a, b)| f == a || b == Some(f)));
+        if !self.scroll_mode {
+            self.index = self.view_start(self.focus.unwrap_or(self.index));
+        }
     }
 
     /// The drawn box `(w, h)` in device px of the current **page-flip** view, exactly
@@ -2957,6 +2999,137 @@ mod tests {
         // A middle file removed → indices after it shift.
         assert_eq!(classify_refresh(&base, &src(&["1.png", "3.png"])), Refresh::Reorder);
     }
+
+    /// A page-flip `Reader` on wgpu's `noop` backend over `pages` name-only pages —
+    /// enough to drive the pairing and re-anchoring, which never touch pixels.
+    /// `lq_cap = 0` lifts `step`'s LQ warm-up gate (no page ever decodes here).
+    fn spread_reader(layout: crate::layout::Layout, scroll_mode: bool, pages: usize) -> super::Reader {
+        use super::{DeviceTier, Viewport};
+        use crate::texpool::TexturePool;
+        use std::sync::Arc;
+        let (device, queue) = wgpu::Device::noop(&wgpu::DeviceDescriptor::default());
+        let mut budget = Budget::for_tier(DeviceTier::High, 512, 4);
+        budget.lq_cap = 0;
+        let pool = Arc::new(TexturePool::with_max_total(budget.texpool_max));
+        let mut r = super::Reader::new(
+            Arc::new(device),
+            Arc::new(queue),
+            pool,
+            budget,
+            crate::page::FitMode::Window,
+            layout,
+            scroll_mode,
+            Direction::Ltr,
+            0,
+            false,
+        );
+        r.source = Some(Arc::new(NamesSource((0..pages).map(|i| format!("{i:03}.png")).collect())));
+        r.viewport = Viewport { w: 1000, h: 1000 };
+        r
+    }
+
+    /// Mark page `w` a joined spread and re-anchor exactly as `drain_pool` does
+    /// when a landed batch teaches the pairing something new.
+    fn learn_wide(r: &mut super::Reader, w: usize) {
+        let before = r.focus.map(|_| r.view_pages(r.index));
+        assert!(r.wide.set(w, true), "page {w} newly wide");
+        r.reanchor_after_repair(before);
+    }
+
+    fn shows(r: &super::Reader, page: usize) -> bool {
+        let (a, b) = r.visible_pages();
+        a == page || b == Some(page)
+    }
+
+    // The reported bug: opening page 10 (the second page of (9,10)) and then learning
+    // a joined spread above it rewrote the anchor to 9, so a later one below with the
+    // opposite parity re-paired around 9 into (8,9) — and the opened page vanished.
+    #[test]
+    fn opened_page_survives_rephase() {
+        use crate::layout::Layout;
+        let mut r = spread_reader(Layout::Spread, false, 20);
+        r.open_at(10);
+        assert_eq!(r.visible_pages(), (9, Some(10)));
+        learn_wide(&mut r, 14);
+        assert!(shows(&r, 10), "after wide 14: {:?}", r.visible_pages());
+        learn_wide(&mut r, 7);
+        assert_eq!(r.visible_pages(), (10, Some(11)), "re-phased around the opened page");
+        assert_eq!(r.index, r.view_start(r.index), "still a real anchor");
+    }
+
+    // Same loss through `goto` (seekbar, Last): it snaps to the pair's lower page.
+    #[test]
+    fn goto_second_page_survives_rephase() {
+        use crate::layout::Layout;
+        let mut r = spread_reader(Layout::Spread, false, 20);
+        r.goto(10);
+        assert_eq!(r.index, 9, "goto still lands on a real anchor");
+        learn_wide(&mut r, 14);
+        learn_wide(&mut r, 7);
+        assert!(shows(&r, 10), "{:?}", r.visible_pages());
+    }
+
+    // Normal flipping must re-anchor exactly as it always has: a step sets the focus
+    // to the anchor it lands on, so the focused re-anchor *is* the old one.
+    #[test]
+    fn stepped_reader_reanchors_as_before() {
+        use crate::layout::Layout;
+        for wide in [3usize, 4, 5, 6, 7, 8] {
+            let mut r = spread_reader(Layout::Spread, false, 20);
+            r.open_at(0);
+            for _ in 0..5 {
+                assert!(r.step(1));
+            }
+            let expect = {
+                assert!(r.wide.set(wide, true));
+                let e = r.view_start(r.index);
+                r.wide.set(wide, false);
+                e
+            };
+            learn_wide(&mut r, wide);
+            assert_eq!(r.index, expect, "wide {wide}");
+        }
+    }
+
+    // Once the reader has moved off the focused page by a path that isn't `goto`, the
+    // next re-pairing drops the focus instead of dragging the reader back to it.
+    #[test]
+    fn stale_focus_is_dropped() {
+        use crate::layout::Layout;
+        let mut r = spread_reader(Layout::Spread, false, 30);
+        r.open_at(10);
+        r.index = 21; // e.g. a layout toggle / scroll-mode excursion
+        learn_wide(&mut r, 25);
+        assert_eq!(r.focus, None);
+        assert!(shows(&r, 21), "{:?}", r.visible_pages());
+        assert!(!shows(&r, 10));
+    }
+
+    // Single layout never pairs, so the focused page is the anchor regardless.
+    #[test]
+    fn single_layout_unaffected() {
+        use crate::layout::Layout;
+        let mut r = spread_reader(Layout::Single, false, 20);
+        r.open_at(10);
+        learn_wide(&mut r, 14);
+        learn_wide(&mut r, 7);
+        assert_eq!(r.visible_pages(), (10, None));
+    }
+
+    // A previous volume's scroll offset must not carry into the next one: `normalize`
+    // would roll the anchor past the opened page.
+    #[test]
+    fn open_at_resets_scroll_offset() {
+        use crate::layout::Layout;
+        let mut r = spread_reader(Layout::Single, true, 20);
+        r.top_offset = 50_000.0;
+        r.pan_x = 12.0;
+        r.open_at(3);
+        r.normalize();
+        assert_eq!((r.index, r.top_offset, r.pan_x), (3, 0.0, 0.0));
+        r.open_at(99);
+        assert_eq!(r.index, 19, "clamped to the volume");
+    }
 }
 
 impl Reader {
@@ -3114,7 +3287,10 @@ impl Reader {
         // re-snap under the reader on the next frame. `step` already passes an anchor,
         // so this is a no-op there (and in single-page layout). Scroll mode is excluded
         // because `layout` persists across the mode toggle, and there `index` is a
-        // strip position, not a pairing anchor.
+        // strip position, not a pairing anchor. The requested page itself is kept as
+        // `focus`, so a later re-pairing keeps it on screen (see `reanchor_after_repair`).
+        let len = self.source.as_ref().map_or(0, |s| s.len());
+        self.focus = Some(index.min(len.saturating_sub(1)));
         self.index = if self.scroll_mode { index } else { self.view_start(index) };
         self.pan_x = 0.0;
         self.pan_y = 0.0; // start new page centered
@@ -3153,6 +3329,7 @@ impl Reader {
                     self.cache.remap(|i| (i < new_len).then_some(i));
                     self.lq_cache.remap(|i| (i < new_len).then_some(i));
                     self.wide.remap(|i| (i < new_len).then_some(i));
+                    self.focus = self.focus.filter(|&f| f < new_len);
                     if self.index >= new_len {
                         self.index = new_len - 1;
                     }
@@ -3175,17 +3352,20 @@ impl Reader {
             Refresh::Reorder => {
                 let new_pos: HashMap<&str, usize> =
                     (0..new_len).map(|i| (new.name(i), i)).collect();
-                let anchor = self.grid_of(old_len).view_pages(self.index).0;
+                let (anchor, facing) = self.grid_of(old_len).view_pages(self.index);
+                // A focused page still on screen is the one to follow — re-keyed by
+                // name like everything else, so the opened file stays in view.
+                let focused = self.focus.filter(|&f| f == anchor || facing == Some(f));
+                let anchor = focused.unwrap_or(anchor);
                 let anchor_name = old.name(anchor).to_string();
                 self.cache.remap(|i| new_pos.get(old.name(i)).copied());
                 self.lq_cache.remap(|i| new_pos.get(old.name(i)).copied());
                 // Orientation follows the *file*, so a page inserted mid-list doesn't
                 // make the reader re-pair around a joined spread that hasn't moved.
                 self.wide.remap(|i| new_pos.get(old.name(i)).copied());
-                self.index = new_pos
-                    .get(anchor_name.as_str())
-                    .copied()
-                    .unwrap_or_else(|| self.index.min(new_len - 1));
+                let kept = new_pos.get(anchor_name.as_str()).copied();
+                self.focus = focused.and(kept);
+                self.index = kept.unwrap_or_else(|| self.index.min(new_len - 1));
                 self.failed.clear();
                 let pool = DecodePool::new(
                     new.clone(),

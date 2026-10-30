@@ -2297,11 +2297,11 @@ impl State {
         self.info_for = None;
         self.reader.nav_times.clear();
         self.reader.rotation = 0; // each volume opens upright
-        self.reader.index = idx.min(source.len() - 1);
+        self.reader.source = Some(source);
+        self.reader.open_at(idx);
         push_recent(&mut self.settings, &key);
         self.volume_key = Some(key);
         self.ui.opened = Some(path.to_path_buf());
-        self.reader.source = Some(source);
         self.library_view = false; // opening anything switches to the reader
         // Fresh pool, fresh caches: drop the cross-frame prefetch memo *and* the
         // thumbnail-tail pivot, or the new pool's empty tail would stay empty until
