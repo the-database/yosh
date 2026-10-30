@@ -129,6 +129,8 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   settled size **above** its source size (where the GPU would magnify); the upscaled texture then
   swaps in place. The lane never reports `Msg::Failed` (that would hide a good page) — it sends
   `Msg::SrSkipped { reason }` instead.
+  How far around the view it upscales follows the Performance tier (`Budget::sr_ahead`/`sr_behind`):
+  High = the whole prefetch window, Mid (Auto on battery) = 3 ahead / 1 behind, Low = the view only.
 - **Single-resize invariant holds:** `decode::decode_sr` runs the model on the whole page, then the same
   HQ CPU resize (`sr_from_master`) to the exact target, so the GPU samples 1:1. The model's full-size
   output (`SrMaster`) is kept per page (`MasterCache`, 256 MB LRU, per pool), so a zoom/resize of an
