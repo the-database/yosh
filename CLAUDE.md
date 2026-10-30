@@ -11,8 +11,15 @@ change is just a texture swap. Performance is the point — treat the decode/ren
 load-bearing and don't regress seek throughput (target ≈ 83 pages/sec; the real pipeline measures ~300 pps
 gray / ~175 pps color at a 1440-px target with `seek_bench`, and page turns are display-capped at the refresh rate).
 
-Cargo workspace, three crates:
-- `crates/yosh` — the application (everything below lives here).
+Cargo workspace:
+- `crates/yosh` — the desktop application shell (window, input, egui chrome).
+- `crates/yosh-engine` — the reader engine: decode pool, page/texture/cache layer, reading math (also used
+  by `crates/yosh-android`).
+- `crates/yosh-image` — the **GPU-free** imaging core the engine is built on: decoders, ICC, tone curves,
+  HQ resize, folder/archive page sources. No wgpu/winit/egui, so batch tools can depend on it too; the
+  engine re-exports `icc`, `source`, `tone`. **Its public API has other consumers** (a MangaJaNai
+  converter backend in this workspace): change it deliberately, and keep its decode/resize output
+  bit-identical for yosh (`decode_digest`, below).
 - `crates/decode_bench`, `crates/present_bench` — throwaway Phase-0 spikes that validated the
   throughput ceiling before the real build. See `SPIKES_RESULTS.md`. Not part of the app.
 
@@ -28,6 +35,8 @@ cargo test  -p yosh spread                             # run a subset of tests b
 
 # Performance — run these when touching the decode path, the frame loop, or egui/wgpu/winit versions:
 cargo run --release -p yosh-engine --example seek_bench -- "<book>" [target_h] [runs]   # engine pages/sec
+cargo run --release -p yosh-engine --example decode_digest -- "<book>" [target_h ...] > a.txt  # per-page output digests:
+                                                       # run before + after a decode-path refactor and diff (must be identical)
 scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]                # UI frame timing, base vs working tree
 ```
 
@@ -59,12 +68,14 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   - The scheduler rebuilds the **nearest-first** job list on *every* navigation (`set_jobs`), so workers
     always grab the highest-priority page relative to the latest position. `poll()` drains finished pages.
   - `inflight` dedups; jobs already running are not re-queued.
-- **`source/mod.rs` — `PageSource` trait** (`Send + Sync`): the abstraction the pool pulls from —
+- **`yosh-image/src/source/mod.rs` — `PageSource` trait** (`Send + Sync`): the abstraction the pool pulls from —
   `read_page(index) -> bytes`, `len`, `name`, `modified`. Implementations: `FolderSource`, `ZipSource`
   (parallel reads), `RarSource` + `SevenzSource` (sequential formats: a reader thread decompresses into
   an in-memory map, then reads are served from there).
-- **Decode + HQ downscale** (`decode.rs` + `tone.rs` + `icc.rs`): magic-byte routing to png / jpeg-decoder
-  / image. This is subtle and deliberate:
+- **Decode + HQ downscale**: the primitives live in `yosh-image` (`decode.rs` magic-byte routing to
+  png / jpeg-decoder / jxl-oxide / psd / image; `resize.rs`; `tone.rs`; `icc.rs`), and the engine's
+  `decode.rs` composes them into the display pipeline (exact targets, LQ tier, animations, SR). This
+  is subtle and deliberate:
   - **Grayscale path** downscales in **true linear light** (sRGB → 16-bit linear → Catmull-Rom resample →
     re-encode through the Dot Gain 20% curve in `tone.rs`). This is what kills halftone-screentone moiré;
     resampling in gamma/perceptual space does **not**. Don't "simplify" it back to a gamma-space resize.
