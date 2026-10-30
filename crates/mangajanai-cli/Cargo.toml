@@ -9,6 +9,11 @@ description = "MangaJaNaiConverterGui's upscaling backend: batch manga/image ups
 name = "mangajanai_upscale"
 path = "src/main.rs"
 
+[features]
+# AVIF input decoding (dav1d, a C library: needs nasm + meson, as yosh's CI builds it). Release
+# builds enable it; default builds stay free of it.
+avif = ["yosh-image/avif"]
+
 [dependencies]
 yosh-image = { version = "0.1.0", path = "../yosh-image", features = ["aji"] }
 serde = { version = "1.0.229", features = ["derive"] }
