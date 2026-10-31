@@ -2,7 +2,13 @@
 //! with `TypeNameHandling.All`: lists are `{"$type": …, "$values": […]}`) — the same keys the 1.x
 //! Python backend read. Anything not listed here is ignored.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// Newtonsoft writes an unset string as `null` (e.g. a chain whose model dropdown has no
+/// selection); read it as empty, which every string setting already handles.
+fn null_as_empty<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Deserialize, Default, Debug, Clone)]
 pub struct Values<T> {
@@ -36,9 +42,13 @@ pub struct Workflow {
     pub display_device_width: i32,
     pub display_device_height: i32,
     pub selected_tab_index: i32,
+    #[serde(deserialize_with = "null_as_empty")]
     pub input_file_path: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub input_folder_path: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub output_folder_path: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub output_filename: String,
     pub upscale_images: bool,
     pub upscale_archives: bool,
@@ -81,14 +91,19 @@ impl Default for Workflow {
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct Chain {
+    #[serde(deserialize_with = "null_as_empty")]
     pub chain_number: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub min_resolution: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub max_resolution: String,
     pub is_grayscale: bool,
     pub is_color: bool,
     pub min_scale_factor: Option<i32>,
     pub max_scale_factor: Option<i32>,
+    #[serde(deserialize_with = "null_as_empty")]
     pub model_file_path: String,
+    #[serde(deserialize_with = "null_as_empty")]
     pub model_tile_size: String,
     pub auto_adjust_levels: bool,
     pub resize_height_before_upscale: Option<i32>,
@@ -223,5 +238,18 @@ mod tests {
         assert_eq!(w.chains.values[0].max_scale_factor, Some(2));
         assert_eq!(w.chains.values[0].min_scale_factor, Some(0), "missing keys take the defaults");
         assert_eq!(s.models_directory.as_deref(), Some("C:\\models"));
+    }
+
+    #[test]
+    fn null_strings_read_as_empty() {
+        let json = r#"{ "Workflows": { "$values": [ { "OutputFolderPath": null, "Chains": { "$values": [
+            { "ModelFilePath": null, "ModelTileSize": null, "MinResolution": null } ] } } ] } }"#;
+        let s = AppState::parse(json).unwrap();
+        let w = s.current_workflow().unwrap();
+        assert_eq!(w.output_folder_path, "");
+        let c = &w.chains.values[0];
+        assert_eq!(c.model_file_path, "");
+        assert_eq!(c.model_tile_size, "");
+        assert_eq!(c.min_resolution, "");
     }
 }
