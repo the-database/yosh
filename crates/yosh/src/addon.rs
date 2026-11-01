@@ -48,7 +48,10 @@ pub fn installed(dir: &Path) -> bool {
 }
 
 /// The rule table: `rules.json` from the add-on if present and valid, else the
-/// built-in MangaJaNaiConverterGui defaults.
+/// built-in MangaJaNaiConverterGui defaults. A `rules.json` naming older model
+/// files keeps working: a model found under its exact name is used as is, and one
+/// whose name carries a precision suffix also matches the same model's other
+/// precisions or its unsuffixed name (`sr::aji`'s lookup order).
 pub fn rules(dir: &Path) -> Vec<SrRule> {
     #[derive(serde::Deserialize)]
     struct Rule {
@@ -179,7 +182,7 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
                 continue;
             }
         };
-        match AjiUpscaler::new(dir, b, device.id, rules(dir), Some(wake.clone())) {
+        match AjiUpscaler::new(dir, b, &device, rules(dir), Some(wake.clone())) {
             Ok(up) => {
                 if let Some(why) = &rtx_failed {
                     eprintln!("yosh: [upscale] TensorRT-RTX failed ({why}); using {}", b.label());
