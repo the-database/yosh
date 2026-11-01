@@ -39,6 +39,7 @@ pub fn backend_name(b: Backend) -> &'static str {
 
 pub struct Upscaler {
     ctx: Context,
+    backend: Backend,
     /// On TensorRT-RTX: where to open the TensorRT context a failed model falls back to.
     fallback: Option<Fallback>,
     model_dirs: Vec<PathBuf>,
@@ -86,7 +87,7 @@ impl Upscaler {
                         cache_dir: cache_dir.clone(),
                         ctx: None,
                     });
-                    return Ok(Self { ctx, fallback, model_dirs, models: HashMap::new(), description });
+                    return Ok(Self { ctx, backend, fallback, model_dirs, models: HashMap::new(), description });
                 }
                 Err(e) => err = format!("{}: {e}", backend_name(backend)),
             }
@@ -111,7 +112,7 @@ impl Upscaler {
         let key = (path.to_path_buf(), tile);
         if !self.models.contains_key(&key) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let model = match load_model(&self.ctx, path, tile, &name) {
+            let model = match load_model(&self.ctx, self.backend, path, tile, &name) {
                 Ok(m) => m,
                 Err(e) => {
                     let Some(fb) = self.fallback.as_mut() else {
@@ -119,7 +120,7 @@ impl Upscaler {
                     };
                     eprintln!("TensorRT-RTX failed for {name} ({e}); using TensorRT instead");
                     let ctx = fb.context()?;
-                    load_model(&ctx, path, tile, &name).map_err(|e| format!("{name}: {e}"))?
+                    load_model(&ctx, Backend::TensorRt, path, tile, &name).map_err(|e| format!("{name}: {e}"))?
                 }
             };
             self.models.insert(key.clone(), model);
@@ -208,10 +209,10 @@ fn open_context(aji: &Aji, backend: Backend, device_id: u64, cache_dir: &Option<
 }
 
 /// Load `path` at `tile` on `ctx`, waiting out a background engine build (reported on stdout).
-fn load_model(ctx: &Context, path: &Path, tile: u32, name: &str) -> Result<Model, String> {
+fn load_model(ctx: &Context, backend: Backend, path: &Path, tile: u32, name: &str) -> Result<Model, String> {
     let model = ctx.load_model(&LoadParams { onnx: path, tile: Some((tile, tile)), overlap: None, async_build: true })?;
     if model.state() == ModelState::Building {
-        progress::engine_build(name, tile);
+        progress::engine_build(name, tile, backend.label());
         while model.state() == ModelState::Building {
             std::thread::sleep(Duration::from_millis(250));
         }
