@@ -142,8 +142,8 @@ fn default_chains() -> Vec<Chain> {
         ("0x1761", "0x1984", "1920p", "70k", "105k"),
         ("0x1985", "0x0", "2048p", "95k", "70k"),
     ] {
-        chains.push(chain(lo, hi, true, 0, 2, format!("2x_MangaJaNai_{bucket}_V1_ESRGAN_{k2}.onnx")));
-        chains.push(chain(lo, hi, true, 2, 0, format!("4x_MangaJaNai_{bucket}_V1_ESRGAN_{k4}.onnx")));
+        chains.push(chain(lo, hi, true, 0, 2, format!("2x_MangaJaNai_{bucket}_V1_ESRGAN_{k2}_fp16.onnx")));
+        chains.push(chain(lo, hi, true, 2, 0, format!("4x_MangaJaNai_{bucket}_V1_ESRGAN_{k4}_fp16.onnx")));
     }
     for (i, c) in chains.iter_mut().enumerate() {
         c.chain_number = (i + 1).to_string();
