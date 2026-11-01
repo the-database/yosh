@@ -153,11 +153,13 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   source height, gray/color, target scale); `rules.json` in the add-on overrides the built-in defaults.
   Model files are named after their ONNX precision, as MangaJaNai GUI 2.0 ships them (the defaults are
   all `_fp16`). The lookup (`sr::aji::lookup_order`) is variant-tolerant, so add-ons built from older or
-  newer GUI model files both work and a `rules.json` naming older files keeps working: the exact name
-  first; then, only for a name ending in `_fp16`/`_bf16`/`_fp32`, the same model's other precisions
-  (bf16, fp16, fp32 on TensorRT/TensorRT-RTX with compute capability >= 8.0, else fp16, fp32) and its
-  unsuffixed name (older add-ons). A `_bf16` name on DirectML goes last. Other names are looked up
-  exactly. When the file used isn't the named one, a log line says which.
+  newer GUI model files both work and a `rules.json` naming older files keeps working. The exact name
+  comes first. A name ending in `_fp16`/`_bf16`/`_fp32` then tries the same model's other precisions
+  (bf16, fp16, fp32 on TensorRT/TensorRT-RTX with compute capability >= 8.0, else fp16, fp32) and then
+  its unsuffixed name (older add-ons); a `_bf16` name on DirectML goes last. Any other name (an older
+  `rules.json`'s unsuffixed MangaJaNai names) then tries itself + each suffix in the same order, so
+  `4x_MangaJaNai_1200p_V1_ESRGAN_70k` finds `..._70k_fp16.onnx`; for custom models those files don't
+  exist, so nothing changes. When the file used isn't the named one, a log line says which.
 - **TensorRT-RTX (Windows):** needs libaji >= v0.19.0 with `aji_trtrtx.dll` and its
   runtime (the `aji-trtrtx-windows-x64.zip` release asset) in the add-on. Engines build in ~5-10 s instead of
   TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~15% faster, output visually identical.

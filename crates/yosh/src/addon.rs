@@ -49,9 +49,9 @@ pub fn installed(dir: &Path) -> bool {
 
 /// The rule table: `rules.json` from the add-on if present and valid, else the
 /// built-in MangaJaNaiConverterGui defaults. A `rules.json` naming older model
-/// files keeps working: a model found under its exact name is used as is, and one
-/// whose name carries a precision suffix also matches the same model's other
-/// precisions or its unsuffixed name (`sr::aji`'s lookup order).
+/// files keeps working: a model found under its exact name is used as is, else the
+/// same model under another precision suffix, or without one (`sr::aji`'s lookup
+/// order), so older unsuffixed names also find the `_fp16` files.
 pub fn rules(dir: &Path) -> Vec<SrRule> {
     #[derive(serde::Deserialize)]
     struct Rule {

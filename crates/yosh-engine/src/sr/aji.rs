@@ -13,11 +13,11 @@
 //! to TensorRT on the same GPU: the TensorRT context opens the first time that
 //! happens, and the other models stay on TensorRT-RTX.
 //!
-//! A rule's model whose name ends in a precision suffix (`_fp16`, `_bf16`, `_fp32`)
-//! may be installed as another precision of the same model, or under the older
-//! unsuffixed name: [`lookup_order`] finds whichever the add-on has, so add-ons
-//! built from older and newer MangaJaNai GUI model files both work, and a
-//! `rules.json` naming older files keeps working.
+//! A rule's model may be installed under another precision suffix (`_fp16`,
+//! `_bf16`, `_fp32`) than the rule names, or with none (older add-ons), or with one
+//! where the rule names none (an older `rules.json`): [`lookup_order`] finds
+//! whichever the add-on has, so add-ons built from older and newer MangaJaNai GUI
+//! model files both work with either names.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -253,32 +253,36 @@ impl AjiUpscaler {
 const PRECISIONS: [&str; 3] = ["_bf16", "_fp16", "_fp32"];
 
 /// The file stems to look for, in order, for a rule's model `name` on `backend`
-/// with CUDA `compute_capability` (`None` on DirectML):
+/// with CUDA `compute_capability` (`None` on DirectML). The precisions go in
+/// preference order: bf16, fp16, fp32 on TensorRT/TensorRT-RTX with compute
+/// capability 8.0 or newer, else fp16, fp32 (never bf16, which DirectML can't run
+/// and Turing and older have no support for).
 ///
-/// 1. `name` itself;
-/// 2. if `name` ends in a precision suffix, the same model's other precisions:
-///    bf16, fp16, fp32 on TensorRT/TensorRT-RTX with compute capability 8.0 or
-///    newer, else fp16, fp32 (never bf16, which DirectML can't run and Turing and
-///    older have no support for);
-/// 3. then its unsuffixed name (`4x_MangaJaNai_1200p_V1_ESRGAN_70k`), as older
-///    add-ons installed it.
+/// - A name ending in a precision suffix: `name` itself, then the same model's
+///   other precisions, then its unsuffixed name
+///   (`4x_MangaJaNai_1200p_V1_ESRGAN_70k`), as older add-ons installed it. One
+///   exception: a `_bf16` name on DirectML goes last, since DirectML can't run
+///   it; tried only when nothing else is installed, its load error then says why.
+/// - Any other name (an older `rules.json`'s unsuffixed MangaJaNai names, custom
+///   models): `name` itself, then `name` with each precision suffix. For a custom
+///   model those files don't exist, so it is in effect looked up exactly.
 ///
-/// So the default rules find an add-on's models whether it was built from older
-/// or newer MangaJaNai GUI model files, and a `rules.json` naming older files
-/// keeps working. One exception: a `_bf16` name on DirectML goes last, since
-/// DirectML can't run it; tried only when nothing else is installed, its load
-/// error then says why. Names without a precision suffix (custom models, and the
-/// older unsuffixed MangaJaNai names) are looked up exactly.
+/// So the default rules and a `rules.json` with older or newer names find an
+/// add-on's models whether it was built from older or newer MangaJaNai GUI files.
 fn lookup_order(name: &str, backend: Backend, compute_capability: Option<(i32, i32)>) -> Vec<String> {
+    let bf16 = backend.is_cuda() && compute_capability.is_some_and(|(major, _)| major >= 8);
+    let prefs: &[&str] = if bf16 { &PRECISIONS } else { &PRECISIONS[1..] };
     let Some((base, suffix)) = PRECISIONS
         .iter()
         .find_map(|&s| name.strip_suffix(s).map(|b| (b, s)))
         .filter(|(b, _)| !b.is_empty())
     else {
-        return vec![name.to_string()];
+        let mut order = vec![name.to_string()];
+        if !name.is_empty() {
+            order.extend(prefs.iter().map(|p| format!("{name}{p}")));
+        }
+        return order;
     };
-    let bf16 = backend.is_cuda() && compute_capability.is_some_and(|(major, _)| major >= 8);
-    let prefs: &[&str] = if bf16 { &PRECISIONS } else { &PRECISIONS[1..] };
     let bf16_on_dml = backend == Backend::DirectMl && suffix == "_bf16";
     let mut order = Vec::new();
     if !bf16_on_dml {
@@ -418,15 +422,29 @@ mod tests {
     }
 
     #[test]
-    fn other_names_are_looked_up_exactly() {
+    fn unsuffixed_names_try_the_suffixed_files_after_the_exact_name() {
         for name in [
             "4x_MangaJaNai_1200p_V1_ESRGAN_70k",
             "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16_fp32_op20",
             "my_model_FP16",
             "_fp16",
-            "",
         ] {
-            assert_eq!(order(name, Backend::TensorRt, Some((12, 0))), [name.to_string()], "{name}");
+            for (b, cc) in [(Backend::TensorRt, Some((12, 0))), (Backend::TensorRtRtx, Some((8, 0)))] {
+                assert_eq!(
+                    order(name, b, cc),
+                    [name.to_string(), format!("{name}_bf16"), format!("{name}_fp16"), format!("{name}_fp32")],
+                    "{name} {b:?}"
+                );
+            }
+            // bf16 only where it runs.
+            for (b, cc) in [(Backend::DirectMl, None), (Backend::TensorRt, Some((7, 5))), (Backend::TensorRtRtx, None)] {
+                assert_eq!(
+                    order(name, b, cc),
+                    [name.to_string(), format!("{name}_fp16"), format!("{name}_fp32")],
+                    "{name} {b:?}"
+                );
+            }
         }
+        assert_eq!(order("", Backend::TensorRt, Some((12, 0))), [String::new()]);
     }
 }
