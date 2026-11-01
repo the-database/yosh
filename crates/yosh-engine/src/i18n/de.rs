@@ -47,6 +47,7 @@ pub static DE: Strings = Strings {
     upscale_starting: "Wird gestartet…",
     upscale_ready: |d| format!("Bereit · {d}"),
     upscale_error: |e| format!("Nicht verfügbar: {e}"),
+    upscale_fallback: |e| format!("TensorRT-RTX fehlgeschlagen ({e}); stattdessen wird TensorRT verwendet"),
     open_addon_folder: "📂 Add-on-Ordner öffnen",
     sr_working: "KI-Hochskalierung…",
     sr_preparing: "KI-Modell wird vorbereitet…",

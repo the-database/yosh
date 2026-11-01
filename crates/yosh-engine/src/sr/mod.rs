@@ -76,4 +76,11 @@ pub trait Upscaler: Send + Sync {
     /// it — lets the pool reuse a kept model output when only the display size
     /// changed (same model ⇒ same output).
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<std::sync::Arc<str>>;
+
+    /// Set once a model fell back from the backend that was asked for
+    /// (TensorRT-RTX) to TensorRT: "<model>: <why>", for the first one. The
+    /// shell shows it, so a fallback isn't only a log line.
+    fn fallback(&self) -> Option<String> {
+        None
+    }
 }

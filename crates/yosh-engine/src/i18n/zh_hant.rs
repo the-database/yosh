@@ -47,6 +47,7 @@ pub static ZH_HANT: Strings = Strings {
     upscale_starting: "正在啟動…",
     upscale_ready: |d| format!("就緒 · {d}"),
     upscale_error: |e| format!("無法使用: {e}"),
+    upscale_fallback: |e| format!("TensorRT-RTX 失敗（{e}），改用 TensorRT"),
     open_addon_folder: "📂 開啟附加元件資料夾",
     sr_working: "AI 超解析度處理中…",
     sr_preparing: "正在準備 AI 模型…",

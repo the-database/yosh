@@ -47,6 +47,7 @@ pub static KO: Strings = Strings {
     upscale_starting: "시작하는 중…",
     upscale_ready: |d| format!("준비됨 · {d}"),
     upscale_error: |e| format!("사용할 수 없음: {e}"),
+    upscale_fallback: |e| format!("TensorRT-RTX 실패 ({e}). 대신 TensorRT를 사용합니다"),
     open_addon_folder: "📂 애드온 폴더 열기",
     sr_working: "AI 업스케일링 중…",
     sr_preparing: "AI 모델 준비 중…",
