@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "mangajanai-cli"
-version = "0.1.2"
+version = "0.1.4"
 dependencies = [
  "embed-manifest",
  "jpeg-encoder",

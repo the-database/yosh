@@ -48,7 +48,7 @@ pub static RU: Strings = Strings {
     upscale_starting: "Запуск…",
     upscale_ready: |d| format!("Готово · {d}"),
     upscale_error: |e| format!("Недоступно: {e}"),
-    upscale_fallback: |e| format!("Сбой TensorRT-RTX ({e}); вместо него используется TensorRT"),
+    upscale_fallback: |e, b| format!("Сбой TensorRT-RTX ({e}); вместо него используется {b}"),
     open_addon_folder: "📂 Открыть папку дополнения",
     sr_working: "ИИ-масштабирование…",
     sr_preparing: "Подготовка ИИ-модели…",

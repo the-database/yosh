@@ -77,7 +77,7 @@ pub trait Upscaler: Send + Sync {
     /// changed (same model ⇒ same output).
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<std::sync::Arc<str>>;
 
-    /// Set once a model fell back from the backend that was asked for
+    /// Set once a model fell back from the backend it was opened on
     /// (TensorRT-RTX) to TensorRT: "<model>: <why>", for the first one. The
     /// shell shows it, so a fallback isn't only a log line.
     fn fallback(&self) -> Option<String> {
