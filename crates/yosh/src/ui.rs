@@ -58,6 +58,8 @@ pub struct UiState {
     pub upscale: bool,
     pub upscale_backend: crate::config::UpscaleBackend,
     pub upscale_status: String,
+    /// "TensorRT-RTX failed (…); using TensorRT instead", or empty.
+    pub upscale_notice: String,
     /// The reader's AI-upscaling chip: shown while an upscaler is running
     /// (`sr_available`); `sr_book_on` is the per-book switch, and `sr_state` what
     /// upscaling is doing for the page in view. Set by the app each frame.
@@ -1216,6 +1218,13 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
             if st.upscale && !st.upscale_status.is_empty() {
                 ui.label(egui::RichText::new(&st.upscale_status).small());
             }
+            if st.upscale && !st.upscale_notice.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("\u{26a0} {}", st.upscale_notice))
+                        .small()
+                        .color(egui::Color32::from_rgb(220, 180, 100)),
+                );
+            }
             ui.label(egui::RichText::new(t.upscale_hint).weak().small());
             if ui.button(t.open_addon_folder).clicked() {
                 st.req_open_addon_folder = true;
@@ -1241,6 +1250,7 @@ fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
             ("\u{26a0}", egui::Color32::from_rgb(220, 130, 130), (t.sr_failed)(e))
         }
     };
+    let tip = if st.upscale_notice.is_empty() { tip } else { format!("{tip}\n\u{26a0} {}", st.upscale_notice) };
     let busy = st.sr_book_on
         && matches!(st.sr_state, Some(SrViewState::Working | SrViewState::Preparing));
     let r = ui

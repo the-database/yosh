@@ -67,7 +67,7 @@ impl Upscaler {
         let mut err = String::from("no compatible GPU found");
         for &backend in candidates {
             if choice == BackendChoice::TensorRtRtx && backend == Backend::TensorRt {
-                eprintln!("TensorRT-RTX failed ({err}); using TensorRT instead");
+                progress::backend_fallback(None, &err);
             }
             let devices = match aji.devices(backend) {
                 Ok(d) if !d.is_empty() => d,
@@ -118,7 +118,7 @@ impl Upscaler {
                     let Some(fb) = self.fallback.as_mut() else {
                         return Err(format!("{name}: {e}"));
                     };
-                    eprintln!("TensorRT-RTX failed for {name} ({e}); using TensorRT instead");
+                    progress::backend_fallback(Some(&name), &e);
                     let ctx = fb.context()?;
                     load_model(&ctx, Backend::TensorRt, path, tile, &name).map_err(|e| format!("{name}: {e}"))?
                 }

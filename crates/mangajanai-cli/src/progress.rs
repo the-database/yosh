@@ -46,6 +46,15 @@ pub fn engine_ready(model: &str) {
     line(&format!("ENGINE_READY {model}"));
 }
 
+/// TensorRT-RTX failed and TensorRT runs instead: at start (`model` None, for the whole run) or
+/// for one model (the others stay on TensorRT-RTX). The GUI shows it as a warning.
+pub fn backend_fallback(model: Option<&str>, why: &str) {
+    match model {
+        None => line(&format!("BACKEND_FALLBACK TensorRT-RTX failed ({why}); using TensorRT instead")),
+        Some(m) => line(&format!("BACKEND_FALLBACK TensorRT-RTX failed for {m} ({why}); using TensorRT for it")),
+    }
+}
+
 /// A file (or archive entry) that failed; the run continues with the next one.
 pub fn error(what: &str, msg: &str) {
     line(&format!("ERROR {what}: {msg}"));
