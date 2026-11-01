@@ -8,6 +8,10 @@
 //! and stay resident. A TensorRT model whose engine isn't built yet comes back
 //! [`SrOutcome::NotReady`]; a watcher thread polls it and bumps the epoch (and
 //! wakes the shell) once it is ready, so the reader retries those pages.
+//!
+//! On TensorRT-RTX (experimental), a model that fails to load or build falls back
+//! to TensorRT on the same GPU: the TensorRT context opens the first time that
+//! happens, and the other models stay on TensorRT-RTX.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,8 +33,16 @@ pub fn enum_devices(dir: &Path, backend: Backend) -> Result<Vec<Device>, String>
 
 enum Slot {
     Ready { model: Arc<Model>, scale: u32 },
-    Building(Arc<Model>),
+    /// `fell_back`: already on the TensorRT fallback context.
+    Building { model: Arc<Model>, fell_back: bool },
     Failed,
+}
+
+/// The TensorRT context a TensorRT-RTX upscaler falls back to, opened on first need.
+struct Fallback {
+    dir: PathBuf,
+    device_id: u64,
+    ctx: Mutex<Option<Result<Context, String>>>,
 }
 
 /// Shared with the build watcher thread.
@@ -43,6 +55,9 @@ struct Watch {
 
 pub struct AjiUpscaler {
     ctx: Context,
+    backend: Backend,
+    /// Present on TensorRT-RTX only.
+    fallback: Option<Fallback>,
     models_dir: PathBuf,
     rules: Vec<SrRule>,
     slots: Mutex<HashMap<String, Slot>>,
@@ -59,22 +74,16 @@ impl AjiUpscaler {
         rules: Vec<SrRule>,
         waker: Option<Waker>,
     ) -> Result<Self, String> {
-        let cache = dir.join("cache");
-        let _ = std::fs::create_dir_all(&cache);
-        let ctx = Aji::load(dir)?.context(&ContextParams {
-            backend,
+        let ctx = open_context(dir, backend, device_id)?;
+        let fallback = (backend == Backend::TensorRtRtx).then(|| Fallback {
+            dir: dir.to_path_buf(),
             device_id,
-            cache_dir: Some(cache),
-            trtexec: None,
-            // TensorRT severities: 0 internal error, 1 error, 2 warning.
-            log: Some(Arc::new(|level, msg| {
-                if level <= 2 {
-                    eprintln!("yosh: [upscale] {msg}");
-                }
-            })),
-        })?;
+            ctx: Mutex::new(None),
+        });
         Ok(Self {
             ctx,
+            backend,
+            fallback,
             models_dir: dir.join("models"),
             rules,
             slots: Mutex::new(HashMap::new()),
@@ -90,8 +99,8 @@ impl AjiUpscaler {
     /// The model and its scale once ready; loads it on first use.
     fn model(&self, name: &str) -> Result<Option<(Arc<Model>, u32)>, String> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(Slot::Building(m)) = slots.get(name) {
-            let m = m.clone();
+        if let Some(Slot::Building { model, fell_back }) = slots.get(name) {
+            let (m, fell_back) = (model.clone(), *fell_back);
             match m.state() {
                 ModelState::Building => return Ok(None),
                 ModelState::Ready => {
@@ -99,8 +108,13 @@ impl AjiUpscaler {
                     slots.insert(name.to_string(), Slot::Ready { model: m, scale });
                 }
                 ModelState::Failed => {
-                    slots.insert(name.to_string(), Slot::Failed);
-                    return Err(self.ctx.last_error());
+                    let e = m.context().last_error();
+                    if fell_back {
+                        slots.insert(name.to_string(), Slot::Failed);
+                        return Err(e);
+                    }
+                    let path = self.models_dir.join(format!("{name}.onnx"));
+                    return self.fall_back(&mut slots, name, &path, e);
                 }
             }
         }
@@ -114,11 +128,25 @@ impl AjiUpscaler {
             slots.insert(name.to_string(), Slot::Failed);
             return Err(format!("model not installed: {}", path.display()));
         }
-        // Library-default tile/overlap (512 px, 32 px). Missing TensorRT engines
-        // build in the background — a reader must never stall on a first-use
-        // build; the watcher below picks up the result.
-        let params = LoadParams { async_build: true, ..LoadParams::new(&path) };
-        let m = match self.ctx.load_model(&params) {
+        match self.load(&mut slots, &self.ctx, name, &path, false) {
+            Err(e) => self.fall_back(&mut slots, name, &path, e),
+            done => done,
+        }
+    }
+
+    /// Load `path` on `ctx` into `name`'s slot. Library-default tile/overlap
+    /// (512 px, 32 px). Missing engines build in the background — a reader must
+    /// never stall on a first-use build; the watcher below picks up the result.
+    fn load(
+        &self,
+        slots: &mut HashMap<String, Slot>,
+        ctx: &Context,
+        name: &str,
+        path: &Path,
+        fell_back: bool,
+    ) -> Result<Option<(Arc<Model>, u32)>, String> {
+        let params = LoadParams { async_build: true, ..LoadParams::new(path) };
+        let m = match ctx.load_model(&params) {
             Ok(m) => Arc::new(m),
             Err(e) => {
                 slots.insert(name.to_string(), Slot::Failed);
@@ -126,13 +154,40 @@ impl AjiUpscaler {
             }
         };
         if m.state() == ModelState::Building {
-            slots.insert(name.to_string(), Slot::Building(m.clone()));
+            slots.insert(name.to_string(), Slot::Building { model: m.clone(), fell_back });
             self.watch_build(m);
             return Ok(None);
         }
         let scale = m.info()?.scale;
         slots.insert(name.to_string(), Slot::Ready { model: m.clone(), scale });
         Ok(Some((m, scale)))
+    }
+
+    /// `name` failed on the primary backend with `err`: on TensorRT-RTX, retry it
+    /// on TensorRT (opening that context on first need); otherwise it stays failed.
+    fn fall_back(
+        &self,
+        slots: &mut HashMap<String, Slot>,
+        name: &str,
+        path: &Path,
+        err: String,
+    ) -> Result<Option<(Arc<Model>, u32)>, String> {
+        let Some(fb) = &self.fallback else {
+            slots.insert(name.to_string(), Slot::Failed);
+            return Err(err);
+        };
+        eprintln!("yosh: [upscale] {} failed for {name} ({err}); using TensorRT", self.backend.label());
+        let ctx = {
+            let mut c = fb.ctx.lock().unwrap_or_else(|e| e.into_inner());
+            c.get_or_insert_with(|| open_context(&fb.dir, Backend::TensorRt, fb.device_id)).clone()
+        };
+        match ctx {
+            Ok(ctx) => self.load(slots, &ctx, name, path, true),
+            Err(e) => {
+                slots.insert(name.to_string(), Slot::Failed);
+                Err(format!("{err}; TensorRT fallback: {e}"))
+            }
+        }
     }
 
     /// Poll a building model in the background; when it (or any other) settles,
@@ -161,6 +216,25 @@ impl AjiUpscaler {
             }
         });
     }
+}
+
+/// Open `backend` on `device_id` with the add-on's engine cache, logging warnings
+/// and errors to stderr.
+fn open_context(dir: &Path, backend: Backend, device_id: u64) -> Result<Context, String> {
+    let cache = dir.join("cache");
+    let _ = std::fs::create_dir_all(&cache);
+    Aji::load(dir)?.context(&ContextParams {
+        backend,
+        device_id,
+        cache_dir: Some(cache),
+        trtexec: None,
+        // TensorRT severities: 0 internal error, 1 error, 2 warning.
+        log: Some(Arc::new(|level, msg| {
+            if level <= 2 {
+                eprintln!("yosh: [upscale] {msg}");
+            }
+        })),
+    })
 }
 
 impl Upscaler for AjiUpscaler {

@@ -49,17 +49,41 @@ pub enum Backend {
     TensorRt = 1,
     /// Windows only.
     DirectMl = 2,
+    /// TensorRT for RTX (`aji_trtrtx`, libaji ≥ v0.19.0; Windows only, and
+    /// experimental): engines build in-process in about a second, with no
+    /// `trtexec`. Older libaji, or one without `aji_trtrtx.dll` and its runtime,
+    /// rejects it ([`Aji::devices`] errors), and there is no automatic fallback:
+    /// callers retry on [`Backend::TensorRt`] themselves.
+    TensorRtRtx = 3,
+}
+
+impl Backend {
+    /// The name users see ("TensorRT", "DirectML", "TensorRT-RTX").
+    pub fn label(self) -> &'static str {
+        match self {
+            Backend::TensorRt => "TensorRT",
+            Backend::DirectMl => "DirectML",
+            Backend::TensorRtRtx => "TensorRT-RTX",
+        }
+    }
+
+    /// Whether this backend runs on CUDA (the TensorRT family).
+    pub fn is_cuda(self) -> bool {
+        matches!(self, Backend::TensorRt | Backend::TensorRtRtx)
+    }
 }
 
 /// A device a backend can run on (`aji_img_device`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Device {
-    /// Stable across runs: PCI location (TensorRT) or DXGI adapter LUID
-    /// (DirectML). Pass to [`ContextParams::device_id`].
+    /// Stable across runs: the PCI domain/bus/device, the same value on every
+    /// backend on single-PCI-segment (desktop) systems (DirectML falls back to
+    /// the adapter LUID if Windows reports no address). Pass to
+    /// [`ContextParams::device_id`].
     pub id: u64,
     pub name: String,
     pub vram_bytes: u64,
-    /// CUDA compute capability (TensorRT); `None` for DirectML.
+    /// CUDA compute capability (TensorRT, TensorRT-RTX); `None` for DirectML.
     pub compute_capability: Option<(i32, i32)>,
 }
 
@@ -232,7 +256,7 @@ impl Aji {
         // SAFETY: `raw` has room for the MAX entries passed as the maximum.
         let n = unsafe { (self.0.api.enum_devices)(backend as c_int, raw.as_mut_ptr(), MAX as c_int) };
         if n < 0 {
-            return Err(format!("the {backend:?} backend could not be loaded"));
+            return Err(format!("the {} backend could not be loaded", backend.label()));
         }
         Ok(raw
             .iter()
@@ -242,7 +266,7 @@ impl Aji {
                 // SAFETY: aji NUL-terminates the name within its 128 bytes.
                 name: unsafe { CStr::from_ptr(d.name.as_ptr()) }.to_string_lossy().into_owned(),
                 vram_bytes: d.vram_bytes,
-                compute_capability: (backend == Backend::TensorRt).then_some((d.sm_major, d.sm_minor)),
+                compute_capability: backend.is_cuda().then_some((d.sm_major, d.sm_minor)),
             })
             .collect())
     }
@@ -335,8 +359,9 @@ impl Context {
     }
 
     /// Load an ONNX model. By default a TensorRT model whose engine isn't cached
-    /// is built here (minutes, once per model/tile/GPU/TensorRT version) and comes
-    /// back ready; with [`LoadParams::async_build`] it comes back
+    /// is built here (up to minutes with TensorRT, about a second with
+    /// TensorRT-RTX; once per model/tile/GPU/TensorRT version) and comes back
+    /// ready; with [`LoadParams::async_build`] it comes back
     /// [`ModelState::Building`] instead.
     pub fn load_model(&self, params: &LoadParams) -> Result<Model, String> {
         let path = cstring(params.onnx)?;
