@@ -134,7 +134,8 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   runtime from the add-on directory (`config::addon_dir()`: `%LOCALAPPDATA%\the-database\yosh\data\addons\upscale`,
   or `yosh-addons\upscale` beside the exe in portable mode; `crates/yosh/src/addon.rs`). That directory
   holds `aji.dll` + backends + their runtimes, `models/*.onnx`, an optional `rules.json`, and `cache/`
-  (TensorRT engines). Without an installed + enabled add-on there is no upscaler, no SR lane, and
+  (TensorRT `*.engine` and TensorRT-RTX `*.rtxengine` + `*.jitcache`; libaji's stale cleanup keeps
+  them apart). Without an installed + enabled add-on there is no upscaler, no SR lane, and
   decoding is bit-identical to a build without it.
 - **The SR lane** (`pool.rs`): one extra pool thread, spawned on the first `set_upscaler`, with its own
   lowest-priority queue (`set_sr_jobs`) and condvar — never the decode window or thumbnails. The reader
@@ -150,7 +151,15 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   upscaled page only re-sizes it — no read, decode or inference — and skips the plain re-decode.
 - **Model choice is data:** `sr::rules` mirrors MangaJaNaiConverterGui's chain rules (first match on
   source height, gray/color, target scale); `rules.json` in the add-on overrides the built-in defaults.
-- UI: Settings → AI upscaling (on/off, Auto = TensorRT then DirectML); top-bar "AI" chip +
+- **TensorRT-RTX (opt-in, experimental, Windows):** needs libaji >= v0.19.0 with `aji_trtrtx.dll` and its
+  runtime (the `aji-trtrtx-windows-x64.zip` release asset) in the add-on. Engines build in ~5 s instead of
+  TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~16% faster. Auto never picks it.
+  The image ABI has no fallback of its own, so `start_blocking` tries TensorRT when it can't start, and
+  `AjiUpscaler` retries a model on a lazily opened TensorRT context when it fails to load or build
+  (stderr says so; the other models stay on TensorRT-RTX). Stored as `upscale_backend: "tensorrt"` +
+  `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
+  fails the whole state.json parse on an unknown token, which would reset every setting.
+- UI: Settings → AI upscaling (on/off, Auto = TensorRT then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +
   corner spinner (`Reader::sr_view_state`); key `U` = per-book switch; info overlay "AI model" row.
 
 ### Central state and the frame loop

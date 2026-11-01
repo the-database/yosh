@@ -16,6 +16,9 @@ pub enum BackendChoice {
     Auto,
     TensorRt,
     DirectMl,
+    /// TensorRT for RTX (opt-in, experimental; needs aji_trtrtx.dll beside aji.dll), falling
+    /// back to TensorRT when it can't start, and per model when one fails to build.
+    TensorRtRtx,
 }
 
 impl BackendChoice {
@@ -24,20 +27,21 @@ impl BackendChoice {
             "auto" => Ok(Self::Auto),
             "trt" | "tensorrt" => Ok(Self::TensorRt),
             "dml" | "directml" => Ok(Self::DirectMl),
-            _ => Err(format!("unknown backend '{s}' (auto, tensorrt, directml)")),
+            "tensorrt-rtx" | "trt-rtx" | "trtrtx" => Ok(Self::TensorRtRtx),
+            _ => Err(format!("unknown backend '{s}' (auto, tensorrt, directml, tensorrt-rtx)")),
         }
     }
 }
 
 pub fn backend_name(b: Backend) -> &'static str {
-    match b {
-        Backend::TensorRt => "TensorRT",
-        Backend::DirectMl => "DirectML",
-    }
+    b.label()
 }
 
 pub struct Upscaler {
     ctx: Context,
+    backend: Backend,
+    /// On TensorRT-RTX: where to open the TensorRT context a failed model falls back to.
+    fallback: Option<Fallback>,
     model_dirs: Vec<PathBuf>,
     models: HashMap<(PathBuf, u32), Model>,
     pub description: String,
@@ -58,9 +62,13 @@ impl Upscaler {
             BackendChoice::Auto => &[Backend::TensorRt, Backend::DirectMl],
             BackendChoice::TensorRt => &[Backend::TensorRt],
             BackendChoice::DirectMl => &[Backend::DirectMl],
+            BackendChoice::TensorRtRtx => &[Backend::TensorRtRtx, Backend::TensorRt],
         };
         let mut err = String::from("no compatible GPU found");
         for &backend in candidates {
+            if choice == BackendChoice::TensorRtRtx && backend == Backend::TensorRt {
+                eprintln!("TensorRT-RTX failed ({err}); using TensorRT instead");
+            }
             let devices = match aji.devices(backend) {
                 Ok(d) if !d.is_empty() => d,
                 Ok(_) => continue,
@@ -70,21 +78,16 @@ impl Upscaler {
                 }
             };
             let device = devices.iter().find(|d| d.id == device_id).unwrap_or(&devices[0]);
-            let params = ContextParams {
-                backend,
-                device_id: device.id,
-                cache_dir: cache_dir.clone(),
-                trtexec: None,
-                log: Some(std::sync::Arc::new(|level, msg| {
-                    if level <= 2 {
-                        eprintln!("[aji] {msg}");
-                    }
-                })),
-            };
-            match aji.context(&params) {
+            match open_context(&aji, backend, device.id, &cache_dir) {
                 Ok(ctx) => {
                     let description = format!("{} on {}", backend_name(backend), device.name);
-                    return Ok(Self { ctx, model_dirs, models: HashMap::new(), description });
+                    let fallback = (backend == Backend::TensorRtRtx).then(|| Fallback {
+                        aji: aji.clone(),
+                        device_id: device.id,
+                        cache_dir: cache_dir.clone(),
+                        ctx: None,
+                    });
+                    return Ok(Self { ctx, backend, fallback, model_dirs, models: HashMap::new(), description });
                 }
                 Err(e) => err = format!("{}: {e}", backend_name(backend)),
             }
@@ -103,29 +106,23 @@ impl Upscaler {
     }
 
     /// The loaded model for `path` at `tile`, loading it (and waiting out a first-use TensorRT
-    /// engine build, reported on stdout) if needed.
+    /// engine build, reported on stdout) if needed. On TensorRT-RTX, a model that fails to load
+    /// or build is retried on TensorRT (that context opens the first time it's needed).
     fn model(&mut self, path: &Path, tile: u32) -> Result<&Model, String> {
         let key = (path.to_path_buf(), tile);
         if !self.models.contains_key(&key) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let model = self.ctx.load_model(&LoadParams {
-                onnx: path,
-                tile: Some((tile, tile)),
-                overlap: None,
-                async_build: true,
-            })?;
-            if model.state() == ModelState::Building {
-                progress::engine_build(&name, tile);
-                while model.state() == ModelState::Building {
-                    std::thread::sleep(Duration::from_millis(250));
+            let model = match load_model(&self.ctx, self.backend, path, tile, &name) {
+                Ok(m) => m,
+                Err(e) => {
+                    let Some(fb) = self.fallback.as_mut() else {
+                        return Err(format!("{name}: {e}"));
+                    };
+                    eprintln!("TensorRT-RTX failed for {name} ({e}); using TensorRT instead");
+                    let ctx = fb.context()?;
+                    load_model(&ctx, Backend::TensorRt, path, tile, &name).map_err(|e| format!("{name}: {e}"))?
                 }
-                if model.state() == ModelState::Ready {
-                    progress::engine_ready(&name);
-                }
-            }
-            if model.state() == ModelState::Failed {
-                return Err(format!("{name}: {}", self.ctx.last_error()));
-            }
+            };
             self.models.insert(key.clone(), model);
         }
         Ok(&self.models[&key])
@@ -177,6 +174,56 @@ impl Upscaler {
         }
         Ok((out, scale))
     }
+}
+
+/// The TensorRT context a TensorRT-RTX upscaler falls back to, opened on first need.
+struct Fallback {
+    aji: Aji,
+    device_id: u64,
+    cache_dir: Option<PathBuf>,
+    ctx: Option<Result<Context, String>>,
+}
+
+impl Fallback {
+    fn context(&mut self) -> Result<Context, String> {
+        let (aji, id, cache) = (&self.aji, self.device_id, &self.cache_dir);
+        self.ctx
+            .get_or_insert_with(|| open_context(aji, Backend::TensorRt, id, cache))
+            .clone()
+            .map_err(|e| format!("TensorRT fallback: {e}"))
+    }
+}
+
+fn open_context(aji: &Aji, backend: Backend, device_id: u64, cache_dir: &Option<PathBuf>) -> Result<Context, String> {
+    aji.context(&ContextParams {
+        backend,
+        device_id,
+        cache_dir: cache_dir.clone(),
+        trtexec: None,
+        log: Some(std::sync::Arc::new(|level, msg| {
+            if level <= 2 {
+                eprintln!("[aji] {msg}");
+            }
+        })),
+    })
+}
+
+/// Load `path` at `tile` on `ctx`, waiting out a background engine build (reported on stdout).
+fn load_model(ctx: &Context, backend: Backend, path: &Path, tile: u32, name: &str) -> Result<Model, String> {
+    let model = ctx.load_model(&LoadParams { onnx: path, tile: Some((tile, tile)), overlap: None, async_build: true })?;
+    if model.state() == ModelState::Building {
+        progress::engine_build(name, tile, backend.label());
+        while model.state() == ModelState::Building {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        if model.state() == ModelState::Ready {
+            progress::engine_ready(name);
+        }
+    }
+    if model.state() == ModelState::Failed {
+        return Err(ctx.last_error());
+    }
+    Ok(model)
 }
 
 /// The devices of one backend, as JSON for the GUI's device list: `[{"id", "name", "vram"}]`
