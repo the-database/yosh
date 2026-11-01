@@ -30,8 +30,17 @@ pub enum Status {
     Error(String),
 }
 
-/// A started upscaler and what it runs on ("<GPU> · <backend>").
-pub type Started = Result<(Arc<dyn Upscaler>, String), String>;
+/// A started upscaler.
+pub struct Running {
+    pub upscaler: Arc<dyn Upscaler>,
+    /// What it runs on ("<GPU> · <backend>").
+    pub device: String,
+    /// Why it isn't on the backend that was asked for: TensorRT-RTX couldn't
+    /// start, so this is TensorRT.
+    pub fallback: Option<String>,
+}
+
+pub type Started = Result<Running, String>;
 
 /// Whether the add-on's library is present in `dir`.
 pub fn installed(dir: &Path) -> bool {
@@ -112,6 +121,8 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
     };
     let mut err = String::from("no compatible GPU");
     for &b in candidates {
+        // Only TensorRT-RTX lists a second backend: reaching it is the fallback.
+        let fallback = (backend == UpscaleBackend::TensorRtRtx && b == Backend::TensorRt).then(|| err.clone());
         let device = match enum_devices(dir, b).map(|d| d.into_iter().next()) {
             Ok(Some(d)) => d,
             Ok(None) => continue,
@@ -122,7 +133,11 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
         };
         match AjiUpscaler::new(dir, b, device.id, rules(dir), Some(wake.clone())) {
             Ok(up) => {
-                return Ok((Arc::new(up), format!("{} · {}", device.name, b.label())));
+                if let Some(why) = &fallback {
+                    eprintln!("yosh: [upscale] TensorRT-RTX failed ({why}); using TensorRT");
+                }
+                let device = format!("{} · {}", device.name, b.label());
+                return Ok(Running { upscaler: Arc::new(up), device, fallback });
             }
             Err(e) => err = e,
         }
