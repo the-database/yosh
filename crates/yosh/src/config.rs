@@ -82,8 +82,8 @@ impl PerfPref {
 
 /// Inference backend for the AI-upscaling add-on. `Auto` = TensorRT, falling back
 /// to DirectML on Windows (any DirectX 12 GPU, no engine builds); on Windows it
-/// tries TensorRT-RTX first when the add-on has it and the GPU is an RTX 30-series
-/// or newer (see `addon::candidates`).
+/// tries TensorRT-RTX first when the add-on has it and the GPU is a GeForce RTX 20 /
+/// GTX 16 series or newer (see `addon::candidates`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum UpscaleBackend {

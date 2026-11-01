@@ -104,13 +104,18 @@ pub fn start(dir: PathBuf, backend: UpscaleBackend, wake: Waker) -> Receiver<Sta
 }
 
 /// Whether Auto prefers TensorRT-RTX on a GPU of this CUDA compute capability:
-/// the consumer GPUs TensorRT-RTX supports from Ampere on (8.6 RTX 30, 8.9 RTX
-/// 40, 12.x RTX 50 and newer). Turing (7.5) is supported too, but without FP32
-/// GEMMs or 3D convolutions, which some models need; data-center parts (8.0,
-/// 9.0, 10.0) aren't supported at all. The explicit choice runs it anywhere.
+/// the consumer GPUs TensorRT-RTX supports (7.5 RTX 20 / GTX 16, 8.6 RTX 30,
+/// 8.9 RTX 40, 12.x RTX 50 and newer). On Turing (7.5) TensorRT-RTX has no FP32
+/// GEMMs or 3D convolutions, but none of the models the apps ship by default
+/// hit those gaps: MangaJaNai ESRGAN is fp16 convolutions only, IllustrationJaNai
+/// FDAT M/XL and SPAN use fp16 MatMuls. Only the optional fp32 IllustrationJaNai
+/// DAT2/HAT_L exports use FP32 GEMMs, and a model that fails on TensorRT-RTX
+/// falls back to TensorRT on its own (`AjiUpscaler`). The data-center parts
+/// (8.0, 9.0, 10.0) stay excluded: TensorRT-RTX 1.7 doesn't support them. The
+/// explicit choice runs it anywhere.
 #[cfg(feature = "sr")]
 fn auto_prefers_tensorrt_rtx((major, minor): (i32, i32)) -> bool {
-    matches!((major, minor), (8, 6) | (8, 9)) || major >= 12
+    matches!((major, minor), (7, 5) | (8, 6) | (8, 9)) || major >= 12
 }
 
 /// The backends to try, in order, for `choice`. `rtx_cc` is the compute
@@ -211,11 +216,11 @@ mod tests {
 
     #[test]
     fn auto_prefers_tensorrt_rtx_on_supported_consumer_gpus() {
-        for cc in [(8, 6), (8, 9), (12, 0), (12, 1), (13, 0)] {
+        for cc in [(7, 5), (8, 6), (8, 9), (12, 0), (12, 1), (13, 0)] {
             assert!(auto_prefers_tensorrt_rtx(cc), "{cc:?}");
         }
-        // Turing (limited), and the data-center parts TensorRT-RTX doesn't support.
-        for cc in [(7, 5), (8, 0), (8, 7), (9, 0), (10, 0), (11, 0), (6, 1)] {
+        // Pre-Turing, and the data-center parts TensorRT-RTX doesn't support.
+        for cc in [(7, 0), (8, 0), (8, 7), (9, 0), (10, 0), (11, 0), (6, 1)] {
             assert!(!auto_prefers_tensorrt_rtx(cc), "{cc:?}");
         }
     }
@@ -225,7 +230,8 @@ mod tests {
         let auto = UpscaleBackend::Auto;
         assert_eq!(candidates(auto, true, Some((12, 0))), [TensorRtRtx, TensorRt, DirectMl]);
         assert_eq!(candidates(auto, true, Some((8, 6))), [TensorRtRtx, TensorRt, DirectMl]);
-        assert_eq!(candidates(auto, true, Some((7, 5))), [TensorRt, DirectMl]);
+        assert_eq!(candidates(auto, true, Some((7, 5))), [TensorRtRtx, TensorRt, DirectMl]);
+        assert_eq!(candidates(auto, true, Some((6, 1))), [TensorRt, DirectMl]);
         assert_eq!(candidates(auto, true, Some((9, 0))), [TensorRt, DirectMl]);
         // Not installed (or no device listed).
         assert_eq!(candidates(auto, true, None), [TensorRt, DirectMl]);

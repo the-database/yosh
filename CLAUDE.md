@@ -155,8 +155,10 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   runtime (the `aji-trtrtx-windows-x64.zip` release asset) in the add-on. Engines build in ~5-10 s instead of
   TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~15% faster, output visually identical.
   Auto tries it first (`addon::candidates`) when `aji_trtrtx.dll` is in the add-on and TensorRT-RTX's first
-  device has compute capability 8.6, 8.9 or 12.x+ (`auto_prefers_tensorrt_rtx`: RTX 30-series and newer).
-  Not on Turing (7.5: supported, but without FP32 GEMMs or 3D convolutions) or the data-center parts
+  device has compute capability 7.5, 8.6, 8.9 or 12.x+ (`auto_prefers_tensorrt_rtx`: GeForce RTX 20 / GTX 16
+  series and newer). Turing is included although TensorRT-RTX has no FP32 GEMMs or 3D convolutions there: no
+  model the apps ship by default needs them (only the optional fp32 IllustrationJaNai DAT2/HAT_L exports use
+  FP32 GEMMs, and a failing model falls back to TensorRT per model). Not on the data-center parts
   TensorRT-RTX doesn't support (8.0, 9.0, 10.0); the explicit choice runs it on any GPU. Skipping it
   (not installed, older GPU, device list failed) is silent. Auto off Windows is TensorRT only.
   The image ABI has no fallback of its own, so `start_blocking` tries TensorRT (Auto: then DirectML) when it can't start, and
