@@ -36,13 +36,10 @@ pub fn archive_done() {
 }
 
 /// A model's engine is being built (first use of this model and tile on this GPU). The line names
-/// the backend ("TensorRT" or "TensorRT-RTX"); the GUI tells them apart by it. The GUI takes the
-/// first word after ENGINE_BUILD as the model, so `bf16` (the model's bf16 variant) is marked after
-/// it, inside the parentheses.
-pub fn engine_build(model: &str, tile: u32, backend: &str, bf16: bool) {
+/// the backend ("TensorRT" or "TensorRT-RTX"); the GUI tells them apart by it.
+pub fn engine_build(model: &str, tile: u32, backend: &str) {
     let takes = if backend == "TensorRT" { "a few minutes" } else { "a few seconds" };
-    let bf16 = if bf16 { ", bf16" } else { "" };
-    line(&format!("ENGINE_BUILD {model} (tile {tile}{bf16}): building the {backend} engine for this GPU; this takes {takes}, once"));
+    line(&format!("ENGINE_BUILD {model} (tile {tile}): building the {backend} engine for this GPU; this takes {takes}, once"));
 }
 
 pub fn engine_ready(model: &str) {

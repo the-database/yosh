@@ -13,9 +13,7 @@
 //!                        falls back to TensorRT if it can't start or a model fails to build)
 //!   --device <id>        a device id from --list-devices (default: the backend's first device)
 //!   --cache-dir <dir>    TensorRT engine cache (default: next to each model)
-//!   -m, --models-dir <d> where models are looked up (repeatable; default: ../models). On
-//!                        TensorRT/TensorRT-RTX with an Ampere or newer GPU, a model's bf16
-//!                        variant in <d>/bf16/ (same file name) is used first when there is one
+//!   -m, --models-dir <d> where models are looked up (repeatable; default: ../models)
 
 mod chain;
 mod encode;
