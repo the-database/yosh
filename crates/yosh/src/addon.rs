@@ -2,7 +2,7 @@
 //! installed, and starting it.
 //!
 //! The add-on is a directory the app never ships: libaji (`aji.dll` with its
-//! DirectML/TensorRT backends and their runtime libraries), a `models/` folder of
+//! DirectML/TensorRT (and optionally TensorRT-RTX) backends and their runtime libraries), a `models/` folder of
 //! ONNX models, optionally a `rules.json` overriding which model handles which
 //! page, and a `cache/` the backend fills (TensorRT engines). Until it exists the
 //! setting is inert and decoding is exactly as without the feature.
@@ -100,9 +100,12 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
     // Auto prefers TensorRT — on an NVIDIA GPU with the TensorRT runtime installed
     // it is far faster (transformer models especially), at the cost of a one-time
     // engine build per model — and falls back to DirectML, which runs on any
-    // DirectX 12 GPU. Off Windows there is only TensorRT.
+    // DirectX 12 GPU. Off Windows there is only TensorRT. TensorRT-RTX (opt-in,
+    // experimental; needs aji_trtrtx.dll in the add-on) falls back to TensorRT when
+    // it can't start, and per model when one fails to build (`AjiUpscaler`).
     let candidates: &[Backend] = match backend {
         UpscaleBackend::TensorRt => &[Backend::TensorRt],
+        UpscaleBackend::TensorRtRtx => &[Backend::TensorRtRtx, Backend::TensorRt],
         UpscaleBackend::DirectMl => &[Backend::DirectMl],
         UpscaleBackend::Auto if cfg!(windows) => &[Backend::TensorRt, Backend::DirectMl],
         UpscaleBackend::Auto => &[Backend::TensorRt],
@@ -119,8 +122,7 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
         };
         match AjiUpscaler::new(dir, b, device.id, rules(dir), Some(wake.clone())) {
             Ok(up) => {
-                let name = if b == Backend::TensorRt { "TensorRT" } else { "DirectML" };
-                return Ok((Arc::new(up), format!("{} · {name}", device.name)));
+                return Ok((Arc::new(up), format!("{} · {}", device.name, b.label())));
             }
             Err(e) => err = e,
         }

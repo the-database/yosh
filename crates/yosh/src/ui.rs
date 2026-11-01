@@ -1197,7 +1197,12 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     use crate::config::UpscaleBackend as B;
                     ui.separator();
                     let choices: &[(B, &str)] = if cfg!(windows) {
-                        &[(B::Auto, t.auto), (B::DirectMl, "DirectML"), (B::TensorRt, "TensorRT")]
+                        &[
+                            (B::Auto, t.auto),
+                            (B::DirectMl, "DirectML"),
+                            (B::TensorRt, "TensorRT"),
+                            (B::TensorRtRtx, "TensorRT-RTX"),
+                        ]
                     } else {
                         &[(B::Auto, t.auto), (B::TensorRt, "TensorRT")]
                     };

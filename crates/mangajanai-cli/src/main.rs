@@ -1,15 +1,16 @@
 //! mangajanai_upscale — MangaJaNaiConverterGui's upscaling backend (it replaces 1.x's PyTorch
 //! backend). Images and archives are decoded, matched to a workflow chain, upscaled through
-//! libaji (TensorRT or DirectML), resized to the target and encoded.
+//! libaji (TensorRT, DirectML or TensorRT-RTX), resized to the target and encoded.
 //!
 //!   mangajanai_upscale --settings <appstate2.json> [options]   the GUI's selected workflow
 //!   mangajanai_upscale (-f <file> | -d <folder>) [-o <out>] [-u <1-4>] [options]
 //!                                                              the default workflow, from the command line
-//!   mangajanai_upscale --list-devices [--backend tensorrt|directml] [--aji-dir <dir>]
+//!   mangajanai_upscale --list-devices [--backend tensorrt|directml|tensorrt-rtx] [--aji-dir <dir>]
 //!
 //! Options:
 //!   --aji-dir <dir>      where aji.dll and its backends are (default: this exe's folder)
-//!   --backend <b>        auto (default) | tensorrt | directml
+//!   --backend <b>        auto (default) | tensorrt | directml | tensorrt-rtx (experimental;
+//!                        falls back to TensorRT if it can't start or a model fails to build)
 //!   --device <id>        a device id from --list-devices (default: the backend's first device)
 //!   --cache-dir <dir>    TensorRT engine cache (default: next to each model)
 //!   -m, --models-dir <d> where models are looked up (repeatable; default: ../models)
@@ -147,6 +148,7 @@ fn main() {
         use yosh_image::aji::Backend;
         let backend = match args.backend {
             BackendChoice::DirectMl => Backend::DirectMl,
+            BackendChoice::TensorRtRtx => Backend::TensorRtRtx,
             _ => Backend::TensorRt,
         };
         match upscaler::devices_json(&args.aji_dir, backend) {
