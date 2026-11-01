@@ -9,7 +9,7 @@
 //! [`SrOutcome::NotReady`]; a watcher thread polls it and bumps the epoch (and
 //! wakes the shell) once it is ready, so the reader retries those pages.
 //!
-//! On TensorRT-RTX (experimental), a model that fails to load or build falls back
+//! On TensorRT-RTX (chosen, or Auto's pick), a model that fails to load or build falls back
 //! to TensorRT on the same GPU: the TensorRT context opens the first time that
 //! happens, and the other models stay on TensorRT-RTX.
 

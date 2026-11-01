@@ -234,8 +234,9 @@ pub struct Strings {
     pub upscale_ready: fn(&str) -> String,
     /// "Unavailable: {error}".
     pub upscale_error: fn(&str) -> String,
-    /// "TensorRT-RTX failed ({why}); using TensorRT instead".
-    pub upscale_fallback: fn(&str) -> String,
+    /// "TensorRT-RTX failed ({why}); using {backend} instead" (TensorRT, or
+    /// DirectML when Auto tried TensorRT-RTX and TensorRT didn't start either).
+    pub upscale_fallback: fn(&str, &str) -> String,
     pub open_addon_folder: &'static str,
     /// The reader's "AI" status chip and busy indicator (what upscaling is doing
     /// for the page in view).

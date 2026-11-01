@@ -151,17 +151,22 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   upscaled page only re-sizes it — no read, decode or inference — and skips the plain re-decode.
 - **Model choice is data:** `sr::rules` mirrors MangaJaNaiConverterGui's chain rules (first match on
   source height, gray/color, target scale); `rules.json` in the add-on overrides the built-in defaults.
-- **TensorRT-RTX (opt-in, experimental, Windows):** needs libaji >= v0.19.0 with `aji_trtrtx.dll` and its
-  runtime (the `aji-trtrtx-windows-x64.zip` release asset) in the add-on. Engines build in ~5 s instead of
-  TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~16% faster. Auto never picks it.
-  The image ABI has no fallback of its own, so `start_blocking` tries TensorRT when it can't start, and
+- **TensorRT-RTX (Windows):** needs libaji >= v0.19.0 with `aji_trtrtx.dll` and its
+  runtime (the `aji-trtrtx-windows-x64.zip` release asset) in the add-on. Engines build in ~5-10 s instead of
+  TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~15% faster, output visually identical.
+  Auto tries it first (`addon::candidates`) when `aji_trtrtx.dll` is in the add-on and TensorRT-RTX's first
+  device has compute capability 8.6, 8.9 or 12.x+ (`auto_prefers_tensorrt_rtx`: RTX 30-series and newer).
+  Not on Turing (7.5: supported, but without FP32 GEMMs or 3D convolutions) or the data-center parts
+  TensorRT-RTX doesn't support (8.0, 9.0, 10.0); the explicit choice runs it on any GPU. Skipping it
+  (not installed, older GPU, device list failed) is silent. Auto off Windows is TensorRT only.
+  The image ABI has no fallback of its own, so `start_blocking` tries TensorRT (Auto: then DirectML) when it can't start, and
   `AjiUpscaler` retries a model on a lazily opened TensorRT context when it fails to load or build
   (the other models stay on TensorRT-RTX). Either fallback shows as a warning under the Settings status
   and in the AI chip's tooltip (`addon::Running::fallback`, `Upscaler::fallback`), and mangajanai-cli
   prints a `BACKEND_FALLBACK` line that MangaJaNaiConverterGui shows in its status bar. Stored as `upscale_backend: "tensorrt"` +
   `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
   fails the whole state.json parse on an unknown token, which would reset every setting.
-- UI: Settings → AI upscaling (on/off, Auto = TensorRT then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +
+- UI: Settings → AI upscaling (on/off, Auto = TensorRT-RTX if suited, then TensorRT, then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +
   corner spinner (`Reader::sr_view_state`); key `U` = per-book switch; info overlay "AI model" row.
 
 ### Central state and the frame loop
