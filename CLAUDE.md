@@ -156,7 +156,9 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~16% faster. Auto never picks it.
   The image ABI has no fallback of its own, so `start_blocking` tries TensorRT when it can't start, and
   `AjiUpscaler` retries a model on a lazily opened TensorRT context when it fails to load or build
-  (stderr says so; the other models stay on TensorRT-RTX). Stored as `upscale_backend: "tensorrt"` +
+  (the other models stay on TensorRT-RTX). Either fallback shows as a warning under the Settings status
+  and in the AI chip's tooltip (`addon::Running::fallback`, `Upscaler::fallback`), and mangajanai-cli
+  prints a `BACKEND_FALLBACK` line that MangaJaNaiConverterGui shows in its status bar. Stored as `upscale_backend: "tensorrt"` +
   `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
   fails the whole state.json parse on an unknown token, which would reset every setting.
 - UI: Settings → AI upscaling (on/off, Auto = TensorRT then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +

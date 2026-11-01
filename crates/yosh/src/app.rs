@@ -340,6 +340,8 @@ struct State {
     // status line the Settings panel shows.
     upscale_rx: Option<std::sync::mpsc::Receiver<addon::Started>>,
     upscale_status: addon::Status,
+    /// TensorRT-RTX couldn't start and the add-on runs on TensorRT: why.
+    upscale_fallback: Option<String>,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
     // runs on a background thread so a slow network-share open never freezes the
@@ -1138,6 +1140,7 @@ impl ApplicationHandler for App {
             update_error: None,
             upscale_rx: None,
             upscale_status: addon::Status::Off,
+            upscale_fallback: None,
             // The pre-spawned CLI open is generation 1, so `State` must start there
             // or its result would be discarded as stale by the drain in `render`.
             open_gen: if cli_open.is_some() { 1 } else { 0 },
@@ -1724,6 +1727,7 @@ impl State {
         self.reader.set_upscaler(None);
         self.upscale_rx = None;
         self.upscale_status = addon::Status::Off;
+        self.upscale_fallback = None;
         if !self.settings.upscale {
             return;
         }
@@ -2840,9 +2844,10 @@ impl State {
         }
         if let Some(rx) = self.upscale_rx.take() {
             match rx.try_recv() {
-                Ok(Ok((up, device))) => {
-                    self.reader.set_upscaler(Some(up));
-                    self.upscale_status = addon::Status::Ready(device);
+                Ok(Ok(run)) => {
+                    self.reader.set_upscaler(Some(run.upscaler));
+                    self.upscale_status = addon::Status::Ready(run.device);
+                    self.upscale_fallback = run.fallback;
                     changed = true;
                 }
                 Ok(Err(e)) => {
@@ -3269,6 +3274,17 @@ impl State {
             addon::Status::Starting => t.upscale_starting.to_string(),
             addon::Status::Ready(d) => (t.upscale_ready)(d),
             addon::Status::Error(e) => (t.upscale_error)(e),
+        };
+        // A TensorRT-RTX fallback, at start or for a model since: shown under the
+        // status and on the AI chip, so it isn't only a log line.
+        self.ui.upscale_notice = match &self.upscale_status {
+            addon::Status::Ready(_) => self
+                .upscale_fallback
+                .clone()
+                .or_else(|| self.reader.upscaler.as_ref().and_then(|u| u.fallback()))
+                .map(|why| (t.upscale_fallback)(&why))
+                .unwrap_or_default(),
+            _ => String::new(),
         };
         // Lets the chrome tell "nothing open" (→ onboarding panel) apart from the
         // library grid; `ui.opened` is sticky once set, so it can't.

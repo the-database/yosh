@@ -58,6 +58,8 @@ pub struct AjiUpscaler {
     backend: Backend,
     /// Present on TensorRT-RTX only.
     fallback: Option<Fallback>,
+    /// The first model that fell back to TensorRT, and why ([`Upscaler::fallback`]).
+    fell_back: Mutex<Option<String>>,
     models_dir: PathBuf,
     rules: Vec<SrRule>,
     slots: Mutex<HashMap<String, Slot>>,
@@ -84,6 +86,7 @@ impl AjiUpscaler {
             ctx,
             backend,
             fallback,
+            fell_back: Mutex::new(None),
             models_dir: dir.join("models"),
             rules,
             slots: Mutex::new(HashMap::new()),
@@ -177,6 +180,10 @@ impl AjiUpscaler {
             return Err(err);
         };
         eprintln!("yosh: [upscale] {} failed for {name} ({err}); using TensorRT", self.backend.label());
+        self.fell_back
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(|| format!("{name}: {err}"));
         let ctx = {
             let mut c = fb.ctx.lock().unwrap_or_else(|e| e.into_inner());
             c.get_or_insert_with(|| open_context(&fb.dir, Backend::TensorRt, fb.device_id)).clone()
@@ -275,6 +282,10 @@ impl Upscaler for AjiUpscaler {
 
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<Arc<str>> {
         select(&self.rules, src_h, gray, target_scale).map(Arc::from)
+    }
+
+    fn fallback(&self) -> Option<String> {
+        self.fell_back.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
