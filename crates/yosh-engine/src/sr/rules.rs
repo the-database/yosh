@@ -42,7 +42,9 @@ pub fn select(rules: &[SrRule], src_h: u32, gray: bool, scale: f32) -> Option<&s
 /// for gray pages the MangaJaNai model trained nearest the source height. Within
 /// each group the 2x model comes first, so a target of exactly 2x picks it, and
 /// anything above 2x takes the 4x model. Model stems are the ONNX exports of the
-/// same checkpoints.
+/// same checkpoints, named after their ONNX precision as MangaJaNai GUI 2.0 ships
+/// them (`_fp16`). `sr::aji` also finds an add-on's other precisions of a model and
+/// the older unsuffixed MangaJaNai names.
 pub fn default_rules() -> Vec<SrRule> {
     let mut rules = vec![
         color(0.0, 2.0, "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16"),
@@ -59,8 +61,8 @@ pub fn default_rules() -> Vec<SrRule> {
         (1985, 0, "2048p", "95k", "70k"),
     ];
     for (lo, hi, bucket, k2, k4) in GRAY {
-        rules.push(gray(lo, hi, 0.0, 2.0, format!("2x_MangaJaNai_{bucket}_V1_ESRGAN_{k2}")));
-        rules.push(gray(lo, hi, 2.0, 0.0, format!("4x_MangaJaNai_{bucket}_V1_ESRGAN_{k4}")));
+        rules.push(gray(lo, hi, 0.0, 2.0, format!("2x_MangaJaNai_{bucket}_V1_ESRGAN_{k2}_fp16")));
+        rules.push(gray(lo, hi, 2.0, 0.0, format!("4x_MangaJaNai_{bucket}_V1_ESRGAN_{k4}_fp16")));
     }
     rules
 }
@@ -89,14 +91,14 @@ mod tests {
     fn default_rules_pick_like_mangajanai_converter() {
         let r = default_rules();
         // Gray: the bucket follows the source height, the factor the target scale.
-        assert_eq!(select(&r, 1200, true, 1.8), Some("2x_MangaJaNai_1200p_V1_ESRGAN_70k"));
-        assert_eq!(select(&r, 1250, true, 3.0), Some("4x_MangaJaNai_1200p_V1_ESRGAN_70k"));
-        assert_eq!(select(&r, 1251, true, 1.5), Some("2x_MangaJaNai_1300p_V1_ESRGAN_75k"));
-        assert_eq!(select(&r, 1700, true, 1.27), Some("2x_MangaJaNai_1600p_V1_ESRGAN_90k"));
-        assert_eq!(select(&r, 1984, true, 2.5), Some("4x_MangaJaNai_1920p_V1_ESRGAN_105k"));
-        assert_eq!(select(&r, 3000, true, 1.1), Some("2x_MangaJaNai_2048p_V1_ESRGAN_95k"));
+        assert_eq!(select(&r, 1200, true, 1.8), Some("2x_MangaJaNai_1200p_V1_ESRGAN_70k_fp16"));
+        assert_eq!(select(&r, 1250, true, 3.0), Some("4x_MangaJaNai_1200p_V1_ESRGAN_70k_fp16"));
+        assert_eq!(select(&r, 1251, true, 1.5), Some("2x_MangaJaNai_1300p_V1_ESRGAN_75k_fp16"));
+        assert_eq!(select(&r, 1700, true, 1.27), Some("2x_MangaJaNai_1600p_V1_ESRGAN_90k_fp16"));
+        assert_eq!(select(&r, 1984, true, 2.5), Some("4x_MangaJaNai_1920p_V1_ESRGAN_105k_fp16"));
+        assert_eq!(select(&r, 3000, true, 1.1), Some("2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16"));
         // Exactly 2x matches both rules of a group; the 2x one comes first.
-        assert_eq!(select(&r, 1400, true, 2.0), Some("2x_MangaJaNai_1400p_V1_ESRGAN_70k"));
+        assert_eq!(select(&r, 1400, true, 2.0), Some("2x_MangaJaNai_1400p_V1_ESRGAN_70k_fp16"));
         // Color ignores height.
         assert_eq!(
             select(&r, 800, false, 2.7),
@@ -106,6 +108,15 @@ mod tests {
             select(&r, 2400, false, 1.2),
             Some("2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16")
         );
+    }
+
+    #[test]
+    fn default_models_are_the_shipped_fp16_files() {
+        let r = default_rules();
+        assert_eq!(r.len(), 16);
+        let names: Vec<&str> = r.iter().filter_map(|r| r.model.as_deref()).collect();
+        assert_eq!(names.iter().filter(|n| n.contains("_MangaJaNai_")).count(), 14);
+        assert!(names.iter().all(|n| n.ends_with("_fp16")), "{names:?}");
     }
 
     #[test]

@@ -6,6 +6,13 @@
 //!   mangajanai_upscale (-f <file> | -d <folder>) [-o <out>] [-u <1-4>] [options]
 //!                                                              the default workflow, from the command line
 //!   mangajanai_upscale --list-devices [--backend tensorrt|directml|tensorrt-rtx] [--aji-dir <dir>]
+//!                        the backend's devices, as JSON: [{"id", "name", "vram",
+//!                        "compute_capability"}] ("8.9"; null on DirectML)
+//!   mangajanai_upscale --model-info <file.onnx> [--backend <b>] [--aji-dir <dir>] [--device <id>]
+//!                        the model's precision, as JSON: {"precision": fp32|fp16|bf16|unknown,
+//!                        "weights": {"fp32", "fp16", "bf16"} (float weight elements), "hint":
+//!                        with --backend, a note when the precision is suboptimal for that
+//!                        backend and device, else null}
 //!
 //! Options:
 //!   --aji-dir <dir>      where aji.dll and its backends are (default: this exe's folder)
@@ -13,13 +20,16 @@
 //!                        falls back to TensorRT if it can't start or a model fails to build)
 //!   --device <id>        a device id from --list-devices (default: the backend's first device)
 //!   --cache-dir <dir>    TensorRT engine cache (default: next to each model)
-//!   -m, --models-dir <d> where models are looked up (repeatable; default: ../models). On
-//!                        TensorRT/TensorRT-RTX with an Ampere or newer GPU, a model's bf16
-//!                        variant in <d>/bf16/ (same file name) is used first when there is one
+//!   -m, --models-dir <d> where models are looked up (repeatable; default: ../models)
+//!
+//! A chain's model runs as given: the file it names, found in the models folders. When its
+//! precision is suboptimal for the backend and GPU, its first load prints
+//! "HINT <model file name>: <text>".
 
 mod chain;
 mod encode;
 mod levels;
+mod precision;
 mod process;
 mod progress;
 mod run;
@@ -38,8 +48,10 @@ struct Args {
     out: Option<PathBuf>,
     scale: i32,
     list_devices: bool,
+    model_info: Option<PathBuf>,
     aji_dir: PathBuf,
-    backend: BackendChoice,
+    /// `None` when not given (Auto, except for `--model-info`, which then gives no hint).
+    backend: Option<BackendChoice>,
     device: u64,
     cache_dir: Option<PathBuf>,
     models_dirs: Vec<PathBuf>,
@@ -57,8 +69,9 @@ fn parse_args() -> Result<Args, String> {
         out: None,
         scale: 2,
         list_devices: false,
+        model_info: None,
         aji_dir: exe_dir(),
-        backend: BackendChoice::Auto,
+        backend: None,
         device: 0,
         cache_dir: None,
         models_dirs: Vec::new(),
@@ -77,8 +90,9 @@ fn parse_args() -> Result<Args, String> {
             }
             "-m" | "--models-dir" | "--models-directory" => a.models_dirs.push(value(&arg)?.into()),
             "--list-devices" => a.list_devices = true,
+            "--model-info" => a.model_info = Some(value(&arg)?.into()),
             "--aji-dir" => a.aji_dir = value(&arg)?.into(),
-            "--backend" => a.backend = BackendChoice::parse(&value(&arg)?.to_string_lossy())?,
+            "--backend" => a.backend = Some(BackendChoice::parse(&value(&arg)?.to_string_lossy())?),
             "--device" => a.device = value(&arg)?.to_string_lossy().parse().map_err(|_| "--device must be a device id".to_string())?,
             "--cache-dir" => a.cache_dir = Some(value(&arg)?.into()),
             "--version" | "-V" => {
@@ -128,8 +142,8 @@ fn default_chains() -> Vec<Chain> {
         ("0x1761", "0x1984", "1920p", "70k", "105k"),
         ("0x1985", "0x0", "2048p", "95k", "70k"),
     ] {
-        chains.push(chain(lo, hi, true, 0, 2, format!("2x_MangaJaNai_{bucket}_V1_ESRGAN_{k2}.onnx")));
-        chains.push(chain(lo, hi, true, 2, 0, format!("4x_MangaJaNai_{bucket}_V1_ESRGAN_{k4}.onnx")));
+        chains.push(chain(lo, hi, true, 0, 2, format!("2x_MangaJaNai_{bucket}_V1_ESRGAN_{k2}_fp16.onnx")));
+        chains.push(chain(lo, hi, true, 2, 0, format!("4x_MangaJaNai_{bucket}_V1_ESRGAN_{k4}_fp16.onnx")));
     }
     for (i, c) in chains.iter_mut().enumerate() {
         c.chain_number = (i + 1).to_string();
@@ -149,11 +163,22 @@ fn main() {
     if args.list_devices {
         use yosh_image::aji::Backend;
         let backend = match args.backend {
-            BackendChoice::DirectMl => Backend::DirectMl,
-            BackendChoice::TensorRtRtx => Backend::TensorRtRtx,
+            Some(BackendChoice::DirectMl) => Backend::DirectMl,
+            Some(BackendChoice::TensorRtRtx) => Backend::TensorRtRtx,
             _ => Backend::TensorRt,
         };
         match upscaler::devices_json(&args.aji_dir, backend) {
+            Ok(json) => println!("{json}"),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(model) = &args.model_info {
+        match upscaler::model_info_json(model, &args.aji_dir, args.backend, args.device) {
             Ok(json) => println!("{json}"),
             Err(e) => {
                 eprintln!("{e}");
@@ -221,7 +246,8 @@ fn main() {
     };
 
     let start = std::time::Instant::now();
-    let (aji_dir, backend, device, cache_dir) = (args.aji_dir.clone(), args.backend, args.device, args.cache_dir.clone());
+    let backend = args.backend.unwrap_or(BackendChoice::Auto);
+    let (aji_dir, device, cache_dir) = (args.aji_dir.clone(), args.device, args.cache_dir.clone());
     run::run(input, output, job, move || Upscaler::open(&aji_dir, backend, device, cache_dir, models_dirs));
     progress::log(&format!("Elapsed time: {:.2} seconds", start.elapsed().as_secs_f64()));
 }

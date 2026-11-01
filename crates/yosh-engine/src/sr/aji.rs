@@ -12,6 +12,12 @@
 //! On TensorRT-RTX (chosen, or Auto's pick), a model that fails to load or build falls back
 //! to TensorRT on the same GPU: the TensorRT context opens the first time that
 //! happens, and the other models stay on TensorRT-RTX.
+//!
+//! A rule's model may be installed under another precision suffix (`_fp16`,
+//! `_bf16`, `_fp32`) than the rule names, or with none (older add-ons), or with one
+//! where the rule names none (an older `rules.json`): [`lookup_order`] finds
+//! whichever the add-on has, so add-ons built from older and newer MangaJaNai GUI
+//! model files both work with either names.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -33,8 +39,9 @@ pub fn enum_devices(dir: &Path, backend: Backend) -> Result<Vec<Device>, String>
 
 enum Slot {
     Ready { model: Arc<Model>, scale: u32 },
-    /// `fell_back`: already on the TensorRT fallback context.
-    Building { model: Arc<Model>, fell_back: bool },
+    /// `fell_back`: already on the TensorRT fallback context. `path`: the file it
+    /// loaded from, for that fallback.
+    Building { model: Arc<Model>, fell_back: bool, path: PathBuf },
     Failed,
 }
 
@@ -56,6 +63,8 @@ struct Watch {
 pub struct AjiUpscaler {
     ctx: Context,
     backend: Backend,
+    /// The device's CUDA compute capability (TensorRT, TensorRT-RTX), for [`lookup_order`].
+    compute_capability: Option<(i32, i32)>,
     /// Present on TensorRT-RTX only.
     fallback: Option<Fallback>,
     /// The first model that fell back to TensorRT, and why ([`Upscaler::fallback`]).
@@ -67,24 +76,25 @@ pub struct AjiUpscaler {
 }
 
 impl AjiUpscaler {
-    /// Load the add-on in `dir` and open `backend` on `device_id` (0 = first).
-    /// `waker` is called when a background engine build finishes.
+    /// Load the add-on in `dir` and open `backend` on `device` (one of
+    /// [`enum_devices`]). `waker` is called when a background engine build finishes.
     pub fn new(
         dir: &Path,
         backend: Backend,
-        device_id: u64,
+        device: &Device,
         rules: Vec<SrRule>,
         waker: Option<Waker>,
     ) -> Result<Self, String> {
-        let ctx = open_context(dir, backend, device_id)?;
+        let ctx = open_context(dir, backend, device.id)?;
         let fallback = (backend == Backend::TensorRtRtx).then(|| Fallback {
             dir: dir.to_path_buf(),
-            device_id,
+            device_id: device.id,
             ctx: Mutex::new(None),
         });
         Ok(Self {
             ctx,
             backend,
+            compute_capability: device.compute_capability,
             fallback,
             fell_back: Mutex::new(None),
             models_dir: dir.join("models"),
@@ -99,11 +109,25 @@ impl AjiUpscaler {
         })
     }
 
+    /// The installed file for a rule's model `name`: the first of [`lookup_order`]
+    /// in the models folder, logged when it isn't `name` itself.
+    fn resolve(&self, name: &str) -> Option<PathBuf> {
+        let order = lookup_order(name, self.backend, self.compute_capability);
+        let (stem, path) = order
+            .iter()
+            .map(|stem| (stem, self.models_dir.join(format!("{stem}.onnx"))))
+            .find(|(_, p)| p.is_file())?;
+        if stem != name {
+            eprintln!("yosh: [upscale] {name}: not installed; using {}", path.display());
+        }
+        Some(path)
+    }
+
     /// The model and its scale once ready; loads it on first use.
     fn model(&self, name: &str) -> Result<Option<(Arc<Model>, u32)>, String> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(Slot::Building { model, fell_back }) = slots.get(name) {
-            let (m, fell_back) = (model.clone(), *fell_back);
+        if let Some(Slot::Building { model, fell_back, path }) = slots.get(name) {
+            let (m, fell_back, path) = (model.clone(), *fell_back, path.clone());
             match m.state() {
                 ModelState::Building => return Ok(None),
                 ModelState::Ready => {
@@ -116,7 +140,6 @@ impl AjiUpscaler {
                         slots.insert(name.to_string(), Slot::Failed);
                         return Err(e);
                     }
-                    let path = self.models_dir.join(format!("{name}.onnx"));
                     return self.fall_back(&mut slots, name, &path, e);
                 }
             }
@@ -126,11 +149,11 @@ impl AjiUpscaler {
             Some(Slot::Failed) => return Err(format!("model {name} failed to load")),
             _ => {}
         }
-        let path = self.models_dir.join(format!("{name}.onnx"));
-        if !path.is_file() {
+        let Some(path) = self.resolve(name) else {
             slots.insert(name.to_string(), Slot::Failed);
+            let path = self.models_dir.join(format!("{name}.onnx"));
             return Err(format!("model not installed: {}", path.display()));
-        }
+        };
         match self.load(&mut slots, &self.ctx, name, &path, false) {
             Err(e) => self.fall_back(&mut slots, name, &path, e),
             done => done,
@@ -157,7 +180,7 @@ impl AjiUpscaler {
             }
         };
         if m.state() == ModelState::Building {
-            slots.insert(name.to_string(), Slot::Building { model: m.clone(), fell_back });
+            slots.insert(name.to_string(), Slot::Building { model: m.clone(), fell_back, path: path.to_path_buf() });
             self.watch_build(m);
             return Ok(None);
         }
@@ -223,6 +246,54 @@ impl AjiUpscaler {
             }
         });
     }
+}
+
+/// The precision suffixes of model file names: a file is named after its ONNX
+/// precision (`4x_MangaJaNai_1200p_V1_ESRGAN_70k_fp16`).
+const PRECISIONS: [&str; 3] = ["_bf16", "_fp16", "_fp32"];
+
+/// The file stems to look for, in order, for a rule's model `name` on `backend`
+/// with CUDA `compute_capability` (`None` on DirectML). The precisions go in
+/// preference order: bf16, fp16, fp32 on TensorRT/TensorRT-RTX with compute
+/// capability 8.0 or newer, else fp16, fp32 (never bf16, which DirectML can't run
+/// and Turing and older have no support for).
+///
+/// - A name ending in a precision suffix: `name` itself, then the same model's
+///   other precisions, then its unsuffixed name
+///   (`4x_MangaJaNai_1200p_V1_ESRGAN_70k`), as older add-ons installed it. One
+///   exception: a `_bf16` name on DirectML goes last, since DirectML can't run
+///   it; tried only when nothing else is installed, its load error then says why.
+/// - Any other name (an older `rules.json`'s unsuffixed MangaJaNai names, custom
+///   models): `name` itself, then `name` with each precision suffix. For a custom
+///   model those files don't exist, so it is in effect looked up exactly.
+///
+/// So the default rules and a `rules.json` with older or newer names find an
+/// add-on's models whether it was built from older or newer MangaJaNai GUI files.
+fn lookup_order(name: &str, backend: Backend, compute_capability: Option<(i32, i32)>) -> Vec<String> {
+    let bf16 = backend.is_cuda() && compute_capability.is_some_and(|(major, _)| major >= 8);
+    let prefs: &[&str] = if bf16 { &PRECISIONS } else { &PRECISIONS[1..] };
+    let Some((base, suffix)) = PRECISIONS
+        .iter()
+        .find_map(|&s| name.strip_suffix(s).map(|b| (b, s)))
+        .filter(|(b, _)| !b.is_empty())
+    else {
+        let mut order = vec![name.to_string()];
+        if !name.is_empty() {
+            order.extend(prefs.iter().map(|p| format!("{name}{p}")));
+        }
+        return order;
+    };
+    let bf16_on_dml = backend == Backend::DirectMl && suffix == "_bf16";
+    let mut order = Vec::new();
+    if !bf16_on_dml {
+        order.push(name.to_string());
+    }
+    order.extend(prefs.iter().filter(|&&p| p != suffix).map(|p| format!("{base}{p}")));
+    order.push(base.to_string());
+    if bf16_on_dml {
+        order.push(name.to_string());
+    }
+    order
 }
 
 /// Open `backend` on `device_id` with the add-on's engine cache, logging warnings
@@ -295,5 +366,85 @@ impl Drop for AjiUpscaler {
         // takes care of itself; just let a running watcher exit on its next tick
         // (without waking anyone) instead of keeping building models alive.
         self.watch.building.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order(name: &str, backend: Backend, cc: Option<(i32, i32)>) -> Vec<String> {
+        lookup_order(name, backend, cc)
+    }
+
+    #[test]
+    fn suffixed_names_try_siblings_then_the_unsuffixed_name() {
+        let m = "4x_MangaJaNai_1200p_V1_ESRGAN_70k";
+        for (b, cc) in [(Backend::TensorRt, Some((8, 6))), (Backend::TensorRtRtx, Some((12, 0)))] {
+            assert_eq!(
+                order(&format!("{m}_fp16"), b, cc),
+                [format!("{m}_fp16"), format!("{m}_bf16"), format!("{m}_fp32"), m.to_string()]
+            );
+            let d = "4x_IllustrationJaNai_V3detail_DAT2_28k";
+            assert_eq!(
+                order(&format!("{d}_bf16"), b, cc),
+                [format!("{d}_bf16"), format!("{d}_fp16"), format!("{d}_fp32"), d.to_string()]
+            );
+            assert_eq!(
+                order(&format!("{d}_fp32"), b, cc),
+                [format!("{d}_fp32"), format!("{d}_bf16"), format!("{d}_fp16"), d.to_string()]
+            );
+        }
+    }
+
+    #[test]
+    fn no_bf16_sibling_on_directml_turing_or_unknown() {
+        let d = "4x_IllustrationJaNai_V3detail_DAT2_28k";
+        for (b, cc) in [
+            (Backend::DirectMl, None),
+            (Backend::TensorRt, Some((7, 5))),
+            (Backend::TensorRtRtx, Some((7, 5))),
+            (Backend::TensorRt, None),
+        ] {
+            assert_eq!(order(&format!("{d}_fp32"), b, cc), [format!("{d}_fp32"), format!("{d}_fp16"), d.to_string()]);
+            assert_eq!(order(&format!("{d}_fp16"), b, cc), [format!("{d}_fp16"), format!("{d}_fp32"), d.to_string()]);
+        }
+        // A bf16 name stays first where it may run (Turing: TensorRT decides) ...
+        assert_eq!(
+            order(&format!("{d}_bf16"), Backend::TensorRt, Some((7, 5))),
+            [format!("{d}_bf16"), format!("{d}_fp16"), format!("{d}_fp32"), d.to_string()]
+        );
+        // ... but goes last on DirectML, which can't run it.
+        assert_eq!(
+            order(&format!("{d}_bf16"), Backend::DirectMl, None),
+            [format!("{d}_fp16"), format!("{d}_fp32"), d.to_string(), format!("{d}_bf16")]
+        );
+    }
+
+    #[test]
+    fn unsuffixed_names_try_the_suffixed_files_after_the_exact_name() {
+        for name in [
+            "4x_MangaJaNai_1200p_V1_ESRGAN_70k",
+            "2x_IllustrationJaNai_V3denoise_FDAT_M_unshuffle_30k_fp16_fp32_op20",
+            "my_model_FP16",
+            "_fp16",
+        ] {
+            for (b, cc) in [(Backend::TensorRt, Some((12, 0))), (Backend::TensorRtRtx, Some((8, 0)))] {
+                assert_eq!(
+                    order(name, b, cc),
+                    [name.to_string(), format!("{name}_bf16"), format!("{name}_fp16"), format!("{name}_fp32")],
+                    "{name} {b:?}"
+                );
+            }
+            // bf16 only where it runs.
+            for (b, cc) in [(Backend::DirectMl, None), (Backend::TensorRt, Some((7, 5))), (Backend::TensorRtRtx, None)] {
+                assert_eq!(
+                    order(name, b, cc),
+                    [name.to_string(), format!("{name}_fp16"), format!("{name}_fp32")],
+                    "{name} {b:?}"
+                );
+            }
+        }
+        assert_eq!(order("", Backend::TensorRt, Some((12, 0))), [String::new()]);
     }
 }
