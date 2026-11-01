@@ -55,6 +55,12 @@ pub fn backend_fallback(model: Option<&str>, why: &str) {
     }
 }
 
+/// A model's precision is suboptimal for the backend and GPU it runs on (`precision::hint`):
+/// printed once per model file, before it loads. The GUI shows it as a non-blocking notice.
+pub fn hint(model: &str, text: &str) {
+    line(&format!("HINT {model}: {text}"));
+}
+
 /// A file (or archive entry) that failed; the run continues with the next one.
 pub fn error(what: &str, msg: &str) {
     line(&format!("ERROR {what}: {msg}"));

@@ -1,13 +1,13 @@
 //! The inference side: one libaji context on the chosen backend/device, the models loaded so far
 //! (by file and tile), and the upscale itself — including recovering alpha for transparent images.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use yosh_image::aji::{Aji, Backend, Context, ContextParams, LoadParams, Model, ModelState, Pixels, PixelsMut, Upscaled};
+use yosh_image::aji::{Aji, Backend, Context, ContextParams, Device, LoadParams, Model, ModelState, Pixels, PixelsMut, Upscaled};
 
-use crate::progress;
+use crate::{precision, progress};
 
 /// Which backend to run on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +22,16 @@ pub enum BackendChoice {
 }
 
 impl BackendChoice {
+    /// The backends `Upscaler::open` tries, in order.
+    fn candidates(self) -> &'static [Backend] {
+        match self {
+            BackendChoice::Auto => &[Backend::TensorRt, Backend::DirectMl],
+            BackendChoice::TensorRt => &[Backend::TensorRt],
+            BackendChoice::DirectMl => &[Backend::DirectMl],
+            BackendChoice::TensorRtRtx => &[Backend::TensorRtRtx, Backend::TensorRt],
+        }
+    }
+
     pub fn parse(s: &str) -> Result<Self, String> {
         match s.to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
@@ -50,6 +60,10 @@ fn resolve_in(model: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 pub struct Upscaler {
     ctx: Context,
     backend: Backend,
+    /// The device `ctx` runs on, for the precision hints.
+    device: Device,
+    /// The model files whose precision hint was already given (once per file, not per tile).
+    hinted: HashSet<PathBuf>,
     /// On TensorRT-RTX: where to open the TensorRT context a failed model falls back to.
     fallback: Option<Fallback>,
     model_dirs: Vec<PathBuf>,
@@ -68,14 +82,8 @@ impl Upscaler {
         model_dirs: Vec<PathBuf>,
     ) -> Result<Self, String> {
         let aji = Aji::load(aji_dir)?;
-        let candidates: &[Backend] = match choice {
-            BackendChoice::Auto => &[Backend::TensorRt, Backend::DirectMl],
-            BackendChoice::TensorRt => &[Backend::TensorRt],
-            BackendChoice::DirectMl => &[Backend::DirectMl],
-            BackendChoice::TensorRtRtx => &[Backend::TensorRtRtx, Backend::TensorRt],
-        };
         let mut err = String::from("no compatible GPU found");
-        for &backend in candidates {
+        for &backend in choice.candidates() {
             if choice == BackendChoice::TensorRtRtx && backend == Backend::TensorRt {
                 progress::backend_fallback(None, &err);
             }
@@ -97,7 +105,16 @@ impl Upscaler {
                         cache_dir: cache_dir.clone(),
                         ctx: None,
                     });
-                    return Ok(Self { ctx, backend, fallback, model_dirs, models: HashMap::new(), description });
+                    return Ok(Self {
+                        ctx,
+                        backend,
+                        device: device.clone(),
+                        hinted: HashSet::new(),
+                        fallback,
+                        model_dirs,
+                        models: HashMap::new(),
+                        description,
+                    });
                 }
                 Err(e) => err = format!("{}: {e}", backend_name(backend)),
             }
@@ -112,11 +129,20 @@ impl Upscaler {
 
     /// The loaded model for `path` at `tile`, loading it (and waiting out a first-use TensorRT
     /// engine build, reported on stdout) if needed. On TensorRT-RTX, a model that fails to load
-    /// or build is retried on TensorRT (that context opens the first time it's needed).
+    /// or build is retried on TensorRT (that context opens the first time it's needed). The first
+    /// load of a file prints its precision hint, if it has one, before anything else about it.
     fn model(&mut self, path: &Path, tile: u32) -> Result<&Model, String> {
         let key = (path.to_path_buf(), tile);
         if !self.models.contains_key(&key) {
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if self.hinted.insert(path.to_path_buf()) {
+                // A file that can't be read is reported by the load below.
+                let p = precision::model_weights(path).map_or(precision::Precision::Unknown, |w| w.precision());
+                let d = &self.device;
+                if let Some(h) = precision::hint(self.backend, d.compute_capability, &d.name, p) {
+                    progress::hint(&name, &h);
+                }
+            }
             let model = match load_model(&self.ctx, self.backend, path, tile, &name) {
                 Ok(m) => m,
                 Err(e) => {
@@ -231,16 +257,65 @@ fn load_model(ctx: &Context, backend: Backend, path: &Path, tile: u32, name: &st
     Ok(model)
 }
 
-/// The devices of one backend, as JSON for the GUI's device list: `[{"id", "name", "vram"}]`
-/// (`id` as a decimal string — it's a full 64-bit value). An unloadable backend is an empty list.
+/// The devices of one backend, as JSON for the GUI's device list:
+/// `[{"id", "name", "vram", "compute_capability"}]` (`id` as a decimal string — it's a full 64-bit
+/// value; `compute_capability` as "major.minor", null on DirectML). An unloadable backend is an
+/// empty list.
 pub fn devices_json(aji_dir: &Path, backend: Backend) -> Result<String, String> {
     let aji = Aji::load(aji_dir)?;
     let devices = aji.devices(backend).unwrap_or_default();
     let list: Vec<_> = devices
         .iter()
-        .map(|d| serde_json::json!({ "id": d.id.to_string(), "name": d.name, "vram": d.vram_bytes }))
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id.to_string(),
+                "name": d.name,
+                "vram": d.vram_bytes,
+                "compute_capability": d.compute_capability.map(|(major, minor)| format!("{major}.{minor}")),
+            })
+        })
         .collect();
     serde_json::to_string(&list).map_err(|e| e.to_string())
+}
+
+/// `--model-info`'s JSON object, fields in the documented order.
+#[derive(serde::Serialize)]
+struct ModelInfo {
+    precision: &'static str,
+    weights: precision::Weights,
+    hint: Option<String>,
+}
+
+/// The precision of the ONNX model at `path`, as JSON:
+/// `{"precision", "weights": {"fp32", "fp16", "bf16"}, "hint"}`. With a `backend`, `hint` is
+/// [`precision::hint`] for the device an upscale would run on (see [`hint_device`]); without one,
+/// or when no device is found, it is null.
+pub fn model_info_json(path: &Path, aji_dir: &Path, backend: Option<BackendChoice>, device_id: u64) -> Result<String, String> {
+    let weights = precision::model_weights(path)?;
+    let p = weights.precision();
+    let hint = backend.and_then(|choice| {
+        let (backend, device) = hint_device(aji_dir, choice, device_id)?;
+        precision::hint(backend, device.compute_capability, &device.name, p)
+    });
+    serde_json::to_string(&ModelInfo { precision: p.as_str(), weights, hint }).map_err(|e| e.to_string())
+}
+
+/// The backend and device an upscale with `choice` and `device_id` would run on, as far as the
+/// device lists tell (no context is opened): the first of [`BackendChoice::candidates`] that lists
+/// a device, and on it the device with that id, else its first.
+fn hint_device(aji_dir: &Path, choice: BackendChoice, device_id: u64) -> Option<(Backend, Device)> {
+    let aji = match Aji::load(aji_dir) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("no hint: {e}");
+            return None;
+        }
+    };
+    choice.candidates().iter().find_map(|&b| {
+        let devices = aji.devices(b).ok()?;
+        let device = devices.iter().find(|d| d.id == device_id).or(devices.first())?;
+        Some((b, device.clone()))
+    })
 }
 
 #[cfg(test)]
