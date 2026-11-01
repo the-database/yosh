@@ -1733,7 +1733,7 @@ impl State {
         };
         self.upscale_status = addon::Status::Starting;
         self.upscale_rx =
-            Some(addon::start(dir, self.settings.upscale_backend, frame_waker(&self.window)));
+            Some(addon::start(dir, self.settings.upscale_choice(), frame_waker(&self.window)));
     }
 
     /// "Show in Explorer" (key `E`): open the containing folder of the current
@@ -3262,7 +3262,7 @@ impl State {
             self.on_battery,
         );
         self.ui.upscale = self.settings.upscale;
-        self.ui.upscale_backend = self.settings.upscale_backend;
+        self.ui.upscale_backend = self.settings.upscale_choice();
         self.ui.upscale_status = match &self.upscale_status {
             addon::Status::Off => String::new(),
             addon::Status::NotInstalled => t.upscale_not_installed.to_string(),
@@ -3731,7 +3731,7 @@ impl State {
             ui_acted = true;
         }
         if let Some(b) = self.ui.req_set_upscale_backend.take() {
-            self.settings.upscale_backend = b;
+            self.settings.set_upscale_choice(b);
             config::save(&self.settings);
             self.start_upscaler();
             ui_acted = true;

@@ -80,8 +80,8 @@ impl PerfPref {
     }
 }
 
-/// Inference backend for the AI-upscaling add-on. `Auto` = DirectML on Windows
-/// (any DirectX 12 GPU, no engine builds), TensorRT elsewhere.
+/// Inference backend for the AI-upscaling add-on. `Auto` = TensorRT, falling back
+/// to DirectML on Windows (any DirectX 12 GPU, no engine builds).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum UpscaleBackend {
@@ -91,6 +91,14 @@ pub enum UpscaleBackend {
     DirectMl,
     #[serde(rename = "tensorrt")]
     TensorRt,
+    /// TensorRT for RTX (Windows; experimental), falling back to TensorRT. Never
+    /// stored under its own token: [`Settings`] keeps it as `tensorrt` plus
+    /// `upscale_tensorrt_rtx` (see [`Settings::set_upscale_choice`]), because an
+    /// older yosh fails the whole state.json parse on an unknown token, and that
+    /// resets every setting, position and recent. Serialized directly it degrades
+    /// to `tensorrt`; it never deserializes.
+    #[serde(rename(serialize = "tensorrt"), skip_deserializing)]
+    TensorRtRtx,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -160,7 +168,11 @@ pub struct Settings {
     /// AI upscaling (the optional add-on): pages shown above their source size are
     /// re-drawn by a model. Off by default, and inert until the add-on is installed.
     pub upscale: bool,
+    /// Read through [`Settings::upscale_choice`]; never holds `TensorRtRtx`.
     pub upscale_backend: UpscaleBackend,
+    /// With `upscale_backend` = TensorRT, run TensorRT-RTX instead (Windows). A
+    /// separate key so an older yosh reads the choice as plain TensorRT.
+    pub upscale_tensorrt_rtx: bool,
     /// Volume paths where AI upscaling was switched off with the per-book toggle
     /// (key `U`). Absent ⇒ on, so the default stores nothing.
     pub upscale_off: HashSet<String>,
@@ -199,10 +211,30 @@ impl Default for Settings {
             perf: PerfPref::Auto,
             upscale: false,
             upscale_backend: UpscaleBackend::Auto,
+            upscale_tensorrt_rtx: false,
             upscale_off: HashSet::new(),
             language: None,
             window: None,
         }
+    }
+}
+
+impl Settings {
+    /// The upscaling backend choice, TensorRT-RTX included (Windows only).
+    pub fn upscale_choice(&self) -> UpscaleBackend {
+        match self.upscale_backend {
+            UpscaleBackend::TensorRt if self.upscale_tensorrt_rtx && cfg!(windows) => {
+                UpscaleBackend::TensorRtRtx
+            }
+            UpscaleBackend::TensorRtRtx => UpscaleBackend::TensorRt,
+            b => b,
+        }
+    }
+
+    /// Store a backend choice in the older-build-compatible form.
+    pub fn set_upscale_choice(&mut self, b: UpscaleBackend) {
+        self.upscale_tensorrt_rtx = b == UpscaleBackend::TensorRtRtx;
+        self.upscale_backend = if self.upscale_tensorrt_rtx { UpscaleBackend::TensorRt } else { b };
     }
 }
 
@@ -325,6 +357,40 @@ mod tests {
             assert_eq!(serde_json::to_string(&pref).unwrap(), token);
             assert_eq!(serde_json::from_str::<PerfPref>(token).unwrap(), pref);
         }
+    }
+
+    /// TensorRT-RTX is stored as `tensorrt` + a flag, so an older build (which
+    /// knows neither the variant nor the key) still parses the file and runs
+    /// plain TensorRT, and this build reads the choice back.
+    #[test]
+    fn tensorrt_rtx_choice_stays_readable_by_older_builds() {
+        let mut s = Settings::default();
+        s.set_upscale_choice(UpscaleBackend::TensorRtRtx);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"upscale_backend\":\"tensorrt\""), "{json}");
+        assert!(json.contains("\"upscale_tensorrt_rtx\":true"), "{json}");
+        assert!(!json.contains("tensorrt-rtx"), "{json}");
+
+        // An older build's view: the same struct without the new key.
+        #[derive(Deserialize)]
+        struct Old {
+            upscale_backend: UpscaleBackend,
+        }
+        let old: Old = serde_json::from_str(&json).expect("older builds must still parse");
+        assert_eq!(old.upscale_backend, UpscaleBackend::TensorRt);
+
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        let want = if cfg!(windows) { UpscaleBackend::TensorRtRtx } else { UpscaleBackend::TensorRt };
+        assert_eq!(back.upscale_choice(), want);
+
+        for b in [UpscaleBackend::Auto, UpscaleBackend::DirectMl, UpscaleBackend::TensorRt] {
+            s.set_upscale_choice(b);
+            assert!(!s.upscale_tensorrt_rtx);
+            assert_eq!(s.upscale_choice(), b);
+        }
+        // The variant itself never round-trips as its own token.
+        assert_eq!(serde_json::to_string(&UpscaleBackend::TensorRtRtx).unwrap(), "\"tensorrt\"");
+        assert!(serde_json::from_str::<UpscaleBackend>("\"tensorrt-rtx\"").is_err());
     }
 
     /// `Auto` defers to the power source; every other choice pins its tier.
