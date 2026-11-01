@@ -2,7 +2,7 @@
 name = "mangajanai-cli"
 version = "0.1.2"
 edition = "2024"
-description = "MangaJaNaiConverterGui's upscaling backend: batch manga/image upscaling on yosh-image + libaji"
+description = "MangaJaNai GUI's upscaling backend: batch manga/image upscaling on yosh-image + libaji"
 
 # The GUI ships and runs this as mangajanai_upscale.exe.
 [[bin]]

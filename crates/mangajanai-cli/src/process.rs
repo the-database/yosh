@@ -101,7 +101,7 @@ pub fn infer(mut work: Work, up: &mut Upscaler) -> Result<Work, String> {
     }
     let file = up.resolve(model).ok_or_else(|| format!("model not found: {model}"))?;
     if !file.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("onnx")) {
-        return Err(format!("{model} is not an ONNX model; convert it to ONNX to use it with MangaJaNaiConverterGui 2.0"));
+        return Err(format!("{model} is not an ONNX model; convert it to ONNX to use it with MangaJaNai GUI 2.0"));
     }
     let tile = chain::tile_size(&c.model_tile_size);
     let (out, scale) = if work.channels == 2 || work.channels == 4 {
