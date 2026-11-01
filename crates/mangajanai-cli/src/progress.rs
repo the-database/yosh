@@ -36,13 +36,10 @@ pub fn archive_done() {
 }
 
 /// A model's engine is being built (first use of this model and tile on this GPU). The line names
-/// the backend ("TensorRT" or "TensorRT-RTX"); the GUI tells them apart by it. The GUI takes the
-/// first word after ENGINE_BUILD as the model, so `bf16` (the model's bf16 variant) is marked after
-/// it, inside the parentheses.
-pub fn engine_build(model: &str, tile: u32, backend: &str, bf16: bool) {
+/// the backend ("TensorRT" or "TensorRT-RTX"); the GUI tells them apart by it.
+pub fn engine_build(model: &str, tile: u32, backend: &str) {
     let takes = if backend == "TensorRT" { "a few minutes" } else { "a few seconds" };
-    let bf16 = if bf16 { ", bf16" } else { "" };
-    line(&format!("ENGINE_BUILD {model} (tile {tile}{bf16}): building the {backend} engine for this GPU; this takes {takes}, once"));
+    line(&format!("ENGINE_BUILD {model} (tile {tile}): building the {backend} engine for this GPU; this takes {takes}, once"));
 }
 
 pub fn engine_ready(model: &str) {
@@ -56,6 +53,12 @@ pub fn backend_fallback(model: Option<&str>, why: &str) {
         None => line(&format!("BACKEND_FALLBACK TensorRT-RTX failed ({why}); using TensorRT instead")),
         Some(m) => line(&format!("BACKEND_FALLBACK TensorRT-RTX failed for {m} ({why}); using TensorRT for it")),
     }
+}
+
+/// A model's precision is suboptimal for the backend and GPU it runs on (`precision::hint`):
+/// printed once per model file, before it loads. The GUI shows it as a non-blocking notice.
+pub fn hint(model: &str, text: &str) {
+    line(&format!("HINT {model}: {text}"));
 }
 
 /// A file (or archive entry) that failed; the run continues with the next one.
