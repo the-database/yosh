@@ -58,7 +58,7 @@ pub struct UiState {
     pub upscale: bool,
     pub upscale_backend: crate::config::UpscaleBackend,
     pub upscale_status: String,
-    /// "TensorRT-RTX failed (…); using TensorRT instead", or empty.
+    /// "TensorRT-RTX failed (…); using TensorRT (or DirectML) instead", or empty.
     pub upscale_notice: String,
     /// The reader's AI-upscaling chip: shown while an upscaler is running
     /// (`sr_available`); `sr_book_on` is the per-book switch, and `sr_state` what

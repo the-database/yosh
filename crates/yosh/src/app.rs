@@ -340,8 +340,8 @@ struct State {
     // status line the Settings panel shows.
     upscale_rx: Option<std::sync::mpsc::Receiver<addon::Started>>,
     upscale_status: addon::Status,
-    /// TensorRT-RTX couldn't start and the add-on runs on TensorRT: why.
-    upscale_fallback: Option<String>,
+    /// TensorRT-RTX couldn't start: why, and the backend running instead.
+    upscale_fallback: Option<(String, &'static str)>,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
     // runs on a background thread so a slow network-share open never freezes the
@@ -3281,8 +3281,9 @@ impl State {
             addon::Status::Ready(_) => self
                 .upscale_fallback
                 .clone()
-                .or_else(|| self.reader.upscaler.as_ref().and_then(|u| u.fallback()))
-                .map(|why| (t.upscale_fallback)(&why))
+                // A model always falls back to TensorRT.
+                .or_else(|| self.reader.upscaler.as_ref().and_then(|u| u.fallback()).map(|why| (why, "TensorRT")))
+                .map(|(why, backend)| (t.upscale_fallback)(&why, backend))
                 .unwrap_or_default(),
             _ => String::new(),
         };

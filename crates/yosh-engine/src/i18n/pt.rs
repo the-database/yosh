@@ -47,7 +47,7 @@ pub static PT: Strings = Strings {
     upscale_starting: "Iniciando…",
     upscale_ready: |d| format!("Pronto · {d}"),
     upscale_error: |e| format!("Indisponível: {e}"),
-    upscale_fallback: |e| format!("O TensorRT-RTX falhou ({e}); usando o TensorRT no lugar"),
+    upscale_fallback: |e, b| format!("O TensorRT-RTX falhou ({e}); usando o {b} no lugar"),
     open_addon_folder: "📂 Abrir pasta do complemento",
     sr_working: "Ampliando com IA…",
     sr_preparing: "Preparando o modelo de IA…",

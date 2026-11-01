@@ -49,8 +49,8 @@ pub enum Backend {
     TensorRt = 1,
     /// Windows only.
     DirectMl = 2,
-    /// TensorRT for RTX (`aji_trtrtx`, libaji ≥ v0.19.0; Windows only, and
-    /// experimental): engines build in-process in about a second, with no
+    /// TensorRT for RTX (`aji_trtrtx`, libaji ≥ v0.19.0; Windows only): engines
+    /// build in-process in about a second, with no
     /// `trtexec`. Older libaji, or one without `aji_trtrtx.dll` and its runtime,
     /// rejects it ([`Aji::devices`] errors), and there is no automatic fallback:
     /// callers retry on [`Backend::TensorRt`] themselves.
