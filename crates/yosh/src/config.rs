@@ -81,7 +81,9 @@ impl PerfPref {
 }
 
 /// Inference backend for the AI-upscaling add-on. `Auto` = TensorRT, falling back
-/// to DirectML on Windows (any DirectX 12 GPU, no engine builds).
+/// to DirectML on Windows (any DirectX 12 GPU, no engine builds); on Windows it
+/// tries TensorRT-RTX first when the add-on has it and the GPU is an RTX 30-series
+/// or newer (see `addon::candidates`).
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum UpscaleBackend {
@@ -91,7 +93,7 @@ pub enum UpscaleBackend {
     DirectMl,
     #[serde(rename = "tensorrt")]
     TensorRt,
-    /// TensorRT for RTX (Windows; experimental), falling back to TensorRT. Never
+    /// TensorRT for RTX (Windows; any GPU it supports), falling back to TensorRT. Never
     /// stored under its own token: [`Settings`] keeps it as `tensorrt` plus
     /// `upscale_tensorrt_rtx` (see [`Settings::set_upscale_choice`]), because an
     /// older yosh fails the whole state.json parse on an unknown token, and that

@@ -47,7 +47,7 @@ pub static JA: Strings = Strings {
     upscale_starting: "起動中…",
     upscale_ready: |d| format!("準備完了 · {d}"),
     upscale_error: |e| format!("利用できません: {e}"),
-    upscale_fallback: |e| format!("TensorRT-RTX が失敗しました ({e})。代わりに TensorRT を使用します"),
+    upscale_fallback: |e, b| format!("TensorRT-RTX が失敗しました ({e})。代わりに {b} を使用します"),
     open_addon_folder: "📂 アドオンのフォルダーを開く",
     sr_working: "AI アップスケール中…",
     sr_preparing: "AI モデルを準備中…",
