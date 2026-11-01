@@ -1,4 +1,4 @@
-//! mangajanai_upscale — MangaJaNaiConverterGui's upscaling backend (it replaces 1.x's PyTorch
+//! mangajanai_upscale — MangaJaNai GUI's upscaling backend (it replaces 1.x's PyTorch
 //! backend). Images and archives are decoded, matched to a workflow chain, upscaled through
 //! libaji (TensorRT, DirectML or TensorRT-RTX), resized to the target and encoded.
 //!
