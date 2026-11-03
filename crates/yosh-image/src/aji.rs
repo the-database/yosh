@@ -37,6 +37,7 @@ use libloading::Library;
 
 const API_VERSION: u32 = 1;
 const LOAD_ASYNC_BUILD: c_int = 1;
+const LOAD_EVEN_TILES: c_int = 2;
 const OK: c_int = 0;
 const CANCELLED: c_int = -4;
 const STATE_READY: c_int = 0;
@@ -376,7 +377,8 @@ impl Context {
             tile_w: tw as c_int,
             tile_h: th as c_int,
             overlap: params.overlap.unwrap_or(0) as c_int,
-            flags: if params.async_build { LOAD_ASYNC_BUILD } else { 0 },
+            flags: (if params.async_build { LOAD_ASYNC_BUILD } else { 0 })
+                | (if params.even_tiles { LOAD_EVEN_TILES } else { 0 }),
         };
         // SAFETY: a live context; `raw` and `path` outlive the call.
         let ptr = unsafe { (self.0.lib.0.api.load)(self.0.ptr.0, &raw) };
@@ -391,19 +393,27 @@ impl Context {
 #[derive(Clone, Debug)]
 pub struct LoadParams<'a> {
     pub onnx: &'a Path,
-    /// Tile size in input pixels; `None` = 512×512. Ignored for fixed-shape
-    /// models (their shape is the tile).
+    /// Tile size in input pixels (with `even_tiles`, the largest); `None` =
+    /// 512×512. Ignored for fixed-shape models (their shape is the tile).
     pub tile: Option<(u32, u32)>,
-    /// Overlap between tiles in input pixels; `None` = 32.
+    /// Minimum overlap between tiles in input pixels; `None` = libaji's
+    /// default (128 since the seam fix; 32 before).
     pub overlap: Option<u32>,
     /// Build a missing TensorRT engine in the background (poll
     /// [`Model::state`]) instead of blocking in `load_model`.
     pub async_build: bool,
+    /// TensorRT / TensorRT-RTX: split each image into even tiles of at most
+    /// `tile`, from an engine that takes any tile shape
+    /// (`AJI_IMG_LOAD_EVEN_TILES`). Fewer pixels inferred, but the
+    /// shape-range engine can be slower per pixel (on an RTX 5090: no loss on
+    /// TensorRT, ~30% on TensorRT-RTX). Ignored by DirectML and by libaji
+    /// builds before the flag.
+    pub even_tiles: bool,
 }
 
 impl<'a> LoadParams<'a> {
     pub fn new(onnx: &'a Path) -> Self {
-        Self { onnx, tile: None, overlap: None, async_build: false }
+        Self { onnx, tile: None, overlap: None, async_build: false, even_tiles: false }
     }
 }
 
