@@ -18,9 +18,12 @@ Cargo workspace:
 - `crates/yosh-image` — the **GPU-free** imaging core the engine is built on: decoders, ICC, tone curves,
   HQ resize, folder/archive page sources, whole-archive entry streaming (`archive`), and (feature `aji`)
   safe runtime-loaded bindings to libaji's image ABI. No wgpu/winit/egui, so batch tools can depend on it
-  too; the engine re-exports `icc`, `source`, `tone`. **Its public API has other consumers** (a MangaJaNai
-  converter backend in this workspace): change it deliberately, and keep its decode/resize output
-  bit-identical for yosh (`decode_digest`, below).
+  too; the engine re-exports `icc`, `source`, `tone`. **Its public API has other consumers**:
+  [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI) (MangaJaNai GUI's upscaling backend
+  and the `mangajanai` command line) depends on it as a git dependency pinned to a commit of this
+  repo. Change it deliberately, keep changes additive where possible (a breaking change means a
+  MangaJaNaiCLI change when it bumps its pin), and keep its decode/resize output bit-identical for
+  yosh (`decode_digest`, below).
 - `crates/decode_bench`, `crates/present_bench` — throwaway Phase-0 spikes that validated the
   throughput ceiling before the real build. See `SPIKES_RESULTS.md`. Not part of the app.
 
@@ -173,7 +176,7 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   The image ABI has no fallback of its own, so `start_blocking` tries TensorRT (Auto: then DirectML) when it can't start, and
   `AjiUpscaler` retries a model on a lazily opened TensorRT context when it fails to load or build
   (the other models stay on TensorRT-RTX). Either fallback shows as a warning under the Settings status
-  and in the AI chip's tooltip (`addon::Running::fallback`, `Upscaler::fallback`), and mangajanai-cli
+  and in the AI chip's tooltip (`addon::Running::fallback`, `Upscaler::fallback`), and MangaJaNaiCLI
   prints a `BACKEND_FALLBACK` line that MangaJaNaiConverterGui shows in its status bar. Stored as `upscale_backend: "tensorrt"` +
   `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
   fails the whole state.json parse on an unknown token, which would reset every setting.

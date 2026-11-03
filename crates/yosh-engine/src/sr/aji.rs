@@ -306,6 +306,7 @@ fn open_context(dir: &Path, backend: Backend, device_id: u64) -> Result<Context,
         device_id,
         cache_dir: Some(cache),
         trtexec: None,
+        trtexec_env: None,
         // TensorRT severities: 0 internal error, 1 error, 2 warning.
         log: Some(Arc::new(|level, msg| {
             if level <= 2 {

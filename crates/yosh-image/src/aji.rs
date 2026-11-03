@@ -275,6 +275,7 @@ impl Aji {
     pub fn context(&self, params: &ContextParams) -> Result<Context, String> {
         let cache = params.cache_dir.as_deref().map(cstring).transpose()?;
         let trtexec = params.trtexec.as_deref().map(cstring).transpose()?;
+        let trtexec_env = params.trtexec_env.as_deref().map(|e| CString::new(e).map_err(|_| "trtexec_env contains a NUL byte".to_string())).transpose()?;
         // The log sink lives in a stable box the context owns; aji gets its address.
         let log: Option<Box<LogSink>> = params.log.clone().map(Box::new);
         let opaque = log.as_deref().map_or(std::ptr::null_mut(), |l| l as *const LogSink as *mut c_void);
@@ -284,7 +285,7 @@ impl Aji {
             device_id: params.device_id,
             cache_dir: cache.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             trtexec: trtexec.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-            trtexec_env: std::ptr::null(),
+            trtexec_env: trtexec_env.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             log: log.is_some().then_some(log_trampoline as LogFn),
             log_opaque: opaque,
         };
@@ -326,6 +327,10 @@ pub struct ContextParams {
     /// The `trtexec` that builds missing TensorRT engines; `None` = next to the
     /// backend library.
     pub trtexec: Option<PathBuf>,
+    /// A POSIX shell prefix for the `trtexec` command line (e.g. `LD_LIBRARY_PATH='/opt/x'`), for a
+    /// `trtexec` that needs environment to find its libraries; `None` = none. Ignored on Windows
+    /// and by backends that build engines in-process.
+    pub trtexec_env: Option<String>,
     pub log: Option<LogSink>,
 }
 
