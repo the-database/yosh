@@ -146,6 +146,20 @@ pub struct UiState {
     pub req_addon_remove: bool,
     /// The AI chip was clicked: flip upscaling for this book (same as key `U`).
     pub req_toggle_upscale: bool,
+    /// AI-upscaling profiles (`profiles.rs`): the ones a menu offers (built-ins,
+    /// then the filled custom slots) with their names, the session's profile
+    /// (`None`: switched off with Shift/Ctrl+0), and the default. Set each frame.
+    pub profile_menu: Vec<(crate::profiles::ProfileId, String)>,
+    pub profile_current: Option<crate::profiles::ProfileId>,
+    pub profile_default: crate::profiles::ProfileId,
+    /// Profile requests: switch this session's (`Some(None)` = off), set the
+    /// default, open the editor, and save the editor's draft.
+    pub req_use_profile: Option<Option<crate::profiles::ProfileId>>,
+    pub req_set_default_profile: Option<crate::profiles::ProfileId>,
+    pub req_open_profile_editor: bool,
+    pub req_save_profiles: Option<crate::profiles::Profiles>,
+    /// The profile editor, while open (or closed with unsaved changes).
+    pub profile_editor: Option<crate::profile_editor::Editor>,
     /// Language picked in the panel (`Some(None)` = back to following the OS).
     pub req_set_lang: Option<Option<yosh_engine::i18n::Lang>>,
     /// Rescan the current library root (toolbar ⟳). Drained by the app.
@@ -756,6 +770,7 @@ pub fn chrome(
     }
 
     settings_window(ctx, st);
+    crate::profile_editor::show(ctx, st);
 
     if st.info_open && !library_view && !st.info.is_empty() {
         // Sit just under the bar, whatever height it actually is (it was a
@@ -1248,6 +1263,9 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     }
                 }
             });
+            if st.upscale {
+                profile_row(ui, st);
+            }
             if st.upscale && !st.upscale_status.is_empty() {
                 ui.label(egui::RichText::new(&st.upscale_status).small());
             }
@@ -1328,6 +1346,31 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
     st.settings_open = open;
 }
 
+/// Settings → AI upscaling: the default profile, and the editor.
+fn profile_row(ui: &mut egui::Ui, st: &mut UiState) {
+    let t = tr();
+    ui.horizontal(|ui| {
+        ui.label(t.upscale_profile);
+        let current = st
+            .profile_menu
+            .iter()
+            .find(|(id, _)| *id == st.profile_default)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_default();
+        egui::ComboBox::from_id_salt("default_profile").selected_text(current).show_ui(ui, |ui| {
+            for (id, name) in &st.profile_menu {
+                if ui.selectable_label(*id == st.profile_default, format!("{}  {name}", id.key())).clicked() {
+                    st.req_set_default_profile = Some(*id);
+                }
+            }
+        });
+        if ui.button(t.edit_profiles).clicked() {
+            st.req_open_profile_editor = true;
+        }
+    });
+    ui.label(egui::RichText::new(t.upscale_profile_hint).weak().small());
+}
+
 /// The top bar's "AI" chip: what upscaling is doing for the page in view (spinner
 /// while it works, then ✔ / – / ⚠, detail on hover). Click = the per-book
 /// switch (key `U`), so it doubles as the way back on when a book has it off.
@@ -1346,6 +1389,14 @@ fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
         }
     };
     let tip = if st.upscale_notice.is_empty() { tip } else { format!("{tip}\n\u{26a0} {}", st.upscale_notice) };
+    let profile = match st.profile_current {
+        Some(id) => st.profile_menu.iter().find(|(p, _)| *p == id).map(|(_, n)| (t.sr_profile)(n)),
+        None => Some(t.sr_profile_off.to_string()),
+    };
+    let tip = match profile {
+        Some(p) => format!("{tip}\n{p}\n{}", t.sr_chip_menu_hint),
+        None => tip,
+    };
     let busy = st.sr_book_on
         && matches!(st.sr_state, Some(SrViewState::Working | SrViewState::Preparing));
     let r = ui
@@ -1358,9 +1409,28 @@ fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
             ui.add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()))
         })
         .inner;
-    if r.on_hover_text(tip).clicked() {
+    let r = r.on_hover_text(tip);
+    if r.clicked() {
         st.req_toggle_upscale = true;
     }
+    // Right-click: switch the profile for this session.
+    r.context_menu(|ui| {
+        for (id, name) in &st.profile_menu {
+            if ui.selectable_label(st.profile_current == Some(*id), format!("{}  {name}", id.key())).clicked() {
+                st.req_use_profile = Some(Some(*id));
+                ui.close();
+            }
+        }
+        if ui.selectable_label(st.profile_current.is_none(), format!("Shift+0  {}", t.off)).clicked() {
+            st.req_use_profile = Some(None);
+            ui.close();
+        }
+        ui.separator();
+        if ui.button(t.edit_profiles).clicked() {
+            st.req_open_profile_editor = true;
+            ui.close();
+        }
+    });
 }
 
 /// First-run onboarding, rendered *inside* the library view when no library folder

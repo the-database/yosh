@@ -3,8 +3,8 @@
 //!
 //! The add-on is a directory the app never ships: libaji (`aji.dll` with its
 //! DirectML/TensorRT (and optionally TensorRT-RTX) backends and their runtime libraries), a `models/` folder of
-//! ONNX models, optionally a `rules.json` overriding which model handles which
-//! page, and a `cache/` the backend fills (TensorRT engines). Until it exists the
+//! ONNX models, optionally a `rules.json` with the custom upscaling profiles
+//! (`profiles.rs`), and a `cache/` the backend fills (TensorRT engines). Until it exists the
 //! setting is inert and decoding is exactly as without the feature.
 
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ use std::sync::mpsc::Receiver;
 
 use yosh_engine::pool::Waker;
 use yosh_engine::sr::Upscaler;
-use yosh_engine::sr::rules::{SrRule, default_rules};
+use yosh_engine::sr::rules::SrRule;
 
 use crate::config::UpscaleBackend;
 
@@ -47,60 +47,15 @@ pub fn installed(dir: &Path) -> bool {
     dir.join(if cfg!(windows) { "aji.dll" } else { "libaji.so" }).is_file()
 }
 
-/// The rule table: `rules.json` from the add-on if present and valid, else the
-/// built-in MangaJaNaiConverterGui defaults. A `rules.json` naming older model
-/// files keeps working: a model found under its exact name is used as is, else the
-/// same model under another precision suffix, or without one (`sr::aji`'s lookup
-/// order), so older unsuffixed names also find the `_fp16` files.
-pub fn rules(dir: &Path) -> Vec<SrRule> {
-    #[derive(serde::Deserialize)]
-    struct Rule {
-        #[serde(default)]
-        min_h: u32,
-        #[serde(default)]
-        max_h: u32,
-        #[serde(default)]
-        gray: bool,
-        #[serde(default)]
-        color: bool,
-        #[serde(default)]
-        min_scale: f32,
-        #[serde(default)]
-        max_scale: f32,
-        model: Option<String>,
-    }
-    let path = dir.join("rules.json");
-    let Ok(bytes) = std::fs::read(&path) else {
-        return default_rules();
-    };
-    match serde_json::from_slice::<Vec<Rule>>(&bytes) {
-        Ok(rs) => rs
-            .into_iter()
-            .map(|r| SrRule {
-                min_h: r.min_h,
-                max_h: r.max_h,
-                gray: r.gray,
-                color: r.color,
-                min_scale: r.min_scale,
-                max_scale: r.max_scale,
-                model: r.model,
-            })
-            .collect(),
-        Err(e) => {
-            eprintln!("yosh: ignoring {}: {e}", path.display());
-            default_rules()
-        }
-    }
-}
-
 /// Start the upscaler on a background thread (loading the runtime and opening the
 /// device take a moment); the result arrives on the returned channel, after which
 /// `wake` is called (send-then-wake).
-pub fn start(dir: PathBuf, backend: UpscaleBackend, wake: Waker) -> Receiver<Started> {
+/// `rules` are the active profile's ([`crate::profiles`]).
+pub fn start(dir: PathBuf, backend: UpscaleBackend, rules: Vec<SrRule>, wake: Waker) -> Receiver<Started> {
     let (tx, rx) = std::sync::mpsc::channel();
     let wake2 = wake.clone();
     std::thread::spawn(move || {
-        let _ = tx.send(start_blocking(&dir, backend, wake2));
+        let _ = tx.send(start_blocking(&dir, backend, rules, wake2));
         wake();
     });
     rx
@@ -152,7 +107,7 @@ fn candidates(
 }
 
 #[cfg(feature = "sr")]
-fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
+fn start_blocking(dir: &Path, backend: UpscaleBackend, rules: Vec<SrRule>, wake: Waker) -> Started {
     use yosh_engine::sr::aji::{AjiUpscaler, Backend, enum_devices};
     // Auto looks at TensorRT-RTX only when the add-on has it. A device list that
     // fails or comes back empty just leaves it out: no fallback to report.
@@ -182,7 +137,7 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
                 continue;
             }
         };
-        match AjiUpscaler::new(dir, b, &device, rules(dir), Some(wake.clone())) {
+        match AjiUpscaler::new(dir, b, &device, rules.clone(), Some(wake.clone())) {
             Ok(up) => {
                 if let Some(why) = &rtx_failed {
                     eprintln!("yosh: [upscale] TensorRT-RTX failed ({why}); using {}", b.label());
@@ -198,7 +153,7 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, wake: Waker) -> Started {
 }
 
 #[cfg(not(feature = "sr"))]
-fn start_blocking(_dir: &Path, _backend: UpscaleBackend, _wake: Waker) -> Started {
+fn start_blocking(_dir: &Path, _backend: UpscaleBackend, _rules: Vec<SrRule>, _wake: Waker) -> Started {
     Err("this build has no upscaling support".into())
 }
 

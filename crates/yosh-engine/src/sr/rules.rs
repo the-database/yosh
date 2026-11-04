@@ -67,6 +67,42 @@ pub fn default_rules() -> Vec<SrRule> {
     rules
 }
 
+/// The "Quality" profile: the default's gray rules, and IllustrationJaNai DAT2 on
+/// colour pages at every scale (only a 4x export exists). The DAT2/HAT pack is
+/// bf16 on NVIDIA compute capability 8.0+ and fp32 elsewhere; `sr::aji`'s lookup
+/// finds the `_fp32` file from this `_bf16` name.
+pub fn quality_rules() -> Vec<SrRule> {
+    let mut rules = vec![color(0.0, 0.0, QUALITY_COLOR)];
+    rules.extend(default_rules().into_iter().filter(|r| r.gray));
+    rules
+}
+
+/// The colour model of [`quality_rules`].
+pub const QUALITY_COLOR: &str = "4x_IllustrationJaNai_V3denoise_DAT2_27k_bf16";
+
+/// The "Performance" profile: the 2x models only, at every scale — the 2x
+/// MangaJaNai of the page's height bucket on gray pages and IllustrationJaNai
+/// SPAN on colour pages. Above 2x the GPU magnifies the rest (the one allowed
+/// GPU resample).
+pub fn performance_rules() -> Vec<SrRule> {
+    let mut rules = vec![color(0.0, 0.0, "2x_IllustrationJaNai_V3denoise_SPAN_S_30k_fp16")];
+    rules.extend(default_rules().into_iter().filter(|r| r.gray && r.max_scale == 2.0).map(|mut r| {
+        r.max_scale = 0.0;
+        r
+    }));
+    rules
+}
+
+/// A model name without its ONNX precision suffix (`_fp16`, `_bf16`, `_fp32`):
+/// the name the precision variants of one model share. `sr::aji`'s lookup tries
+/// every precision for an unsuffixed name, so a rule may name either.
+pub fn model_base(name: &str) -> &str {
+    ["_fp16", "_bf16", "_fp32"]
+        .iter()
+        .find_map(|s| name.strip_suffix(s))
+        .unwrap_or(name)
+}
+
 fn color(min_scale: f32, max_scale: f32, model: &str) -> SrRule {
     SrRule {
         min_h: 0,
@@ -117,6 +153,29 @@ mod tests {
         let names: Vec<&str> = r.iter().filter_map(|r| r.model.as_deref()).collect();
         assert_eq!(names.iter().filter(|n| n.contains("_MangaJaNai_")).count(), 14);
         assert!(names.iter().all(|n| n.ends_with("_fp16")), "{names:?}");
+    }
+
+    #[test]
+    fn quality_and_performance_profiles() {
+        let q = quality_rules();
+        assert_eq!(select(&q, 1500, false, 1.3), Some(QUALITY_COLOR));
+        assert_eq!(select(&q, 1500, false, 3.0), Some(QUALITY_COLOR));
+        assert_eq!(select(&q, 1500, true, 1.3), Some("2x_MangaJaNai_1500p_V1_ESRGAN_90k_fp16"));
+        assert_eq!(select(&q, 1500, true, 3.0), Some("4x_MangaJaNai_1500p_V1_ESRGAN_105k_fp16"));
+        let p = performance_rules();
+        assert_eq!(p.len(), 8);
+        assert_eq!(select(&p, 900, false, 3.5), Some("2x_IllustrationJaNai_V3denoise_SPAN_S_30k_fp16"));
+        assert_eq!(select(&p, 1500, true, 1.3), Some("2x_MangaJaNai_1500p_V1_ESRGAN_90k_fp16"));
+        assert_eq!(select(&p, 1500, true, 3.5), Some("2x_MangaJaNai_1500p_V1_ESRGAN_90k_fp16"));
+        assert_eq!(select(&p, 3000, true, 4.0), Some("2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16"));
+    }
+
+    #[test]
+    fn model_base_strips_only_a_precision_suffix() {
+        assert_eq!(model_base("4x_X_DAT2_27k_bf16"), "4x_X_DAT2_27k");
+        assert_eq!(model_base("2x_X_fp16_fp32"), "2x_X_fp16");
+        assert_eq!(model_base("2x_X_fp32_op17"), "2x_X_fp32_op17");
+        assert_eq!(model_base("custom"), "custom");
     }
 
     #[test]
