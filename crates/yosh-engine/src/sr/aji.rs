@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use yosh_image::aji::{Aji, Context, ContextParams, LoadParams, Model, ModelState, Pixels, PixelsMut, Upscaled};
@@ -70,7 +70,8 @@ pub struct AjiUpscaler {
     /// The first model that fell back to TensorRT, and why ([`Upscaler::fallback`]).
     fell_back: Mutex<Option<String>>,
     models_dir: PathBuf,
-    rules: Vec<SrRule>,
+    /// Swapped whole by [`Upscaler::set_rules`] (a profile switch).
+    rules: RwLock<Arc<Vec<SrRule>>>,
     slots: Mutex<HashMap<String, Slot>>,
     watch: Arc<Watch>,
 }
@@ -98,7 +99,7 @@ impl AjiUpscaler {
             fallback,
             fell_back: Mutex::new(None),
             models_dir: dir.join("models"),
-            rules,
+            rules: RwLock::new(Arc::new(rules)),
             slots: Mutex::new(HashMap::new()),
             watch: Arc::new(Watch {
                 building: Mutex::new(Vec::new()),
@@ -107,6 +108,10 @@ impl AjiUpscaler {
                 waker,
             }),
         })
+    }
+
+    fn rules(&self) -> Arc<Vec<SrRule>> {
+        self.rules.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The installed file for a rule's model `name`: the first of [`lookup_order`]
@@ -326,7 +331,8 @@ impl Upscaler for AjiUpscaler {
         target_scale: f32,
         cancel: &dyn Fn() -> bool,
     ) -> SrOutcome {
-        let Some(name) = select(&self.rules, h, channels == 1, target_scale) else {
+        let rules = self.rules();
+        let Some(name) = select(&rules, h, channels == 1, target_scale) else {
             return SrOutcome::Skip;
         };
         let (model, scale) = match self.model(name) {
@@ -353,7 +359,11 @@ impl Upscaler for AjiUpscaler {
     }
 
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<Arc<str>> {
-        select(&self.rules, src_h, gray, target_scale).map(Arc::from)
+        select(&self.rules(), src_h, gray, target_scale).map(Arc::from)
+    }
+
+    fn set_rules(&self, rules: Vec<SrRule>) {
+        *self.rules.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(rules);
     }
 
     fn fallback(&self) -> Option<String> {
