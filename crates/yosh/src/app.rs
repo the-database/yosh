@@ -20,6 +20,7 @@ use fast_image_resize::Resizer;
 use notify::Watcher as _; // brings the `.watch()` method into scope
 
 use crate::addon;
+use crate::addon_setup;
 use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
@@ -342,6 +343,24 @@ struct State {
     upscale_status: addon::Status,
     /// TensorRT-RTX couldn't start: why, and the backend running instead.
     upscale_fallback: Option<(String, &'static str)>,
+    // Installing the add-on (`addon_setup.rs`): the running install, its latest
+    // progress, and the last failure. `addon_installed` / `addon_update` cache the
+    // folder's state (refreshed by `start_upscaler`), so the panel doesn't stat
+    // the disk every frame. `aji_loaded`: an upscaler was started in this process,
+    // so libaji may still be loaded and its files can't be replaced on Windows.
+    addon_job: Option<addon_setup::Job>,
+    addon_progress: Option<addon_setup::Progress>,
+    addon_error: Option<String>,
+    addon_installed: bool,
+    addon_needs_install: bool,
+    addon_update: bool,
+    /// The installed add-on's size on disk (bytes), for Remove's confirmation.
+    addon_size: u64,
+    /// A GPU here lacks the add-on's files (`addon_setup::needs_setup_for_gpus`, checked
+    /// off-thread on each `start_upscaler`): Settings offers Install for this GPU.
+    addon_new_gpu: bool,
+    gpu_check_rx: Option<std::sync::mpsc::Receiver<bool>>,
+    aji_loaded: bool,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
     // runs on a background thread so a slow network-share open never freezes the
@@ -1141,6 +1160,16 @@ impl ApplicationHandler for App {
             upscale_rx: None,
             upscale_status: addon::Status::Off,
             upscale_fallback: None,
+            addon_job: None,
+            addon_progress: None,
+            addon_error: None,
+            addon_installed: false,
+            addon_needs_install: true,
+            addon_update: false,
+            addon_size: 0,
+            addon_new_gpu: false,
+            gpu_check_rx: None,
+            aji_loaded: false,
             // The pre-spawned CLI open is generation 1, so `State` must start there
             // or its result would be discarded as stale by the drain in `render`.
             open_gen: if cli_open.is_some() { 1 } else { 0 },
@@ -1170,7 +1199,18 @@ impl ApplicationHandler for App {
             rescan_rx,
         });
         if let Some(state) = self.state.as_mut() {
-            state.start_upscaler();
+            // A removal or update asked for while the add-on was loaded runs now,
+            // before the upscaler loads it; after an update the upscaler starts
+            // when it finishes.
+            if state.settings.addon_remove_pending {
+                state.remove_addon();
+            } else if state.settings.addon_update_pending
+                && config::addon_dir().is_some_and(|d| addon::installed(&d))
+            {
+                state.begin_addon_install(addon_setup::Mode::Full);
+            } else {
+                state.start_upscaler();
+            }
         }
     }
 
@@ -1728,16 +1768,77 @@ impl State {
         self.upscale_rx = None;
         self.upscale_status = addon::Status::Off;
         self.upscale_fallback = None;
-        if !self.settings.upscale {
+        let dir = config::addon_dir();
+        self.addon_installed = dir.as_deref().is_some_and(addon::installed);
+        self.addon_needs_install = !self.addon_installed || dir.as_deref().is_some_and(addon_setup::incomplete);
+        self.addon_update = self.addon_installed && dir.as_deref().is_some_and(addon_setup::update_available);
+        self.addon_size = match dir.as_deref() {
+            Some(d) if self.addon_installed => addon_setup::folder_size(d),
+            _ => 0,
+        };
+        self.addon_new_gpu = false;
+        self.gpu_check_rx = None;
+        if let Some(d) = dir.clone().filter(|_| self.addon_installed && self.addon_job.is_none()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wake = frame_waker(&self.window);
+            std::thread::spawn(move || {
+                let _ = tx.send(addon_setup::needs_setup_for_gpus(&d));
+                wake();
+            });
+            self.gpu_check_rx = Some(rx);
+        }
+        // An install is replacing the add-on's files: it starts the upscaler when done.
+        if !self.settings.upscale || self.addon_job.is_some() {
             return;
         }
-        let Some(dir) = config::addon_dir().filter(|d| addon::installed(d)) else {
+        let Some(dir) = dir.filter(|_| self.addon_installed) else {
             self.upscale_status = addon::Status::NotInstalled;
             return;
         };
+        self.aji_loaded = true;
         self.upscale_status = addon::Status::Starting;
         self.upscale_rx =
             Some(addon::start(dir, self.settings.upscale_choice(), frame_waker(&self.window)));
+    }
+
+    /// Install or update the add-on in the background (`addon_setup.rs`). The
+    /// upscaler is stopped first; `poll_background` restarts it when the install ends.
+    fn begin_addon_install(&mut self, mode: addon_setup::Mode) {
+        let Some(dir) = config::addon_dir() else {
+            return;
+        };
+        if self.settings.addon_update_pending {
+            self.settings.addon_update_pending = false;
+            config::save(&self.settings);
+        }
+        self.reader.set_upscaler(None);
+        self.upscale_rx = None;
+        self.upscale_status = addon::Status::Off;
+        self.upscale_fallback = None;
+        self.addon_error = None;
+        self.addon_progress = Some(addon_setup::Progress::Starting);
+        self.addon_new_gpu = false;
+        self.gpu_check_rx = None;
+        self.addon_job = Some(addon_setup::start(dir, mode, frame_waker(&self.window)));
+    }
+
+    /// Delete the add-on (Settings → Remove, or a removal saved for this start)
+    /// and switch AI upscaling off. Only call it while libaji isn't loaded.
+    fn remove_addon(&mut self) {
+        self.reader.set_upscaler(None);
+        self.upscale_rx = None;
+        self.settings.addon_remove_pending = false;
+        self.settings.addon_update_pending = false;
+        self.settings.upscale = false;
+        config::save(&self.settings);
+        self.addon_error = match config::addon_dir() {
+            Some(dir) => addon_setup::remove(&dir).err(),
+            None => None,
+        };
+        if let Some(e) = &self.addon_error {
+            eprintln!("yosh: [addon] remove failed: {e}");
+        }
+        self.start_upscaler();
     }
 
     /// "Show in Explorer" (key `E`): open the containing folder of the current
@@ -2842,6 +2943,48 @@ impl State {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
         }
+        if let Some(rx) = self.gpu_check_rx.take() {
+            match rx.try_recv() {
+                Ok(lacks) => {
+                    self.addon_new_gpu = lacks;
+                    changed |= lacks;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.gpu_check_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some(job) = self.addon_job.take() {
+            // `Some(error)` once the install has ended (`None`: done or cancelled).
+            let mut ended: Option<Option<String>> = None;
+            loop {
+                match job.rx.try_recv() {
+                    Ok(addon_setup::Event::Progress(p)) => {
+                        self.addon_progress = Some(p);
+                        changed = true;
+                    }
+                    Ok(addon_setup::Event::Done | addon_setup::Event::Cancelled) => ended = Some(None),
+                    Ok(addon_setup::Event::Failed(e)) => ended = Some(Some(e)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        ended.get_or_insert(Some("the install stopped".into()));
+                        break;
+                    }
+                }
+                if ended.is_some() {
+                    break;
+                }
+            }
+            match ended {
+                None => self.addon_job = Some(job),
+                Some(err) => {
+                    self.addon_progress = None;
+                    self.addon_error = err;
+                    // Re-reads the folder (installed? current?) and starts the upscaler.
+                    self.start_upscaler();
+                    changed = true;
+                }
+            }
+        }
         if let Some(rx) = self.upscale_rx.take() {
             match rx.try_recv() {
                 Ok(Ok(run)) => {
@@ -3275,6 +3418,32 @@ impl State {
             addon::Status::Ready(d) => (t.upscale_ready)(d),
             addon::Status::Error(e) => (t.upscale_error)(e),
         };
+        self.ui.addon = if let Some(p) = &self.addon_progress {
+            use addon_setup::{Part, Progress};
+            let (text, frac) = match *p {
+                Progress::Starting => (t.addon_preparing, 0.0),
+                Progress::Download { part: Part::Installer, frac } => (t.addon_dl_installer, frac),
+                Progress::Download { part: Part::Runtime, frac } => (t.addon_dl_runtime, frac),
+                Progress::Download { part: Part::Models, frac } => (t.addon_dl_models, frac),
+                Progress::Unpack { frac } => (t.addon_unpacking, frac),
+            };
+            ui::AddonView::Running { text: text.to_string(), frac }
+        } else if self.settings.addon_update_pending {
+            ui::AddonView::Pending
+        } else if self.addon_needs_install {
+            ui::AddonView::Install
+        } else if self.addon_update {
+            ui::AddonView::Update(addon_setup::CLI_VERSION.to_string())
+        } else if self.addon_new_gpu {
+            ui::AddonView::InstallForGpu
+        } else {
+            ui::AddonView::Hidden
+        };
+        self.ui.addon_error = self.addon_error.clone().unwrap_or_default();
+        self.ui.addon_remove_pending = self.settings.addon_remove_pending;
+        self.ui.addon_removable =
+            self.addon_installed && self.addon_job.is_none() && !self.settings.addon_remove_pending;
+        self.ui.addon_size = self.addon_size as f32 / 1e9;
         // A TensorRT-RTX fallback, at start or for a model since: shown under the
         // status and on the AI chip, so it isn't only a log line.
         self.ui.upscale_notice = match &self.upscale_status {
@@ -3755,6 +3924,43 @@ impl State {
         }
         if std::mem::take(&mut self.ui.req_toggle_upscale) {
             self.apply_action(Action::ToggleUpscale);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_addon_install) && self.addon_job.is_none() {
+            if self.addon_installed && !self.addon_needs_install && !self.addon_update && self.addon_new_gpu {
+                // Install for this GPU: setup only adds files, so it can run while
+                // libaji is loaded.
+                self.begin_addon_install(addon_setup::Mode::SetupOnly);
+            } else if self.addon_installed && !self.addon_needs_install && self.aji_loaded {
+                // libaji may still be loaded, so its files can't be replaced (Windows
+                // refuses; on Linux a rewritten .so under a running process crashes
+                // it): update at the next start, before the upscaler loads it.
+                self.settings.addon_update_pending = true;
+                config::save(&self.settings);
+            } else {
+                if !self.settings.upscale {
+                    self.settings.upscale = true;
+                    config::save(&self.settings);
+                }
+                self.begin_addon_install(addon_setup::Mode::Full);
+            }
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_addon_remove) && self.addon_job.is_none() {
+            if self.aji_loaded {
+                // Its files are in use (see the update above): remove at the next start.
+                self.settings.addon_remove_pending = true;
+                self.settings.addon_update_pending = false;
+                config::save(&self.settings);
+            } else {
+                self.remove_addon();
+            }
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_addon_cancel) {
+            if let Some(job) = &self.addon_job {
+                job.cancel();
+            }
             ui_acted = true;
         }
         if std::mem::take(&mut self.ui.req_open_addon_folder) {

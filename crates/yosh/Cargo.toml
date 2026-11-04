@@ -37,6 +37,12 @@ self-replace = "1"
 # FSEvents) on the open folder, so images added on disk appear without reopening.
 # Pure-Rust, no C toolchain.
 notify = "8"
+# Installing the AI add-on (addon_setup.rs): the pinned MangaJaNaiCLI archive is checked
+# against its SHA-256 and unpacked (zip on Windows, tar.zst on Linux). All pure Rust.
+sha2 = "0.11"
+zip = "9"
+tar = "0.4"
+ruzstd = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

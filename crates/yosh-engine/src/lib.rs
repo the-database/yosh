@@ -28,3 +28,5 @@ pub mod thumbcache;
 // The GPU-free imaging core lives in `yosh-image` (shared with batch tools);
 // re-exported so `yosh_engine::{icc, source, tone}` keep their paths.
 pub use yosh_image::{icc, source, tone};
+#[cfg(feature = "sr")]
+pub use yosh_image::nvml;
