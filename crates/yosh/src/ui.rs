@@ -80,6 +80,13 @@ pub struct UiState {
     /// error (empty: none). Set by the app each frame.
     pub addon: AddonView,
     pub addon_error: String,
+    /// Remove the add-on: offered when one is installed and nothing is running
+    /// (`addon_size` = its size in GB, for the confirmation), the confirmation
+    /// being shown, and a removal waiting for the next start.
+    pub addon_removable: bool,
+    pub addon_size: f32,
+    pub addon_remove_confirm: bool,
+    pub addon_remove_pending: bool,
     /// The reader's AI-upscaling chip: shown while an upscaler is running
     /// (`sr_available`); `sr_book_on` is the per-book switch, and `sr_state` what
     /// upscaling is doing for the page in view. Set by the app each frame.
@@ -134,6 +141,7 @@ pub struct UiState {
     /// Install (or update) the add-on, and cancel a running install.
     pub req_addon_install: bool,
     pub req_addon_cancel: bool,
+    pub req_addon_remove: bool,
     /// The AI chip was clicked: flip upscaling for this book (same as key `U`).
     pub req_toggle_upscale: bool,
     /// Language picked in the panel (`Some(None)` = back to following the OS).
@@ -1285,9 +1293,29 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                         .color(egui::Color32::from_rgb(220, 180, 100)),
                 );
             }
-            if ui.button(t.open_addon_folder).clicked() {
-                st.req_open_addon_folder = true;
+            if st.addon_remove_pending {
+                ui.label(egui::RichText::new(t.addon_remove_restart).small());
             }
+            if st.addon_remove_confirm && st.addon_removable {
+                ui.label((t.addon_remove_confirm)(st.addon_size));
+                ui.horizontal(|ui| {
+                    if ui.button(t.addon_remove_yes).clicked() {
+                        st.addon_remove_confirm = false;
+                        st.req_addon_remove = true;
+                    }
+                    if ui.button(t.addon_cancel).clicked() {
+                        st.addon_remove_confirm = false;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.button(t.open_addon_folder).clicked() {
+                    st.req_open_addon_folder = true;
+                }
+                if st.addon_removable && !st.addon_remove_confirm && ui.button(t.addon_remove).clicked() {
+                    st.addon_remove_confirm = true;
+                }
+            });
         });
     st.settings_open = open;
 }

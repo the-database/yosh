@@ -254,6 +254,12 @@ pub struct Strings {
     pub addon_unpacking: &'static str,
     pub addon_failed: fn(&str) -> String,
     pub addon_cancel: &'static str,
+    /// Remove the add-on: the button, its confirmation (`gb` = the folder's size), the
+    /// confirming button, and the note when it waits for the next start.
+    pub addon_remove: &'static str,
+    pub addon_remove_confirm: fn(f32) -> String,
+    pub addon_remove_yes: &'static str,
+    pub addon_remove_restart: &'static str,
     /// The reader's "AI" status chip and busy indicator (what upscaling is doing
     /// for the page in view).
     pub sr_working: &'static str,

@@ -191,7 +191,9 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   offers *Update*, a missing one beside `mangajanai` means an unfinished install (Install again), and
   a hand-made add-on (no `mangajanai`) is left alone. libaji's files can't be replaced while it's
   loaded, so an Update asked for after an upscaler started in this process is saved as
-  `addon_update_pending` and runs at the next start, before the upscaler loads. To bump: release
+  `addon_update_pending` and runs at the next start, before the upscaler loads. *Remove the add-on*
+  (with a confirmation giving its size) deletes the folder but a `rules.json`, the same way
+  (`addon_remove_pending`); the Windows uninstaller deletes the add-ons folder too. To bump: release
   MangaJaNaiCLI, then update `CLI_VERSION` and both `CLI_ASSET` pins. `YOSH_ADDON_ARCHIVE=<archive>`
   installs from a local MangaJaNaiCLI build instead (not pin-checked); `install_end_to_end` is the
   manual whole-install test (`--ignored`).
