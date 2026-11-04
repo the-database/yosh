@@ -27,14 +27,14 @@ const CLI_REPO: &str = "the-database/MangaJaNaiCLI";
 #[cfg(windows)]
 const CLI_ASSET: (&str, &str, u64) = (
     "mangajanai-windows-x64.zip",
-    "0000000000000000000000000000000000000000000000000000000000000000",
-    0,
+    "d7110b20706511c92bbce6d4f5858f8c18bafa5563c8d2da550168dcfd67b35b",
+    8_582_800,
 );
 #[cfg(not(windows))]
 const CLI_ASSET: (&str, &str, u64) = (
     "mangajanai-linux-x64.tar.zst",
-    "0000000000000000000000000000000000000000000000000000000000000000",
-    0,
+    "990db59284bb3465b80cdec2606b1b272a65cab220b226fca863fd71fadfb24c",
+    7_166_457,
 );
 const PROGRAM: &str = if cfg!(windows) { "mangajanai.exe" } else { "mangajanai" };
 const RECORD: &str = "yosh-addon.json";
