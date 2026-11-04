@@ -111,11 +111,7 @@ cargo build --release -p yosh --features avif   # requires nasm + dav1d (or a ve
 ceiling; see `SPIKES_RESULTS.md`.
 
 ## Related projects
-yosh is part of the JaNai suite: see [animejan.ai](https://animejan.ai) for an overview of all the apps.
-- [MangaJaNai GUI](https://github.com/the-database/MangaJaNaiGUI) and
-  [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI): upscale manga and images ahead of
-  time. MangaJaNaiCLI decodes and resizes with yosh's imaging core (`yosh-image`).
-- [animejanai-inference](https://github.com/the-database/animejanai-inference): the GPU inference
-  engine (libaji) the AI upscaling add-on runs on.
-- [MangaJaNai](https://github.com/the-database/MangaJaNai): the manga upscaling models the add-on's
-  default rules use.
+- [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai): Real-time anime upscaling in mpv
+- [VideoJaNai](https://github.com/the-database/VideoJaNai): Upscale video files
+- [MangaJaNai GUI](https://github.com/the-database/MangaJaNaiGUI): Upscale manga and images
+- [traiNNer-redux](https://github.com/the-database/traiNNer-redux): Train your own upscaling models
