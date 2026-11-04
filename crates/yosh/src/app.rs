@@ -356,6 +356,10 @@ struct State {
     addon_update: bool,
     /// The installed add-on's size on disk (bytes), for Remove's confirmation.
     addon_size: u64,
+    /// A GPU here lacks the add-on's files (`addon_setup::needs_setup_for_gpus`, checked
+    /// off-thread on each `start_upscaler`): Settings offers Install for this GPU.
+    addon_new_gpu: bool,
+    gpu_check_rx: Option<std::sync::mpsc::Receiver<bool>>,
     aji_loaded: bool,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
@@ -1163,6 +1167,8 @@ impl ApplicationHandler for App {
             addon_needs_install: true,
             addon_update: false,
             addon_size: 0,
+            addon_new_gpu: false,
+            gpu_check_rx: None,
             aji_loaded: false,
             // The pre-spawned CLI open is generation 1, so `State` must start there
             // or its result would be discarded as stale by the drain in `render`.
@@ -1201,7 +1207,7 @@ impl ApplicationHandler for App {
             } else if state.settings.addon_update_pending
                 && config::addon_dir().is_some_and(|d| addon::installed(&d))
             {
-                state.begin_addon_install();
+                state.begin_addon_install(addon_setup::Mode::Full);
             } else {
                 state.start_upscaler();
             }
@@ -1770,6 +1776,17 @@ impl State {
             Some(d) if self.addon_installed => addon_setup::folder_size(d),
             _ => 0,
         };
+        self.addon_new_gpu = false;
+        self.gpu_check_rx = None;
+        if let Some(d) = dir.clone().filter(|_| self.addon_installed && self.addon_job.is_none()) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let wake = frame_waker(&self.window);
+            std::thread::spawn(move || {
+                let _ = tx.send(addon_setup::needs_setup_for_gpus(&d));
+                wake();
+            });
+            self.gpu_check_rx = Some(rx);
+        }
         // An install is replacing the add-on's files: it starts the upscaler when done.
         if !self.settings.upscale || self.addon_job.is_some() {
             return;
@@ -1786,7 +1803,7 @@ impl State {
 
     /// Install or update the add-on in the background (`addon_setup.rs`). The
     /// upscaler is stopped first; `poll_background` restarts it when the install ends.
-    fn begin_addon_install(&mut self) {
+    fn begin_addon_install(&mut self, mode: addon_setup::Mode) {
         let Some(dir) = config::addon_dir() else {
             return;
         };
@@ -1800,7 +1817,9 @@ impl State {
         self.upscale_fallback = None;
         self.addon_error = None;
         self.addon_progress = Some(addon_setup::Progress::Starting);
-        self.addon_job = Some(addon_setup::start(dir, frame_waker(&self.window)));
+        self.addon_new_gpu = false;
+        self.gpu_check_rx = None;
+        self.addon_job = Some(addon_setup::start(dir, mode, frame_waker(&self.window)));
     }
 
     /// Delete the add-on (Settings → Remove, or a removal saved for this start)
@@ -2924,6 +2943,16 @@ impl State {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
             }
         }
+        if let Some(rx) = self.gpu_check_rx.take() {
+            match rx.try_recv() {
+                Ok(lacks) => {
+                    self.addon_new_gpu = lacks;
+                    changed |= lacks;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.gpu_check_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
         if let Some(job) = self.addon_job.take() {
             // `Some(error)` once the install has ended (`None`: done or cancelled).
             let mut ended: Option<Option<String>> = None;
@@ -3405,6 +3434,8 @@ impl State {
             ui::AddonView::Install
         } else if self.addon_update {
             ui::AddonView::Update(addon_setup::CLI_VERSION.to_string())
+        } else if self.addon_new_gpu {
+            ui::AddonView::InstallForGpu
         } else {
             ui::AddonView::Hidden
         };
@@ -3896,7 +3927,11 @@ impl State {
             ui_acted = true;
         }
         if std::mem::take(&mut self.ui.req_addon_install) && self.addon_job.is_none() {
-            if self.addon_installed && !self.addon_needs_install && self.aji_loaded {
+            if self.addon_installed && !self.addon_needs_install && !self.addon_update && self.addon_new_gpu {
+                // Install for this GPU: setup only adds files, so it can run while
+                // libaji is loaded.
+                self.begin_addon_install(addon_setup::Mode::SetupOnly);
+            } else if self.addon_installed && !self.addon_needs_install && self.aji_loaded {
                 // libaji may still be loaded, so its files can't be replaced (Windows
                 // refuses; on Linux a rewritten .so under a running process crashes
                 // it): update at the next start, before the upscaler loads it.
@@ -3907,7 +3942,7 @@ impl State {
                     self.settings.upscale = true;
                     config::save(&self.settings);
                 }
-                self.begin_addon_install();
+                self.begin_addon_install(addon_setup::Mode::Full);
             }
             ui_acted = true;
         }

@@ -54,6 +54,8 @@ pub static RU: Strings = Strings {
     addon_install_hint: "Загружает среду выполнения для GPU и модели ИИ с GitHub (около 1 ГБ).",
     addon_update: |v| format!("Обновить дополнение ({v})"),
     addon_update_restart: "Дополнение используется: обновление установится при следующем запуске yosh.",
+    addon_install_gpu: "Установить для этого GPU",
+    addon_install_gpu_hint: "Дополнение настроено для другого GPU: этому нужны свои файлы (обычно несколько сотен МБ).",
     addon_preparing: "Подготовка…",
     addon_dl_installer: "Загрузка установщика…",
     addon_dl_runtime: "Загрузка среды выполнения для GPU…",

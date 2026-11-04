@@ -53,6 +53,8 @@ pub static ES: Strings = Strings {
     addon_install_hint: "Descarga el entorno de GPU y los modelos de IA desde GitHub (aprox. 1 GB).",
     addon_update: |v| format!("Actualizar el complemento ({v})"),
     addon_update_restart: "El complemento está en uso: la actualización se instalará la próxima vez que se inicie yosh.",
+    addon_install_gpu: "Instalar para esta GPU",
+    addon_install_gpu_hint: "El complemento se configuró para otra GPU: esta necesita sus propios archivos (normalmente unos cientos de MB).",
     addon_preparing: "Preparando…",
     addon_dl_installer: "Descargando el instalador…",
     addon_dl_runtime: "Descargando el entorno de GPU…",

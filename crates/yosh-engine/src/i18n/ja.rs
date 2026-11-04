@@ -53,6 +53,8 @@ pub static JA: Strings = Strings {
     addon_install_hint: "GPU ランタイムと AI モデルを GitHub からダウンロードします（約 1 GB）。",
     addon_update: |v| format!("アドオンを更新 ({v})"),
     addon_update_restart: "アドオンは使用中です。次回 yosh の起動時に更新がインストールされます。",
+    addon_install_gpu: "この GPU 用にインストール",
+    addon_install_gpu_hint: "アドオンは別の GPU 用にセットアップされています。この GPU には専用のファイルが必要です（通常は数百 MB）。",
     addon_preparing: "準備中…",
     addon_dl_installer: "インストーラーをダウンロード中…",
     addon_dl_runtime: "GPU ランタイムをダウンロード中…",

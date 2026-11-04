@@ -246,6 +246,10 @@ pub struct Strings {
     pub addon_update: fn(&str) -> String,
     /// After Update while the add-on is loaded (its files can't be replaced until a restart).
     pub addon_update_restart: &'static str,
+    /// The add-on lacks files for a GPU here (set up on another PC or GPU): the button that
+    /// re-runs setup, and the line under it.
+    pub addon_install_gpu: &'static str,
+    pub addon_install_gpu_hint: &'static str,
     /// The install's progress bar, by step.
     pub addon_preparing: &'static str,
     pub addon_dl_installer: &'static str,
