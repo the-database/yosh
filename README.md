@@ -19,6 +19,21 @@ Grab the latest [release](https://github.com/the-database/yosh/releases):
 
 The installer/exe are unsigned, so SmartScreen may warn on first run — choose *More info → Run anyway*.
 
+## Install (Linux)
+Download **`yosh-linux-x64`** from the latest [release](https://github.com/the-database/yosh/releases),
+make it executable and run it:
+
+```sh
+chmod +x yosh-linux-x64
+./yosh-linux-x64 "<path>"
+```
+
+It's a single binary. It needs a desktop session (X11 or Wayland) and a GPU driver with Vulkan support.
+
+## Install (Android)
+Download **`yosh-android.apk`** from the latest [release](https://github.com/the-database/yosh/releases)
+and install it (allow installs from your browser or file manager when Android asks).
+
 ## Build & run
 
 ```sh
@@ -94,3 +109,9 @@ cargo build --release -p yosh --features avif   # requires nasm + dav1d (or a ve
 
 `crates/decode_bench` and `crates/present_bench` are the throwaway spikes that validated the throughput
 ceiling; see `SPIKES_RESULTS.md`.
+
+## Related projects
+- [mpv-AnimeJaNai](https://github.com/the-database/mpv-AnimeJaNai): Real-time anime upscaling in mpv
+- [VideoJaNai](https://github.com/the-database/VideoJaNai): Upscale video files
+- [MangaJaNai GUI](https://github.com/the-database/MangaJaNaiGUI): Upscale manga and images
+- [traiNNer-redux](https://github.com/the-database/traiNNer-redux): Train your own upscaling models
