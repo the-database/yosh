@@ -238,6 +238,32 @@ pub struct Strings {
     /// DirectML when Auto tried TensorRT-RTX and TensorRT didn't start either).
     pub upscale_fallback: fn(&str, &str) -> String,
     pub open_addon_folder: &'static str,
+    /// Settings → AI upscaling: the button that installs the add-on (`mangajanai setup`), and
+    /// the line under it.
+    pub addon_install: &'static str,
+    pub addon_install_hint: &'static str,
+    /// The button when a newer add-on release is pinned; `{v}` is its version ("v0.3.1").
+    pub addon_update: fn(&str) -> String,
+    /// After Update while the add-on is loaded (its files can't be replaced until a restart).
+    pub addon_update_restart: &'static str,
+    /// The add-on lacks files for a GPU here (set up on another PC or GPU): the button that
+    /// re-runs setup, and the line under it.
+    pub addon_install_gpu: &'static str,
+    pub addon_install_gpu_hint: &'static str,
+    /// The install's progress bar, by step.
+    pub addon_preparing: &'static str,
+    pub addon_dl_installer: &'static str,
+    pub addon_dl_runtime: &'static str,
+    pub addon_dl_models: &'static str,
+    pub addon_unpacking: &'static str,
+    pub addon_failed: fn(&str) -> String,
+    pub addon_cancel: &'static str,
+    /// Remove the add-on: the button, its confirmation (`gb` = the folder's size), the
+    /// confirming button, and the note when it waits for the next start.
+    pub addon_remove: &'static str,
+    pub addon_remove_confirm: fn(f32) -> String,
+    pub addon_remove_yes: &'static str,
+    pub addon_remove_restart: &'static str,
     /// The reader's "AI" status chip and busy indicator (what upscaling is doing
     /// for the page in view).
     pub sr_working: &'static str,

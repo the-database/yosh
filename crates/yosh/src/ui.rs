@@ -9,6 +9,24 @@ use yosh_engine::i18n::tr;
 
 use crate::library::{series_status, vol_state, LibCtx, Library, VolState};
 
+/// The Settings panel's add-on install row.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum AddonView {
+    /// Installed and current, or put together by hand.
+    #[default]
+    Hidden,
+    /// Not installed: the Install button.
+    Install,
+    /// yosh installed an older release: Update to this version.
+    Update(String),
+    /// Update asked for while loaded: it runs at the next start.
+    Pending,
+    /// A GPU here has no files in the add-on (set up on another PC or GPU).
+    InstallForGpu,
+    /// Installing: what it's doing and how far along (0..1).
+    Running { text: String, frac: f32 },
+}
+
 #[derive(Default)]
 pub struct UiState {
     /// Path the user requested to open this frame (consumed by the app).
@@ -60,6 +78,17 @@ pub struct UiState {
     pub upscale_status: String,
     /// "TensorRT-RTX failed (…); using TensorRT (or DirectML) instead", or empty.
     pub upscale_notice: String,
+    /// The add-on install / update row (`addon_setup.rs`), and the last install's
+    /// error (empty: none). Set by the app each frame.
+    pub addon: AddonView,
+    pub addon_error: String,
+    /// Remove the add-on: offered when one is installed and nothing is running
+    /// (`addon_size` = its size in GB, for the confirmation), the confirmation
+    /// being shown, and a removal waiting for the next start.
+    pub addon_removable: bool,
+    pub addon_size: f32,
+    pub addon_remove_confirm: bool,
+    pub addon_remove_pending: bool,
     /// The reader's AI-upscaling chip: shown while an upscaler is running
     /// (`sr_available`); `sr_book_on` is the per-book switch, and `sr_state` what
     /// upscaling is doing for the page in view. Set by the app each frame.
@@ -111,6 +140,10 @@ pub struct UiState {
     pub req_set_upscale: Option<bool>,
     pub req_set_upscale_backend: Option<crate::config::UpscaleBackend>,
     pub req_open_addon_folder: bool,
+    /// Install (or update) the add-on, and cancel a running install.
+    pub req_addon_install: bool,
+    pub req_addon_cancel: bool,
+    pub req_addon_remove: bool,
     /// The AI chip was clicked: flip upscaling for this book (same as key `U`).
     pub req_toggle_upscale: bool,
     /// Language picked in the panel (`Some(None)` = back to following the OS).
@@ -1226,9 +1259,71 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 );
             }
             ui.label(egui::RichText::new(t.upscale_hint).weak().small());
-            if ui.button(t.open_addon_folder).clicked() {
-                st.req_open_addon_folder = true;
+            match &st.addon {
+                AddonView::Hidden => {}
+                AddonView::Install => {
+                    if ui.button(t.addon_install).clicked() {
+                        st.req_addon_install = true;
+                    }
+                    ui.label(egui::RichText::new(t.addon_install_hint).weak().small());
+                }
+                AddonView::Update(v) => {
+                    if ui.button((t.addon_update)(v)).clicked() {
+                        st.req_addon_install = true;
+                    }
+                }
+                AddonView::Pending => {
+                    ui.label(egui::RichText::new(t.addon_update_restart).small());
+                }
+                AddonView::InstallForGpu => {
+                    if ui.button(t.addon_install_gpu).clicked() {
+                        st.req_addon_install = true;
+                    }
+                    ui.label(egui::RichText::new(t.addon_install_gpu_hint).weak().small());
+                }
+                AddonView::Running { text, frac } => {
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::ProgressBar::new(*frac)
+                                .desired_width(220.0)
+                                .text(format!("{text} {:.0}%", frac * 100.0)),
+                        );
+                        if ui.button(t.addon_cancel).clicked() {
+                            st.req_addon_cancel = true;
+                        }
+                    });
+                }
             }
+            if !st.addon_error.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("\u{26a0} {}", (t.addon_failed)(&st.addon_error)))
+                        .small()
+                        .color(egui::Color32::from_rgb(220, 180, 100)),
+                );
+            }
+            if st.addon_remove_pending {
+                ui.label(egui::RichText::new(t.addon_remove_restart).small());
+            }
+            if st.addon_remove_confirm && st.addon_removable {
+                ui.label((t.addon_remove_confirm)(st.addon_size));
+                ui.horizontal(|ui| {
+                    if ui.button(t.addon_remove_yes).clicked() {
+                        st.addon_remove_confirm = false;
+                        st.req_addon_remove = true;
+                    }
+                    if ui.button(t.addon_cancel).clicked() {
+                        st.addon_remove_confirm = false;
+                    }
+                });
+            }
+            ui.horizontal(|ui| {
+                if ui.button(t.open_addon_folder).clicked() {
+                    st.req_open_addon_folder = true;
+                }
+                if st.addon_removable && !st.addon_remove_confirm && ui.button(t.addon_remove).clicked() {
+                    st.addon_remove_confirm = true;
+                }
+            });
         });
     st.settings_open = open;
 }

@@ -18,6 +18,8 @@
 
 #[cfg(feature = "aji")]
 pub mod aji;
+#[cfg(feature = "aji")]
+pub mod nvml;
 pub mod archive;
 pub mod decode;
 pub mod icc;
