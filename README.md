@@ -19,6 +19,21 @@ Grab the latest [release](https://github.com/the-database/yosh/releases):
 
 The installer/exe are unsigned, so SmartScreen may warn on first run — choose *More info → Run anyway*.
 
+## Install (Linux)
+Download **`yosh-linux-x64`** from the latest [release](https://github.com/the-database/yosh/releases),
+make it executable and run it:
+
+```sh
+chmod +x yosh-linux-x64
+./yosh-linux-x64 "<path>"
+```
+
+It's a single binary. It needs a desktop session (X11 or Wayland) and a GPU driver with Vulkan support.
+
+## Install (Android)
+Download **`yosh-android.apk`** from the latest [release](https://github.com/the-database/yosh/releases)
+and install it (allow installs from your browser or file manager when Android asks).
+
 ## Build & run
 
 ```sh
@@ -94,3 +109,13 @@ cargo build --release -p yosh --features avif   # requires nasm + dav1d (or a ve
 
 `crates/decode_bench` and `crates/present_bench` are the throwaway spikes that validated the throughput
 ceiling; see `SPIKES_RESULTS.md`.
+
+## Related projects
+yosh is part of the JaNai suite: see [animejan.ai](https://animejan.ai) for an overview of all the apps.
+- [MangaJaNai GUI](https://github.com/the-database/MangaJaNaiGUI) and
+  [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI): upscale manga and images ahead of
+  time. MangaJaNaiCLI decodes and resizes with yosh's imaging core (`yosh-image`).
+- [animejanai-inference](https://github.com/the-database/animejanai-inference): the GPU inference
+  engine (libaji) the AI upscaling add-on runs on.
+- [MangaJaNai](https://github.com/the-database/MangaJaNai): the manga upscaling models the add-on's
+  default rules use.
