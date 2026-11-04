@@ -178,6 +178,9 @@ pub struct Settings {
     /// Volume paths where AI upscaling was switched off with the per-book toggle
     /// (key `U`). Absent ⇒ on, so the default stores nothing.
     pub upscale_off: HashSet<String>,
+    /// The add-on update was asked for while the add-on was loaded (its files
+    /// can't be replaced then): run it at the next start, before the upscaler loads.
+    pub addon_update_pending: bool,
     /// UI language as a `yosh_engine::i18n::Lang` token ("ja", "zh-Hant", …), or
     /// `None` to follow the OS display language.
     pub language: Option<String>,
@@ -215,6 +218,7 @@ impl Default for Settings {
             upscale_backend: UpscaleBackend::Auto,
             upscale_tensorrt_rtx: false,
             upscale_off: HashSet::new(),
+            addon_update_pending: false,
             language: None,
             window: None,
         }
