@@ -354,6 +354,8 @@ struct State {
     addon_installed: bool,
     addon_needs_install: bool,
     addon_update: bool,
+    /// The installed add-on's size on disk (bytes), for Remove's confirmation.
+    addon_size: u64,
     aji_loaded: bool,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
@@ -1160,6 +1162,7 @@ impl ApplicationHandler for App {
             addon_installed: false,
             addon_needs_install: true,
             addon_update: false,
+            addon_size: 0,
             aji_loaded: false,
             // The pre-spawned CLI open is generation 1, so `State` must start there
             // or its result would be discarded as stale by the drain in `render`.
@@ -1190,9 +1193,12 @@ impl ApplicationHandler for App {
             rescan_rx,
         });
         if let Some(state) = self.state.as_mut() {
-            // An update asked for while the add-on was loaded runs now, before the
-            // upscaler loads it; the upscaler starts when it finishes.
-            if state.settings.addon_update_pending
+            // A removal or update asked for while the add-on was loaded runs now,
+            // before the upscaler loads it; after an update the upscaler starts
+            // when it finishes.
+            if state.settings.addon_remove_pending {
+                state.remove_addon();
+            } else if state.settings.addon_update_pending
                 && config::addon_dir().is_some_and(|d| addon::installed(&d))
             {
                 state.begin_addon_install();
@@ -1760,6 +1766,10 @@ impl State {
         self.addon_installed = dir.as_deref().is_some_and(addon::installed);
         self.addon_needs_install = !self.addon_installed || dir.as_deref().is_some_and(addon_setup::incomplete);
         self.addon_update = self.addon_installed && dir.as_deref().is_some_and(addon_setup::update_available);
+        self.addon_size = match dir.as_deref() {
+            Some(d) if self.addon_installed => addon_setup::folder_size(d),
+            _ => 0,
+        };
         // An install is replacing the add-on's files: it starts the upscaler when done.
         if !self.settings.upscale || self.addon_job.is_some() {
             return;
@@ -1791,6 +1801,25 @@ impl State {
         self.addon_error = None;
         self.addon_progress = Some(addon_setup::Progress::Starting);
         self.addon_job = Some(addon_setup::start(dir, frame_waker(&self.window)));
+    }
+
+    /// Delete the add-on (Settings → Remove, or a removal saved for this start)
+    /// and switch AI upscaling off. Only call it while libaji isn't loaded.
+    fn remove_addon(&mut self) {
+        self.reader.set_upscaler(None);
+        self.upscale_rx = None;
+        self.settings.addon_remove_pending = false;
+        self.settings.addon_update_pending = false;
+        self.settings.upscale = false;
+        config::save(&self.settings);
+        self.addon_error = match config::addon_dir() {
+            Some(dir) => addon_setup::remove(&dir).err(),
+            None => None,
+        };
+        if let Some(e) = &self.addon_error {
+            eprintln!("yosh: [addon] remove failed: {e}");
+        }
+        self.start_upscaler();
     }
 
     /// "Show in Explorer" (key `E`): open the containing folder of the current
@@ -3380,6 +3409,10 @@ impl State {
             ui::AddonView::Hidden
         };
         self.ui.addon_error = self.addon_error.clone().unwrap_or_default();
+        self.ui.addon_remove_pending = self.settings.addon_remove_pending;
+        self.ui.addon_removable =
+            self.addon_installed && self.addon_job.is_none() && !self.settings.addon_remove_pending;
+        self.ui.addon_size = self.addon_size as f32 / 1e9;
         // A TensorRT-RTX fallback, at start or for a model since: shown under the
         // status and on the AI chip, so it isn't only a log line.
         self.ui.upscale_notice = match &self.upscale_status {
@@ -3875,6 +3908,17 @@ impl State {
                     config::save(&self.settings);
                 }
                 self.begin_addon_install();
+            }
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_addon_remove) && self.addon_job.is_none() {
+            if self.aji_loaded {
+                // Its files are in use (see the update above): remove at the next start.
+                self.settings.addon_remove_pending = true;
+                self.settings.addon_update_pending = false;
+                config::save(&self.settings);
+            } else {
+                self.remove_addon();
             }
             ui_acted = true;
         }

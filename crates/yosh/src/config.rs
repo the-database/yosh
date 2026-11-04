@@ -181,6 +181,8 @@ pub struct Settings {
     /// The add-on update was asked for while the add-on was loaded (its files
     /// can't be replaced then): run it at the next start, before the upscaler loads.
     pub addon_update_pending: bool,
+    /// The same for Remove: delete the add-on at the next start, before it loads.
+    pub addon_remove_pending: bool,
     /// UI language as a `yosh_engine::i18n::Lang` token ("ja", "zh-Hant", …), or
     /// `None` to follow the OS display language.
     pub language: Option<String>,
@@ -219,6 +221,7 @@ impl Default for Settings {
             upscale_tensorrt_rtx: false,
             upscale_off: HashSet::new(),
             addon_update_pending: false,
+            addon_remove_pending: false,
             language: None,
             window: None,
         }

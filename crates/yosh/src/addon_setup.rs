@@ -106,6 +106,45 @@ pub fn update_available(dir: &Path) -> bool {
     installed_release(dir).is_some_and(|v| v != CLI_VERSION)
 }
 
+/// What the add-on folder holds on disk, in bytes (runtime, models, engine cache).
+pub fn folder_size(dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() => folder_size(&e.path()),
+            Ok(t) if t.is_file() => e.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Delete the add-on: everything in `dir` but a `rules.json` the user wrote (kept so a later
+/// install picks it up again). Fails on the first file that can't be deleted; on Windows that is
+/// libaji's files while they're loaded, so don't call this after an upscaler started.
+pub fn remove(dir: &Path) -> Result<(), String> {
+    let rules = dir.join("rules.json");
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", dir.display())),
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path == rules {
+            continue;
+        }
+        let r = match e.file_type() {
+            Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        r.map_err(|err| format!("{}: {err}", path.display()))?;
+    }
+    if !rules.is_file() {
+        let _ = std::fs::remove_dir(dir);
+    }
+    Ok(())
+}
+
 /// Install (or update) the add-on into `dir` on a background thread.
 pub fn start(dir: PathBuf, wake: Waker) -> Job {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -452,6 +491,30 @@ mod tests {
     fn unknown_and_short_lines_are_ignored() {
         let (_, out, done) = feed_all(&["GPU: something", "SETUP_PLAN", "SETUP_DOWNLOAD x", "SETUP_FUTURE a b"]);
         assert!(out.is_empty() && !done);
+    }
+
+    #[test]
+    fn remove_keeps_only_rules_json() {
+        let dir = std::env::temp_dir().join(format!("yosh-addon-remove-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        for (f, n) in [("aji.dll", 3), ("models/a.onnx", 5), ("cache/x.engine", 7), (RECORD, 2)] {
+            std::fs::write(dir.join(f), vec![0u8; n]).unwrap();
+        }
+        assert_eq!(folder_size(&dir), 17);
+        remove(&dir).unwrap();
+        assert!(!dir.exists(), "no rules.json: the folder goes too");
+
+        std::fs::create_dir_all(dir.join("models")).unwrap();
+        std::fs::write(dir.join("models/a.onnx"), b"x").unwrap();
+        std::fs::write(dir.join("rules.json"), b"[]").unwrap();
+        remove(&dir).unwrap();
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, ["rules.json"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        // A folder that's already gone is removed.
+        remove(&dir).unwrap();
     }
 
     #[test]

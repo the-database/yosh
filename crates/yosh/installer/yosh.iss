@@ -59,6 +59,12 @@ Name: "{group}\{#AppName}"; Filename: "{app}\{#AppExe}"; AppUserModelID: "the-da
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopicon; AppUserModelID: "the-database.yosh"
 
+; The AI-upscaling add-on (config::addon_dir: the per-user local data dir) is
+; installed by the app, not by this installer, but it is ~1 GB, so uninstalling
+; removes it too. Settings, positions and thumbnails are left as they are.
+[UninstallDelete]
+Type: filesandordirs; Name: "{localappdata}\the-database\yosh\data\addons"
+
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "Launch yosh"; Flags: nowait postinstall skipifsilent
 
