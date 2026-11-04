@@ -53,6 +53,8 @@ pub static DE: Strings = Strings {
     addon_install_hint: "Lädt die GPU-Laufzeit und die KI-Modelle von GitHub herunter (etwa 1 GB).",
     addon_update: |v| format!("Add-on aktualisieren ({v})"),
     addon_update_restart: "Das Add-on wird gerade verwendet: Das Update wird beim nächsten Start von yosh installiert.",
+    addon_install_gpu: "Für diese GPU installieren",
+    addon_install_gpu_hint: "Das Add-on wurde für eine andere GPU eingerichtet: Diese braucht eigene Dateien (meist einige hundert MB).",
     addon_preparing: "Wird vorbereitet…",
     addon_dl_installer: "Installationsprogramm wird heruntergeladen…",
     addon_dl_runtime: "GPU-Laufzeit wird heruntergeladen…",

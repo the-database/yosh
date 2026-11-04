@@ -53,6 +53,8 @@ pub static ZH_HANT: Strings = Strings {
     addon_install_hint: "從 GitHub 下載 GPU 執行環境和 AI 模型（約 1 GB）。",
     addon_update: |v| format!("更新附加元件 ({v})"),
     addon_update_restart: "附加元件正在使用中：更新將在下次啟動 yosh 時安裝。",
+    addon_install_gpu: "為此 GPU 安裝",
+    addon_install_gpu_hint: "附加元件是為另一張 GPU 設定的：這張 GPU 需要它自己的檔案（通常幾百 MB）。",
     addon_preparing: "正在準備…",
     addon_dl_installer: "正在下載安裝程式…",
     addon_dl_runtime: "正在下載 GPU 執行環境…",

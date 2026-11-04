@@ -49,6 +49,8 @@ pub static EN: Strings = Strings {
     addon_install_hint: "Downloads the GPU runtime and the AI models from GitHub (about 1 GB).",
     addon_update: |v| format!("Update the add-on ({v})"),
     addon_update_restart: "The add-on is in use: the update installs when yosh next starts.",
+    addon_install_gpu: "Install for this GPU",
+    addon_install_gpu_hint: "The add-on was set up for another GPU: this one needs its own files (usually a few hundred MB).",
     addon_preparing: "Preparing…",
     addon_dl_installer: "Downloading the installer…",
     addon_dl_runtime: "Downloading the GPU runtime…",

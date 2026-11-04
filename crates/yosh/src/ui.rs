@@ -21,6 +21,8 @@ pub enum AddonView {
     Update(String),
     /// Update asked for while loaded: it runs at the next start.
     Pending,
+    /// A GPU here has no files in the add-on (set up on another PC or GPU).
+    InstallForGpu,
     /// Installing: what it's doing and how far along (0..1).
     Running { text: String, frac: f32 },
 }
@@ -1272,6 +1274,12 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 }
                 AddonView::Pending => {
                     ui.label(egui::RichText::new(t.addon_update_restart).small());
+                }
+                AddonView::InstallForGpu => {
+                    if ui.button(t.addon_install_gpu).clicked() {
+                        st.req_addon_install = true;
+                    }
+                    ui.label(egui::RichText::new(t.addon_install_gpu_hint).weak().small());
                 }
                 AddonView::Running { text, frac } => {
                     ui.horizontal(|ui| {

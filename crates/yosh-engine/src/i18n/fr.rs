@@ -53,6 +53,8 @@ pub static FR: Strings = Strings {
     addon_install_hint: "Télécharge l’environnement GPU et les modèles d’IA depuis GitHub (environ 1 Go).",
     addon_update: |v| format!("Mettre à jour le module ({v})"),
     addon_update_restart: "Le module est en cours d’utilisation : la mise à jour s’installera au prochain démarrage de yosh.",
+    addon_install_gpu: "Installer pour ce GPU",
+    addon_install_gpu_hint: "Le module a été configuré pour un autre GPU : celui-ci a besoin de ses propres fichiers (en général quelques centaines de Mo).",
     addon_preparing: "Préparation…",
     addon_dl_installer: "Téléchargement du programme d’installation…",
     addon_dl_runtime: "Téléchargement de l’environnement GPU…",

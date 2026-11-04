@@ -53,6 +53,8 @@ pub static KO: Strings = Strings {
     addon_install_hint: "GitHub에서 GPU 런타임과 AI 모델을 다운로드합니다(약 1GB).",
     addon_update: |v| format!("애드온 업데이트 ({v})"),
     addon_update_restart: "애드온이 사용 중입니다. 다음에 yosh를 시작할 때 업데이트가 설치됩니다.",
+    addon_install_gpu: "이 GPU용으로 설치",
+    addon_install_gpu_hint: "애드온이 다른 GPU용으로 설정되어 있습니다. 이 GPU에는 전용 파일이 필요합니다(보통 수백 MB).",
     addon_preparing: "준비 중…",
     addon_dl_installer: "설치 프로그램 다운로드 중…",
     addon_dl_runtime: "GPU 런타임 다운로드 중…",

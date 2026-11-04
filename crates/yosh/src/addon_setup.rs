@@ -87,12 +87,49 @@ impl Job {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Record {
     cli: String,
+    /// The NVIDIA GPUs' compute capabilities ("8.6") when setup last ran: setup picks the
+    /// TensorRT files (and TensorRT-RTX) by them. `None` in a record without them (not checked).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gpus: Option<Vec<String>>,
+}
+
+fn read_record(dir: &Path) -> Option<Record> {
+    serde_json::from_slice(&std::fs::read(dir.join(RECORD)).ok()?).ok()
+}
+
+/// This machine's NVIDIA GPUs' compute capabilities, as the record keeps them.
+#[cfg(feature = "sr")]
+fn gpu_keys() -> Vec<String> {
+    let mut v: Vec<String> =
+        yosh_engine::nvml::gpus().iter().map(|g| format!("{}.{}", g.major, g.minor)).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+#[cfg(not(feature = "sr"))]
+fn gpu_keys() -> Vec<String> {
+    Vec::new()
+}
+
+/// Whether some GPU here has a compute capability setup didn't install for (`recorded`).
+fn lacks_gpu(recorded: &[String], now: &[String]) -> bool {
+    now.iter().any(|g| !recorded.contains(g))
+}
+
+/// Whether the add-on yosh installed in `dir` lacks files for one of this machine's NVIDIA GPUs:
+/// it was set up on another PC (a portable yosh moved) or before a GPU swap. Re-running setup
+/// fetches what's missing. Blocking (loads NVML): call it off the UI thread.
+pub fn needs_setup_for_gpus(dir: &Path) -> bool {
+    match read_record(dir).and_then(|r| r.gpus) {
+        Some(recorded) => lacks_gpu(&recorded, &gpu_keys()),
+        None => false,
+    }
 }
 
 /// The MangaJaNaiCLI release yosh installed `dir` from, if yosh installed it.
 pub fn installed_release(dir: &Path) -> Option<String> {
-    let b = std::fs::read(dir.join(RECORD)).ok()?;
-    serde_json::from_slice::<Record>(&b).ok().map(|r| r.cli)
+    read_record(dir).map(|r| r.cli)
 }
 
 /// Whether an install into `dir` began but didn't finish (the program is there, the record isn't):
@@ -145,8 +182,19 @@ pub fn remove(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What an install does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Mode {
+    /// Unpack the pinned mangajanai release, then run setup (install or update).
+    Full,
+    /// Run the installed mangajanai's setup only: fetch what this machine's GPUs are missing.
+    /// It only adds files (the ones already installed are skipped), so it can run while libaji
+    /// is loaded.
+    SetupOnly,
+}
+
 /// Install (or update) the add-on into `dir` on a background thread.
-pub fn start(dir: PathBuf, wake: Waker) -> Job {
+pub fn start(dir: PathBuf, mode: Mode, wake: Waker) -> Job {
     let (tx, rx) = std::sync::mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     let child = Arc::new(Mutex::new(None));
@@ -157,7 +205,7 @@ pub fn start(dir: PathBuf, wake: Waker) -> Job {
             wake();
         };
         send(Event::Progress(Progress::Starting));
-        let ev = match install(&dir, &cancel, &child, &tx, &wake) {
+        let ev = match install(&dir, mode, &cancel, &child, &tx, &wake) {
             Ok(()) => Event::Done,
             Err(_) if cancel.load(Ordering::Relaxed) => Event::Cancelled,
             Err(e) => Event::Failed(e),
@@ -175,6 +223,7 @@ pub fn start(dir: PathBuf, wake: Waker) -> Job {
 
 fn install(
     dir: &Path,
+    mode: Mode,
     cancel: &AtomicBool,
     child: &Mutex<Option<Child>>,
     tx: &Sender<Event>,
@@ -184,6 +233,22 @@ fn install(
         let _ = tx.send(Event::Progress(p));
         wake();
     };
+    if mode == Mode::Full {
+        unpack_release(dir, cancel, &progress)?;
+    }
+    run_setup(dir, cancel, child, &progress)?;
+    // Setup-only ran the installed program, so the record keeps its release.
+    let cli = match mode {
+        Mode::SetupOnly => read_record(dir).map(|r| r.cli),
+        Mode::Full => None,
+    }
+    .unwrap_or_else(|| CLI_VERSION.into());
+    let rec = serde_json::to_vec_pretty(&Record { cli, gpus: Some(gpu_keys()) }).unwrap_or_default();
+    std::fs::write(dir.join(RECORD), rec).map_err(|e| format!("{RECORD}: {e}"))
+}
+
+/// Download the pinned mangajanai release (or YOSH_ADDON_ARCHIVE), check it and unpack it.
+fn unpack_release(dir: &Path, cancel: &AtomicBool, progress: &dyn Fn(Progress)) -> Result<(), String> {
     let dl = dir.join(DOWNLOAD_DIR);
     std::fs::create_dir_all(&dl).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (asset, sha, bytes) = CLI_ASSET;
@@ -213,9 +278,7 @@ fn install(
     }
     let _ = std::fs::remove_file(&archive);
     let _ = std::fs::remove_dir(&dl);
-    run_setup(dir, cancel, child, &progress)?;
-    let rec = serde_json::to_vec_pretty(&Record { cli: CLI_VERSION.into() }).unwrap_or_default();
-    std::fs::write(dir.join(RECORD), rec).map_err(|e| format!("{RECORD}: {e}"))
+    Ok(())
 }
 
 /// Run `mangajanai setup --progress lines` in `dir` and turn its lines into progress.
@@ -518,6 +581,28 @@ mod tests {
     }
 
     #[test]
+    fn a_gpu_setup_never_saw_needs_setup() {
+        let rec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!lacks_gpu(&rec(&["12.0"]), &rec(&["12.0"])));
+        // Moved from an RTX 50 PC to an RTX 30 one.
+        assert!(lacks_gpu(&rec(&["12.0"]), &rec(&["8.6"])));
+        // A second card of another generation.
+        assert!(lacks_gpu(&rec(&["12.0"]), &rec(&["12.0", "8.9"])));
+        // A card taken out, or no NVIDIA GPU (DirectML only): nothing to fetch.
+        assert!(!lacks_gpu(&rec(&["12.0", "8.9"]), &rec(&["12.0"])));
+        assert!(!lacks_gpu(&rec(&["12.0"]), &[]));
+        // Set up on a PC without NVIDIA, now on one with.
+        assert!(lacks_gpu(&[], &rec(&["8.6"])));
+    }
+
+    #[test]
+    fn record_without_gpus_still_reads() {
+        let r: Record = serde_json::from_str(r#"{"cli": "v0.3.1"}"#).unwrap();
+        assert_eq!(r.cli, "v0.3.1");
+        assert!(r.gpus.is_none());
+    }
+
+    #[test]
     fn archive_entries_unpack_flat() {
         assert_eq!(flat_name("./mangajanai").as_deref(), Some("mangajanai"));
         assert_eq!(flat_name("aji.dll").as_deref(), Some("aji.dll"));
@@ -553,7 +638,7 @@ mod tests {
 #[ignore]
 fn install_end_to_end() {
     let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON_DIR").expect("YOSH_TEST_ADDON_DIR"));
-    let job = start(dir.clone(), Arc::new(|| {}));
+    let job = start(dir.clone(), Mode::Full, Arc::new(|| {}));
     let mut last = String::new();
     loop {
         match job.rx.recv().expect("install thread") {
@@ -575,4 +660,27 @@ fn install_end_to_end() {
     }
     assert_eq!(installed_release(&dir).as_deref(), Some(CLI_VERSION));
     assert!(!incomplete(&dir) && crate::addon::installed(&dir));
+}
+
+/// "Install for this GPU" on an add-on in YOSH_TEST_ADDON_DIR whose record and setup.json were
+/// edited to look set up for another GPU: the check sees it, setup-only fetches what's missing,
+/// and the record then matches this machine. Run by hand with `--ignored --nocapture`.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn setup_for_gpus_end_to_end() {
+    let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON_DIR").expect("YOSH_TEST_ADDON_DIR"));
+    assert!(needs_setup_for_gpus(&dir), "the record should look like another GPU's");
+    let before = installed_release(&dir);
+    let job = start(dir.clone(), Mode::SetupOnly, Arc::new(|| {}));
+    loop {
+        match job.rx.recv().expect("install thread") {
+            Event::Progress(p) => eprintln!("{p:?}"),
+            Event::Done => break,
+            Event::Cancelled => panic!("cancelled"),
+            Event::Failed(e) => panic!("{e}"),
+        }
+    }
+    assert!(!needs_setup_for_gpus(&dir));
+    assert_eq!(installed_release(&dir), before, "setup-only keeps the release");
 }
