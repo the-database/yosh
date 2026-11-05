@@ -175,6 +175,10 @@ pub struct Settings {
     /// With `upscale_backend` = TensorRT, run TensorRT-RTX instead (Windows). A
     /// separate key so an older yosh reads the choice as plain TensorRT.
     pub upscale_tensorrt_rtx: bool,
+    /// The AI-upscaling profile yosh starts on (`profiles::ProfileId::token`:
+    /// "quality", "balanced", "performance", "custom1".."custom9"). A plain string,
+    /// so a token from a newer yosh reads as Balanced instead of failing the parse.
+    pub upscale_profile: String,
     /// Volume paths where AI upscaling was switched off with the per-book toggle
     /// (key `U`). Absent ⇒ on, so the default stores nothing.
     pub upscale_off: HashSet<String>,
@@ -219,6 +223,7 @@ impl Default for Settings {
             upscale: false,
             upscale_backend: UpscaleBackend::Auto,
             upscale_tensorrt_rtx: false,
+            upscale_profile: "balanced".into(),
             upscale_off: HashSet::new(),
             addon_update_pending: false,
             addon_remove_pending: false,
