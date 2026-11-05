@@ -67,6 +67,7 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
 | `Ctrl`+wheel | zoom at the cursor — the pixel under it stays put, in the same steps as `+` `-` |
 | `Z` | stretch small pages (off: a fit never scales past 100% native; zoom still can) |
 | `U` | AI upscaling on/off for this book (needs the optional add-on; see Settings) |
+| `Shift`+`1` `2` `3` / `Ctrl`+`1`…`9` | AI upscaling profile: built-in Quality / Balanced / Performance, or your own (Settings → AI upscaling → Edit profiles); `Shift`+`0` turns it off |
 | `E` | show in Explorer (opens the folder and selects the file/archive) |
 | `I` | image info overlay |
 | `B` | bottom seekbar (reveals near the bottom edge; click/drag to jump) |

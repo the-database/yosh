@@ -14,6 +14,9 @@ mod config;
 mod flipbench;
 mod gpu;
 mod library;
+mod mwf;
+mod profile_editor;
+mod profiles;
 mod ui;
 mod update;
 

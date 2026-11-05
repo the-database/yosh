@@ -264,6 +264,89 @@ pub struct Strings {
     pub addon_remove_confirm: fn(f32) -> String,
     pub addon_remove_yes: &'static str,
     pub addon_remove_restart: &'static str,
+    // --- desktop: AI-upscaling profiles (Settings, the profile editor, the AI chip) ---
+    /// The profile editor window's title.
+    pub profiles_title: &'static str,
+    /// Built-in profile names (Shift+1/2/3).
+    pub profile_quality: &'static str,
+    pub profile_balanced: &'static str,
+    pub profile_performance: &'static str,
+    /// An unnamed custom slot: "Custom {n}".
+    pub profile_custom: fn(u8) -> String,
+    /// The editor's list headings.
+    pub profiles_builtin: &'static str,
+    pub profiles_custom: &'static str,
+    /// An empty custom slot in the list.
+    pub profile_empty: &'static str,
+    /// "Custom slot {n} is empty. Start it from:" (then buttons).
+    pub profile_empty_slot: fn(u8) -> String,
+    /// A copied profile's name: "Copy of {name}".
+    pub profile_copy_of: fn(&str) -> String,
+    pub profile_one_model: &'static str,
+    pub profile_import: &'static str,
+    pub profile_import_hint: &'static str,
+    pub profile_name: &'static str,
+    pub profile_clear: &'static str,
+    pub profile_builtin_note: &'static str,
+    pub profile_copy: &'static str,
+    pub profile_slots_full: &'static str,
+    /// How the rule table reads.
+    pub rules_hint: &'static str,
+    /// A rule bound of 0: no limit (short, shown in a number field).
+    pub any: &'static str,
+    /// Rule table column headings.
+    pub col_pages: &'static str,
+    pub col_height: &'static str,
+    pub col_scale: &'static str,
+    pub col_model: &'static str,
+    /// Which pages a rule applies to.
+    pub pages_gray: &'static str,
+    pub pages_color: &'static str,
+    pub pages_both: &'static str,
+    pub pages_none: &'static str,
+    /// Rule row buttons.
+    pub move_up: &'static str,
+    pub move_down: &'static str,
+    pub remove_rule: &'static str,
+    pub add_rule: &'static str,
+    /// A rule's model choice that skips upscaling.
+    pub model_none: &'static str,
+    pub model_missing: &'static str,
+    /// The "try a page" line: "Try a page: [1400 px] [Gray] shown at [1.5×] → model".
+    pub try_page: &'static str,
+    pub try_shown_at: &'static str,
+    pub try_none: &'static str,
+    pub add_model: &'static str,
+    pub add_model_hint: &'static str,
+    pub profiles_save: &'static str,
+    pub profiles_revert: &'static str,
+    pub profiles_unsaved: &'static str,
+    pub profiles_save_failed: fn(&str) -> String,
+    /// File dialog titles.
+    pub dlg_import_mwf: &'static str,
+    pub dlg_add_model: &'static str,
+    /// "Imported “{name}”: {count} rules."
+    pub mwf_imported: fn(&str, usize) -> String,
+    /// One chain setting yosh doesn't carry over ("chain {n}: …").
+    pub mwf_ignored_width: fn(usize) -> String,
+    pub mwf_ignored_resize: fn(usize) -> String,
+    /// "Not carried over (yosh has no such setting): {list}".
+    pub mwf_ignored: fn(&str) -> String,
+    pub mwf_missing_models: fn(usize) -> String,
+    pub mwf_failed: fn(&str) -> String,
+    pub model_added: fn(&str) -> String,
+    pub model_add_failed: fn(&str) -> String,
+    /// Settings → AI upscaling: the profile yosh starts on.
+    pub upscale_profile: &'static str,
+    pub edit_profiles: &'static str,
+    pub upscale_profile_hint: &'static str,
+    /// The AI chip's tooltip: "Profile: {name}".
+    pub sr_profile: fn(&str) -> String,
+    pub sr_profile_off: &'static str,
+    pub sr_chip_menu_hint: &'static str,
+    /// Toasts for a profile switch.
+    pub toast_profile: fn(&str) -> String,
+    pub toast_profile_empty: fn(u8) -> String,
     /// The reader's "AI" status chip and busy indicator (what upscaling is doing
     /// for the page in view).
     pub sr_working: &'static str,
