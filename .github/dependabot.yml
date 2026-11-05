@@ -1,0 +1,22 @@
+# Dependabot: monthly, grouped, to keep the noise down. The pins Dependabot can't see (upstream
+# release tags and asset SHA-256s) are bumped by bump-pins.yml instead.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      # Their own PR: run the frame-loop benchmarks in CLAUDE.md before merging.
+      gui-stack:
+        patterns: ["egui*", "wgpu*", "winit*"]
+      cargo:
+        patterns: ["*"]
+        update-types: [minor, patch]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
