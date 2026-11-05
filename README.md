@@ -54,6 +54,22 @@ Default `cargo build` needs no system libraries (pure-Rust decoders).
   - PSD shows the flattened composite (8-bit RGB); it's browsable in folders/archives but is **not**
     registered as a default `.psd` handler (a "View with yosh" right-click entry is offered instead).
 
+## AI upscaling (optional)
+Pages shown larger than their source can be redrawn by an AI model a moment after they appear: the
+MangaJaNai models for grayscale pages, IllustrationJaNai for colour. It's an add-on that stays off
+until you install it from ⚙ Settings → AI upscaling → *Install the add-on*. yosh downloads
+[MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI), which fetches the runtime for your GPU
+and the models (about 1 GB with an NVIDIA GPU).
+
+- **GPUs:** NVIDIA (TensorRT, plus TensorRT-RTX on Windows), and AMD or Intel through DirectML on
+  Windows. On Linux, NVIDIA only. Not on Android.
+- **Profiles:** `Shift`+`1` `2` `3` pick the built-in Quality, Balanced (the default) or Performance
+  profiles. `Ctrl`+`1`…`9` are your own, set up in Settings → AI upscaling → *Edit profiles*: which
+  model upscales gray or colour pages at which source height and scale. You can also import a
+  MangaJaNai GUI workflow (`.mwf`). `U` turns upscaling off or on for the current book.
+- **Removing it:** Settings → AI upscaling → *Remove the add-on* (the Windows uninstaller also
+  removes it).
+
 ## Controls (press <kbd>F1</kbd> in-app for the full list)
 | | |
 |---|---|
