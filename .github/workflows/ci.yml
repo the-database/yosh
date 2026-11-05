@@ -17,7 +17,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # winit/rfd need the desktop dev libs at build time (same set release.yml uses).
       - name: Install Linux build deps
