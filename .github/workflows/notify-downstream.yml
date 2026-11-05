@@ -1,0 +1,52 @@
+name: Notify downstream
+
+# Asks the repos that pin this repo's releases to re-pin: a repository_dispatch (event_type
+# upstream-release, client_payload {source: yosh-image, tag}) to each, whose bump-pins.yml then
+# opens a bump PR there. release.yml calls it after a v* release; MangaJaNaiCLI re-pins yosh-image
+# to that commit only if crates/yosh-image changed. Run it by hand with any yosh ref (e.g. main)
+# to bump yosh-image without a yosh release.
+#
+# Needs the JANAI_BUMP_TOKEN secret: a fine-grained PAT with Contents write on the repos below.
+# Without it this only warns, so a release never fails over it.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: The release tag (blank = this repo's latest release)
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'yosh ref: a release tag, a branch or a commit'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          [ -n "$TAG" ] || TAG="$(gh release view -R "$GITHUB_REPOSITORY" --json tagName -q .tagName)"
+          [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "::error::not a tag: $TAG"; exit 1; }
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Release: $TAG"
+      - name: Dispatch
+        env:
+          GH_TOKEN: ${{ secrets.JANAI_BUMP_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::warning::JANAI_BUMP_TOKEN isn't set, so no bump PRs were requested for $TAG"
+            exit 0
+          fi
+          for repo in the-database/MangaJaNaiCLI; do
+            gh api "repos/$repo/dispatches" -f event_type=upstream-release \
+              -f "client_payload[source]=yosh-image" -f "client_payload[tag]=$TAG"
+            echo "Asked $repo to re-pin yosh-image $TAG" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
