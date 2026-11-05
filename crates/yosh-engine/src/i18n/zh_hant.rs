@@ -132,6 +132,7 @@ pub static ZH_HANT: Strings = Strings {
     sr_preparing_tip: "正在準備 AI 模型 — 首次使用會建構 TensorRT 引擎（約 1 分鐘）",
     sr_done: "此頁已經過 AI 超解析度",
     sr_not_needed: "以原始尺寸或更小顯示 — 無需放大",
+    sr_unsupported: "動畫、GIF 與 .ico 檔案不進行 AI 放大",
     sr_no_model: "沒有適用於此頁的 AI 模型",
     sr_failed: |e| format!("AI 超解析度失敗: {e}"),
     sr_book_off: "本書的 AI 超解析度已關閉（按 U 開啟）",

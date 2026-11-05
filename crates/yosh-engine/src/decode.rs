@@ -265,8 +265,11 @@ pub struct SrMaster {
     /// The source page's size; `pixels` is `scale` times it on both axes.
     pub src_w: u32,
     pub src_h: u32,
-    /// One luma channel (`true`) or packed RGB.
+    /// The model saw one luma channel (`true`) or RGB — what picks the model.
     pub gray: bool,
+    /// The page has transparency: `pixels` carries straight alpha after the
+    /// color (gray + alpha, or RGBA) instead of luma / packed RGB alone.
+    pub alpha: bool,
     pub pixels: Vec<u8>,
 }
 
@@ -288,6 +291,10 @@ pub enum SrDecode {
 /// `target_h` through the same HQ resize as every other page. So the GPU samples
 /// it 1:1: the model takes over exactly the magnification the GPU would otherwise
 /// do, and the single-resize invariant holds. `src_w`/`src_h` stay the file's.
+///
+/// A page with transparency goes through [`upscale_with_alpha`] (gray + alpha
+/// or RGBA, as MangaJaNaiCLI does): unless its alpha is uniform, that is two
+/// inferences, so a see-through page costs twice an opaque one.
 pub fn decode_sr(
     bytes: &[u8],
     target_h: u32,
@@ -299,28 +306,142 @@ pub fn decode_sr(
         return Ok(SrDecode::Skipped(SrSkip::Unsupported));
     }
     let p = prepare(bytes)?;
-    if target_h <= p.h || !p.opaque {
-        return Ok(SrDecode::Skipped(SrSkip::Unsupported));
+    if target_h <= p.h {
+        return Ok(SrDecode::Skipped(SrSkip::NotNeeded));
     }
     let gray = p.gray_by_channels || rgba_is_grayscale(&p.full, GRAYSCALE_THRESHOLD);
-    let input = if p.gray_by_channels {
-        p.full
-    } else if gray {
-        rgba_to_luma(&p.full)
+    let target_scale = target_h as f32 / p.h as f32;
+    let alpha = !p.opaque;
+    let outcome = if alpha {
+        // Straight-alpha RGBA (a single-channel source is always opaque).
+        let input = if gray { luma_alpha(&p.full) } else { p.full };
+        upscale_with_alpha(up, p.w, p.h, gray, &input, target_scale, cancel)
     } else {
-        rgba_to_rgb(&p.full)
+        let input = if p.gray_by_channels {
+            p.full
+        } else if gray {
+            rgba_to_luma(&p.full)
+        } else {
+            rgba_to_rgb(&p.full)
+        };
+        up.upscale(p.w, p.h, if gray { 1 } else { 3 }, &input, target_scale, cancel)
     };
-    let ch = if gray { 1 } else { 3 };
-    let (scale, out, model) = match up.upscale(p.w, p.h, ch, &input, target_h as f32 / p.h as f32, cancel) {
+    let (scale, out, model) = match outcome {
         SrOutcome::Done { scale, pixels, model } => (scale, pixels, model),
         SrOutcome::Skip => return Ok(SrDecode::Skipped(SrSkip::NoModel)),
         SrOutcome::NotReady => return Ok(SrDecode::Skipped(SrSkip::NotReady)),
         SrOutcome::Cancelled => return Ok(SrDecode::Cancelled),
         SrOutcome::Failed(e) => return Err(e),
     };
-    let master = std::sync::Arc::new(SrMaster { model, scale, src_w: p.w, src_h: p.h, gray, pixels: out });
+    let master = std::sync::Arc::new(SrMaster { model, scale, src_w: p.w, src_h: p.h, gray, alpha, pixels: out });
     let img = sr_from_master(&master, target_h, resizer)?;
     Ok(SrDecode::Page(img, master))
+}
+
+/// Straight-alpha RGBA → interleaved luma + alpha.
+fn luma_alpha(rgba: &[u8]) -> Vec<u8> {
+    let luma = rgba_to_luma(rgba);
+    luma.iter().zip(rgba.as_chunks::<4>().0).flat_map(|(&y, p)| [y, p[3]]).collect()
+}
+
+/// Upscale a straight-alpha image (`gray`: luma + alpha, else RGBA) through a
+/// model that only takes color — MangaJaNaiCLI's `upscale_with_alpha`, so both
+/// apps make the same of a transparent page. `Done` carries the output in the
+/// input's layout (alpha last, straight).
+///
+/// Uniform alpha (every pixel equally transparent) upscales the color once and
+/// rebuilds the alpha at the output size. Otherwise the color is composited
+/// once onto black and once onto white, both are upscaled, and the alpha is
+/// recovered from how far apart they come out ([`recover_alpha`]).
+fn upscale_with_alpha(
+    up: &dyn Upscaler,
+    w: u32,
+    h: u32,
+    gray: bool,
+    pixels: &[u8],
+    target_scale: f32,
+    cancel: &dyn Fn() -> bool,
+) -> SrOutcome {
+    let n = if gray { 2 } else { 4 };
+    let cc = n - 1;
+    if let Some(a) = uniform_alpha(pixels, n) {
+        let color: Vec<u8> = pixels.chunks_exact(n).flat_map(|px| px[..cc].iter().copied()).collect();
+        return match up.upscale(w, h, cc as u32, &color, target_scale, cancel) {
+            SrOutcome::Done { scale, pixels, model } => {
+                let out = pixels.chunks_exact(cc).flat_map(|px| px.iter().copied().chain([a])).collect();
+                SrOutcome::Done { scale, pixels: out, model }
+            }
+            other => other,
+        };
+    }
+    let (on_black, on_white) = on_black_and_white(pixels, n);
+    let (scale, black, model) = match up.upscale(w, h, cc as u32, &on_black, target_scale, cancel) {
+        SrOutcome::Done { scale, pixels, model } => (scale, pixels, model),
+        other => return other,
+    };
+    let white = match up.upscale(w, h, cc as u32, &on_white, target_scale, cancel) {
+        SrOutcome::Done { scale: s, pixels, model: m } if s == scale && m == model && pixels.len() == black.len() => {
+            pixels
+        }
+        SrOutcome::Done { .. } => return SrOutcome::Failed("the alpha pass came back from a different model".into()),
+        other => return other,
+    };
+    SrOutcome::Done { scale, pixels: recover_alpha(&black, &white, cc), model }
+}
+
+/// The alpha every pixel has, if they all have the same one (`n` channels,
+/// alpha last).
+fn uniform_alpha(pixels: &[u8], n: usize) -> Option<u8> {
+    let mut it = pixels.chunks_exact(n).map(|px| px[n - 1]);
+    let first = it.next()?;
+    it.all(|a| a == first).then_some(first)
+}
+
+/// The color channels of straight-alpha `pixels` (`n` channels, alpha last)
+/// composited onto black and onto white.
+fn on_black_and_white(pixels: &[u8], n: usize) -> (Vec<u8>, Vec<u8>) {
+    let cc = n - 1;
+    let mut on_black = Vec::with_capacity(pixels.len() / n * cc);
+    let mut on_white = Vec::with_capacity(on_black.capacity());
+    for px in pixels.chunks_exact(n) {
+        let a = px[cc] as u32;
+        for &v in &px[..cc] {
+            on_black.push(((v as u32 * a + 127) / 255) as u8);
+            on_white.push(((v as u32 * a + 255 * (255 - a) + 127) / 255) as u8);
+        }
+    }
+    (on_black, on_white)
+}
+
+/// Straight-alpha pixels (`cc` color channels + alpha) from the upscaled black
+/// and white passes. Alpha is 1 − (white − black) per channel; on color the
+/// channels' estimates are blended toward their extremes (`max·mean +
+/// min·(1 − mean)`, chaiNNer's denoise, which suppresses model noise in
+/// semi-transparent areas). The color is the black pass un-premultiplied.
+fn recover_alpha(black: &[u8], white: &[u8], cc: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(black.len() / cc * (cc + 1));
+    for (b, wh) in black.chunks_exact(cc).zip(white.chunks_exact(cc)) {
+        let est = |i: usize| (255 - (wh[i] as i32 - b[i] as i32)).clamp(0, 255) as f32 / 255.0;
+        let a = if cc == 1 {
+            est(0)
+        } else {
+            let (mut lo, mut hi, mut sum) = (1.0f32, 0.0f32, 0.0f32);
+            for i in 0..cc {
+                let e = est(i);
+                lo = lo.min(e);
+                hi = hi.max(e);
+                sum += e;
+            }
+            let mean = sum / cc as f32;
+            hi * mean + lo * (1.0 - mean)
+        };
+        let a = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u32;
+        for &v in b {
+            out.push((v as u32 * 255 + a / 2).checked_div(a).map_or(0, |c| c.min(255) as u8));
+        }
+        out.push(a as u8);
+    }
+    out
 }
 
 /// Size a kept model output to `target_h` through the same HQ resize as every
@@ -330,7 +451,23 @@ pub fn sr_from_master(m: &SrMaster, target_h: u32, resizer: &mut Resizer) -> Res
     let (sw, sh) = (m.src_w * m.scale, m.src_h * m.scale);
     let (tw, th) = target_dims(sw, sh, target_h);
     check_fits(tw, th)?;
-    let mut img = if m.gray {
+    let mut img = if m.alpha {
+        // Transparent: an RGBA texture, premultiplied before the resize like a
+        // transparent page on the normal path (`finish`), so its Lanczos3 doesn't
+        // bleed the color of see-through pixels into their neighbours. A gray
+        // page's luma fills all three channels.
+        let mut rgba = if m.gray {
+            m.pixels.as_chunks::<2>().0.iter().flat_map(|&[y, a]| [y, y, y, a]).collect()
+        } else {
+            m.pixels.clone()
+        };
+        premultiply_alpha(&mut rgba);
+        if tw == sw && th == sh {
+            DecodedImage { w: sw, h: sh, src_w: sw, src_h: sh, gray: false, path: ResizePath::None, pixels: rgba }
+        } else {
+            downscale_color(&rgba, sw, sh, tw, th, resizer)?
+        }
+    } else if m.gray {
         if tw == sw && th == sh {
             DecodedImage { w: sw, h: sh, src_w: sw, src_h: sh, gray: true, path: ResizePath::None, pixels: m.pixels.clone() }
         } else {
@@ -347,7 +484,8 @@ pub fn sr_from_master(m: &SrMaster, target_h: u32, resizer: &mut Resizer) -> Res
     img.src_w = m.src_w;
     img.src_h = m.src_h;
     let s = m.scale.min(u8::MAX as u32) as u8;
-    img.path = if m.gray { ResizePath::SrGray(s) } else { ResizePath::SrColor(s) };
+    // The path names the final resize: a transparent gray page takes the color one.
+    img.path = if m.gray && !m.alpha { ResizePath::SrGray(s) } else { ResizePath::SrColor(s) };
     Ok(img)
 }
 
@@ -961,12 +1099,10 @@ mod tests {
         let bytes = png_bytes(50, 80, png::ColorType::Grayscale, &gray);
         let up = FakeUpscaler::new(2);
         let unsupported = |d: SrDecode| matches!(d, SrDecode::Skipped(SrSkip::Unsupported));
+        let not_needed = |d: SrDecode| matches!(d, SrDecode::Skipped(SrSkip::NotNeeded));
         // Shown at or below source size: nothing for a model to do.
-        assert!(unsupported(sr(&bytes, 80, &up)));
-        assert!(unsupported(sr(&bytes, 40, &up)));
-        // Transparent pages keep their alpha on the normal path.
-        let rgba: Vec<u8> = (0..50 * 80).flat_map(|_| [10, 200, 30, 100]).collect();
-        assert!(unsupported(sr(&png_bytes(50, 80, png::ColorType::Rgba, &rgba), 200, &up)));
+        assert!(not_needed(sr(&bytes, 80, &up)));
+        assert!(not_needed(sr(&bytes, 40, &up)));
         // Animations aren't stills.
         let mut gif = Vec::new();
         {
@@ -987,6 +1123,125 @@ mod tests {
         assert!(matches!(sr(&bytes, 200, &up), SrDecode::Skipped(SrSkip::NoModel)));
         up.outcome = || Some(SrOutcome::Failed("boom".into()));
         assert!(decode_sr(&bytes, 200, &up, &|| false, &mut Resizer::new()).is_err());
+    }
+
+    #[test]
+    fn uniform_alpha_is_detected() {
+        assert_eq!(uniform_alpha(&[1, 2, 3, 128, 4, 5, 6, 128], 4), Some(128));
+        assert_eq!(uniform_alpha(&[1, 2, 3, 128, 4, 5, 6, 127], 4), None);
+        assert_eq!(uniform_alpha(&[9, 0, 8, 0], 2), Some(0));
+    }
+
+    /// With a model that changes nothing, the black and white passes give the
+    /// alpha back (to rounding) and the color un-premultiplied (exact where the
+    /// alpha is high, coarser where it's low).
+    #[test]
+    fn alpha_survives_an_identity_model() {
+        let px = [200u8, 100, 50, 255, 200, 100, 50, 128, 10, 20, 30, 0, 255, 255, 255, 64, 7, 250, 90, 238];
+        let (b, w) = on_black_and_white(&px, 4);
+        let out = recover_alpha(&b, &w, 3);
+        for (o, i) in out.as_chunks::<4>().0.iter().zip(px.as_chunks::<4>().0) {
+            assert!((o[3] as i32 - i[3] as i32).abs() <= 1, "alpha {} vs {}", o[3], i[3]);
+            if i[3] >= 64 {
+                for c in 0..3 {
+                    assert!((o[c] as i32 - i[c] as i32).abs() <= 4, "color {} vs {}", o[c], i[c]);
+                }
+            }
+        }
+        // Opaque pixels come back exactly.
+        assert_eq!(&out[0..4], &px[0..4]);
+        let gray = [100u8, 200, 30, 0, 180, 255];
+        let (b, w) = on_black_and_white(&gray, 2);
+        let out = recover_alpha(&b, &w, 1);
+        assert!((out[1] as i32 - 200).abs() <= 1 && out[3] == 0);
+        assert_eq!(&out[4..6], &[180, 255]);
+    }
+
+    /// A page with any transparency is upscaled, not skipped: color as RGB on
+    /// black and on white (two model runs), alpha recovered, and the result an
+    /// RGBA texture premultiplied for the GPU, at exactly the target size.
+    #[test]
+    fn sr_upscales_transparent_pages() {
+        // Mostly opaque color with a few nearly-opaque pixels (a game CG's case).
+        let (w, h) = (40u32, 30u32);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| [(i * 5 % 256) as u8, 40, 200, if i % 7 == 0 { 238 + (i % 17) as u8 } else { 255 }])
+            .collect();
+        let bytes = png_bytes(w, h, png::ColorType::Rgba, &rgba);
+        let up = FakeUpscaler::new(2);
+        let SrDecode::Page(img, master) = sr(&bytes, 60, &up) else { panic!("transparent page upscales") };
+        assert_eq!(up.seen.lock().unwrap().iter().map(|s| s.0).collect::<Vec<_>>(), [3, 3], "black + white passes");
+        assert!(master.alpha && !master.gray && master.pixels.len() == (80 * 60 * 4) as usize);
+        assert!(!img.gray && img.path == ResizePath::SrColor(2));
+        assert_eq!((img.w, img.h, img.src_w, img.src_h), (80, 60, w, h));
+        // At the model's own size there is no resample: each output pixel is its
+        // source pixel, premultiplied (to the recovery's rounding).
+        let mut want = rgba.clone();
+        premultiply_alpha(&mut want);
+        for y in 0..60 {
+            for x in 0..80 {
+                let o = &img.pixels[((y * 80 + x) * 4) as usize..][..4];
+                let i = &want[(((y / 2) * w + x / 2) * 4) as usize..][..4];
+                for c in 0..4 {
+                    assert!((o[c] as i32 - i[c] as i32).abs() <= 2, "({x},{y})[{c}] {} vs {}", o[c], i[c]);
+                }
+            }
+        }
+        // Between source and model size it goes through the color Lanczos3, still
+        // to the exact target.
+        let SrDecode::Page(img, _) = sr(&bytes, 45, &up) else { panic!() };
+        assert_eq!((img.w, img.h, img.pixels.len()), (60, 45, 60 * 45 * 4));
+
+        // Uniform alpha: one model run, the alpha rebuilt as it was.
+        let flat: Vec<u8> = (0..w * h).flat_map(|i| [(i % 256) as u8, 90, 10, 128]).collect();
+        let up = FakeUpscaler::new(2);
+        let SrDecode::Page(_, master) = sr(&png_bytes(w, h, png::ColorType::Rgba, &flat), 60, &up) else {
+            panic!()
+        };
+        assert_eq!(up.seen.lock().unwrap().len(), 1);
+        assert!(master.pixels.as_chunks::<4>().0.iter().all(|p| p[3] == 128));
+
+        // A visually gray transparent page goes to the model as one luma channel
+        // (a gray model, as the rules pick for gray) and comes out RGBA.
+        let ga: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let g = (i * 3 % 256) as u8;
+                [g, g, g, (i % 256) as u8]
+            })
+            .collect();
+        let up = FakeUpscaler::new(2);
+        let SrDecode::Page(img, master) = sr(&png_bytes(w, h, png::ColorType::Rgba, &ga), 60, &up) else {
+            panic!()
+        };
+        assert_eq!(up.seen.lock().unwrap().iter().map(|s| s.0).collect::<Vec<_>>(), [1, 1]);
+        assert!(master.gray && master.alpha && master.pixels.len() == (80 * 60 * 2) as usize);
+        assert!(!img.gray && img.path == ResizePath::SrColor(2) && img.pixels.len() == 80 * 60 * 4);
+
+        // A model verdict on either pass passes through.
+        let mut up = FakeUpscaler::new(2);
+        up.outcome = || Some(SrOutcome::NotReady);
+        assert!(matches!(sr(&bytes, 60, &up), SrDecode::Skipped(SrSkip::NotReady)));
+    }
+
+    /// Re-sizing a kept transparent model output matches a full upscale too.
+    #[test]
+    fn resizing_a_kept_transparent_output_matches_a_full_upscale() {
+        let rgba: Vec<u8> =
+            (0..50 * 70).flat_map(|i| [(i * 11 % 256) as u8, (i % 97) as u8, 60, (i * 13 % 256) as u8]).collect();
+        let bytes = png_bytes(50, 70, png::ColorType::Rgba, &rgba);
+        let up = FakeUpscaler::new(4);
+        let mut r = Resizer::new();
+        let SrDecode::Page(_, master) = decode_sr(&bytes, 100, &up, &|| false, &mut r).unwrap() else {
+            panic!()
+        };
+        for target in [123, 200, 280, 400] {
+            let SrDecode::Page(full, _) = decode_sr(&bytes, target, &up, &|| false, &mut r).unwrap() else {
+                panic!()
+            };
+            let resized = sr_from_master(&master, target, &mut r).unwrap();
+            assert_eq!((resized.w, resized.h), (full.w, full.h), "target {target}");
+            assert!(resized.pixels == full.pixels, "target {target}: same pixels");
+        }
     }
 
     /// Re-sizing a kept model output gives exactly what a full decode → model →
