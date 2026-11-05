@@ -74,6 +74,9 @@ pub struct UiState {
     /// add-on's status line ("Ready · <GPU>", "Add-on not installed", …). Set by
     /// the app each frame.
     pub upscale: bool,
+    /// An add-on is installed (by yosh, completely, or by hand): only then are the
+    /// on/off, backend and profile controls shown.
+    pub addon_present: bool,
     pub upscale_backend: crate::config::UpscaleBackend,
     pub upscale_status: String,
     /// "TensorRT-RTX failed (…); using TensorRT (or DirectML) instead", or empty.
@@ -1243,45 +1246,49 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
             // says whether it's installed and what it runs on.
             ui.label(egui::RichText::new(t.ai_upscaling).strong())
                 .on_hover_text(t.upscale_pages);
-            ui.horizontal(|ui| {
-                if ui.selectable_label(st.upscale, t.on).clicked() && !st.upscale {
-                    st.req_set_upscale = Some(true);
-                }
-                if ui.selectable_label(!st.upscale, t.off).clicked() && st.upscale {
-                    st.req_set_upscale = Some(false);
-                }
-                if st.upscale {
-                    use crate::config::UpscaleBackend as B;
-                    ui.separator();
-                    let choices: &[(B, &str)] = if cfg!(windows) {
-                        &[
-                            (B::Auto, t.auto),
-                            (B::DirectMl, "DirectML"),
-                            (B::TensorRt, "TensorRT"),
-                            (B::TensorRtRtx, "TensorRT-RTX"),
-                        ]
-                    } else {
-                        &[(B::Auto, t.auto), (B::TensorRt, "TensorRT")]
-                    };
-                    for &(b, text) in choices {
-                        if ui.selectable_label(st.upscale_backend == b, text).clicked() {
-                            st.req_set_upscale_backend = Some(b);
+            // Until the add-on is installed there is nothing to switch on: only the
+            // hint and the install button below.
+            if st.addon_present {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(st.upscale, t.on).clicked() && !st.upscale {
+                        st.req_set_upscale = Some(true);
+                    }
+                    if ui.selectable_label(!st.upscale, t.off).clicked() && st.upscale {
+                        st.req_set_upscale = Some(false);
+                    }
+                    if st.upscale {
+                        use crate::config::UpscaleBackend as B;
+                        ui.separator();
+                        let choices: &[(B, &str)] = if cfg!(windows) {
+                            &[
+                                (B::Auto, t.auto),
+                                (B::DirectMl, "DirectML"),
+                                (B::TensorRt, "TensorRT"),
+                                (B::TensorRtRtx, "TensorRT-RTX"),
+                            ]
+                        } else {
+                            &[(B::Auto, t.auto), (B::TensorRt, "TensorRT")]
+                        };
+                        for &(b, text) in choices {
+                            if ui.selectable_label(st.upscale_backend == b, text).clicked() {
+                                st.req_set_upscale_backend = Some(b);
+                            }
                         }
                     }
+                });
+                if st.upscale {
+                    profile_row(ui, st);
                 }
-            });
-            if st.upscale {
-                profile_row(ui, st);
-            }
-            if st.upscale && !st.upscale_status.is_empty() {
-                ui.label(egui::RichText::new(&st.upscale_status).small());
-            }
-            if st.upscale && !st.upscale_notice.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("\u{26a0} {}", st.upscale_notice))
-                        .small()
-                        .color(egui::Color32::from_rgb(220, 180, 100)),
-                );
+                if st.upscale && !st.upscale_status.is_empty() {
+                    ui.label(egui::RichText::new(&st.upscale_status).small());
+                }
+                if st.upscale && !st.upscale_notice.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("\u{26a0} {}", st.upscale_notice))
+                            .small()
+                            .color(egui::Color32::from_rgb(220, 180, 100)),
+                    );
+                }
             }
             ui.label(egui::RichText::new(t.upscale_hint).weak().small());
             match &st.addon {
@@ -1342,7 +1349,7 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                 });
             }
             ui.horizontal(|ui| {
-                if ui.button(t.open_addon_folder).clicked() {
+                if st.addon_present && ui.button(t.open_addon_folder).clicked() {
                     st.req_open_addon_folder = true;
                 }
                 if st.addon_removable && !st.addon_remove_confirm && ui.button(t.addon_remove).clicked() {
