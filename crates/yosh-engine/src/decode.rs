@@ -159,6 +159,27 @@ fn downscale_color(
     Ok(DecodedImage { w: tw, h: target_h, src_w: w, src_h: h, gray: false, path: ResizePath::Color, pixels })
 }
 
+/// [`downscale_color`] for a page with transparency: `rgba` is **straight**
+/// alpha, and the result is premultiplied, ready for the page shader's
+/// premultiplied blend. The resizer weights the color by alpha itself
+/// (`fast_image_resize`'s `mul_div_alpha`, on by default), so the input must
+/// not be premultiplied already: that applied alpha twice, and dividing the
+/// result by a tiny resized alpha at a soft edge came out as bright specks
+/// (color far above alpha). Premultiplying the straight result keeps every
+/// pixel's color at or below its alpha.
+fn downscale_transparent(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    tw: u32,
+    target_h: u32,
+    resizer: &mut Resizer,
+) -> Result<DecodedImage, String> {
+    let mut img = downscale_color(rgba, w, h, tw, target_h, resizer)?;
+    premultiply_alpha(&mut img.pixels);
+    Ok(img)
+}
+
 /// LQ grayscale: a fast 8-bit Bilinear downscale in gamma space. Skips the HQ
 /// cost — the 32M-px sRGB→linear pass, the U16 Catmull-Rom, and the Dot-Gain
 /// re-encode — so it's several times faster (and shows some screentone moiré).
@@ -248,11 +269,10 @@ fn finish(p: Prepared, target_h: u32, resizer: &mut Resizer) -> Result<DecodedIm
         let mut img = downscale_gray(&rgba_to_luma(&full), w, h, tw, th, resizer)?;
         img.path = ResizePath::GrayFromColor; // same gray path, but source was color
         Ok(img)
-    } else {
-        if !opaque {
-            premultiply_alpha(&mut full);
-        }
+    } else if opaque {
         downscale_color(&full, w, h, tw, th, resizer)
+    } else {
+        downscale_transparent(&full, w, h, tw, th, resizer)
     }
 }
 
@@ -452,20 +472,19 @@ pub fn sr_from_master(m: &SrMaster, target_h: u32, resizer: &mut Resizer) -> Res
     let (tw, th) = target_dims(sw, sh, target_h);
     check_fits(tw, th)?;
     let mut img = if m.alpha {
-        // Transparent: an RGBA texture, premultiplied before the resize like a
-        // transparent page on the normal path (`finish`), so its Lanczos3 doesn't
-        // bleed the color of see-through pixels into their neighbours. A gray
+        // Transparent: a premultiplied RGBA texture, resized like a transparent
+        // page on the normal path (`finish` → `downscale_transparent`). A gray
         // page's luma fills all three channels.
         let mut rgba = if m.gray {
             m.pixels.as_chunks::<2>().0.iter().flat_map(|&[y, a]| [y, y, y, a]).collect()
         } else {
             m.pixels.clone()
         };
-        premultiply_alpha(&mut rgba);
         if tw == sw && th == sh {
+            premultiply_alpha(&mut rgba);
             DecodedImage { w: sw, h: sh, src_w: sw, src_h: sh, gray: false, path: ResizePath::None, pixels: rgba }
         } else {
-            downscale_color(&rgba, sw, sh, tw, th, resizer)?
+            downscale_transparent(&rgba, sw, sh, tw, th, resizer)?
         }
     } else if m.gray {
         if tw == sw && th == sh {
@@ -548,16 +567,21 @@ fn downscale_rgba_frame(
     target_h: u32,
     resizer: &mut Resizer,
 ) -> Result<DecodedImage, String> {
-    // GIF/WebP frames can be transparent — premultiply before resize/return.
-    if !is_opaque(&rgba) {
-        premultiply_alpha(&mut rgba);
-    }
+    // GIF/WebP frames can be transparent — the texture is premultiplied.
+    let opaque = is_opaque(&rgba);
     let (tw, th) = target_dims(w, h, target_h);
     check_fits(tw, th)?;
     if tw == w && th == h {
+        if !opaque {
+            premultiply_alpha(&mut rgba);
+        }
         return Ok(DecodedImage { w, h, src_w: w, src_h: h, gray: false, path: ResizePath::None, pixels: rgba });
     }
-    downscale_color(&rgba, w, h, tw, th, resizer)
+    if opaque {
+        downscale_color(&rgba, w, h, tw, th, resizer)
+    } else {
+        downscale_transparent(&rgba, w, h, tw, th, resizer)
+    }
 }
 
 /// Turn an animation's decoded frames into a `DecodedPage`: downscale each frame
@@ -974,6 +998,51 @@ mod tests {
                 assert!((p[0] as i32 - 100).abs() <= 1 && (p[1] as i32 - 50).abs() <= 1);
             }
             _ => panic!("png is a still"),
+        }
+    }
+
+    /// A downscaled transparent page is a valid premultiplied texture: no
+    /// channel above its alpha. Premultiplying *before* the resizer (which
+    /// weights by alpha itself) broke this at soft edges — faint, bright
+    /// pixels beside a hard opaque edge came out as specks like (255,255,255,1)
+    /// that the premultiplied blend draws at full brightness. Checked on the
+    /// normal path and on an AI master (whose alpha recovery makes such pixels).
+    #[test]
+    fn downscaled_transparent_page_stays_premultiplied() {
+        let (w, h) = (64u32, 64u32);
+        let rgba: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                if x < 24 {
+                    [20, 20, 30, 255]
+                } else if x < 40 {
+                    [255, (y * 4) as u8, 255 - (y * 4) as u8, ((x + y) % 4) as u8]
+                } else {
+                    [0, 0, 0, 0]
+                }
+            })
+            .collect();
+        let check = |img: &DecodedImage, what: &str| {
+            for (i, p) in img.pixels.as_chunks::<4>().0.iter().enumerate() {
+                assert!(p[..3].iter().all(|&c| c <= p[3]), "{what}: pixel {i} {p:?} has color above alpha");
+            }
+        };
+        let mut resizer = Resizer::new();
+        let bytes = png_bytes(w, h, png::ColorType::Rgba, &rgba);
+        for th in [41, 50, 63] {
+            let DecodedPage::Still(img) = decode_page(&bytes, th, false, &mut resizer).unwrap() else { panic!() };
+            assert_eq!(img.h, th);
+            check(&img, "decode");
+            let master = SrMaster {
+                model: "m".into(),
+                scale: 1,
+                src_w: w,
+                src_h: h,
+                gray: false,
+                alpha: true,
+                pixels: rgba.clone(),
+            };
+            check(&sr_from_master(&master, th, &mut resizer).unwrap(), "sr");
         }
     }
 

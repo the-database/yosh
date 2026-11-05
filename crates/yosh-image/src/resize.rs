@@ -7,8 +7,11 @@
 //! - [`lanczos`]: color (or anything else) in gamma space, Lanczos3.
 //! - [`bilinear`]: a fast gamma-space bilinear (yosh's transient seek tier).
 //!
-//! RGBA with alpha should be premultiplied before resizing (and un-premultiplied
-//! after, if straight alpha is wanted) to avoid fringing.
+//! 4-channel (and 2-channel) input is **straight** alpha: the resizer weights
+//! the color by alpha itself (`fast_image_resize`'s `mul_div_alpha`, on by
+//! default), so transparent pixels don't fringe, and the output is straight
+//! too. Don't premultiply first: that applies alpha twice, and soft edges come
+//! out with color far above alpha. Premultiply the output if that's wanted.
 
 pub use fast_image_resize::Resizer;
 use fast_image_resize::images::{Image, ImageRef};
