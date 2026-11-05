@@ -1167,6 +1167,7 @@ mod tests {
             src_w: 1,
             src_h: 1,
             gray: true,
+            alpha: false,
             pixels: vec![0; bytes],
         })
     }

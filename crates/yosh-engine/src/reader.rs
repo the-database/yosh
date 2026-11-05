@@ -832,9 +832,10 @@ pub enum SrViewState {
     /// The page on screen is the upscaled one (possibly being re-sized for a
     /// new zoom, which is quick).
     Done,
-    /// Shown at or below its native size (or an animation/transparent page):
-    /// nothing for a model to improve.
+    /// Shown at or below its native size: nothing for a model to improve.
     NotNeeded,
+    /// An animation, an `.ico` or a GIF: those aren't upscaled.
+    Unsupported,
     /// No model applies to this page.
     NoModel,
     /// The model or runtime failed.
@@ -849,7 +850,7 @@ impl SrViewState {
             SrViewState::Working | SrViewState::Preparing => 4,
             SrViewState::Failed(_) | SrViewState::NoModel => 3,
             SrViewState::Done => 2,
-            SrViewState::NotNeeded => 1,
+            SrViewState::Unsupported | SrViewState::NotNeeded => 1,
         }
     }
 }
@@ -1069,7 +1070,7 @@ impl Reader {
         (!models.is_empty()).then(|| models.join(" / "))
     }
 
-    /// Whether the SR lane should produce page `i` at `want`: an opaque still
+    /// Whether the SR lane should produce page `i` at `want`: a still
     /// shown above its source size, not already skipped at this target.
     fn sr_wants(&self, i: usize, p: &PageTexture, want: u32, sr_active: bool) -> bool {
         sr_active
@@ -1089,13 +1090,17 @@ impl Reader {
         if p.sr && (p.target_h == want || self.sr_wants(i, p, want, true)) {
             return Some(SrViewState::Done);
         }
-        if p.frame_count() != 1 || want <= p.src_h {
+        if want <= p.src_h {
             return Some(SrViewState::NotNeeded);
+        }
+        if p.frame_count() != 1 {
+            return Some(SrViewState::Unsupported);
         }
         Some(match self.sr_skip.get(&i) {
             Some((t, r)) if *t == want => match r {
                 SrSkip::NotReady => SrViewState::Preparing,
-                SrSkip::Unsupported => SrViewState::NotNeeded,
+                SrSkip::NotNeeded => SrViewState::NotNeeded,
+                SrSkip::Unsupported => SrViewState::Unsupported,
                 SrSkip::NoModel => SrViewState::NoModel,
                 SrSkip::Failed(e) => SrViewState::Failed(e.clone()),
             },

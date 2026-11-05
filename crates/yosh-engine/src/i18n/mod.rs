@@ -271,6 +271,7 @@ pub struct Strings {
     pub sr_preparing_tip: &'static str,
     pub sr_done: &'static str,
     pub sr_not_needed: &'static str,
+    pub sr_unsupported: &'static str,
     pub sr_no_model: &'static str,
     /// "AI upscaling failed: {error}".
     pub sr_failed: fn(&str) -> String,

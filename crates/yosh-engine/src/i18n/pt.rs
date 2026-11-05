@@ -71,6 +71,7 @@ pub static PT: Strings = Strings {
     sr_preparing_tip: "Preparando o modelo de IA — no primeiro uso é criado um mecanismo TensorRT (cerca de um minuto)",
     sr_done: "Esta página foi ampliada com IA",
     sr_not_needed: "Exibida no tamanho nativo ou menor — nada a ampliar",
+    sr_unsupported: "Animações, GIFs e arquivos .ico não são ampliados por IA",
     sr_no_model: "Nenhum modelo de IA se aplica a esta página",
     sr_failed: |e| format!("Falha na ampliação com IA: {e}"),
     sr_book_off: "A ampliação com IA está desligada neste livro (U para ligar)",

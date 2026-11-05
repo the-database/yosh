@@ -71,6 +71,7 @@ pub static JA: Strings = Strings {
     sr_preparing_tip: "AI モデルを準備しています — 初回は TensorRT エンジンを構築します（約 1 分）",
     sr_done: "このページは AI アップスケール済み",
     sr_not_needed: "原寸以下で表示中 — アップスケール不要",
+    sr_unsupported: "アニメーション・GIF・.ico ファイルは AI アップスケールの対象外",
     sr_no_model: "このページに合う AI モデルがありません",
     sr_failed: |e| format!("AI アップスケールに失敗しました: {e}"),
     sr_book_off: "この本の AI アップスケールはオフです（U でオン）",
