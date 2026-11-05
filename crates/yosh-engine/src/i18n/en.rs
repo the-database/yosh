@@ -67,6 +67,7 @@ pub static EN: Strings = Strings {
     sr_preparing_tip: "Preparing the AI model — the first use builds a TensorRT engine (about a minute)",
     sr_done: "This page is AI-upscaled",
     sr_not_needed: "Shown at or below its native size — nothing to upscale",
+    sr_unsupported: "Animations, GIFs and .ico files aren't AI-upscaled",
     sr_no_model: "No AI model applies to this page",
     sr_failed: |e| format!("AI upscaling failed: {e}"),
     sr_book_off: "AI upscaling is off for this book (U to turn on)",

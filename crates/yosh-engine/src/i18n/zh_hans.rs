@@ -71,6 +71,7 @@ pub static ZH_HANS: Strings = Strings {
     sr_preparing_tip: "正在准备 AI 模型 — 首次使用会构建 TensorRT 引擎（约 1 分钟）",
     sr_done: "此页已经过 AI 超分辨率",
     sr_not_needed: "以原始尺寸或更小显示 — 无需放大",
+    sr_unsupported: "动画、GIF 和 .ico 文件不进行 AI 放大",
     sr_no_model: "没有适用于此页的 AI 模型",
     sr_failed: |e| format!("AI 超分辨率失败: {e}"),
     sr_book_off: "本书的 AI 超分辨率已关闭（按 U 开启）",

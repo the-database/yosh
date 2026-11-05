@@ -42,8 +42,10 @@ pub enum SrOutcome {
 /// surfaced to the user through [`crate::reader::SrViewState`]).
 #[derive(Clone, Debug, PartialEq)]
 pub enum SrSkip {
-    /// Nothing for a model to do: shown at or below source size, an animation,
-    /// or transparent (alpha stays on the normal path).
+    /// Nothing for a model to do: shown at or below source size.
+    NotNeeded,
+    /// A file decoded as more than one image (an animation, an `.ico`) or a GIF:
+    /// those aren't upscaled.
     Unsupported,
     /// No rule maps this page to a model.
     NoModel,

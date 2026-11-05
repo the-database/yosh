@@ -71,6 +71,7 @@ pub static ES: Strings = Strings {
     sr_preparing_tip: "Preparando el modelo de IA: la primera vez se construye un motor TensorRT (alrededor de un minuto)",
     sr_done: "Esta página está escalada con IA",
     sr_not_needed: "Se muestra a su tamaño nativo o menor: nada que escalar",
+    sr_unsupported: "Las animaciones, los GIF y los archivos .ico no se escalan con IA",
     sr_no_model: "Ningún modelo de IA se aplica a esta página",
     sr_failed: |e| format!("Falló el escalado con IA: {e}"),
     sr_book_off: "El escalado con IA está desactivado en este libro (U para activarlo)",
