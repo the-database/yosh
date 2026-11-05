@@ -24,6 +24,7 @@ use crate::addon_setup;
 use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
+use crate::profiles::{self, ProfileId, Profiles};
 use yosh_engine::gesture::{GestureCtx, GestureEvent, Phase, TouchGestures};
 use yosh_engine::i18n::{self, tr, Lang};
 use yosh_engine::page::{FitMode, PagePipeline};
@@ -343,6 +344,14 @@ struct State {
     upscale_status: addon::Status,
     /// TensorRT-RTX couldn't start: why, and the backend running instead.
     upscale_fallback: Option<(String, &'static str)>,
+    /// The custom upscaling profiles (`rules.json`, `profiles.rs`), the profile in
+    /// use this session (`Settings::upscale_profile` at start; Shift/Ctrl+1..9
+    /// switch it), and whether Shift/Ctrl+0 switched upscaling off.
+    profiles: Profiles,
+    profile: ProfileId,
+    profile_off: bool,
+    /// Shift is down (Shift+1..3 pick a built-in profile; Ctrl is `ctrl_held`).
+    shift_held: bool,
     // Installing the add-on (`addon_setup.rs`): the running install, its latest
     // progress, and the last failure. `addon_installed` / `addon_update` cache the
     // folder's state (refreshed by `start_upscaler`), so the panel doesn't stat
@@ -1160,6 +1169,10 @@ impl ApplicationHandler for App {
             upscale_rx: None,
             upscale_status: addon::Status::Off,
             upscale_fallback: None,
+            profiles: Profiles::default(),
+            profile: ProfileId::Balanced,
+            profile_off: false,
+            shift_held: false,
             addon_job: None,
             addon_progress: None,
             addon_error: None,
@@ -1202,6 +1215,8 @@ impl ApplicationHandler for App {
             // A removal or update asked for while the add-on was loaded runs now,
             // before the upscaler loads it; after an update the upscaler starts
             // when it finishes.
+            state.load_profiles();
+            state.profile = state.default_profile();
             if state.settings.addon_remove_pending {
                 state.remove_addon();
             } else if state.settings.addon_update_pending
@@ -1271,7 +1286,9 @@ impl ApplicationHandler for App {
             WindowEvent::DroppedFile(path) => state.ui.pending_open = Some(path),
             WindowEvent::RedrawRequested => state.render(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if let Some(action) = action_from(&event) && !response.consumed {
+                if let Some(action) = action_from(&event, state.ctrl_held, state.shift_held)
+                    && !response.consumed
+                {
                     if matches!(action, Action::Quit) {
                         // Immediate exit, skipping destructor teardown — see
                         // `CloseRequested` above.
@@ -1324,12 +1341,16 @@ impl ApplicationHandler for App {
             // Ctrl arms the wheel's focal zoom. Not routed through `action_from`: this
             // is modifier *state*, not a keypress, and the wheel needs it on the frame
             // the notch arrives.
-            WindowEvent::ModifiersChanged(m) => state.ctrl_held = m.state().control_key(),
+            WindowEvent::ModifiersChanged(m) => {
+                state.ctrl_held = m.state().control_key();
+                state.shift_held = m.state().shift_key();
+            }
             WindowEvent::Focused(false) => {
                 state.cursor_in_window = false;
                 // A Ctrl-held alt-tab releases the key while we're unfocused, so the
                 // flag would stay stuck on until the next ModifiersChanged.
                 state.ctrl_held = false;
+                state.shift_held = false;
             }
             WindowEvent::Occluded(true) => {
                 state.cursor_in_window = false;
@@ -1416,6 +1437,9 @@ enum Action {
     TogglePageTransition,
     ToggleStretch,
     ToggleUpscale,
+    /// Shift+1..3 (built-in), Ctrl+1..9 (custom): switch the AI-upscaling
+    /// profile; `None` (Shift/Ctrl+0) switches upscaling off.
+    UseProfile(Option<ProfileId>),
     ToggleAnimBar,
     PrevVolume,
     NextVolume,
@@ -1424,10 +1448,49 @@ enum Action {
     Quit,
 }
 
+fn top_row_digit(c: KeyCode) -> Option<u8> {
+    use KeyCode::*;
+    Some(match c {
+        Digit0 => 0,
+        Digit1 => 1,
+        Digit2 => 2,
+        Digit3 => 3,
+        Digit4 => 4,
+        Digit5 => 5,
+        Digit6 => 6,
+        Digit7 => 7,
+        Digit8 => 8,
+        Digit9 => 9,
+        _ => return None,
+    })
+}
+
+/// What Shift/Ctrl + digit `n` switches to: `Some(None)` = upscaling off,
+/// `None` = nothing (Shift+4..9).
+fn profile_key(n: u8, ctrl: bool) -> Option<Option<ProfileId>> {
+    match (n, ctrl) {
+        (0, _) => Some(None),
+        (n, true) => Some(Some(ProfileId::Custom(n))),
+        (1, false) => Some(Some(ProfileId::Quality)),
+        (2, false) => Some(Some(ProfileId::Balanced)),
+        (3, false) => Some(Some(ProfileId::Performance)),
+        _ => None,
+    }
+}
+
 /// Map a key event to an action, preferring the physical key but falling back to
 /// the logical key (covers injected events without scancodes). Vertical keys are
 /// absolute (forward/backward); horizontal keys are resolved by reading direction.
-fn action_from(ev: &KeyEvent) -> Option<Action> {
+fn action_from(ev: &KeyEvent, ctrl: bool, shift: bool) -> Option<Action> {
+    // Shift/Ctrl + a top-row digit: the AI-upscaling profiles, as in
+    // mpv-AnimeJaNai. Never the bare digits' view presets. Not the number pad,
+    // whose Shift turns into the navigation keys with Num Lock on.
+    if (ctrl || shift)
+        && let PhysicalKey::Code(c) = ev.physical_key
+        && let Some(n) = top_row_digit(c)
+    {
+        return profile_key(n, ctrl).map(Action::UseProfile);
+    }
     if let PhysicalKey::Code(c) = ev.physical_key {
         match c {
             KeyCode::ArrowDown | KeyCode::Space | KeyCode::PageDown => return Some(Action::Forward),
@@ -1646,6 +1709,7 @@ impl State {
             }
             Action::ToggleStretch => self.toggle_stretch(),
             Action::ToggleUpscale => self.toggle_upscale(),
+            Action::UseProfile(p) => self.use_profile(p),
             Action::ToggleAnimBar => self.playback.hidden = !self.playback.hidden,
             Action::ToggleFullscreen => {
                 let fs = match self.window.fullscreen() {
@@ -1745,7 +1809,9 @@ impl State {
             self.toast(tr().toast_upscale_unavailable);
             return;
         }
-        let on = !self.reader.sr_enabled();
+        // Back on after Shift/Ctrl+0 switched it off: on, for this book too.
+        let on = self.profile_off || !self.reader.sr_enabled();
+        self.profile_off = false;
         self.reader.set_sr_enabled(on);
         if let Some(k) = &self.volume_key {
             if on {
@@ -1797,8 +1863,124 @@ impl State {
         };
         self.aji_loaded = true;
         self.upscale_status = addon::Status::Starting;
+        // `rules.json` may have changed (by hand, or an install's); a profile
+        // that's gone falls back to the default.
+        self.load_profiles();
+        if !self.profiles.exists(self.profile) {
+            self.profile = self.default_profile();
+        }
+        let rules = self.profile_rules(&dir);
         self.upscale_rx =
-            Some(addon::start(dir, self.settings.upscale_choice(), frame_waker(&self.window)));
+            Some(addon::start(dir, self.settings.upscale_choice(), rules, frame_waker(&self.window)));
+    }
+
+    /// Read the custom profiles from the add-on's `rules.json`. An older
+    /// `rules.json` (one bare rule list, which replaced the built-in rules) is now
+    /// custom slot 1: it becomes the default profile, so that add-on keeps picking
+    /// the same models, and the file is rewritten in the profiles form.
+    fn load_profiles(&mut self) {
+        let Some(dir) = config::addon_dir() else {
+            return;
+        };
+        let loaded = profiles::load(&dir);
+        self.profiles = loaded.profiles;
+        if loaded.legacy {
+            self.settings.upscale_profile = ProfileId::Custom(1).token();
+            self.profile = ProfileId::Custom(1);
+            config::save(&self.settings);
+            if let Err(e) = profiles::save(&dir, &self.profiles) {
+                eprintln!("yosh: couldn't rewrite rules.json: {e}");
+            }
+        }
+    }
+
+    /// The default profile from the settings, if it still exists (a custom slot
+    /// may have been emptied), else Balanced.
+    fn default_profile(&self) -> ProfileId {
+        ProfileId::from_token(&self.settings.upscale_profile)
+            .filter(|&id| self.profiles.exists(id))
+            .unwrap_or_default()
+    }
+
+    /// The session's profile's rules for the add-on in `dir`.
+    fn profile_rules(&self, dir: &Path) -> Vec<yosh_engine::sr::rules::SrRule> {
+        self.profiles.rules(self.profile, &dir.join("models")).unwrap_or_default()
+    }
+
+    /// Switch the AI-upscaling profile for this session (Shift+1..3, Ctrl+1..9,
+    /// the AI chip's menu), or switch upscaling off (`None`, Shift/Ctrl+0). The
+    /// running upscaler takes the new rules in place, and the pages already
+    /// upscaled with a model the new rules don't pick are re-done
+    /// (`Reader::upscaler_rules_changed`).
+    fn use_profile(&mut self, id: Option<ProfileId>) {
+        if let Some(ProfileId::Custom(n)) = id
+            && !self.profiles.exists(ProfileId::Custom(n))
+        {
+            self.toast((tr().toast_profile_empty)(n));
+            return;
+        }
+        if self.reader.upscaler.is_none() && self.upscale_rx.is_none() {
+            self.toast(tr().toast_upscale_unavailable);
+            return;
+        }
+        match id {
+            None => {
+                self.profile_off = true;
+                self.reader.set_sr_enabled(false);
+                self.toast(tr().toast_upscale_off);
+            }
+            Some(id) => {
+                let book_on = self.volume_key.as_ref().is_none_or(|k| !self.settings.upscale_off.contains(k));
+                self.profile_off = false;
+                self.profile = id;
+                self.reader.set_sr_enabled(book_on);
+                self.apply_profile_rules();
+                self.toast((tr().toast_profile)(&self.profiles.name(id)));
+            }
+        }
+        self.reader.prefetch();
+    }
+
+    /// Save the profile editor's custom slots to `rules.json`, and run the
+    /// session's profile with its new rules (if it was a slot now emptied: the
+    /// default profile).
+    fn save_profiles(&mut self, p: Profiles) {
+        let Some(dir) = config::addon_dir() else {
+            return;
+        };
+        let t = tr();
+        if let Err(e) = profiles::save(&dir, &p) {
+            if let Some(ed) = self.ui.profile_editor.as_mut() {
+                ed.note = Some(((t.profiles_save_failed)(&e), true));
+            }
+            return;
+        }
+        let changed = p.rules(self.profile, Path::new("")) != self.profiles.rules(self.profile, Path::new(""));
+        self.profiles = p;
+        if let Some(ed) = self.ui.profile_editor.as_mut() {
+            ed.saved = self.profiles.clone();
+            ed.note = None;
+        }
+        if !self.profiles.exists(self.profile) {
+            self.profile = self.default_profile();
+            self.apply_profile_rules();
+        } else if changed {
+            self.apply_profile_rules();
+        }
+        self.reader.prefetch();
+    }
+
+    /// Hand the session profile's rules to the running upscaler (a start still
+    /// under way reads them when it's done: `poll_background`).
+    fn apply_profile_rules(&mut self) {
+        let Some(dir) = config::addon_dir() else {
+            return;
+        };
+        let rules = self.profile_rules(&dir);
+        if let Some(up) = &self.reader.upscaler {
+            up.set_rules(rules);
+            self.reader.upscaler_rules_changed();
+        }
     }
 
     /// Install or update the add-on in the background (`addon_setup.rs`). The
@@ -2426,7 +2608,7 @@ impl State {
         }
         let key = path.to_string_lossy().into_owned();
         self.reader.spread_offset = self.settings.spread_offsets.get(&key).copied().unwrap_or(0) as usize;
-        self.reader.set_sr_enabled(!self.settings.upscale_off.contains(&key));
+        self.reader.set_sr_enabled(!self.profile_off && !self.settings.upscale_off.contains(&key));
         // Explicit start (e.g. a specific dropped image) wins; else CLI start
         // index; else the saved position.
         let idx = match start {
@@ -2989,6 +3171,8 @@ impl State {
             match rx.try_recv() {
                 Ok(Ok(run)) => {
                     self.reader.set_upscaler(Some(run.upscaler));
+                    // A profile picked while it was starting.
+                    self.apply_profile_rules();
                     self.upscale_status = addon::Status::Ready(run.device);
                     self.upscale_fallback = run.fallback;
                     changed = true;
@@ -3515,6 +3699,9 @@ impl State {
         self.ui.resize_path = self.reader.resize_path_label();
         self.ui.sr_available = self.reader.upscaler.is_some();
         self.ui.sr_book_on = self.reader.sr_enabled();
+        self.ui.profile_menu = self.profiles.usable().into_iter().map(|id| (id, self.profiles.name(id))).collect();
+        self.ui.profile_current = (!self.profile_off).then_some(self.profile);
+        self.ui.profile_default = self.default_profile();
         self.ui.sr_state = self.reader.sr_view_state();
         self.ui.sr_model = self.reader.sr_model_label().unwrap_or_default();
         // Drain transient messages the reader queued (boundary hit, zoom level)
@@ -3922,6 +4109,32 @@ impl State {
             self.start_upscaler();
             ui_acted = true;
         }
+        if let Some(p) = self.ui.req_use_profile.take() {
+            self.use_profile(p);
+            ui_acted = true;
+        }
+        if let Some(id) = self.ui.req_set_default_profile.take() {
+            self.settings.upscale_profile = id.token();
+            config::save(&self.settings);
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_open_profile_editor) {
+            match self.ui.profile_editor.as_mut() {
+                Some(ed) => ed.open = true,
+                None => {
+                    if let Some(dir) = config::addon_dir() {
+                        self.load_profiles();
+                        self.ui.profile_editor =
+                            Some(crate::profile_editor::Editor::new(&self.profiles, self.profile, dir.join("models")));
+                    }
+                }
+            }
+            ui_acted = true;
+        }
+        if let Some(p) = self.ui.req_save_profiles.take() {
+            self.save_profiles(p);
+            ui_acted = true;
+        }
         if std::mem::take(&mut self.ui.req_toggle_upscale) {
             self.apply_action(Action::ToggleUpscale);
             ui_acted = true;
@@ -4148,7 +4361,23 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_tier, DeviceTier};
+    use super::{effective_tier, profile_key, DeviceTier};
+    use crate::profiles::ProfileId;
+
+    /// mpv-AnimeJaNai's profile keys: Shift+1..3 built-in, Ctrl+1..9 custom,
+    /// either + 0 off; Shift+4..9 do nothing (and never the view presets).
+    #[test]
+    fn profile_keys() {
+        assert_eq!(profile_key(1, false), Some(Some(ProfileId::Quality)));
+        assert_eq!(profile_key(2, false), Some(Some(ProfileId::Balanced)));
+        assert_eq!(profile_key(3, false), Some(Some(ProfileId::Performance)));
+        assert_eq!(profile_key(4, false), None);
+        assert_eq!(profile_key(9, false), None);
+        assert_eq!(profile_key(0, false), Some(None));
+        assert_eq!(profile_key(0, true), Some(None));
+        assert_eq!(profile_key(1, true), Some(Some(ProfileId::Custom(1))));
+        assert_eq!(profile_key(9, true), Some(Some(ProfileId::Custom(9))));
+    }
     use crate::config::PerfPref;
     use yosh_engine::reader::Budget;
 
