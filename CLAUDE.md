@@ -215,8 +215,9 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   keeps the NVIDIA GPUs' compute capabilities setup ran for; on each upscaler start a background check
   (`needs_setup_for_gpus`, NVML via `yosh_image::nvml`, independent of the add-on) offers *Install for
   this GPU* when one here is new (a portable yosh moved, a GPU swap): `Mode::SetupOnly` re-runs only
-  setup, which only adds files, so it runs while libaji is loaded. To bump: release
-  MangaJaNaiCLI, then update `CLI_VERSION` and both `CLI_ASSET` pins. `YOSH_ADDON_ARCHIVE=<archive>`
+  setup, which only adds files, so it runs while libaji is loaded. To bump: a MangaJaNaiCLI
+  release opens the PR here (`bump-pins.yml` runs `scripts/bump_pins.py mangajanai-cli <tag>`,
+  which updates `CLI_VERSION` and both `CLI_ASSET` pins from the downloaded archives). `YOSH_ADDON_ARCHIVE=<archive>`
   installs from a local MangaJaNaiCLI build instead (not pin-checked); `install_end_to_end` is the
   manual whole-install test (`--ignored`).
 
@@ -273,5 +274,8 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   zip + bare exe, and the Linux binary) **only on `v*` tags**. `workflow_dispatch` builds artifacts **without**
   releasing. Pushing to `main` alone runs **no** CI. **Be sparing with CI runs** — don't tag/dispatch to "test";
   validate locally first.
+- A release's last job (`notify-downstream.yml`) asks MangaJaNaiCLI to re-pin yosh-image to the tagged
+  commit; its bump PR opens only if `crates/yosh-image` changed. Needs the `JANAI_BUMP_TOKEN` secret,
+  as does `bump-pins.yml` (the MangaJaNaiCLI bump PRs here).
 - The version string the app reports (CLI `--version`, F1 help, self-update compare) comes from
   `CARGO_PKG_VERSION`, so the `Cargo.toml` bump is the single source of truth.

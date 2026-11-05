@@ -266,3 +266,13 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: yosh-android.apk
+
+  # MangaJaNaiCLI opens a PR that re-pins yosh-image to this release's commit, if crates/yosh-image
+  # changed (its bump-pins.yml). No CLI_VERSION involved: that pin flows the other way.
+  notify-downstream:
+    needs: [build, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/notify-downstream.yml
+    with:
+      tag: ${{ github.ref_name }}
+    secrets: inherit
