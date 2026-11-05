@@ -79,6 +79,11 @@ pub trait Upscaler: Send + Sync {
     /// changed (same model ⇒ same output).
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<std::sync::Arc<str>>;
 
+    /// Replace the rules that pick the model (a profile switch). Takes effect
+    /// for the next page; the reader re-runs the pages upscaled with a model the
+    /// new rules no longer pick ([`crate::reader::Reader::upscaler_rules_changed`]).
+    fn set_rules(&self, _rules: Vec<rules::SrRule>) {}
+
     /// Set once a model fell back from the backend it was opened on
     /// (TensorRT-RTX) to TensorRT: "<model>: <why>", for the first one. The
     /// shell shows it, so a fallback isn't only a log line.

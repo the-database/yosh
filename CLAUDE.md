@@ -161,7 +161,17 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   Opaque pages take the unchanged path. Still skipped: GIFs, `.ico`s and animations (`SrSkip::Unsupported`,
   "AI ×" in the chip) and pages shown at or below source size (`SrSkip::NotNeeded`, "AI –").
 - **Model choice is data:** `sr::rules` mirrors MangaJaNaiConverterGui's chain rules (first match on
-  source height, gray/color, target scale); `rules.json` in the add-on overrides the built-in defaults.
+  source height, gray/color, target scale). **Profiles** (`profiles.rs`, laid out like mpv-AnimeJaNai's
+  slots) pick the rule table: built-in Quality / Balanced / Performance (Shift+1/2/3; `quality_rules`,
+  `default_rules` = MangaJaNai GUI's default workflow, `performance_rules`) and nine custom slots
+  (Ctrl+1..9) that the egui editor (`profile_editor.rs`, Settings → AI upscaling → Edit profiles) fills
+  and saves to the add-on's `rules.json` (`{"profiles":[{slot, name, rules}]}`); Shift/Ctrl+0 = off for
+  the session. An older bare-array `rules.json` loads as slot 1 and becomes the default profile
+  (`Settings::upscale_profile`, a plain string token). A switch hands the new rules to the running
+  upscaler (`Upscaler::set_rules`) and `Reader::upscaler_rules_changed` re-runs pages upscaled with a
+  model the new rules don't pick. Import .mwf (`mwf.rs`) reads a MangaJaNai GUI workflow export the
+  way MangaJaNaiCLI does; width limits and resize-before-upscale have no yosh equivalent and are
+  reported as not carried over.
   Model files are named after their ONNX precision, as MangaJaNai GUI 2.0 ships them (the defaults are
   all `_fp16`). The lookup (`sr::aji::lookup_order`) is variant-tolerant, so add-ons built from older or
   newer GUI model files both work and a `rules.json` naming older files keeps working. The exact name
@@ -189,7 +199,7 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
   fails the whole state.json parse on an unknown token, which would reset every setting.
 - UI: Settings → AI upscaling (on/off, Auto = TensorRT-RTX if suited, then TensorRT, then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +
-  corner spinner (`Reader::sr_view_state`); key `U` = per-book switch; info overlay "AI model" row.
+  corner spinner (`Reader::sr_view_state`; right-click = profile menu); key `U` = per-book switch; info overlay "AI model" row.
 - **Installing it (`addon_setup.rs`):** Settings → AI upscaling → *Install the add-on* makes the add-on
   folder a MangaJaNaiCLI install: it downloads the `mangajanai` release archive pinned in `CLI_VERSION` /
   `CLI_ASSET` (SHA-256 checked; zip on Windows, tar.zst on Linux, unpacked flat), then runs

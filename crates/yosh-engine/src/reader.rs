@@ -1020,6 +1020,23 @@ impl Reader {
         }
     }
 
+    /// The upscaler's rules changed ([`Upscaler::set_rules`], a profile switch):
+    /// pages skipped under the old rules are retried, and `prefetch` re-runs the
+    /// upscaled pages whose model the new rules don't pick (in place: the old
+    /// image shows until the new one lands) or reverts them to plain decodes.
+    pub fn upscaler_rules_changed(&mut self) {
+        self.sr_skip.clear();
+        self.sr_skip_gen += 1;
+    }
+
+    /// For an upscaled page: whether the rules now pick another model for it at
+    /// `want` (`Some(true)`: re-run it), or none (`None`: back to a plain decode).
+    fn sr_model_moved(&self, p: &PageTexture, want: u32) -> Option<bool> {
+        let up = self.upscaler.as_ref()?;
+        let now = up.model_for(p.src_h, p.gray, want as f32 / p.src_h.max(1) as f32)?;
+        Some(p.sr_model.as_deref() != Some(&*now))
+    }
+
     /// Whether pages are being AI-upscaled right now (an upscaler is installed and
     /// the per-book switch is on).
     pub fn sr_active(&self) -> bool {
@@ -2193,7 +2210,9 @@ impl Reader {
                         let quality_stale = !lq && p.lq; // have LQ, now want HQ
                         // AI upscale switched off / removed: back to a plain decode,
                         // in place (the upscaled texture shows until it lands).
-                        let sr_revert = p.sr && !sr_active;
+                        // So are pages whose rule now names no model (a profile switch).
+                        let sr_revert = p.sr
+                            && (!sr_active || (want > p.src_h && self.sr_model_moved(p, want).is_none()));
                         // An upscaled page whose size changed is refreshed by the SR
                         // lane (from its kept model output when it can) — not by a
                         // plain decode first, which would flash it soft. Falls back
@@ -2232,7 +2251,10 @@ impl Reader {
                         let want = self.page_target_h(i);
                         // First upscale (a plain page at its settled size), or a
                         // refresh of an upscaled page whose size changed.
-                        let due = (!p.sr && p.target_h == want) || (p.sr && p.target_h != want);
+                        // Or one the rules now give another model (a profile switch).
+                        let due = (!p.sr && p.target_h == want)
+                            || (p.sr && p.target_h != want)
+                            || (p.sr && self.sr_model_moved(p, want) == Some(true));
                         (due && self.sr_wants(i, p, want, true)).then_some((i, want))
                     })
                     .collect()
