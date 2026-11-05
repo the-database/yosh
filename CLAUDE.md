@@ -152,6 +152,14 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   HQ CPU resize (`sr_from_master`) to the exact target, so the GPU samples 1:1. The model's full-size
   output (`SrMaster`) is kept per page (`MasterCache`, 256 MB LRU, per pool), so a zoom/resize of an
   upscaled page only re-sizes it — no read, decode or inference — and skips the plain re-decode.
+- **Transparent pages** (any alpha < 255) upscale the way MangaJaNaiCLI does (`decode::upscale_with_alpha`):
+  uniform alpha upscales the color once and rebuilds the alpha; otherwise the color is composited onto
+  black and onto white, both are upscaled (**two inferences**, so twice the time), and the alpha is
+  recovered from the difference. Gray pages still go to the model as luma (gray models), color as RGB.
+  The `SrMaster` keeps straight gray + alpha / RGBA, and `sr_from_master` premultiplies it before the
+  one Lanczos3 resize (like a transparent page's normal decode), so it uploads as an RGBA texture.
+  Opaque pages take the unchanged path. Still skipped: GIFs, `.ico`s and animations (`SrSkip::Unsupported`,
+  "AI ×" in the chip) and pages shown at or below source size (`SrSkip::NotNeeded`, "AI –").
 - **Model choice is data:** `sr::rules` mirrors MangaJaNaiConverterGui's chain rules (first match on
   source height, gray/color, target scale). **Profiles** (`profiles.rs`, laid out like mpv-AnimeJaNai's
   slots) pick the rule table: built-in Quality / Balanced / Performance (Shift+1/2/3; `quality_rules`,

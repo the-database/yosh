@@ -132,6 +132,7 @@ pub static FR: Strings = Strings {
     sr_preparing_tip: "Préparation du modèle d’IA — la première utilisation construit un moteur TensorRT (environ une minute)",
     sr_done: "Cette page est agrandie par IA",
     sr_not_needed: "Affichée à sa taille native ou moins — rien à agrandir",
+    sr_unsupported: "Les animations, les GIF et les fichiers .ico ne sont pas agrandis par l’IA",
     sr_no_model: "Aucun modèle d’IA ne s’applique à cette page",
     sr_failed: |e| format!("Échec de l’agrandissement par IA : {e}"),
     sr_book_off: "L’agrandissement par IA est désactivé pour ce livre (U pour l’activer)",

@@ -132,6 +132,7 @@ pub static DE: Strings = Strings {
     sr_preparing_tip: "Das KI-Modell wird vorbereitet — beim ersten Mal wird eine TensorRT-Engine erstellt (etwa eine Minute)",
     sr_done: "Diese Seite ist KI-hochskaliert",
     sr_not_needed: "In nativer Größe oder kleiner angezeigt — nichts hochzuskalieren",
+    sr_unsupported: "Animationen, GIFs und .ico-Dateien werden nicht per KI hochskaliert",
     sr_no_model: "Für diese Seite passt kein KI-Modell",
     sr_failed: |e| format!("KI-Hochskalierung fehlgeschlagen: {e}"),
     sr_book_off: "KI-Hochskalierung ist für dieses Buch aus (U zum Einschalten)",

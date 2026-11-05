@@ -856,6 +856,13 @@ pub fn chrome(
                                             .monospace(),
                                     );
                                     ui.end_row();
+                                } else if let Some(why) = sr_skip_reason(st) {
+                                    ui.label(
+                                        egui::RichText::new(tr().info_ai_model)
+                                            .color(egui::Color32::from_gray(150)),
+                                    );
+                                    ui.label(egui::RichText::new(why).color(egui::Color32::from_gray(190)));
+                                    ui.end_row();
                                 }
                             });
                     });
@@ -1371,8 +1378,24 @@ fn profile_row(ui: &mut egui::Ui, st: &mut UiState) {
     ui.label(egui::RichText::new(t.upscale_profile_hint).weak().small());
 }
 
+/// Why AI upscaling left the page in view as it is, for the info overlay's
+/// "AI model" row: only where something stopped it (not when the page doesn't
+/// need it, or upscaling is off or still working).
+fn sr_skip_reason(st: &UiState) -> Option<String> {
+    let t = tr();
+    if !st.sr_book_on {
+        return None;
+    }
+    match st.sr_state.as_ref()? {
+        SrViewState::Unsupported => Some(t.sr_unsupported.into()),
+        SrViewState::NoModel => Some(t.sr_no_model.into()),
+        SrViewState::Failed(e) => Some((t.sr_failed)(e)),
+        _ => None,
+    }
+}
+
 /// The top bar's "AI" chip: what upscaling is doing for the page in view (spinner
-/// while it works, then ✔ / – / ⚠, detail on hover). Click = the per-book
+/// while it works, then ✔ / – / × / ⚠, detail on hover). Click = the per-book
 /// switch (key `U`), so it doubles as the way back on when a book has it off.
 fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
     let t = tr();
@@ -1383,6 +1406,7 @@ fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
         (Some(SrViewState::Preparing), _) => ("", ui.visuals().text_color(), t.sr_preparing_tip.into()),
         (Some(SrViewState::Done), _) => ("\u{2714}", egui::Color32::from_rgb(130, 200, 130), t.sr_done.into()),
         (Some(SrViewState::NotNeeded), _) => ("\u{2013}", ui.visuals().weak_text_color(), t.sr_not_needed.into()),
+        (Some(SrViewState::Unsupported), _) => ("\u{d7}", ui.visuals().weak_text_color(), t.sr_unsupported.into()),
         (Some(SrViewState::NoModel), _) => ("\u{26a0}", egui::Color32::from_rgb(220, 180, 100), t.sr_no_model.into()),
         (Some(SrViewState::Failed(e)), _) => {
             ("\u{26a0}", egui::Color32::from_rgb(220, 130, 130), (t.sr_failed)(e))

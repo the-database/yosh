@@ -132,6 +132,7 @@ pub static KO: Strings = Strings {
     sr_preparing_tip: "AI 모델을 준비하는 중 — 처음 사용할 때 TensorRT 엔진을 빌드합니다 (약 1분)",
     sr_done: "이 페이지는 AI 업스케일됨",
     sr_not_needed: "원본 크기 이하로 표시 중 — 업스케일 불필요",
+    sr_unsupported: "애니메이션, GIF, .ico 파일은 AI 업스케일 대상이 아님",
     sr_no_model: "이 페이지에 맞는 AI 모델이 없음",
     sr_failed: |e| format!("AI 업스케일링 실패: {e}"),
     sr_book_off: "이 책의 AI 업스케일링이 꺼져 있음 (U로 켜기)",
