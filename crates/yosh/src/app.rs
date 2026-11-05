@@ -3594,6 +3594,7 @@ impl State {
             self.on_battery,
         );
         self.ui.upscale = self.settings.upscale;
+        self.ui.addon_present = self.addon_installed && !self.addon_needs_install;
         self.ui.upscale_backend = self.settings.upscale_choice();
         self.ui.upscale_status = match &self.upscale_status {
             addon::Status::Off => String::new(),
