@@ -11,9 +11,9 @@ edition = "2024"
 yosh-engine = { path = "../yosh-engine" }
 winit = "0.30.13"
 wgpu = "30"
-egui = "0.36"
-egui-wgpu = "0.36"
-egui-winit = "0.36"
+egui = "0.37"
+egui-wgpu = "0.37"
+egui-winit = "0.37"
 # Phosphor icon font for the library section carets (pure-Rust glyph set — no C
 # toolchain; the same crate the Android shell uses, so the carets render
 # identically and never fall back to tofu boxes).
