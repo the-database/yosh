@@ -24,7 +24,7 @@ jobs:
             rustflags: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The app's reported version comes from Cargo.toml (CARGO_PKG_VERSION); the
       # release name/installer come from the tag. They must agree — guard against
@@ -160,7 +160,7 @@ jobs:
           Copy-Item crates/yosh/installer/Output/yosh-setup-x64.exe yosh-setup-x64.exe
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
@@ -173,7 +173,7 @@ jobs:
 
       - name: Upload Windows installer artifacts
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: yosh-windows-installers
           path: |
@@ -203,7 +203,7 @@ jobs:
       KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
       KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # A release tag must be release-signed — never publish a debug-signed APK.
       # Fail fast on a tag if the keystore secret is missing. (A manual
@@ -256,7 +256,7 @@ jobs:
         run: cp crates/yosh-android/out/yosh.apk yosh-android.apk
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: yosh-android-apk
           path: yosh-android.apk
