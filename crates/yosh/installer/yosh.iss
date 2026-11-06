@@ -62,6 +62,14 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; Tasks: desktopico
 ; The AI-upscaling add-on (config::addon_dir: the per-user local data dir) is
 ; installed by the app, not by this installer, but it is ~1 GB, so uninstalling
 ; removes it too. Settings, positions and thumbnails are left as they are.
+; First, an add-on whose runtime and models are in the shared pack store
+; (%LOCALAPPDATA%\the-database\aji, shared with other apps) drops its ref there,
+; freeing what no other app uses. A private add-on, or a mangajanai too old to
+; know --remove, just exits; the folder's deletion then leaves a dead ref that
+; the store frees later anyway.
+[UninstallRun]
+Filename: "{localappdata}\the-database\yosh\data\addons\upscale\mangajanai.exe"; Parameters: "setup --remove"; Flags: runhidden skipifdoesntexist waituntilterminated; RunOnceId: "yosh-addon-unref"
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\the-database\yosh\data\addons"
 

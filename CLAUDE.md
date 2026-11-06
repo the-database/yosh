@@ -220,6 +220,25 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   which updates `CLI_VERSION` and both `CLI_ASSET` pins from the downloaded archives). `YOSH_ADDON_ARCHIVE=<archive>`
   installs from a local MangaJaNaiCLI build instead (not pin-checked); `install_end_to_end` is the
   manual whole-install test (`--ignored`).
+- **Shared pack store:**
+  - An installed (not portable) yosh runs setup with `--store --app-id yosh-addon --app-path
+    <the add-on's mangajanai>`, when the add-on's mangajanai has it (`supports_store`).
+    TensorRT, its GPU files, TensorRT-RTX and the models then live once per user in
+    `%LOCALAPPDATA%\the-database\aji` (aji-runtime), shared with MangaJaNaiCLI and the other apps.
+    An older add-on's matching files move there instead of downloading again.
+  - The switch happens only in a full install/update (never a setup-only run beside a loaded
+    libaji).
+  - The ref is tied to the add-on's program, so it lives as long as the add-on folder.
+  - The add-on's `aji-runtime.json` points libaji at the packs and lists the model folders:
+    `addon::models_dirs` = `models/` (the user's own models, which *Add model* copies there)
+    first, then the store's, used by `sr::aji` (`with_model_dirs`), the profiles and the editor.
+  - *Remove the add-on* and the Windows uninstaller (`[UninstallRun]`) run
+    `mangajanai setup --remove` before deleting the folder.
+  - Portable yosh keeps everything in its own add-on folder.
+  - Tests: `YOSH_ADDON_MIRROR=<folder>` passes `--mirror` (the shared runtime release's archives
+    and index), and `AJI_RUNTIME_STORE` points the store at a test folder; never test against the
+    real one. The manual tests are `install_end_to_end`, `store_addon_end_to_end` and
+    `store_remove_end_to_end`, run in that order with `--ignored`.
 
 ### Central state and the frame loop
 - **`app.rs` — `State`** is the winit `ApplicationHandler` and owns the shell: gpu, egui, the `Reader`

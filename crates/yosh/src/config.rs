@@ -273,6 +273,11 @@ fn config_file() -> Option<PathBuf> {
         .map(|d| d.config_dir().join("state.json"))
 }
 
+/// Whether this yosh is portable (a `yosh-portable.txt` marker beside the exe).
+pub fn portable() -> bool {
+    std::env::current_exe().ok().and_then(|e| e.parent().map(is_portable_dir)).unwrap_or(false)
+}
+
 /// The AI-upscaling add-on's directory (see `addon.rs`): beside the exe in portable
 /// mode, else under the per-OS local data dir. `None` if neither resolves.
 pub fn addon_dir() -> Option<PathBuf> {
