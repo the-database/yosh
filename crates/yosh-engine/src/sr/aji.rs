@@ -69,7 +69,9 @@ pub struct AjiUpscaler {
     fallback: Option<Fallback>,
     /// The first model that fell back to TensorRT, and why ([`Upscaler::fallback`]).
     fell_back: Mutex<Option<String>>,
-    models_dir: PathBuf,
+    /// Where models are looked up, in order: the add-on's `models/` first (the user's own
+    /// models go there), then any folders [`AjiUpscaler::with_model_dirs`] added.
+    models_dirs: Vec<PathBuf>,
     /// Swapped whole by [`Upscaler::set_rules`] (a profile switch).
     rules: RwLock<Arc<Vec<SrRule>>>,
     slots: Mutex<HashMap<String, Slot>>,
@@ -98,7 +100,7 @@ impl AjiUpscaler {
             compute_capability: device.compute_capability,
             fallback,
             fell_back: Mutex::new(None),
-            models_dir: dir.join("models"),
+            models_dirs: vec![dir.join("models")],
             rules: RwLock::new(Arc::new(rules)),
             slots: Mutex::new(HashMap::new()),
             watch: Arc::new(Watch {
@@ -110,17 +112,24 @@ impl AjiUpscaler {
         })
     }
 
+    /// Also look up models in `dirs`, after the add-on's `models/` (e.g. the model packs of a
+    /// shared pack store, which the add-on's `aji-runtime.json` lists).
+    pub fn with_model_dirs(mut self, dirs: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.models_dirs.extend(dirs);
+        self
+    }
+
     fn rules(&self) -> Arc<Vec<SrRule>> {
         self.rules.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The installed file for a rule's model `name`: the first of [`lookup_order`]
-    /// in the models folder, logged when it isn't `name` itself.
+    /// in the models folders (in order), logged when it isn't `name` itself.
     fn resolve(&self, name: &str) -> Option<PathBuf> {
         let order = lookup_order(name, self.backend, self.compute_capability);
         let (stem, path) = order
             .iter()
-            .map(|stem| (stem, self.models_dir.join(format!("{stem}.onnx"))))
+            .flat_map(|stem| self.models_dirs.iter().map(move |d| (stem, d.join(format!("{stem}.onnx")))))
             .find(|(_, p)| p.is_file())?;
         if stem != name {
             eprintln!("yosh: [upscale] {name}: not installed; using {}", path.display());
@@ -156,7 +165,7 @@ impl AjiUpscaler {
         }
         let Some(path) = self.resolve(name) else {
             slots.insert(name.to_string(), Slot::Failed);
-            let path = self.models_dir.join(format!("{name}.onnx"));
+            let path = self.models_dirs[0].join(format!("{name}.onnx"));
             return Err(format!("model not installed: {}", path.display()));
         };
         match self.load(&mut slots, &self.ctx, name, &path, false) {

@@ -8,6 +8,17 @@
 //! against its own pins, and records what it installed in `setup.json`, so a re-run fetches only
 //! what changed. `yosh-addon.json` records the release yosh installed: a newer pin here offers an
 //! update. An add-on put together by hand has no record and is left alone.
+//!
+//! An installed (not portable) yosh runs setup in **store mode** (`--store --app-id yosh-addon
+//! --app-path <the add-on's mangajanai>`), when the add-on's mangajanai knows it: TensorRT, its GPU
+//! files, TensorRT-RTX and the models then go into the per-user pack store that MangaJaNaiCLI and
+//! the other apps share (the-database/aji-runtime), once per user instead of once per app, and an
+//! older add-on's matching files move there instead of downloading again. The add-on's
+//! `aji-runtime.json` points libaji at them and lists the model folders (`addon::models_dirs`).
+//! The ref is tied to the add-on's own program, so it lives exactly as long as the add-on folder:
+//! *Remove the add-on* and the Windows uninstaller run `mangajanai setup --remove` first, and an
+//! add-on folder deleted any other way leaves a dead ref that the store frees later. A portable
+//! yosh keeps everything in its own add-on folder, as before.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -40,6 +51,8 @@ const PROGRAM: &str = if cfg!(windows) { "mangajanai.exe" } else { "mangajanai" 
 const RECORD: &str = "yosh-addon.json";
 const DOWNLOAD_DIR: &str = ".yosh-download";
 const UA: &str = concat!("yosh/", env!("CARGO_PKG_VERSION"));
+/// The add-on's id in the shared pack store (its `refs/<id>.json`).
+const STORE_APP_ID: &str = "yosh-addon";
 
 /// Which part of the install a download is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,10 +168,63 @@ pub fn folder_size(dir: &Path) -> u64 {
         .sum()
 }
 
+/// Whether setup put this add-on's packs in the shared pack store (its `setup.json` says so).
+fn store_install(dir: &Path) -> bool {
+    std::fs::read(dir.join("setup.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|j| j.get("store").is_some_and(|s| !s.is_null()))
+}
+
+/// A `mangajanai` command in `dir`, without a console window.
+fn program(dir: &Path) -> Command {
+    let mut cmd = Command::new(dir.join(PROGRAM));
+    cmd.current_dir(dir).stdin(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Whether the add-on's mangajanai has store mode (`setup --store`, MangaJaNaiCLI after v0.3.1).
+fn supports_store(dir: &Path) -> bool {
+    program(dir)
+        .arg("--help")
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("--app-id"))
+}
+
+/// The arguments for `mangajanai setup` in `dir`: store mode for an installed yosh whose
+/// add-on supports it, the add-on's own folder otherwise. `YOSH_ADDON_MIRROR` adds `--mirror`
+/// (local archives, for testing before a release is published).
+fn setup_args(dir: &Path, portable: bool, store_ok: bool) -> Vec<std::ffi::OsString> {
+    let mut a: Vec<std::ffi::OsString> = ["setup", "--progress", "lines"].iter().map(Into::into).collect();
+    if !portable && store_ok {
+        a.extend(["--store".into(), "--app-id".into(), STORE_APP_ID.into(), "--app-path".into(), dir.join(PROGRAM).into()]);
+    }
+    if let Some(m) = std::env::var_os("YOSH_ADDON_MIRROR") {
+        a.extend(["--mirror".into(), m]);
+    }
+    a
+}
+
 /// Delete the add-on: everything in `dir` but a `rules.json` the user wrote (kept so a later
-/// install picks it up again). Fails on the first file that can't be deleted; on Windows that is
-/// libaji's files while they're loaded, so don't call this after an upscaler started.
+/// install picks it up again). A store install first drops its ref (`mangajanai setup
+/// --remove`), freeing the packs no other app uses. Fails on the first file that can't be
+/// deleted; on Windows that is libaji's files while they're loaded, so don't call this after an
+/// upscaler started.
 pub fn remove(dir: &Path) -> Result<(), String> {
+    if store_install(dir) {
+        match program(dir).args(["setup", "--remove"]).stdout(Stdio::null()).stderr(Stdio::null()).status() {
+            Ok(s) if s.success() => {}
+            // The folder goes anyway: its ref is then dead, and the store frees its packs later.
+            r => eprintln!("yosh: [addon] dropping the pack store ref failed ({r:?}); removing the folder anyway"),
+        }
+    }
     let rules = dir.join("rules.json");
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -236,7 +302,7 @@ fn install(
     if mode == Mode::Full {
         unpack_release(dir, cancel, &progress)?;
     }
-    run_setup(dir, cancel, child, &progress)?;
+    run_setup(dir, mode, cancel, child, &progress)?;
     // Setup-only ran the installed program, so the record keeps its release.
     let cli = match mode {
         Mode::SetupOnly => read_record(dir).map(|r| r.cli),
@@ -284,22 +350,17 @@ fn unpack_release(dir: &Path, cancel: &AtomicBool, progress: &dyn Fn(Progress)) 
 /// Run `mangajanai setup --progress lines` in `dir` and turn its lines into progress.
 fn run_setup(
     dir: &Path,
+    mode: Mode,
     cancel: &AtomicBool,
     child: &Mutex<Option<Child>>,
     progress: &dyn Fn(Progress),
 ) -> Result<(), String> {
-    let mut cmd = Command::new(dir.join(PROGRAM));
-    cmd.args(["setup", "--progress", "lines"])
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    let mut cmd = program(dir);
+    // Moving a private add-on into the store removes its own runtime files, so that happens only
+    // in a full install or update (before libaji loads), never in a setup-only run beside a
+    // loaded libaji; a store install stays one either way.
+    let store_ok = supports_store(dir) && (mode == Mode::Full || store_install(dir));
+    cmd.args(setup_args(dir, crate::config::portable(), store_ok)).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut c = cmd.spawn().map_err(|e| format!("{PROGRAM}: {e}"))?;
     let stdout = c.stdout.take();
     let stderr = c.stderr.take();
@@ -581,6 +642,37 @@ mod tests {
     }
 
     #[test]
+    fn setup_args_choose_store_mode_for_installed_yosh_only() {
+        let dir = Path::new("addon");
+        let s = |v: Vec<std::ffi::OsString>| v.into_iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let plain = ["setup", "--progress", "lines"];
+        if std::env::var_os("YOSH_ADDON_MIRROR").is_none() {
+            assert_eq!(s(setup_args(dir, true, true)), plain, "portable: private");
+            assert_eq!(s(setup_args(dir, false, false)), plain, "a mangajanai without --store: private");
+            let store = s(setup_args(dir, false, true));
+            assert_eq!(&store[..3], plain);
+            assert_eq!(&store[3..6], ["--store", "--app-id", "yosh-addon"]);
+            assert_eq!(store[6], "--app-path");
+            assert_eq!(Path::new(&store[7]), dir.join(PROGRAM), "the ref lives as long as the add-on's program");
+        }
+    }
+
+    #[test]
+    fn store_installs_are_recognised_from_setup_json() {
+        let dir = std::env::temp_dir().join(format!("yosh-addon-store-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!store_install(&dir));
+        std::fs::write(dir.join("setup.json"), br#"{"components":{}}"#).unwrap();
+        assert!(!store_install(&dir));
+        std::fs::write(dir.join("setup.json"), br#"{"components":{},"store":{"app_id":"yosh-addon","app_path":"x"}}"#).unwrap();
+        assert!(store_install(&dir));
+        // remove() of a store install without its program still removes the folder
+        remove(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn a_gpu_setup_never_saw_needs_setup() {
         let rec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert!(!lacks_gpu(&rec(&["12.0"]), &rec(&["12.0"])));
@@ -660,6 +752,50 @@ fn install_end_to_end() {
     }
     assert_eq!(installed_release(&dir).as_deref(), Some(CLI_VERSION));
     assert!(!incomplete(&dir) && crate::addon::installed(&dir));
+}
+
+/// After `install_end_to_end` in store mode (an installed yosh, AJI_RUNTIME_STORE pointing at a
+/// test store): the add-on finds its models in the store, the upscaler starts on the store's
+/// runtime, and *Remove the add-on* drops its ref, freeing the packs. Run by hand with
+/// `--ignored --nocapture`.
+#[cfg(all(test, feature = "sr"))]
+#[test]
+#[ignore]
+fn store_addon_end_to_end() {
+    let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON_DIR").expect("YOSH_TEST_ADDON_DIR"));
+    let store = PathBuf::from(std::env::var_os("AJI_RUNTIME_STORE").expect("AJI_RUNTIME_STORE (never the real store)"));
+    assert!(store_install(&dir), "not a store install");
+    let dirs = crate::addon::models_dirs(&dir);
+    eprintln!("model folders: {dirs:?}");
+    assert!(dirs.len() > 1 && dirs[1..].iter().all(|d| d.starts_with(&store)));
+    let rules = crate::profiles::Profiles::default().rules(crate::profiles::ProfileId::Balanced, &dirs).unwrap();
+    for r in &rules {
+        if let Some(m) = &r.model {
+            assert!(crate::profiles::model_installed(&dirs, m), "{m} not found");
+        }
+    }
+    let rx = crate::addon::start(dir.clone(), crate::config::UpscaleBackend::Auto, rules, Arc::new(|| {}));
+    match rx.recv().expect("upscaler thread") {
+        Ok(r) => eprintln!("upscaler running on {}", r.device),
+        Err(e) => panic!("upscaler: {e}"),
+    }
+    assert!(store.join("refs").join(format!("{STORE_APP_ID}.json")).is_file());
+}
+
+/// *Remove the add-on* on a store install (after `store_addon_end_to_end`, in a process of its
+/// own: yosh removes before libaji loads): the ref goes, and with no other app the store empties.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn store_remove_end_to_end() {
+    let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON_DIR").expect("YOSH_TEST_ADDON_DIR"));
+    let store = PathBuf::from(std::env::var_os("AJI_RUNTIME_STORE").expect("AJI_RUNTIME_STORE (never the real store)"));
+    assert!(store_install(&dir));
+    remove(&dir).unwrap();
+    assert!(!dir.join(PROGRAM).exists());
+    assert!(!store.join("refs").join(format!("{STORE_APP_ID}.json")).exists(), "ref dropped");
+    let left: Vec<_> = std::fs::read_dir(store.join("packs")).map(|r| r.flatten().map(|e| e.file_name()).collect()).unwrap_or_default();
+    assert!(left.is_empty(), "packs left: {left:?}");
 }
 
 /// "Install for this GPU" on an add-on in YOSH_TEST_ADDON_DIR whose record and setup.json were
