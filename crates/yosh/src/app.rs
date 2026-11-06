@@ -1904,7 +1904,7 @@ impl State {
 
     /// The session's profile's rules for the add-on in `dir`.
     fn profile_rules(&self, dir: &Path) -> Vec<yosh_engine::sr::rules::SrRule> {
-        self.profiles.rules(self.profile, &dir.join("models")).unwrap_or_default()
+        self.profiles.rules(self.profile, &addon::models_dirs(dir)).unwrap_or_default()
     }
 
     /// Switch the AI-upscaling profile for this session (Shift+1..3, Ctrl+1..9,
@@ -1955,7 +1955,7 @@ impl State {
             }
             return;
         }
-        let changed = p.rules(self.profile, Path::new("")) != self.profiles.rules(self.profile, Path::new(""));
+        let changed = p.rules(self.profile, &[]) != self.profiles.rules(self.profile, &[]);
         self.profiles = p;
         if let Some(ed) = self.ui.profile_editor.as_mut() {
             ed.saved = self.profiles.clone();
@@ -4126,7 +4126,7 @@ impl State {
                     if let Some(dir) = config::addon_dir() {
                         self.load_profiles();
                         self.ui.profile_editor =
-                            Some(crate::profile_editor::Editor::new(&self.profiles, self.profile, dir.join("models")));
+                            Some(crate::profile_editor::Editor::new(&self.profiles, self.profile, addon::models_dirs(&dir)));
                     }
                 }
             }

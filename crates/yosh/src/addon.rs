@@ -42,6 +42,18 @@ pub struct Running {
 
 pub type Started = Result<Running, String>;
 
+/// Where the add-on's models are: its `models/` (the user's own models go there), then, when
+/// setup put the add-on's packs in the shared pack store, the model pack folders the add-on's
+/// `aji-runtime.json` lists (its `models` key; MangaJaNaiCLI `setup --store`).
+pub fn models_dirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.join("models")];
+    let json = std::fs::read(dir.join("aji-runtime.json")).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Some(list) = json.as_ref().and_then(|j| j.get("models")).and_then(|m| m.as_array()) {
+        dirs.extend(list.iter().filter_map(|v| v.as_str()).map(PathBuf::from));
+    }
+    dirs
+}
+
 /// Whether the add-on's library is present in `dir`.
 pub fn installed(dir: &Path) -> bool {
     dir.join(if cfg!(windows) { "aji.dll" } else { "libaji.so" }).is_file()
@@ -139,6 +151,7 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, rules: Vec<SrRule>, wake:
         };
         match AjiUpscaler::new(dir, b, &device, rules.clone(), Some(wake.clone())) {
             Ok(up) => {
+                let up = up.with_model_dirs(models_dirs(dir).into_iter().skip(1));
                 if let Some(why) = &rtx_failed {
                     eprintln!("yosh: [upscale] TensorRT-RTX failed ({why}); using {}", b.label());
                 }
@@ -171,6 +184,19 @@ pub fn open_folder(dir: &Path) {
 mod tests {
     use super::*;
     use yosh_engine::sr::aji::Backend::{DirectMl, TensorRt, TensorRtRtx};
+
+    #[test]
+    fn models_dirs_add_the_store_packs_from_aji_runtime_json() {
+        let dir = std::env::temp_dir().join(format!("yosh-addon-models-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(models_dirs(&dir), vec![dir.join("models")]);
+        std::fs::write(dir.join("aji-runtime.json"), br#"{"format":1,"trt":"t","models":["/store/m1","/store/m2"]}"#).unwrap();
+        assert_eq!(models_dirs(&dir), vec![dir.join("models"), PathBuf::from("/store/m1"), PathBuf::from("/store/m2")]);
+        std::fs::write(dir.join("aji-runtime.json"), b"not json").unwrap();
+        assert_eq!(models_dirs(&dir), vec![dir.join("models")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn auto_prefers_tensorrt_rtx_on_supported_consumer_gpus() {

@@ -115,12 +115,12 @@ impl Profiles {
         }
     }
 
-    /// The rules `id` runs with the models in `models_dir`, or `None` for an
+    /// The rules `id` runs with the models in `models_dirs`, or `None` for an
     /// empty slot. Quality uses Balanced's colour rules when the add-on has no
     /// DAT2 model (one made by hand, without the DAT2/HAT pack).
-    pub fn rules(&self, id: ProfileId, models_dir: &Path) -> Option<Vec<SrRule>> {
+    pub fn rules(&self, id: ProfileId, models_dirs: &[PathBuf]) -> Option<Vec<SrRule>> {
         Some(match id {
-            ProfileId::Quality if !model_installed(models_dir, QUALITY_COLOR) => {
+            ProfileId::Quality if !model_installed(models_dirs, QUALITY_COLOR) => {
                 let mut r = default_rules();
                 r.retain(|r| !r.gray);
                 r.extend(quality_rules().into_iter().filter(|r| r.gray));
@@ -302,22 +302,23 @@ pub fn save(addon_dir: &Path, profiles: &Profiles) -> Result<(), String> {
 
 // ---- models -------------------------------------------------------------------------
 
-/// Whether a rule's model `name` is in `models_dir` under any precision (the
-/// files `sr::aji`'s lookup would find for it).
-pub fn model_installed(models_dir: &Path, name: &str) -> bool {
+/// Whether a rule's model `name` is in one of `models_dirs` under any precision
+/// (the files `sr::aji`'s lookup would find for it).
+pub fn model_installed(models_dirs: &[PathBuf], name: &str) -> bool {
     let base = model_base(name);
     std::iter::once(name.to_string())
         .chain(std::iter::once(base.to_string()))
         .chain(["_fp16", "_bf16", "_fp32"].iter().map(|s| format!("{base}{s}")))
-        .any(|stem| models_dir.join(format!("{stem}.onnx")).is_file())
+        .any(|stem| models_dirs.iter().any(|d| d.join(format!("{stem}.onnx")).is_file()))
 }
 
-/// The models in `models_dir`, one entry per model (its precision variants
+/// The models in `models_dirs`, one entry per model (its precision variants
 /// share a name, [`model_base`]: the lookup picks the best one installed),
 /// sorted.
-pub fn installed_models(models_dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(models_dir)
-        .into_iter()
+pub fn installed_models(models_dirs: &[PathBuf]) -> Vec<String> {
+    let mut names: Vec<String> = models_dirs
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
         .flatten()
         .flatten()
         .filter_map(|e| {
@@ -422,17 +423,18 @@ mod tests {
         for f in ["b_fp16.onnx", "b_fp32.onnx", "a.onnx", "notes.txt"] {
             std::fs::write(dir.join(f), b"x").unwrap();
         }
-        assert_eq!(installed_models(&dir), vec!["a".to_string(), "b".to_string()]);
-        assert!(model_installed(&dir, "b_bf16"));
-        assert!(model_installed(&dir, "b"));
-        assert!(!model_installed(&dir, "c_fp16"));
+        let dirs = [dir.clone()];
+        assert_eq!(installed_models(&dirs), vec!["a".to_string(), "b".to_string()]);
+        assert!(model_installed(&dirs, "b_bf16"));
+        assert!(model_installed(&dirs, "b"));
+        assert!(!model_installed(&dirs, "c_fp16"));
         let p = Profiles::default();
-        let q = p.rules(ProfileId::Quality, &dir).unwrap();
+        let q = p.rules(ProfileId::Quality, &dirs).unwrap();
         assert!(q.iter().all(|r| r.model.as_deref() != Some(QUALITY_COLOR)));
         assert_eq!(q.iter().filter(|r| r.color).count(), 2, "Balanced's colour rules");
         std::fs::write(dir.join(format!("{}.onnx", model_base(QUALITY_COLOR).to_owned() + "_fp32")), b"x").unwrap();
-        assert_eq!(p.rules(ProfileId::Quality, &dir).unwrap(), quality_rules());
-        assert_eq!(p.rules(ProfileId::Custom(3), &dir), None);
+        assert_eq!(p.rules(ProfileId::Quality, &dirs).unwrap(), quality_rules());
+        assert_eq!(p.rules(ProfileId::Custom(3), &dirs), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -22,8 +22,10 @@ pub struct Editor {
     pub saved: Profiles,
     pub draft: Profiles,
     pub selected: ProfileId,
-    /// `models/`, and the models in it (precision variants under one name).
-    pub models_dir: PathBuf,
+    /// Where models are: the add-on's `models/` first (models added here go there), then the
+    /// shared store's model packs ([`crate::addon::models_dirs`]); and the models in them
+    /// (precision variants under one name).
+    pub models_dirs: Vec<PathBuf>,
     pub models: Vec<String>,
     /// The "try a page" inputs.
     pub try_h: u32,
@@ -34,14 +36,14 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(profiles: &Profiles, selected: ProfileId, models_dir: PathBuf) -> Self {
-        let models = profiles::installed_models(&models_dir);
+    pub fn new(profiles: &Profiles, selected: ProfileId, models_dirs: Vec<PathBuf>) -> Self {
+        let models = profiles::installed_models(&models_dirs);
         Self {
             open: true,
             saved: profiles.clone(),
             draft: profiles.clone(),
             selected,
-            models_dir,
+            models_dirs,
             models,
             try_h: 1400,
             try_gray: true,
@@ -94,7 +96,7 @@ impl Editor {
                     .rules
                     .iter()
                     .filter_map(|r| r.model.as_deref())
-                    .filter(|m| !profiles::model_installed(&self.models_dir, m))
+                    .filter(|m| !profiles::model_installed(&self.models_dirs, m))
                     .count();
                 if missing > 0 {
                     msg = format!("{msg}\n{}", (t.mwf_missing_models)(missing));
@@ -115,9 +117,9 @@ impl Editor {
         else {
             return;
         };
-        match profiles::add_model(&self.models_dir, &path) {
+        match profiles::add_model(&self.models_dirs[0], &path) {
             Ok(name) => {
-                self.models = profiles::installed_models(&self.models_dir);
+                self.models = profiles::installed_models(&self.models_dirs);
                 self.note = Some(((t.model_added)(&name), false));
             }
             Err(e) => self.note = Some(((t.model_add_failed)(&e), true)),
@@ -318,7 +320,7 @@ fn rules_table(ui: &mut egui::Ui, ed: &mut Editor) {
         }
     };
     let models = &ed.models;
-    let models_dir = &ed.models_dir;
+    let models_dirs = &ed.models_dirs;
     let mut action: Option<(usize, i32)> = None; // (row, -1 up / 1 down / 0 remove)
     egui::Grid::new(("rules", ed.selected.token())).striped(true).num_columns(6).spacing([10.0, 4.0]).show(
         ui,
@@ -373,7 +375,7 @@ fn rules_table(ui: &mut egui::Ui, ed: &mut Editor) {
                         }
                     });
                 });
-                ui.add_enabled_ui(editable, |ui| model_combo(ui, i, &mut r.model, models, models_dir));
+                ui.add_enabled_ui(editable, |ui| model_combo(ui, i, &mut r.model, models, models_dirs));
                 if editable {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text(t.move_up).clicked() {
@@ -415,10 +417,10 @@ fn model_combo(
     i: usize,
     model: &mut Option<String>,
     models: &[String],
-    models_dir: &std::path::Path,
+    models_dirs: &[PathBuf],
 ) {
     let t = tr();
-    let missing = model.as_deref().is_some_and(|m| !profiles::model_installed(models_dir, m));
+    let missing = model.as_deref().is_some_and(|m| !profiles::model_installed(models_dirs, m));
     let shown = match model.as_deref() {
         None => egui::RichText::new(t.model_none).italics(),
         Some(m) if missing => egui::RichText::new(format!("⚠ {m}")).color(egui::Color32::from_rgb(220, 180, 100)),
