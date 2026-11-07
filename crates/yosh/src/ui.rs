@@ -237,6 +237,14 @@ pub struct UiState {
     /// Page indices with an LQ preview thumbnail (the whole volume once warm),
     /// painted as a fainter wash beneath the HQ cache bar. Refilled each frame.
     pub seek_lq_buffered: Vec<usize>,
+    /// AI upscaling, painted as a strip just *above* the track (empty — so not
+    /// drawn — unless upscaling is active): pages showing their upscaled image,
+    /// pages queued or running on the SR lane, and pages whose model output is
+    /// kept (an upscale again is only a re-size). Refilled each frame the
+    /// seekbar shows (`Reader::sr_seek_marks`).
+    pub seek_sr_done: Vec<usize>,
+    pub seek_sr_queued: Vec<usize>,
+    pub seek_sr_kept: Vec<usize>,
 
     /// Animation control panel (bottom-left), shown for animated GIF/WebP pages.
     /// Display fields set by the app each frame; the `anim_req_*` fields are
@@ -341,6 +349,10 @@ pub(crate) fn drag_shadow(ctx: &egui::Context, frac: f32, si: f32) {
     painter.add(mesh);
 }
 
+/// AI upscaling's color: the seekbar's AI strip and the top bar's "AI ✔" chip
+/// once the page in view is upscaled, so the two read as one feature.
+const AI_VIOLET: egui::Color32 = egui::Color32::from_rgb(170, 150, 255);
+
 /// BandiView-style seekbar: a translucent pill floating above the bottom edge
 /// with a track, a filled progress segment, and a circular handle. Click or drag
 /// anywhere to jump; hovering previews the target page as "page / total". The
@@ -395,30 +407,9 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                     // pipeline keeps more pages ahead than behind, so the band sits
                     // asymmetrically around the handle.
                     let half = (span / last * 0.5).max(0.75); // half a page-step wide
-                    let (yt, yb) = (cy + 6.0, cy + 8.0);
-                    // Faint wash: pages with an LQ preview thumbnail (the whole volume
-                    // once warm). Same green as the HQ bar but barely-there, so it
-                    // reads as a single cache bar with two intensities; the brighter
-                    // HQ ticks below draw on top.
-                    let lq_tick = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 55);
-                    for &i in &st.seek_lq_buffered {
-                        if i >= total {
-                            continue;
-                        }
-                        let xc = x_of(i as f32 / last);
-                        let a = (xc - half).clamp(x0, x1);
-                        let b = (xc + half).clamp(x0, x1);
-                        p.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
-                            0.0,
-                            lq_tick,
-                        );
-                    }
-                    if !st.seek_buffered.is_empty() {
-                        // Muted + translucent so it reads as secondary info — never
-                        // louder than the progress fill (alpha 190) or the handle.
-                        let buf = egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150);
-                        for &i in &st.seek_buffered {
+                    // One page-step-wide tick per listed page, between `yt` and `yb`.
+                    let ticks = |pages: &[usize], yt: f32, yb: f32, color: egui::Color32| {
+                        for &i in pages {
                             if i >= total {
                                 continue;
                             }
@@ -428,10 +419,29 @@ fn seekbar_bar(ctx: &egui::Context, st: &mut UiState) {
                             p.rect_filled(
                                 egui::Rect::from_min_max(egui::pos2(a, yt), egui::pos2(b, yb)),
                                 0.0,
-                                buf,
+                                color,
                             );
                         }
-                    }
+                    };
+                    // Faint wash: pages with an LQ preview thumbnail (the whole volume
+                    // once warm). Same green as the HQ bar but barely-there, so it
+                    // reads as a single cache bar with two intensities; the brighter
+                    // HQ ticks draw on top. Muted + translucent so it reads as
+                    // secondary info — never louder than the progress fill (alpha
+                    // 190) or the handle.
+                    let (yt, yb) = (cy + 6.0, cy + 8.0);
+                    ticks(&st.seek_lq_buffered, yt, yb, egui::Color32::from_rgba_unmultiplied(120, 165, 140, 55));
+                    ticks(&st.seek_buffered, yt, yb, egui::Color32::from_rgba_unmultiplied(120, 165, 140, 150));
+                    // AI strip, mirrored above the track in its own violet, with the
+                    // same intensity language: a faint wash where a model output is
+                    // kept, dimmer ticks for pages queued/upscaling now, brighter
+                    // ones where the upscaled image is the texture on hand. All
+                    // empty unless upscaling is active, so nothing draws otherwise.
+                    let (yt, yb) = (cy - 8.0, cy - 6.0);
+                    let ai = |a| egui::Color32::from_rgba_unmultiplied(AI_VIOLET.r(), AI_VIOLET.g(), AI_VIOLET.b(), a);
+                    ticks(&st.seek_sr_kept, yt, yb, ai(55));
+                    ticks(&st.seek_sr_queued, yt, yb, ai(95));
+                    ticks(&st.seek_sr_done, yt, yb, ai(170));
                     let start_x = if rtl { x1 } else { x0 };
                     p.line_segment(
                         [egui::pos2(start_x, cy), egui::pos2(handle_x, cy)],
@@ -1406,12 +1416,14 @@ fn sr_skip_reason(st: &UiState) -> Option<String> {
 /// switch (key `U`), so it doubles as the way back on when a book has it off.
 fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
     let t = tr();
+    // One color per state. Done wears the seekbar AI strip's violet (the upscaled
+    // image is what's showing); problems stay amber/red, the rest plain or gray.
     let (mark, color, tip): (&str, egui::Color32, String) = match (&st.sr_state, st.sr_book_on) {
         (_, false) => ("off", ui.visuals().weak_text_color(), t.sr_book_off.into()),
         (None, true) => ("", ui.visuals().weak_text_color(), t.sr_working.into()),
         (Some(SrViewState::Working), _) => ("", ui.visuals().text_color(), t.sr_working.into()),
         (Some(SrViewState::Preparing), _) => ("", ui.visuals().text_color(), t.sr_preparing_tip.into()),
-        (Some(SrViewState::Done), _) => ("\u{2714}", egui::Color32::from_rgb(130, 200, 130), t.sr_done.into()),
+        (Some(SrViewState::Done), _) => ("\u{2714}", AI_VIOLET, t.sr_done.into()),
         (Some(SrViewState::NotNeeded), _) => ("\u{2013}", ui.visuals().weak_text_color(), t.sr_not_needed.into()),
         (Some(SrViewState::Unsupported), _) => ("\u{d7}", ui.visuals().weak_text_color(), t.sr_unsupported.into()),
         (Some(SrViewState::NoModel), _) => ("\u{26a0}", egui::Color32::from_rgb(220, 180, 100), t.sr_no_model.into()),
@@ -1433,11 +1445,14 @@ fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
     let r = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
+            let text = if mark.is_empty() { "AI".to_string() } else { format!("AI {mark}") };
+            let r = ui.add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()));
+            // In the mark's slot, after "AI", so "AI" never shifts as the state
+            // goes working → ✔.
             if busy {
                 ui.add(egui::Spinner::new().size(12.0));
             }
-            let text = if mark.is_empty() { "AI".to_string() } else { format!("AI {mark}") };
-            ui.add(egui::Label::new(egui::RichText::new(text).color(color)).sense(egui::Sense::click()))
+            r
         })
         .inner;
     let r = r.on_hover_text(tip);

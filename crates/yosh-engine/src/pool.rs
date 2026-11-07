@@ -558,6 +558,14 @@ impl DecodePool {
         self.sr_cv.notify_all();
     }
 
+    /// Append the pages whose model output the SR lane still keeps
+    /// ([`MasterCache`]) — upscaling one of them again only re-sizes it, no
+    /// inference. For the seekbar's AI strip; one brief lock, no allocation
+    /// beyond `out`.
+    pub fn sr_kept_indices(&self, out: &mut Vec<usize>) {
+        out.extend(self.masters.lock().unwrap_or_else(|e| e.into_inner()).map.keys().copied());
+    }
+
     /// Replace the SR lane's queue (`(index, target_h)`, nearest-first). Pages no
     /// longer listed are abandoned mid-inference at the next tile.
     pub fn set_sr_jobs(&self, jobs: Vec<(usize, u32)>) {

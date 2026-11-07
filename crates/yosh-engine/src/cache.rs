@@ -98,6 +98,12 @@ impl PageCache {
         self.map.keys().copied()
     }
 
+    /// The buffered pages whose texture is the AI-upscaled image (the seekbar's
+    /// AI strip). A subset of [`Self::buffered_indices`].
+    pub fn upscaled_indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.map.iter().filter(|(_, p)| p.sr).map(|(i, _)| *i)
+    }
+
     pub fn clear(&mut self) {
         self.epoch += 1;
         for (_, page) in self.map.drain() {
