@@ -3819,6 +3819,15 @@ impl State {
                 self.cursor_in_window && (self.cursor_y as f32) > win_h - reveal * 1.5;
             self.ui.seek_show =
                 self.settings.seekbar_enabled && !self.library_view && len > 1 && near_bottom;
+            // The AI strip only matters while the seekbar is up (it takes the SR
+            // lane's kept-output lock briefly), so a hidden seekbar costs nothing.
+            if self.ui.seek_show {
+                self.reader.sr_seek_marks(
+                    &mut self.ui.seek_sr_done,
+                    &mut self.ui.seek_sr_queued,
+                    &mut self.ui.seek_sr_kept,
+                );
+            }
         }
         // A background open is in flight: show the spinner over the current page
         // (or the dark fill on a first open) until the new source lands.

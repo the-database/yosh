@@ -808,6 +808,10 @@ pub struct Reader {
     /// Reading position the whole-volume thumbnail tail was last built around, or
     /// `None` when the tail needs (re)building — see [`LQ_TAIL_RESTRIDE`].
     lq_tail_pivot: Option<usize>,
+    /// The pages last handed to the SR lane (`set_sr_jobs`): queued or running.
+    /// Exact between rebuilds, since a landing or a skip bumps the jobs key.
+    /// Only read by [`Reader::sr_seek_marks`].
+    sr_queued: Vec<usize>,
 }
 
 /// Whether page `i` is within AI-upscale reach of the pages in view `lo..=hi`:
@@ -978,6 +982,7 @@ impl Reader {
             drag_seam: std::cell::Cell::new(None),
             last_jobs_key: None,
             lq_tail_pivot: None,
+            sr_queued: Vec::new(),
         }
     }
 
@@ -1068,6 +1073,25 @@ impl Reader {
             .chain(b)
             .filter_map(|i| self.sr_page_state(i))
             .max_by_key(SrViewState::rank)
+    }
+
+    /// AI upscaling across the volume, for the seekbar: the pages showing their
+    /// upscaled image (`done`), queued or running on the SR lane (`queued`), and
+    /// whose model output is still kept (`kept` — upscaling them again is only a
+    /// re-size). Each is cleared first, and all stay empty while upscaling isn't
+    /// active. Reads state the pipeline already keeps; schedules nothing.
+    pub fn sr_seek_marks(&self, done: &mut Vec<usize>, queued: &mut Vec<usize>, kept: &mut Vec<usize>) {
+        done.clear();
+        queued.clear();
+        kept.clear();
+        if !self.sr_active() || self.source.is_none() {
+            return;
+        }
+        done.extend(self.cache.upscaled_indices());
+        queued.extend_from_slice(&self.sr_queued);
+        if let Some(pool) = &self.pool {
+            pool.sr_kept_indices(kept);
+        }
     }
 
     /// The model(s) that upscaled the page(s) in view, for the info overlay
@@ -2261,6 +2285,8 @@ impl Reader {
             } else {
                 Vec::new()
             };
+            self.sr_queued.clear();
+            self.sr_queued.extend(sr_jobs.iter().map(|&(i, _)| i));
             pool.set_sr_jobs(sr_jobs);
         }
         // Whole-volume LQ tier: a lowest-priority queue of tiny thumbnail jobs for
@@ -3344,6 +3370,17 @@ mod tests {
         assert_eq!(reach(6, 7, 0, 0), vec![6, 7], "a spread is both pages");
         assert_eq!(reach(6, 7, 3, 1), vec![5, 6, 7, 8, 9, 10], "Mid");
         assert_eq!(reach(0, 0, 3, 1), vec![0, 1, 2, 3], "nothing before page 0");
+    }
+
+    /// Without an active upscaler the seekbar's AI strip gets nothing — not even
+    /// a queue left over from when upscaling was on — so it isn't drawn at all.
+    #[test]
+    fn sr_seek_marks_are_empty_unless_upscaling_is_active() {
+        let mut r = spread_reader(crate::layout::Layout::Single, false, 4);
+        r.sr_queued = vec![1, 2];
+        let (mut done, mut queued, mut kept) = (vec![9], vec![9], vec![9]);
+        r.sr_seek_marks(&mut done, &mut queued, &mut kept);
+        assert!(done.is_empty() && queued.is_empty() && kept.is_empty());
     }
 
     /// The decode view settles only after [`super::SETTLE`] of stillness, never
