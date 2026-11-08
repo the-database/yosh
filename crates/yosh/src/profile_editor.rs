@@ -148,42 +148,32 @@ pub fn show(ctx: &egui::Context, st: &mut UiState) {
         .open(&mut open)
         .default_width(900.0)
         .default_height(560.0)
+        .min_height(220.0)
         .resizable(true)
         .collapsible(false)
         .show(ctx, |ui| {
+            // The footer (note, Save/Revert) is a bottom panel, laid out first, so
+            // it always keeps its place; the lists scroll in whatever height is
+            // left. The window is capped at the egui screen (egui's constrain), so
+            // on a short screen the body shrinks instead of pushing Save off it.
+            egui::Panel::bottom("profile_editor_footer")
+                .frame(egui::Frame::NONE.inner_margin(egui::Margin { top: 6, ..Default::default() }))
+                .show(ui, |ui| footer(ui, ed, &mut save));
+            let h = ui.available_height().max(80.0);
             ui.horizontal_top(|ui| {
                 ui.vertical(|ui| {
                     ui.set_width(200.0);
-                    profile_list(ui, ed);
+                    egui::ScrollArea::vertical().id_salt("profile_list").auto_shrink(false).max_height(h).show(
+                        ui,
+                        |ui| profile_list(ui, ed),
+                    );
                 });
                 ui.separator();
                 ui.vertical(|ui| {
-                    egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(440.0).show(ui, |ui| {
-                        profile_body(ui, ed);
-                    });
-                });
-            });
-            ui.separator();
-            if let Some((msg, bad)) = &ed.note {
-                let text = egui::RichText::new(msg).small();
-                ui.label(if *bad { text.color(egui::Color32::from_rgb(220, 180, 100)) } else { text });
-            }
-            ui.horizontal(|ui| {
-                if ui.button(t.add_model).on_hover_text(t.add_model_hint).clicked() {
-                    ed.add_model();
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dirty = ed.draft != ed.saved;
-                    if ui.add_enabled(dirty, egui::Button::new(t.profiles_save)).clicked() {
-                        save = true;
-                    }
-                    if ui.add_enabled(dirty, egui::Button::new(t.profiles_revert)).clicked() {
-                        ed.draft = ed.saved.clone();
-                        ed.note = None;
-                    }
-                    if dirty {
-                        ui.label(egui::RichText::new(t.profiles_unsaved).weak().small());
-                    }
+                    egui::ScrollArea::vertical().id_salt("profile_body").auto_shrink(false).max_height(h).show(
+                        ui,
+                        |ui| profile_body(ui, ed),
+                    );
                 });
             });
         });
@@ -197,6 +187,33 @@ pub fn show(ctx: &egui::Context, st: &mut UiState) {
             ed.open = false;
         }
     }
+}
+
+/// The editor's footer: the last note, Add model, and Save / Revert.
+fn footer(ui: &mut egui::Ui, ed: &mut Editor, save: &mut bool) {
+    let t = tr();
+    if let Some((msg, bad)) = &ed.note {
+        let text = egui::RichText::new(msg).small();
+        ui.label(if *bad { text.color(egui::Color32::from_rgb(220, 180, 100)) } else { text });
+    }
+    ui.horizontal(|ui| {
+        if ui.button(t.add_model).on_hover_text(t.add_model_hint).clicked() {
+            ed.add_model();
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let dirty = ed.draft != ed.saved;
+            if ui.add_enabled(dirty, egui::Button::new(t.profiles_save)).clicked() {
+                *save = true;
+            }
+            if ui.add_enabled(dirty, egui::Button::new(t.profiles_revert)).clicked() {
+                ed.draft = ed.saved.clone();
+                ed.note = None;
+            }
+            if dirty {
+                ui.label(egui::RichText::new(t.profiles_unsaved).weak().small());
+            }
+        });
+    });
 }
 
 fn profile_list(ui: &mut egui::Ui, ed: &mut Editor) {
