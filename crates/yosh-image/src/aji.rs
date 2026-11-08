@@ -187,6 +187,8 @@ struct Api {
     release: unsafe extern "C" fn(*mut *mut c_void),
     last_error: unsafe extern "C" fn(*mut c_void) -> *const c_char,
     destroy: unsafe extern "C" fn(*mut *mut c_void),
+    /// libaji 0.24.0+; `None` in an older one.
+    release_device: Option<unsafe extern "C" fn(c_int, u64) -> c_int>,
 }
 
 /// A context or model pointer. libaji allows a context from any thread and
@@ -243,8 +245,25 @@ impl Aji {
             release: sym!(b"aji_img_release\0"),
             last_error: sym!(b"aji_img_last_error\0"),
             destroy: sym!(b"aji_img_destroy\0"),
+            // SAFETY: the type mirrors aji_image.h's aji_img_release_device.
+            release_device: unsafe { lib.get(b"aji_img_release_device\0") }.ok().map(|f| *f),
         };
         Ok(Self(Arc::new(LibInner { api, _lib: lib })))
+    }
+
+    /// Frees what the process still holds on a device once every context on it is closed: on the
+    /// CUDA backends, the CUDA context TensorRT's runtime keeps until the process exits (a few
+    /// hundred MB). It resets the device for the whole process, so only when nothing else in it
+    /// uses CUDA there. `Ok(false)` when this libaji predates it (0.24.0); an error while a
+    /// context on the device is still open.
+    pub fn release_device(&self, backend: Backend, device_id: u64) -> Result<bool, String> {
+        let Some(f) = self.0.api.release_device else { return Ok(false) };
+        // SAFETY: plain values; libaji refuses while a context on the device is open.
+        match unsafe { f(backend as c_int, device_id) } {
+            0 => Ok(true),
+            -2 => Err("a context on the device is still open".into()),
+            _ => Err(format!("the {} device could not be released", backend.label())),
+        }
     }
 
     /// Devices `backend` can run on. An error means the backend (or its runtime)
