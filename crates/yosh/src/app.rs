@@ -21,6 +21,7 @@ use notify::Watcher as _; // brings the `.watch()` method into scope
 
 use crate::addon;
 use crate::addon_setup;
+use crate::addon_store;
 use crate::config;
 use crate::gpu::Gpu;
 use crate::library::{cover_bytes, Library, VolKind};
@@ -370,6 +371,15 @@ struct State {
     addon_new_gpu: bool,
     gpu_check_rx: Option<std::sync::mpsc::Receiver<bool>>,
     aji_loaded: bool,
+    /// The shared pack store (`addon_store.rs`, Settings → Storage): where it is (`None`: no
+    /// Storage row, i.e. not a store install, or an add-on whose mangajanai has no `store`),
+    /// refreshed off-thread on each `start_upscaler`; and a running move / move back / reset,
+    /// its progress (bytes copied, total) and its last failure.
+    store_info: Option<addon_store::Info>,
+    store_rx: Option<std::sync::mpsc::Receiver<Option<addon_store::Info>>>,
+    store_job: Option<addon_store::Job>,
+    store_progress: Option<(u64, u64)>,
+    store_error: Option<String>,
 
     // Async open: source construction (the I/O-bound part of opening a volume)
     // runs on a background thread so a slow network-share open never freezes the
@@ -1183,6 +1193,11 @@ impl ApplicationHandler for App {
             addon_new_gpu: false,
             gpu_check_rx: None,
             aji_loaded: false,
+            store_info: None,
+            store_rx: None,
+            store_job: None,
+            store_progress: None,
+            store_error: None,
             // The pre-spawned CLI open is generation 1, so `State` must start there
             // or its result would be discarded as stale by the drain in `render`.
             open_gen: if cli_open.is_some() { 1 } else { 0 },
@@ -1223,6 +1238,12 @@ impl ApplicationHandler for App {
                 && config::addon_dir().is_some_and(|d| addon::installed(&d))
             {
                 state.begin_addon_install(addon_setup::Mode::Full);
+            } else if let Some(token) = state.settings.addon_store_move_pending.clone()
+                && config::addon_dir().is_some_and(|d| addon::installed(&d))
+            {
+                // A move of the shared pack store asked for while it was in use; the
+                // upscaler starts when it's done.
+                state.begin_store_job(addon_store::Action::from_pending(&token));
             } else {
                 state.start_upscaler();
             }
@@ -1853,14 +1874,31 @@ impl State {
             });
             self.gpu_check_rx = Some(rx);
         }
-        // An install is replacing the add-on's files: it starts the upscaler when done.
-        if !self.settings.upscale || self.addon_job.is_some() {
+        // Where the shared pack store is, for the Storage row (not while a move runs: it
+        // reports when it's done).
+        let store = dir.as_deref().is_some_and(|d| self.addon_installed && addon_setup::store_install(d));
+        if !store {
+            self.store_info = None;
+            self.store_rx = None;
+        } else if let Some(d) = dir.clone().filter(|_| self.store_job.is_none()) {
+            self.store_rx = Some(addon_store::query(d, frame_waker(&self.window)));
+        }
+        // An install or a move is changing the add-on's files: it starts the upscaler when done.
+        if !self.settings.upscale || self.addon_job.is_some() || self.store_job.is_some() {
             return;
         }
         let Some(dir) = dir.filter(|_| self.addon_installed) else {
             self.upscale_status = addon::Status::NotInstalled;
             return;
         };
+        // A moved store's folder is missing (an unplugged drive): say so, rather than load
+        // libaji and fail on the runtime it can't find.
+        if store
+            && let Some(folder) = addon_store::default_root().and_then(|r| addon_store::missing_folder(&r))
+        {
+            self.upscale_status = addon::Status::StoreMissing(folder.display().to_string());
+            return;
+        }
         self.aji_loaded = true;
         self.upscale_status = addon::Status::Starting;
         // `rules.json` may have changed (by hand, or an install's); a profile
@@ -2004,6 +2042,26 @@ impl State {
         self.addon_job = Some(addon_setup::start(dir, mode, frame_waker(&self.window)));
     }
 
+    /// Move the shared pack store, move it back or reset it (Settings → Storage) in the
+    /// background (`addon_store.rs`). The upscaler is stopped first; `poll_background`
+    /// restarts it when the job ends (after a reset: once setup has installed the packs again).
+    fn begin_store_job(&mut self, action: addon_store::Action) {
+        let Some(dir) = config::addon_dir() else {
+            return;
+        };
+        if self.settings.addon_store_move_pending.take().is_some() {
+            config::save(&self.settings);
+        }
+        self.reader.set_upscaler(None);
+        self.upscale_rx = None;
+        self.upscale_status = addon::Status::Off;
+        self.upscale_fallback = None;
+        self.store_rx = None;
+        self.store_error = None;
+        self.store_progress = None;
+        self.store_job = Some(addon_store::start(dir, action, frame_waker(&self.window)));
+    }
+
     /// Delete the add-on (Settings → Remove, or a removal saved for this start)
     /// and switch AI upscaling off. Only call it while libaji isn't loaded.
     fn remove_addon(&mut self) {
@@ -2011,6 +2069,7 @@ impl State {
         self.upscale_rx = None;
         self.settings.addon_remove_pending = false;
         self.settings.addon_update_pending = false;
+        self.settings.addon_store_move_pending = None;
         self.settings.upscale = false;
         config::save(&self.settings);
         self.addon_error = match config::addon_dir() {
@@ -3167,6 +3226,59 @@ impl State {
                 }
             }
         }
+        if let Some(rx) = self.store_rx.take() {
+            match rx.try_recv() {
+                Ok(info) => {
+                    self.store_info = info;
+                    changed = true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.store_rx = Some(rx),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        if let Some(job) = self.store_job.take() {
+            // `Some(error)` once the job has ended (`None`: done).
+            let mut ended: Option<Option<String>> = None;
+            loop {
+                match job.rx.try_recv() {
+                    Ok(addon_store::Event::Progress(done, total)) => {
+                        self.store_progress = Some((done, total));
+                        changed = true;
+                    }
+                    Ok(addon_store::Event::Done) => ended = Some(None),
+                    Ok(addon_store::Event::Failed(e)) => ended = Some(Some(e)),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        ended.get_or_insert(Some("the move stopped".into()));
+                        break;
+                    }
+                }
+                if ended.is_some() {
+                    break;
+                }
+            }
+            match ended {
+                None => self.store_job = Some(job),
+                Some(err) => {
+                    self.store_progress = None;
+                    let reset = err.is_none() && job.action == addon_store::Action::Reset;
+                    self.store_error = err;
+                    changed = true;
+                    if reset {
+                        // The store starts empty at the default path: install the add-on's
+                        // packs into it again. Setup only adds files, so this runs beside a
+                        // loaded libaji too; the upscaler starts when it's done.
+                        if let Some(i) = self.store_info.as_mut() {
+                            (i.moved, i.target, i.available, i.bytes) = (false, None, true, 0);
+                        }
+                        self.begin_addon_install(addon_setup::Mode::SetupOnly);
+                    } else {
+                        // Re-reads where the store is and starts the upscaler.
+                        self.start_upscaler();
+                    }
+                }
+            }
+        }
         if let Some(rx) = self.upscale_rx.take() {
             match rx.try_recv() {
                 Ok(Ok(run)) => {
@@ -3602,6 +3714,7 @@ impl State {
             addon::Status::Starting => t.upscale_starting.to_string(),
             addon::Status::Ready(d) => (t.upscale_ready)(d),
             addon::Status::Error(e) => (t.upscale_error)(e),
+            addon::Status::StoreMissing(folder) => (t.upscale_store_missing)(folder),
         };
         self.ui.addon = if let Some(p) = &self.addon_progress {
             use addon_setup::{Part, Progress};
@@ -3626,8 +3739,31 @@ impl State {
         };
         self.ui.addon_error = self.addon_error.clone().unwrap_or_default();
         self.ui.addon_remove_pending = self.settings.addon_remove_pending;
-        self.ui.addon_removable =
-            self.addon_installed && self.addon_job.is_none() && !self.settings.addon_remove_pending;
+        self.ui.addon_removable = self.addon_installed
+            && self.addon_job.is_none()
+            && self.store_job.is_none()
+            && !self.settings.addon_remove_pending;
+        self.ui.storage = (self.store_info.is_some() || self.store_job.is_some()).then(|| {
+            let info = self.store_info.as_ref();
+            let running = self.store_job.as_ref().map(|j| match (&j.action, self.store_progress) {
+                (addon_store::Action::Reset, _) => (t.storage_resetting.to_string(), 0.0),
+                (_, Some((done, total))) if total > 0 => {
+                    ((t.storage_moving)(done as f32 / 1e9, total as f32 / 1e9), done as f32 / total as f32)
+                }
+                _ => (t.storage_starting.to_string(), 0.0),
+            });
+            ui::StorageView {
+                folder: info.map(|i| i.folder().display().to_string()).unwrap_or_default(),
+                root: info.map(|i| i.root.display().to_string()).unwrap_or_default(),
+                moved: info.is_some_and(|i| i.moved),
+                missing: info.is_some_and(|i| i.missing()),
+                gb: info.map_or(0.0, |i| i.bytes as f32 / 1e9),
+                running,
+                pending: self.settings.addon_store_move_pending.is_some(),
+                error: self.store_error.clone().unwrap_or_default(),
+                enabled: self.store_job.is_none() && self.addon_job.is_none(),
+            }
+        });
         self.ui.addon_size = self.addon_size as f32 / 1e9;
         // A TensorRT-RTX fallback, at start or for a model since: shown under the
         // status and on the AI chip, so it isn't only a log line.
@@ -4149,7 +4285,7 @@ impl State {
             self.apply_action(Action::ToggleUpscale);
             ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_addon_install) && self.addon_job.is_none() {
+        if std::mem::take(&mut self.ui.req_addon_install) && self.addon_job.is_none() && self.store_job.is_none() {
             if self.addon_installed && !self.addon_needs_install && !self.addon_update && self.addon_new_gpu {
                 // Install for this GPU: setup only adds files, so it can run while
                 // libaji is loaded.
@@ -4169,7 +4305,7 @@ impl State {
             }
             ui_acted = true;
         }
-        if std::mem::take(&mut self.ui.req_addon_remove) && self.addon_job.is_none() {
+        if std::mem::take(&mut self.ui.req_addon_remove) && self.addon_job.is_none() && self.store_job.is_none() {
             if self.aji_loaded {
                 // Its files are in use (see the update above): remove at the next start.
                 self.settings.addon_remove_pending = true;
@@ -4183,6 +4319,34 @@ impl State {
         if std::mem::take(&mut self.ui.req_addon_cancel) {
             if let Some(job) = &self.addon_job {
                 job.cancel();
+            }
+            ui_acted = true;
+        }
+        // Storage: a picked folder becomes the move's target (a folder with files in it gets
+        // a subfolder), shown in the confirmation before anything moves.
+        if let Some(folder) = self.ui.req_storage_pick.take() {
+            self.ui.storage_confirm = Some(addon_store::Action::Move(addon_store::move_target(&folder)));
+            ui_acted = true;
+        }
+        if let Some(action) = self.ui.req_storage.take() {
+            if self.store_job.is_none() && self.addon_job.is_none() {
+                match action.pending_token() {
+                    // On Windows a store file loaded here (libaji's TensorRT) can't move:
+                    // move at the next start, before the upscaler loads.
+                    Some(token) if cfg!(windows) && self.aji_loaded => {
+                        self.settings.addon_store_move_pending = Some(token);
+                        config::save(&self.settings);
+                    }
+                    _ => self.begin_store_job(action),
+                }
+            }
+            ui_acted = true;
+        }
+        if std::mem::take(&mut self.ui.req_storage_retry) {
+            // Try again: re-read where the store is, and start the upscaler if it's back.
+            if self.store_job.is_none() && self.addon_job.is_none() {
+                self.store_error = None;
+                self.start_upscaler();
             }
             ui_acted = true;
         }

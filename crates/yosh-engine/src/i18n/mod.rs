@@ -264,6 +264,39 @@ pub struct Strings {
     pub addon_remove_confirm: fn(f32) -> String,
     pub addon_remove_yes: &'static str,
     pub addon_remove_restart: &'static str,
+    /// Settings → AI upscaling → Storage, shown when the add-on's files are in the shared pack
+    /// store (MangaJaNaiCLI `store`): the heading and the line under it.
+    pub storage: &'static str,
+    pub storage_hint: &'static str,
+    /// Under the folder's path: in the default place, moved from `{root}`, or missing.
+    pub storage_default: &'static str,
+    pub storage_moved: fn(&str) -> String,
+    pub storage_missing: &'static str,
+    /// The folder's size, after its path.
+    pub storage_size: fn(f32) -> String,
+    /// The buttons: Move…, Move back, and (folder missing) Try again / Reset.
+    pub storage_move: &'static str,
+    pub storage_move_back: &'static str,
+    pub storage_retry: &'static str,
+    pub storage_reset: &'static str,
+    /// The folder picker's title.
+    pub dlg_storage: &'static str,
+    /// The confirmations: Move (`gb`, the new folder), Move back (`gb`, the default folder),
+    /// Reset (the missing folder); and the confirming buttons.
+    pub storage_move_confirm: fn(f32, &str) -> String,
+    pub storage_back_confirm: fn(f32, &str) -> String,
+    pub storage_reset_confirm: fn(&str) -> String,
+    pub storage_move_yes: &'static str,
+    pub storage_reset_yes: &'static str,
+    /// A move's progress bar (`done`, `total` GB), before its copy starts, and a reset.
+    pub storage_moving: fn(f32, f32) -> String,
+    pub storage_starting: &'static str,
+    pub storage_resetting: &'static str,
+    /// A move asked for while the add-on is loaded: it runs at the next start.
+    pub storage_restart: &'static str,
+    pub storage_failed: fn(&str) -> String,
+    /// AI upscaling can't start: the shared folder `{folder}` is missing.
+    pub upscale_store_missing: fn(&str) -> String,
     // --- desktop: AI-upscaling profiles (Settings, the profile editor, the AI chip) ---
     /// The profile editor window's title.
     pub profiles_title: &'static str,
@@ -678,6 +711,18 @@ mod tests {
             let z = (t.zoom_toast)(125.0, Some(t.fit_width));
             assert!(z.contains("125.00") && z.contains('\n') && z.contains(t.fit_width), "{l:?}");
             assert!(!(t.zoom_toast)(125.0, None).contains('\n'), "{l:?}");
+            // Storage: every folder and size shows up (the reset one names it twice).
+            assert!((t.storage_moved)("C:/ROOT").contains("C:/ROOT"), "{l:?}");
+            assert!((t.storage_size)(4.25).contains("4.2"), "{l:?}");
+            let m = (t.storage_move_confirm)(4.25, "D:/TO");
+            assert!(m.contains("4.2") && m.contains("D:/TO"), "{l:?}");
+            let b = (t.storage_back_confirm)(4.25, "C:/ROOT");
+            assert!(b.contains("4.2") && b.contains("C:/ROOT"), "{l:?}");
+            assert_eq!((t.storage_reset_confirm)("D:/GONE").matches("D:/GONE").count(), 2, "{l:?}");
+            let p = (t.storage_moving)(1.25, 4.25);
+            assert!(p.contains("1.2") && p.contains("4.2"), "{l:?}");
+            assert!((t.storage_failed)("ERR").contains("ERR"), "{l:?}");
+            assert!((t.upscale_store_missing)("D:/GONE").contains("D:/GONE"), "{l:?}");
             // Same help shape as English, so no section silently goes missing.
             assert_eq!(t.help_sections.len(), en::EN.help_sections.len(), "{l:?}");
         }

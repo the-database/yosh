@@ -235,6 +235,19 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   - *Remove the add-on* and the Windows uninstaller (`[UninstallRun]`) run
     `mangajanai setup --remove` before deleting the folder.
   - Portable yosh keeps everything in its own add-on folder.
+  - **Storage** (`addon_store.rs`, Settings → AI upscaling, like MangaJaNai GUI's App Settings >
+    Storage): shown for a store install whose mangajanai has `store` (`mangajanai store location
+    --json` succeeds; older add-ons hide it). It shows the store's folder and size, *Move…*
+    (folder picker; a folder with files gets a `JaNai shared runtime` subfolder; confirmation with
+    the size; `store move --progress lines`, `STORE_MOVE` lines as a progress bar) and *Move back*
+    (`store move --default`). While a moved store's folder is missing: *Try again* (re-checks,
+    restarts the upscaler) and *Reset* (`store reset`, then a setup-only run installs the packs
+    again). The commands run off the UI thread, without a console window. On Windows a move
+    asked for after an upscaler started waits for the next start (`addon_store_move_pending`):
+    libaji has TensorRT loaded from the store. While the folder is missing the upscaler doesn't
+    start (`addon::Status::StoreMissing`, checked with a stat of the default path's link). The
+    engine cache stays in the add-on's `cache/`. Manual test: `store_move_end_to_end`
+    (`--ignored`).
   - Tests: `YOSH_ADDON_MIRROR=<folder>` passes `--mirror` (the shared runtime release's archives
     and index), and `AJI_RUNTIME_STORE` points the store at a test folder; never test against the
     real one. The manual tests are `install_end_to_end`, `store_addon_end_to_end` and
