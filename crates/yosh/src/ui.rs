@@ -27,6 +27,27 @@ pub enum AddonView {
     Running { text: String, frac: f32 },
 }
 
+/// Settings → AI upscaling → Storage: where the shared pack store is (`addon_store.rs`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StorageView {
+    /// The folder the store's files are in, and its default path (the same unless moved).
+    pub folder: String,
+    pub root: String,
+    pub moved: bool,
+    /// Moved to a folder that's missing now (an unplugged drive).
+    pub missing: bool,
+    /// Its size in GB (0: unknown).
+    pub gb: f32,
+    /// A move or reset under way: what it's doing and how far along (0..1).
+    pub running: Option<(String, f32)>,
+    /// A move waits for the next start.
+    pub pending: bool,
+    /// The last move's or reset's error (empty: none).
+    pub error: String,
+    /// No install, move or reset is running.
+    pub enabled: bool,
+}
+
 #[derive(Default)]
 pub struct UiState {
     /// Path the user requested to open this frame (consumed by the app).
@@ -92,6 +113,11 @@ pub struct UiState {
     pub addon_size: f32,
     pub addon_remove_confirm: bool,
     pub addon_remove_pending: bool,
+    /// The Storage row, when the add-on's packs are in the shared pack store and its
+    /// mangajanai has `store` (`None`: hidden). Set by the app each frame. The confirmation
+    /// being shown is the UI's own (the app sets it for a picked folder).
+    pub storage: Option<StorageView>,
+    pub storage_confirm: Option<crate::addon_store::Action>,
     /// The reader's AI-upscaling chip: shown while an upscaler is running
     /// (`sr_available`); `sr_book_on` is the per-book switch, and `sr_state` what
     /// upscaling is doing for the page in view. Set by the app each frame.
@@ -147,6 +173,11 @@ pub struct UiState {
     pub req_addon_install: bool,
     pub req_addon_cancel: bool,
     pub req_addon_remove: bool,
+    /// Storage: a folder picked with Move… (the app works out the target and asks), a
+    /// confirmed move / move back / reset, and Try again.
+    pub req_storage_pick: Option<PathBuf>,
+    pub req_storage: Option<crate::addon_store::Action>,
+    pub req_storage_retry: bool,
     /// The AI chip was clicked: flip upscaling for this book (same as key `U`).
     pub req_toggle_upscale: bool,
     /// AI-upscaling profiles (`profiles.rs`): the ones a menu offers (built-ins,
@@ -1366,8 +1397,83 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     st.addon_remove_confirm = true;
                 }
             });
+            if let Some(sv) = st.storage.clone() {
+                storage_row(ui, st, &sv);
+            }
         });
     st.settings_open = open;
+}
+
+/// Settings → AI upscaling → Storage, laid out like MangaJaNai GUI's App Settings > Storage:
+/// the folder and its size, Move… / Move back, and Try again / Reset only while it's missing.
+fn storage_row(ui: &mut egui::Ui, st: &mut UiState, sv: &StorageView) {
+    use crate::addon_store::Action;
+    let t = tr();
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new(t.storage).strong());
+    ui.label(egui::RichText::new(t.storage_hint).weak().small());
+    if !sv.folder.is_empty() {
+        let size = if sv.gb > 0.0 { format!("  ·  {}", (t.storage_size)(sv.gb)) } else { String::new() };
+        ui.label(egui::RichText::new(format!("{}{size}", sv.folder)).monospace().small());
+        let note = if sv.missing {
+            t.storage_missing.to_string()
+        } else if sv.moved {
+            (t.storage_moved)(&sv.root)
+        } else {
+            t.storage_default.to_string()
+        };
+        ui.label(egui::RichText::new(note).weak().small());
+    }
+    if let Some((text, frac)) = &sv.running {
+        ui.add(egui::ProgressBar::new(*frac).desired_width(220.0).text(text.as_str()));
+    } else if let Some(a) = st.storage_confirm.clone() {
+        let (question, yes) = match &a {
+            Action::Move(to) => ((t.storage_move_confirm)(sv.gb, &to.display().to_string()), t.storage_move_yes),
+            Action::MoveBack => ((t.storage_back_confirm)(sv.gb, &sv.root), t.storage_move_yes),
+            Action::Reset => ((t.storage_reset_confirm)(&sv.folder), t.storage_reset_yes),
+        };
+        ui.label(question);
+        ui.horizontal(|ui| {
+            if ui.add_enabled(sv.enabled, egui::Button::new(yes)).clicked() {
+                st.storage_confirm = None;
+                st.req_storage = Some(a);
+            }
+            if ui.button(t.addon_cancel).clicked() {
+                st.storage_confirm = None;
+            }
+        });
+    } else if sv.pending {
+        ui.label(egui::RichText::new(t.storage_restart).small());
+    } else {
+        ui.add_enabled_ui(sv.enabled, |ui| {
+            ui.horizontal(|ui| {
+                if sv.missing {
+                    if ui.button(t.storage_retry).clicked() {
+                        st.req_storage_retry = true;
+                    }
+                    if ui.button(t.storage_reset).clicked() {
+                        st.storage_confirm = Some(Action::Reset);
+                    }
+                } else {
+                    if ui.button(t.storage_move).clicked()
+                        && let Some(p) = rfd::FileDialog::new().set_title(t.dlg_storage).pick_folder()
+                    {
+                        st.req_storage_pick = Some(p);
+                    }
+                    if sv.moved && ui.button(t.storage_move_back).clicked() {
+                        st.storage_confirm = Some(Action::MoveBack);
+                    }
+                }
+            });
+        });
+    }
+    if !sv.error.is_empty() {
+        ui.label(
+            egui::RichText::new(format!("\u{26a0} {}", (t.storage_failed)(&sv.error)))
+                .small()
+                .color(egui::Color32::from_rgb(220, 180, 100)),
+        );
+    }
 }
 
 /// Settings → AI upscaling: the default profile, and the editor.

@@ -8,6 +8,7 @@
 
 mod addon;
 mod addon_setup;
+mod addon_store;
 mod app;
 mod config;
 #[cfg(feature = "flipbench")]
