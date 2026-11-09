@@ -169,7 +169,7 @@ pub fn folder_size(dir: &Path) -> u64 {
 }
 
 /// Whether setup put this add-on's packs in the shared pack store (its `setup.json` says so).
-fn store_install(dir: &Path) -> bool {
+pub(crate) fn store_install(dir: &Path) -> bool {
     std::fs::read(dir.join("setup.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -177,7 +177,7 @@ fn store_install(dir: &Path) -> bool {
 }
 
 /// A `mangajanai` command in `dir`, without a console window.
-fn program(dir: &Path) -> Command {
+pub(crate) fn program(dir: &Path) -> Command {
     let mut cmd = Command::new(dir.join(PROGRAM));
     cmd.current_dir(dir).stdin(Stdio::null());
     #[cfg(windows)]
