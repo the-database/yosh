@@ -59,10 +59,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
-# Embed the application icon into the .exe (build.rs). Windows-only so a plain
-# `cargo build` on Linux pulls nothing extra.
+# Embed the application icon and manifest into the .exe (build.rs). Windows-only
+# so a plain `cargo build` on Linux pulls nothing extra.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+embed-manifest = "1.5"
 
 [features]
 default = ["sr"]
