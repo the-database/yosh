@@ -285,7 +285,10 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   `the-database/yosh` (the canonical repo; the old `yosh-rust` name 301-redirects). If newer, the top bar
   offers a one-click in-place update: download the platform asset, **validate it's a real executable
   (MZ/ELF magic) before** `self_replace`, then relaunch. Works for installed and portable builds.
-- **Windows icon/identity**: `build.rs` embeds `assets/yosh.ico` via `winresource` (Explorer/installer icon);
+- **Windows icon/identity**: `build.rs` embeds `assets/yosh.ico` via `winresource` (Explorer/installer icon)
+  and, via `embed-manifest`, the same application manifest as MangaJaNaiCLI: UTF-8 active code page (older
+  libaji and the TensorRT-RTX runtime take paths through the process code page; a non-ASCII add-on path needs it),
+  long paths, Common Controls v6, per-monitor v2 DPI awareness, Windows 10/11 compatibility;
   at runtime `app.rs::bind_exe_icon()` pulls that square multi-res icon back out of the exe (`ExtractIconExW`)
   and binds it as the window/taskbar icon — the bundled `yosh.png` is non-square and the taskbar's large slot
   rejects it. `main.rs` sets an explicit AppUserModelID that the installer shortcut must match.
