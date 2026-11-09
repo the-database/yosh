@@ -187,6 +187,10 @@ pub struct Settings {
     pub addon_update_pending: bool,
     /// The same for Remove: delete the add-on at the next start, before it loads.
     pub addon_remove_pending: bool,
+    /// A move of the shared pack store asked for while the add-on was loaded (on Windows a
+    /// store file in use can't move): the folder to move it to, "" = back to the default path
+    /// (`addon_store::Action::from_pending`). Runs at the next start, before the upscaler loads.
+    pub addon_store_move_pending: Option<String>,
     /// UI language as a `yosh_engine::i18n::Lang` token ("ja", "zh-Hant", …), or
     /// `None` to follow the OS display language.
     pub language: Option<String>,
@@ -227,6 +231,7 @@ impl Default for Settings {
             upscale_off: HashSet::new(),
             addon_update_pending: false,
             addon_remove_pending: false,
+            addon_store_move_pending: None,
             language: None,
             window: None,
         }

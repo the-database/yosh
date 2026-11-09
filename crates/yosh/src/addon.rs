@@ -28,6 +28,9 @@ pub enum Status {
     /// Running on the named device.
     Ready(String),
     Error(String),
+    /// The shared pack store was moved to this folder, which is missing now (an unplugged
+    /// drive): not started (`addon_store::missing_folder`).
+    StoreMissing(String),
 }
 
 /// A started upscaler.
