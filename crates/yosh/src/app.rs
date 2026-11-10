@@ -2714,6 +2714,7 @@ impl State {
         // frame that draws them. Same for the AI-upscale add-on, if one is running.
         pool.set_waker(self.reader.waker.clone());
         pool.set_upscaler(self.reader.upscaler.clone());
+        pool.set_sr_master_budget((self.reader.sr_master_mb as usize) << 20);
         self.reader.pool = Some(pool);
         self.reader.reset_volume_state();
         self.info_for = None;
@@ -3041,6 +3042,7 @@ impl State {
         self.reader.lq_tier = b.lq_tier;
         self.reader.sr_ahead = b.sr_ahead;
         self.reader.sr_behind = b.sr_behind;
+        self.reader.sr_master_mb = b.sr_master_mb;
         self.reader.cache.set_cap(b.cache_cap, current);
         self.reader.lq_cache.set_cap(b.lq_cap, current);
         self.reader.tex_pool.set_max_total(b.texpool_max);
@@ -3062,6 +3064,12 @@ impl State {
         // otherwise suppress the very prefetch that refills the new pool).
         pool.set_waker(self.reader.waker.clone());
         pool.set_upscaler(self.reader.upscaler.clone());
+        // Same pages, same upscaler: keep what the SR lane already upscaled (the
+        // new reach prunes it on the next prefetch).
+        if let Some(old) = &self.reader.pool {
+            pool.adopt_sr_masters(old);
+        }
+        pool.set_sr_master_budget((b.sr_master_mb as usize) << 20);
         self.reader.pool = Some(pool);
         // A profile change while minimized must not un-park the reader.
         if self.parked

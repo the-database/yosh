@@ -155,8 +155,13 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   High = the whole prefetch window, Mid (Auto on battery) = 3 ahead / 1 behind, Low = the view only.
 - **Single-resize invariant holds:** `decode::decode_sr` runs the model on the whole page, then the same
   HQ CPU resize (`sr_from_master`) to the exact target, so the GPU samples 1:1. The model's full-size
-  output (`SrMaster`) is kept per page (`MasterCache`, 256 MB LRU, per pool), so a zoom/resize of an
-  upscaled page only re-sizes it — no read, decode or inference — and skips the plain re-decode.
+  output (`SrMaster`) is kept per page (`MasterCache`, per pool), so a zoom/resize/fullscreen switch of
+  an upscaled page only re-sizes it — no read, decode or inference — and skips the plain re-decode.
+  What it keeps follows the tier's reach: each prefetch drops the pages more than 2 past
+  `sr_ahead`/`sr_behind` (`Reader`, `DecodePool::retain_sr_masters`), and `Budget::sr_master_mb`
+  (the reader's RAM slice, 256 MB – 4 GB) caps it, least recently used out. A tier change's new pool
+  takes the old one's (`adopt_sr_masters`). (A fixed 256 MB used to evict most of a High-tier reach of
+  colour or 4x pages, so a resize re-ran the model on nearly every page ahead.)
 - **Transparent pages** (any alpha < 255) upscale the way MangaJaNaiCLI does (`decode::upscale_with_alpha`):
   uniform alpha upscales the color once and rebuilds the alpha; otherwise the color is composited onto
   black and onto white, both are upscaled (**two inferences**, so twice the time), and the alpha is

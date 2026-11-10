@@ -132,17 +132,20 @@ pub struct DecodePool {
     wake_pending: Arc<AtomicBool>,
 }
 
-/// How many bytes of kept model outputs ([`MasterCache`]) a pool may hold: a
-/// 4x gray page from a 1200x1700 source is ~32 MB, a color one ~98 MB, so this
-/// covers the pages in view and their neighbours — where zooms happen.
+/// How many bytes of kept model outputs ([`MasterCache`]) a pool may hold until
+/// the shell sets its budget ([`DecodePool::set_sr_master_budget`], from system
+/// RAM: `Budget::sr_master_mb`). A 4x gray page from a 1200x1700 source is ~32 MB,
+/// a color one ~98 MB.
 const SR_MASTER_BUDGET: usize = 256 << 20;
 
 /// The SR lane's kept model outputs by page, so an upscaled page whose display
 /// size changed is re-sized from its [`SrMaster`] instead of re-reading,
 /// re-decoding and re-running the model (the output doesn't depend on the
-/// display size). Least-recently-used out once over `budget` bytes; the newest
-/// entry always stays, however large. Lives with the pool, so it never outlives
-/// the volume its indices belong to.
+/// display size). The reader drops the pages that left the AI-upscale reach
+/// ([`DecodePool::retain_sr_masters`]), so it holds about the pages the lane
+/// upscales ahead and behind; `budget` bytes is the ceiling on top of that,
+/// least-recently-used out (the newest entry always stays, however large). Lives
+/// with the pool, so it never outlives the volume its indices belong to.
 struct MasterCache {
     map: HashMap<usize, (Arc<SrMaster>, u64)>,
     bytes: usize,
@@ -170,11 +173,16 @@ impl MasterCache {
         if let Some((old, _)) = self.map.insert(index, (m, self.tick)) {
             self.bytes -= old.pixels.len();
         }
+        self.evict_over_budget(index);
+    }
+
+    /// Least-recently-used out until within `budget`, never `keep`.
+    fn evict_over_budget(&mut self, keep: usize) {
         while self.bytes > self.budget && self.map.len() > 1 {
             let lru = self
                 .map
                 .iter()
-                .filter(|(i, _)| **i != index)
+                .filter(|(i, _)| **i != keep)
                 .min_by_key(|(_, (_, t))| *t)
                 .map(|(i, _)| *i);
             let Some(lru) = lru else { break };
@@ -182,6 +190,24 @@ impl MasterCache {
                 self.bytes -= old.pixels.len();
             }
         }
+    }
+
+    fn set_budget(&mut self, budget: usize) {
+        self.budget = budget;
+        let newest = self.map.iter().max_by_key(|(_, (_, t))| *t).map(|(i, _)| *i);
+        self.evict_over_budget(newest.unwrap_or(usize::MAX));
+    }
+
+    /// Drop the entries whose index `keep` rejects.
+    fn retain(&mut self, keep: impl Fn(usize) -> bool) {
+        let bytes = &mut self.bytes;
+        self.map.retain(|&i, (m, _)| {
+            let k = keep(i);
+            if !k {
+                *bytes -= m.pixels.len();
+            }
+            k
+        });
     }
 
     fn clear(&mut self) {
@@ -564,6 +590,31 @@ impl DecodePool {
     /// beyond `out`.
     pub fn sr_kept_indices(&self, out: &mut Vec<usize>) {
         out.extend(self.masters.lock().unwrap_or_else(|e| e.into_inner()).map.keys().copied());
+    }
+
+    /// The ceiling, in bytes, on the kept model outputs ([`MasterCache`]); the
+    /// least recently used go first when they're over it.
+    pub fn set_sr_master_budget(&self, bytes: usize) {
+        self.masters.lock().unwrap_or_else(|e| e.into_inner()).set_budget(bytes);
+    }
+
+    /// Drop the kept model outputs of the pages `keep` rejects: the reader keeps
+    /// those within its AI-upscale reach, so what it no longer upscales doesn't
+    /// hold memory up to the budget.
+    pub fn retain_sr_masters(&self, keep: impl Fn(usize) -> bool) {
+        self.masters.lock().unwrap_or_else(|e| e.into_inner()).retain(keep);
+    }
+
+    /// Take over `old`'s kept model outputs (and its budget): a pool rebuilt on the
+    /// same source with the same upscaler (a performance-tier change) keeps the
+    /// pages it already upscaled, instead of running the model on them again.
+    pub fn adopt_sr_masters(&self, old: &DecodePool) {
+        let taken = {
+            let mut o = old.masters.lock().unwrap_or_else(|e| e.into_inner());
+            let budget = o.budget;
+            std::mem::replace(&mut *o, MasterCache::new(budget))
+        };
+        *self.masters.lock().unwrap_or_else(|e| e.into_inner()) = taken;
     }
 
     /// Replace the SR lane's queue (`(index, target_h)`, nearest-first). Pages no
@@ -1201,6 +1252,25 @@ mod tests {
         assert_eq!(c.bytes, 500);
         c.clear();
         assert!(c.get(9).is_none() && c.bytes == 0);
+    }
+
+    /// The reader's reach drops what it no longer upscales, and a smaller budget
+    /// evicts the least recently used at once (the newest stays).
+    #[test]
+    fn master_cache_retains_the_reach_and_follows_its_budget() {
+        let mut c = MasterCache::new(1000);
+        for i in 0..10 {
+            c.insert(i, master(50));
+        }
+        c.retain(|i| (3..=7).contains(&i));
+        assert_eq!(c.bytes, 250);
+        assert!(c.get(2).is_none() && c.get(8).is_none() && c.get(5).is_some());
+        c.set_budget(120); // 5 was used last, 7 inserted last of the rest
+        assert_eq!(c.bytes, 100);
+        assert!(c.get(5).is_some() && c.get(7).is_some() && c.get(3).is_none());
+        c.set_budget(10); // alone over budget: the newest stays
+        assert_eq!(c.map.len(), 1);
+        assert!(c.get(7).is_some());
     }
 
     /// The SR lane only ever sees its own queue: without an upscaler (no add-on)
