@@ -149,7 +149,12 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   lowest-priority queue (`set_sr_jobs`) and condvar — never the decode window or thumbnails. The reader
   queues the pages of the prefetch window (nearest-first) once the normal decode shows each at its
   settled size **above** its source size (where the GPU would magnify); the upscaled texture then
-  swaps in place. The lane never reports `Msg::Failed` (that would hide a good page) — it sends
+  swaps in place. The lane runs one page at a time, so while a page in view still waits for its
+  plain decode (not decoded, LQ, or at a stale size) it gets only the view: a neighbour decoded
+  first used to hold it for a whole inference after a jump or cold open. A page that will never get
+  another plain decode (failed, at or below source size, skipped) isn't waited for. The job in
+  flight and results `poll` hasn't delivered yet aren't queued again (`JobState::replace_sr_jobs`),
+  which used to make the lane re-size the page it had just made. The lane never reports `Msg::Failed` (that would hide a good page) — it sends
   `Msg::SrSkipped { reason }` instead.
   How far around the view it upscales follows the Performance tier (`Budget::sr_ahead`/`sr_behind`):
   High = the whole prefetch window, Mid (Auto on battery) = 3 ahead / 1 behind, Low = the view only.
