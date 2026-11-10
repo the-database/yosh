@@ -2266,6 +2266,17 @@ impl Reader {
                 }
             })
             .collect();
+        // The page(s) in view (for AI upscaling, continuous scroll counts the
+        // anchor page only), and whether one of them still waits for its plain
+        // decode: not decoded yet, LQ, or at a stale size. A page that can't get
+        // there (a failed decode) or needs nothing more is never in `jobs`, so
+        // this always ends once the decodes queued here land.
+        let (va, vb) = if self.scroll_mode {
+            (self.index, None)
+        } else {
+            self.view_pages(self.index)
+        };
+        let view_pending = jobs.iter().any(|&(i, ..)| i == va || Some(i) == vb);
         if let Some(pool) = &self.pool {
             pool.set_jobs(jobs);
         }
@@ -2277,12 +2288,7 @@ impl Reader {
         if self.upscaler.is_some() && let Some(pool) = &self.pool {
             // Within the window, only as far around the view as the performance
             // tier allows (`Budget::sr_ahead`/`sr_behind`).
-            let (a, b) = if self.scroll_mode {
-                (self.index, None)
-            } else {
-                self.view_pages(self.index)
-            };
-            let (lo, hi) = (a.min(b.unwrap_or(a)), a.max(b.unwrap_or(a)));
+            let (lo, hi) = (va.min(vb.unwrap_or(va)), va.max(vb.unwrap_or(va)));
             let (ahead, behind) = (self.sr_ahead, self.sr_behind);
             if sr_active {
                 // Kept model outputs: the reach, and a few pages past it so a step
@@ -2290,6 +2296,11 @@ impl Reader {
                 let (ka, kb) = (ahead + SR_KEEP_SLACK, behind + SR_KEEP_SLACK);
                 pool.retain_sr_masters(|i| sr_in_reach(i, lo, hi, ka, kb));
             }
+            // The lane runs one page at a time, so while a page in view still
+            // waits for its plain decode it gets the view only: otherwise a
+            // nearby page whose decode lands first (a jump, a cold open) would
+            // hold the lane for a whole inference before the page in view.
+            let (ahead, behind) = if view_pending { (0, 0) } else { (ahead, behind) };
             let sr_jobs: Vec<(usize, u32)> = if sr_active && settled {
                 window
                     .iter()
@@ -3411,6 +3422,169 @@ mod tests {
         let (mut done, mut queued, mut kept) = (vec![9], vec![9], vec![9]);
         r.sr_seek_marks(&mut done, &mut queued, &mut kept);
         assert!(done.is_empty() && queued.is_empty() && kept.is_empty());
+    }
+
+    /// An upscaler that never runs a model: these tests only look at what the
+    /// reader queues for the SR lane.
+    struct QueueOnly;
+    impl crate::sr::Upscaler for QueueOnly {
+        fn upscale(&self, _: u32, _: u32, _: u32, _: &[u8], _: f32, _: &dyn Fn() -> bool) -> crate::sr::SrOutcome {
+            crate::sr::SrOutcome::Skip
+        }
+        fn epoch(&self) -> u64 {
+            0
+        }
+        fn model_for(&self, _: u32, _: bool, _: f32) -> Option<std::sync::Arc<str>> {
+            Some("m".into())
+        }
+    }
+
+    /// A source whose reads fail: the pool's workers and SR lane get nothing to
+    /// decode, and the tests land pages in the cache themselves.
+    struct NoReads(usize);
+    impl crate::source::PageSource for NoReads {
+        fn len(&self) -> usize {
+            self.0
+        }
+        fn name(&self, _: usize) -> &str {
+            "p"
+        }
+        fn read_page(&self, _: usize) -> std::io::Result<std::sync::Arc<Vec<u8>>> {
+            Err(std::io::Error::other("no reads"))
+        }
+    }
+
+    /// A High-tier reader with a pool and an upscaler, its view settled.
+    fn sr_reader(layout: crate::layout::Layout, scroll_mode: bool, index: usize) -> super::Reader {
+        let mut r = spread_reader(layout, scroll_mode, 20);
+        let src: std::sync::Arc<dyn crate::source::PageSource> = std::sync::Arc::new(NoReads(20));
+        r.source = Some(src.clone());
+        r.pool = Some(super::DecodePool::new(src, r.device.clone(), r.queue.clone(), r.tex_pool.clone(), 1));
+        r.set_upscaler(Some(std::sync::Arc::new(QueueOnly)));
+        r.view_settled = true;
+        r.index = index;
+        r
+    }
+
+    /// Land a plain decode of page `i` (`src_h` tall, aspect 0.7) at its current
+    /// decode target, or `off` pixels away from it (a stale size).
+    fn land(r: &mut super::Reader, i: usize, src_h: u32, off: i32, lq: bool) {
+        land_as(r, i, src_h, off, |p| p.lq = lq);
+    }
+
+    fn land_as(r: &mut super::Reader, i: usize, src_h: u32, off: i32, edit: impl Fn(&mut crate::page::PageTexture)) {
+        let put = |r: &mut super::Reader, th: u32| {
+            let img = crate::decode::DecodedImage {
+                w: 2,
+                h: 2,
+                src_w: src_h * 7 / 10,
+                src_h,
+                gray: true,
+                path: crate::decode::ResizePath::GrayLinear,
+                pixels: vec![0; 4],
+            };
+            let mut p = crate::page::PagePipeline::upload(&r.device, &r.queue, &img, &r.tex_pool, th);
+            edit(&mut p);
+            r.cache.insert(i, p, r.index);
+        };
+        // The target follows the page's aspect, known once it has landed.
+        put(r, 1);
+        let want = r.page_target_h(i);
+        put(r, want.saturating_add_signed(off));
+    }
+
+    fn sr_queue(r: &mut super::Reader) -> Vec<usize> {
+        r.prefetch();
+        r.sr_queued.clone()
+    }
+
+    /// After a jump the pages around the new view can finish their plain decode
+    /// before the page in view does. The SR lane runs one page at a time, so
+    /// until the view's own decode lands it gets nothing else: the page in view
+    /// is then its first job, not the second.
+    #[test]
+    fn sr_lane_gets_the_page_in_view_first_after_a_jump() {
+        let mut r = sr_reader(crate::layout::Layout::Single, false, 10);
+        land(&mut r, 11, 500, 0, false);
+        land(&mut r, 12, 500, 0, false);
+        assert_eq!(sr_queue(&mut r), Vec::<usize>::new(), "page 10 not decoded yet");
+        // A fast-tier (LQ) decode isn't the page's final one either.
+        land(&mut r, 10, 500, 0, true);
+        assert_eq!(sr_queue(&mut r), Vec::<usize>::new(), "page 10 still LQ");
+        land(&mut r, 10, 500, 0, false);
+        let q = sr_queue(&mut r);
+        assert_eq!(q.first(), Some(&10), "{q:?}");
+        assert!(q.contains(&11) && q.contains(&12), "then the look-ahead: {q:?}");
+    }
+
+    /// A cold open decodes at a first guess of the size and again once the window
+    /// settles; a neighbour at the settled size doesn't jump ahead of the page in
+    /// view still at the old one.
+    #[test]
+    fn sr_lane_waits_for_the_view_at_its_settled_size() {
+        let mut r = sr_reader(crate::layout::Layout::Single, false, 0);
+        land(&mut r, 0, 500, 120, false);
+        land(&mut r, 1, 500, 0, false);
+        land(&mut r, 3, 500, 0, false);
+        assert_eq!(sr_queue(&mut r), Vec::<usize>::new());
+        land(&mut r, 0, 500, 0, false);
+        assert_eq!(sr_queue(&mut r), vec![0, 1, 3]);
+    }
+
+    /// A page in view that will never get another plain decode doesn't hold the
+    /// look-ahead back: a failed decode, one shown at or below its source size
+    /// (nothing to upscale; this is also what a decode capped at the GPU's
+    /// texture limit is measured against, as its target is capped too), one the
+    /// lane skipped (GIF, `.ico`, animation, no model), and an upscaled page
+    /// whose size changed (the lane re-sizes it, no plain decode first).
+    #[test]
+    fn sr_look_ahead_never_waits_on_a_view_page_that_needs_nothing() {
+        let ahead = |r: &mut super::Reader| {
+            land(r, 11, 500, 0, false);
+            land(r, 12, 500, 0, false);
+            sr_queue(r)
+        };
+        let mut r = sr_reader(crate::layout::Layout::Single, false, 10);
+        r.failed.insert(10, "corrupt".into());
+        assert_eq!(ahead(&mut r), vec![11, 12], "failed");
+
+        let mut r = sr_reader(crate::layout::Layout::Single, false, 10);
+        land(&mut r, 10, 2000, 0, false);
+        assert!(r.page_target_h(10) <= 2000);
+        assert_eq!(ahead(&mut r), vec![11, 12], "at or below source size");
+
+        let mut r = sr_reader(crate::layout::Layout::Single, false, 10);
+        land(&mut r, 10, 500, 0, false);
+        let want = r.page_target_h(10);
+        r.sr_skip.insert(10, (want, crate::sr::SrSkip::Unsupported));
+        assert_eq!(ahead(&mut r), vec![11, 12], "skipped by the lane");
+
+        let mut r = sr_reader(crate::layout::Layout::Single, false, 10);
+        land_as(&mut r, 10, 500, 300, |p| {
+            p.sr = true;
+            p.sr_model = Some("m".into());
+        });
+        assert_eq!(ahead(&mut r), vec![10, 11, 12], "an upscaled page re-sized by the lane");
+    }
+
+    /// A spread waits for both pages in view; continuous scroll for its anchor.
+    #[test]
+    fn sr_lane_waits_for_every_page_in_view() {
+        let mut r = sr_reader(crate::layout::Layout::Spread, false, 4);
+        let (a, b) = r.view_pages(4);
+        let b = b.expect("a two-page view");
+        r.index = a;
+        land(&mut r, a, 500, 0, false);
+        land(&mut r, b + 1, 500, 0, false);
+        assert_eq!(sr_queue(&mut r), vec![a], "only the view while {b} decodes");
+        land(&mut r, b, 500, 0, false);
+        assert_eq!(&sr_queue(&mut r)[..3], &[a, b, b + 1]);
+
+        let mut r = sr_reader(crate::layout::Layout::Single, true, 5);
+        land(&mut r, 6, 500, 0, false);
+        assert_eq!(sr_queue(&mut r), Vec::<usize>::new());
+        land(&mut r, 5, 500, 0, false);
+        assert_eq!(sr_queue(&mut r), vec![5, 6]);
     }
 
     /// The decode view settles only after [`super::SETTLE`] of stillness, never
