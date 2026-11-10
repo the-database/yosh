@@ -112,6 +112,17 @@ pub struct ModelInfo {
     pub overlap: u32,
 }
 
+/// Whether `err`, from [`Context::load_model`], [`Model::info`] or
+/// [`Model::upscale`], says the GPU ran out of memory. libaji (after v0.25.0)
+/// reports that as "out of GPU memory: …" or "out of GPU memory loading …", with
+/// what was needed and how much is free, and a model's own buffers as "out of
+/// memory for …". The image ABI has no status code at load (`aji_img_load`
+/// returns NULL and a message), so the message is the signal. Another backend on
+/// the same GPU would need more memory, not less: don't fall back on this.
+pub fn is_out_of_memory(err: &str) -> bool {
+    err.starts_with("out of GPU memory") || err.starts_with("out of memory for ")
+}
+
 /// How [`Model::upscale`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upscaled {
@@ -581,7 +592,29 @@ impl Model {
 
 #[cfg(test)]
 mod tests {
-    use super::fits;
+    use super::{fits, is_out_of_memory};
+
+    #[test]
+    fn out_of_memory_is_told_apart_by_libajis_messages() {
+        // libaji's own wording (aji_img_trt.cpp)
+        for e in [
+            "out of GPU memory: 4x_MangaJaNai_1500p_V1_ESRGAN_105k_fp16 needs 1351 MB for its activations (420 of 32607 MB of GPU memory free)",
+            "out of GPU memory loading 2x_MangaJaNai_1200p_V1_ESRGAN_70k_fp16 (12 of 32607 MB of GPU memory free)",
+            "out of memory for 2x_MangaJaNai_1200p_V1_ESRGAN_70k_fp16's tile buffers (12 of 32607 MB of GPU memory free)",
+            "out of GPU memory: 2x_model for a 2400x3500 image (90 of 8188 MB of GPU memory free)",
+        ] {
+            assert!(is_out_of_memory(e), "{e}");
+        }
+        for e in [
+            "TensorRT-RTX engine build failed for m (see m.rtxengine.build.log)",
+            "cannot read model: m.onnx",
+            "createExecutionContext failed (12 of 32607 MB of GPU memory free)",
+            "out of host memory for tiling buffers",
+            "",
+        ] {
+            assert!(!is_out_of_memory(e), "{e}");
+        }
+    }
 
     #[test]
     fn buffer_bounds_are_checked_before_crossing_ffi() {

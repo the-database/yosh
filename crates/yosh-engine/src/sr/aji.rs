@@ -11,7 +11,9 @@
 //!
 //! On TensorRT-RTX (chosen, or Auto's pick), a model that fails to load or build falls back
 //! to TensorRT on the same GPU: the TensorRT context opens the first time that
-//! happens, and the other models stay on TensorRT-RTX.
+//! happens, and the other models stay on TensorRT-RTX. Not when it failed for lack of
+//! GPU memory ([`yosh_image::aji::is_out_of_memory`]): a second CUDA context and another
+//! copy of the model would need more of it, so that model fails with libaji's message.
 //!
 //! [`Upscaler::release_gpu`] (the shell calls it while upscaling is idle) closes the
 //! models and the contexts and has libaji (0.24.0+) free the device, which on the
@@ -334,7 +336,8 @@ impl AjiUpscaler {
     }
 
     /// `name` failed on the primary backend with `err`: on TensorRT-RTX, retry it
-    /// on TensorRT (opening that context on first need); otherwise it stays failed.
+    /// on TensorRT (opening that context on first need); otherwise, or when it ran
+    /// out of GPU memory, it stays failed.
     fn fall_back(
         &self,
         slots: &mut HashMap<String, Slot>,
@@ -342,7 +345,7 @@ impl AjiUpscaler {
         path: &Path,
         err: String,
     ) -> Result<Option<(Arc<Model>, u32)>, String> {
-        let Some(fb) = &self.fallback else {
+        let Some(fb) = self.fallback.as_ref().filter(|_| !yosh_image::aji::is_out_of_memory(&err)) else {
             slots.insert(name.to_string(), Slot::Failed);
             return Err(err);
         };

@@ -211,7 +211,9 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   (not installed, older GPU, device list failed) is silent. Auto off Windows is TensorRT only.
   The image ABI has no fallback of its own, so `start_blocking` tries TensorRT (Auto: then DirectML) when it can't start, and
   `AjiUpscaler` retries a model on a lazily opened TensorRT context when it fails to load or build
-  (the other models stay on TensorRT-RTX). Either fallback shows as a warning under the Settings status
+  (the other models stay on TensorRT-RTX), except when it ran out of GPU memory
+  (`yosh_image::aji::is_out_of_memory`, libaji's "out of GPU memory" message): a second CUDA context
+  and another copy of the model would only need more, and the fallback would hide the reason. Either fallback shows as a warning under the Settings status
   and in the AI chip's tooltip (`addon::Running::fallback`, `Upscaler::fallback`), and MangaJaNaiCLI
   prints a `BACKEND_FALLBACK` line that MangaJaNaiConverterGui shows in its status bar. Stored as `upscale_backend: "tensorrt"` +
   `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
