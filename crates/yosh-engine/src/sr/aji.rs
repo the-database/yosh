@@ -28,7 +28,7 @@ use std::time::Duration;
 use yosh_image::aji::{Aji, Context, ContextParams, LoadParams, Model, ModelState, Pixels, PixelsMut, Upscaled};
 pub use yosh_image::aji::{Backend, Device};
 
-use super::rules::{select, SrRule};
+use super::rules::{auto_levels, select, SrRule};
 use super::{SrOutcome, Upscaler};
 use crate::pool::Waker;
 
@@ -369,6 +369,10 @@ impl Upscaler for AjiUpscaler {
 
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<Arc<str>> {
         select(&self.rules(), src_h, gray, target_scale).map(Arc::from)
+    }
+
+    fn auto_levels(&self, src_h: u32, gray: bool, target_scale: f32) -> bool {
+        auto_levels(&self.rules(), src_h, gray, target_scale)
     }
 
     fn set_rules(&self, rules: Vec<SrRule>) {

@@ -17,6 +17,7 @@
 //! Which model handles a page is data ([`rules`]), mirroring
 //! MangaJaNaiConverterGui's workflow chains so both apps pick identically.
 
+pub mod levels;
 pub mod rules;
 
 #[cfg(feature = "sr")]
@@ -78,6 +79,14 @@ pub trait Upscaler: Send + Sync {
     /// it — lets the pool reuse a kept model output when only the display size
     /// changed (same model ⇒ same output).
     fn model_for(&self, src_h: u32, gray: bool, target_scale: f32) -> Option<std::sync::Arc<str>>;
+
+    /// Whether a gray page's levels are auto-adjusted before the model
+    /// ([`rules::SrRule::auto_levels`]); the caller does it, before any alpha
+    /// compositing, so a transparent page gets the levels of its own luma. Part of
+    /// what a kept model output was made with, like [`Upscaler::model_for`].
+    fn auto_levels(&self, _src_h: u32, _gray: bool, _target_scale: f32) -> bool {
+        false
+    }
 
     /// Replace the rules that pick the model (a profile switch). Takes effect
     /// for the next page; the reader re-runs the pages upscaled with a model the

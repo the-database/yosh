@@ -1035,11 +1035,13 @@ impl Reader {
     }
 
     /// For an upscaled page: whether the rules now pick another model for it at
-    /// `want` (`Some(true)`: re-run it), or none (`None`: back to a plain decode).
+    /// `want`, or switch its auto levels (`Some(true)`: re-run it), or none
+    /// (`None`: back to a plain decode).
     fn sr_model_moved(&self, p: &PageTexture, want: u32) -> Option<bool> {
         let up = self.upscaler.as_ref()?;
-        let now = up.model_for(p.src_h, p.gray, want as f32 / p.src_h.max(1) as f32)?;
-        Some(p.sr_model.as_deref() != Some(&*now))
+        let scale = want as f32 / p.src_h.max(1) as f32;
+        let now = up.model_for(p.src_h, p.gray, scale)?;
+        Some(p.sr_model.as_deref() != Some(&*now) || p.sr_levels != up.auto_levels(p.src_h, p.gray, scale))
     }
 
     /// Whether pages are being AI-upscaled right now (an upscaler is installed and

@@ -1,7 +1,8 @@
 //! Model selection: an ordered rule list, first match wins — the same shape as
 //! MangaJaNaiConverterGui's workflow "chains", so a model pack's rule table means
 //! the same thing in both apps. Only the fields a reader needs are modelled:
-//! source-height range, gray/color, and target-scale range.
+//! source-height range, gray/color, target-scale range, the model, and the
+//! chain's "Auto Adjust Levels on Grayscale Images".
 
 /// One rule. A bound of 0 means "unbounded" (MangaJaNaiConverterGui's convention).
 #[derive(Clone, Debug, PartialEq)]
@@ -18,6 +19,10 @@ pub struct SrRule {
     /// Model file stem (`<models dir>/<model>.onnx`), or `None` for "don't
     /// upscale pages matching this rule".
     pub model: Option<String>,
+    /// Auto-adjust a gray page's levels before the model ([`super::levels`]):
+    /// MangaJaNai GUI's "Auto Adjust Levels on Grayscale Images", on in its
+    /// default workflow's gray chains. Colour pages ignore it.
+    pub auto_levels: bool,
 }
 
 impl SrRule {
@@ -30,16 +35,26 @@ impl SrRule {
     }
 }
 
+/// The rule that upscales a page, if any: the first matching rule, when it has a model.
+pub fn pick(rules: &[SrRule], src_h: u32, gray: bool, scale: f32) -> Option<&SrRule> {
+    rules.iter().find(|r| r.matches(src_h, gray, scale)).filter(|r| r.model.is_some())
+}
+
 /// The model for a page, if any: the first matching rule's model.
 pub fn select(rules: &[SrRule], src_h: u32, gray: bool, scale: f32) -> Option<&str> {
-    rules
-        .iter()
-        .find(|r| r.matches(src_h, gray, scale))
-        .and_then(|r| r.model.as_deref())
+    pick(rules, src_h, gray, scale).and_then(|r| r.model.as_deref())
+}
+
+/// Whether a page's levels are auto-adjusted before its model: the picked rule's
+/// [`SrRule::auto_levels`], on gray pages only.
+pub fn auto_levels(rules: &[SrRule], src_h: u32, gray: bool, scale: f32) -> bool {
+    gray && pick(rules, src_h, gray, scale).is_some_and(|r| r.auto_levels)
 }
 
 /// MangaJaNaiConverterGui's default workflow: IllustrationJaNai for color pages;
-/// for gray pages the MangaJaNai model trained nearest the source height. Within
+/// for gray pages the MangaJaNai model trained nearest the source height, with
+/// the levels auto-adjusted first (as the GUI's gray chains and MangaJaNaiCLI's
+/// `--preset manga` do; the other profiles inherit it with these rules). Within
 /// each group the 2x model comes first, so a target of exactly 2x picks it, and
 /// anything above 2x takes the 4x model. Model stems are the ONNX exports of the
 /// same checkpoints, named after their ONNX precision as MangaJaNai GUI 2.0 ships
@@ -112,11 +127,12 @@ fn color(min_scale: f32, max_scale: f32, model: &str) -> SrRule {
         min_scale,
         max_scale,
         model: Some(model.to_string()),
+        auto_levels: false,
     }
 }
 
 fn gray(min_h: u32, max_h: u32, min_scale: f32, max_scale: f32, model: String) -> SrRule {
-    SrRule { min_h, max_h, gray: true, color: false, min_scale, max_scale, model: Some(model) }
+    SrRule { min_h, max_h, gray: true, color: false, min_scale, max_scale, model: Some(model), auto_levels: true }
 }
 
 #[cfg(test)]
@@ -156,6 +172,28 @@ mod tests {
     }
 
     #[test]
+    fn gray_rules_adjust_levels_like_the_gui_default_workflow() {
+        // The GUI's default chains: AutoAdjustLevels on the 14 gray ones, off on colour.
+        for rules in [default_rules(), quality_rules(), performance_rules()] {
+            assert!(rules.iter().all(|r| r.auto_levels == r.gray), "{rules:?}");
+        }
+        let r = default_rules();
+        assert!(auto_levels(&r, 1500, true, 1.5));
+        assert!(auto_levels(&r, 1500, true, 3.0));
+        assert!(!auto_levels(&r, 1500, false, 1.5), "colour pages never");
+        // A gray page whose rule has levels off, or no model, gets none.
+        let mut off = r.clone();
+        off.iter_mut().for_each(|r| r.auto_levels = false);
+        assert!(!auto_levels(&off, 1500, true, 1.5));
+        let none = vec![SrRule { model: None, ..r[2].clone() }];
+        assert!(!auto_levels(&none, 1200, true, 1.5));
+        // A rule for both kinds applies levels to the gray pages only.
+        let both = vec![SrRule { gray: true, color: true, ..r[2].clone() }];
+        assert!(auto_levels(&both, 1200, true, 1.5));
+        assert!(!auto_levels(&both, 1200, false, 1.5));
+    }
+
+    #[test]
     fn quality_and_performance_profiles() {
         let q = quality_rules();
         assert_eq!(select(&q, 1500, false, 1.3), Some(QUALITY_COLOR));
@@ -181,8 +219,8 @@ mod tests {
     #[test]
     fn first_match_wins_and_none_means_skip() {
         let rules = vec![
-            SrRule { min_h: 0, max_h: 1000, gray: true, color: true, min_scale: 0.0, max_scale: 0.0, model: None },
-            SrRule { min_h: 0, max_h: 0, gray: true, color: true, min_scale: 0.0, max_scale: 0.0, model: Some("any".into()) },
+            SrRule { min_h: 0, max_h: 1000, gray: true, color: true, min_scale: 0.0, max_scale: 0.0, model: None, auto_levels: false },
+            SrRule { min_h: 0, max_h: 0, gray: true, color: true, min_scale: 0.0, max_scale: 0.0, model: Some("any".into()), auto_levels: false },
         ];
         assert_eq!(select(&rules, 900, true, 2.0), None, "an explicit no-model rule wins");
         assert_eq!(select(&rules, 1001, false, 2.0), Some("any"));

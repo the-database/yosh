@@ -196,6 +196,8 @@ pub struct PageTexture {
     pub sr: bool,
     /// The model that upscaled it (for the info overlay); `None` unless `sr`.
     pub sr_model: Option<std::sync::Arc<str>>,
+    /// The page's levels were auto-adjusted before the model (`SrRule::auto_levels`).
+    pub sr_levels: bool,
     /// Extra frames/layers 1..N (frame 0 is `texture`/`view`). `None` for stills.
     /// Animation (GIF/WebP) frames share this page's size; `.ico` layers may each
     /// be a different size, so recycling keys off each texture's own dimensions.
@@ -280,6 +282,7 @@ impl PageTexture {
             lq: _,
             sr: _,
             sr_model: _,
+            sr_levels: _,
             anim,
             frame0_delay_ms: _,
             anim_total_ms: _,
@@ -451,6 +454,7 @@ impl PagePipeline {
             lq: false,
             sr: false,
             sr_model: None,
+            sr_levels: false,
             anim: None,
             frame0_delay_ms: 0,
             anim_total_ms: 0,

@@ -332,6 +332,9 @@ pub struct Strings {
     pub col_height: &'static str,
     pub col_scale: &'static str,
     pub col_model: &'static str,
+    /// The rule table's auto-levels column, and its hover text.
+    pub col_levels: &'static str,
+    pub levels_hint: &'static str,
     /// Which pages a rule applies to.
     pub pages_gray: &'static str,
     pub pages_color: &'static str,
@@ -363,6 +366,10 @@ pub struct Strings {
     /// One chain setting yosh doesn't carry over ("chain {n}: …").
     pub mwf_ignored_width: fn(usize) -> String,
     pub mwf_ignored_resize: fn(usize) -> String,
+    /// "chain {n}: tile size {px} px (yosh uses 512 px)".
+    pub mwf_ignored_tile: fn(usize, u32) -> String,
+    /// The workflow's grayscale detection threshold, when it isn't yosh's 12.
+    pub mwf_ignored_threshold: fn(i32) -> String,
     /// "Not carried over (yosh has no such setting): {list}".
     pub mwf_ignored: fn(&str) -> String,
     pub mwf_missing_models: fn(usize) -> String,

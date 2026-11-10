@@ -5,12 +5,16 @@
 //! Newtonsoft-serialized workflow whose `Chains` is `{"$values": [...]}`; a chain's
 //! `MinResolution`/`MaxResolution` are `"WxH"` and its scale factors whole numbers,
 //! 0 meaning unbounded, and the first chain that matches an image is used — the
-//! same as [`SrRule`]. What yosh has no use for (width limits, resizing before
-//! the model) is reported back as [`Import::ignored`] instead of silently dropped.
+//! same as [`SrRule`]. A chain's "Auto Adjust Levels on Grayscale Images" carries
+//! over ([`SrRule::auto_levels`]). What yosh has no equivalent for — width limits,
+//! resizing before the model, a tile size other than the 512 px it always uses,
+//! a grayscale detection threshold other than its own — is reported back
+//! ([`Import::ignored`], [`Import::gray_threshold`]) instead of silently dropped.
 
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer};
+use yosh_engine::decode::GRAYSCALE_THRESHOLD;
 use yosh_engine::sr::rules::SrRule;
 
 /// Newtonsoft writes an unset string as `null`; read it as empty.
@@ -29,6 +33,8 @@ struct Values<T> {
 struct Workflow {
     #[serde(deserialize_with = "null_as_empty")]
     workflow_name: String,
+    /// The workflow's gray detection threshold (the GUI's default is 12).
+    grayscale_detection_threshold: Option<i32>,
     chains: Values<Chain>,
 }
 
@@ -45,6 +51,10 @@ struct Chain {
     max_scale_factor: Option<i32>,
     #[serde(deserialize_with = "null_as_empty")]
     model_file_path: String,
+    /// "Auto (Estimate)", "Maximum", "No Tiling" or a number of pixels.
+    #[serde(deserialize_with = "null_as_empty")]
+    model_tile_size: String,
+    auto_adjust_levels: bool,
     resize_height_before_upscale: Option<i32>,
     resize_width_before_upscale: Option<i32>,
     resize_factor_before_upscale: Option<f64>,
@@ -60,6 +70,8 @@ impl Default for Chain {
             min_scale_factor: Some(0),
             max_scale_factor: Some(0),
             model_file_path: String::new(),
+            model_tile_size: "Auto (Estimate)".into(),
+            auto_adjust_levels: false,
             resize_height_before_upscale: Some(0),
             resize_width_before_upscale: Some(0),
             resize_factor_before_upscale: Some(100.0),
@@ -73,6 +85,22 @@ fn parse_resolution(s: &str) -> (u32, u32) {
     (it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
 
+/// The tile size libaji runs every model of yosh's at (its default).
+const YOSH_TILE: u32 = 512;
+
+/// The tile (input pixels) a chain's "Model Tile Size" runs at in MangaJaNaiCLI
+/// (`chain::tile_size`): "Auto (Estimate)" and anything unrecognized 512,
+/// "Maximum"/"No Tiling" 1024, a number snapped to a multiple of 16.
+fn tile_size(setting: &str) -> u32 {
+    match setting.trim() {
+        "Maximum" | "No Tiling" => 1024,
+        s => match s.parse::<u32>() {
+            Ok(n) => (n / 16 * 16).clamp(64, 4096),
+            Err(_) => YOSH_TILE,
+        },
+    }
+}
+
 /// What yosh can't carry over from a chain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ignored {
@@ -80,6 +108,9 @@ pub enum Ignored {
     Width,
     /// "Resize before upscale" (yosh always gives the model the whole page).
     PreResize,
+    /// A model tile size other than 512 px, as MangaJaNaiCLI would run it (yosh
+    /// runs every model at 512).
+    TileSize(u32),
 }
 
 /// An imported workflow.
@@ -90,6 +121,9 @@ pub struct Import {
     pub rules: Vec<SrRule>,
     /// `(chain number, what)`, 1-based like the GUI's chain list.
     pub ignored: Vec<(usize, Ignored)>,
+    /// The workflow's grayscale detection threshold, when it isn't yosh's own
+    /// ([`GRAYSCALE_THRESHOLD`], the GUI's default): not carried over.
+    pub gray_threshold: Option<i32>,
 }
 
 /// The model a chain names, as a rule's model: the file stem (the GUI stores
@@ -126,6 +160,11 @@ pub fn parse(text: &str, fallback_name: &str) -> Result<Import, String> {
             if pre {
                 ignored.push((i + 1, Ignored::PreResize));
             }
+            let tile = tile_size(&c.model_tile_size);
+            // Only where a model runs: a "No Model" chain's tile means nothing.
+            if tile != YOSH_TILE && model(&c.model_file_path).is_some() {
+                ignored.push((i + 1, Ignored::TileSize(tile)));
+            }
             SrRule {
                 min_h,
                 max_h,
@@ -134,11 +173,13 @@ pub fn parse(text: &str, fallback_name: &str) -> Result<Import, String> {
                 min_scale: c.min_scale_factor.unwrap_or(0).max(0) as f32,
                 max_scale: c.max_scale_factor.unwrap_or(0).max(0) as f32,
                 model: model(&c.model_file_path),
+                auto_levels: c.auto_adjust_levels,
             }
         })
         .collect();
     let name = if wf.workflow_name.trim().is_empty() { fallback_name } else { wf.workflow_name.trim() };
-    Ok(Import { name: name.to_string(), rules, ignored })
+    let gray_threshold = wf.grayscale_detection_threshold.filter(|&t| t != GRAYSCALE_THRESHOLD);
+    Ok(Import { name: name.to_string(), rules, ignored, gray_threshold })
 }
 
 /// Read a `.mwf` file.
@@ -168,6 +209,7 @@ mod tests {
         let imp = parse(mwf, "file").unwrap();
         assert_eq!(imp.name, "Upscale Manga");
         assert!(imp.ignored.is_empty());
+        assert_eq!(imp.gray_threshold, None);
         let r = &imp.rules;
         assert_eq!(r.len(), 4);
         assert_eq!((r[0].min_h, r[0].max_h, r[0].gray, r[0].color), (0, 1250, true, false));
@@ -198,6 +240,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_levels_carry_over_and_tile_size_and_threshold_are_reported() {
+        let mwf = r#"{"GrayscaleDetectionThreshold":20,"Chains":{"$values":[
+            {"IsGrayscale":true,"AutoAdjustLevels":true,"ModelTileSize":"Auto (Estimate)","ModelFilePath":"a.onnx"},
+            {"IsGrayscale":true,"AutoAdjustLevels":false,"ModelTileSize":"256","ModelFilePath":"b.onnx"},
+            {"IsColor":true,"ModelTileSize":"Maximum","ModelFilePath":"c.onnx"},
+            {"IsColor":true,"ModelTileSize":"No Tiling","ModelFilePath":"No Model"},
+            {"IsColor":true,"ModelTileSize":"520","ModelFilePath":"d.onnx"},
+            {"IsColor":true,"ModelTileSize":null,"ModelFilePath":"e.onnx"}
+        ]}}"#;
+        let imp = parse(mwf, "x").unwrap();
+        let levels: Vec<bool> = imp.rules.iter().map(|r| r.auto_levels).collect();
+        assert_eq!(levels, [true, false, false, false, false, false]);
+        // 520 snaps to 512, which yosh runs; a null size is "Auto (Estimate)".
+        assert_eq!(imp.ignored, vec![(2, Ignored::TileSize(256)), (3, Ignored::TileSize(1024))]);
+        assert_eq!(imp.gray_threshold, Some(20));
+        let same = parse(r#"{"GrayscaleDetectionThreshold":12,"Chains":{"$values":[]}}"#, "x").unwrap();
+        assert_eq!(same.gray_threshold, None);
+    }
+
+    #[test]
     fn the_default_workflow_imports_as_the_default_rules() {
         // MangaJaNai GUI's default chains (MangaJaNaiCLI's `default_chains`), as the GUI exports them.
         let mut chains = vec![
@@ -221,13 +283,15 @@ mod tests {
             .map(|(lo, hi, g, mn, mx, m)| {
                 format!(
                     r#"{{"MinResolution":"{lo}","MaxResolution":"{hi}","IsGrayscale":{g},"IsColor":{c},
-                       "MinScaleFactor":{mn},"MaxScaleFactor":{mx},"ModelFilePath":"{m}.onnx"}}"#,
+                       "MinScaleFactor":{mn},"MaxScaleFactor":{mx},"ModelFilePath":"{m}.onnx",
+                       "ModelTileSize":"Auto (Estimate)","AutoAdjustLevels":{g}}}"#,
                     c = !g
                 )
             })
             .collect();
-        let mwf = format!(r#"{{"Chains":{{"$values":[{}]}}}}"#, values.join(","));
+        let mwf = format!(r#"{{"GrayscaleDetectionThreshold":12,"Chains":{{"$values":[{}]}}}}"#, values.join(","));
         let imp = parse(&mwf, "x").unwrap();
         assert_eq!(imp.rules, default_rules());
+        assert!(imp.ignored.is_empty() && imp.gray_threshold.is_none());
     }
 }
