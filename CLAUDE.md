@@ -78,7 +78,12 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   an in-memory map, then reads are served from there).
 - **Decode + HQ downscale**: the primitives live in `yosh-image` (`decode.rs` magic-byte routing to
   png / jpeg-decoder / jxl-oxide / psd / image; `resize.rs`; `tone.rs`; `icc.rs`), and the engine's
-  `decode.rs` composes them into the display pipeline (exact targets, LQ tier, animations, SR). This
+  `decode.rs` composes them into the display pipeline (exact targets, LQ tier, animations, SR). The
+  yosh-image decoders turn pages upright by EXIF Orientation (JPEG, PNG `eXIf`, WebP, TIFF; jxl-oxide
+  does JPEG XL's), on every path including the LQ IDCT-scaled JPEG one, so `src_w`/`src_h` and
+  `meta::probe` are the upright size; an untagged file decodes exactly as before. `decode::animation`
+  tells animated GIF/WebP/APNG/JPEG XL/AVIF from stills by their headers (MangaJaNaiCLI copies those
+  instead of upscaling a frame; the engine's `is_multi_image` uses its WebP check). This
   is subtle and deliberate:
   - **Grayscale path** downscales in **true linear light** (sRGB → 16-bit linear → Catmull-Rom resample →
     re-encode through the Dot Gain 20% curve in `tone.rs`). This is what kills halftone-screentone moiré;

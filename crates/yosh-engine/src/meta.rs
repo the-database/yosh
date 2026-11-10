@@ -53,7 +53,20 @@ fn iso_box_dims(b: &[u8]) -> Option<(u32, u32)> {
 
 /// Probe an encoded image's header for `(width, height, "FORMAT · detail")`
 /// without a full decode. Returns `(0, 0, ...)` if dimensions can't be read.
+/// The size is the upright one the page is shown at: an EXIF Orientation that
+/// turns it on its side swaps the stored width and height (and is named in the
+/// detail).
 pub fn probe(b: &[u8]) -> (u32, u32, String) {
+    let (w, h, detail) = probe_stored(b);
+    match yosh_image::decode::exif_orientation_of(b) {
+        1 => (w, h, detail),
+        o @ 5..=8 => (h, w, format!("{detail} · EXIF orientation {o}")),
+        o => (w, h, format!("{detail} · EXIF orientation {o}")),
+    }
+}
+
+/// [`probe`] before EXIF Orientation: the size as stored.
+fn probe_stored(b: &[u8]) -> (u32, u32, String) {
     let be16 = |i: usize| u16::from_be_bytes([b[i], b[i + 1]]) as u32;
     let le16 = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as u32;
     // PNG
