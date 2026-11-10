@@ -33,19 +33,19 @@ use yosh_engine::pool::Waker;
 
 /// The MangaJaNaiCLI release the add-on is installed from. A bump here offers installed add-ons
 /// an update.
-pub const CLI_VERSION: &str = "v0.7.0";
+pub const CLI_VERSION: &str = "v0.8.0";
 const CLI_REPO: &str = "the-database/MangaJaNaiCLI";
 #[cfg(windows)]
 const CLI_ASSET: (&str, &str, u64) = (
     "mangajanai-windows-x64.zip",
-    "81f890b4d5d6dd6662a067cff39b5e45f6bab31f56f0e7ad5cfcda4511a688fc",
-    11_096_228,
+    "b3ed5c6b8fbfba993ab3c1bff3be58655fa5714a8af19437d9a0bf1387b1008c",
+    11_168_775,
 );
 #[cfg(not(windows))]
 const CLI_ASSET: (&str, &str, u64) = (
     "mangajanai-linux-x64.tar.zst",
-    "6f1ca4ffa2a803d16b1837e430592bbae204d4fb3ef83d05ddaa74a48db3553b",
-    9_219_521,
+    "a803268a5e851e17b4197519a2221f5a7fffb92d50d52e683969a2870990d0d0",
+    9_274_753,
 );
 const PROGRAM: &str = if cfg!(windows) { "mangajanai.exe" } else { "mangajanai" };
 const RECORD: &str = "yosh-addon.json";
