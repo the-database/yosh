@@ -23,8 +23,8 @@ use image::AnimationDecoder;
 
 use crate::sr::{SrOutcome, SrSkip, Upscaler};
 use yosh_image::decode::{
-    color_manage, decode_jpeg_scaled, decode_raw, is_grayscale as rgba_is_grayscale, is_opaque,
-    premultiply_alpha, rgb_to_rgba, rgba_to_luma, rgba_to_rgb, GRAYSCALE_THRESHOLD,
+    animation, color_manage, decode_jpeg_scaled, decode_raw, is_grayscale as rgba_is_grayscale, is_opaque,
+    premultiply_alpha, Animation, rgb_to_rgba, rgba_to_luma, rgba_to_rgb, GRAYSCALE_THRESHOLD,
 };
 use yosh_image::resize;
 
@@ -642,14 +642,13 @@ fn decode_ico(bytes: &[u8]) -> Result<Vec<DecodedImage>, String> {
 }
 
 /// Pages [`decode_page`] decodes as more than one image: `.ico` (layers), GIF
-/// (always frame-decoded) and animated WebP. Same magic checks as `decode_page`.
+/// (always frame-decoded) and animated WebP. Same checks as `decode_page`; the
+/// WebP one is yosh-image's [`animation`], which MangaJaNaiCLI uses to copy
+/// animations instead of upscaling them.
 fn is_multi_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0x00, 0x00, 0x01, 0x00])
         || bytes.starts_with(b"GIF8")
-        || (bytes.len() >= 12
-            && &bytes[0..4] == b"RIFF"
-            && &bytes[8..12] == b"WEBP"
-            && WebPDecoder::new(std::io::Cursor::new(bytes)).is_ok_and(|d| d.has_animation()))
+        || animation(bytes) == Some(Animation::Webp)
 }
 
 /// Decode a page to a still image, an animation (GIF/WebP), or layered (`.ico`).
@@ -1350,5 +1349,33 @@ mod tests {
         assert_eq!(native.pixels, gray, "native pixels unaltered");
         let small = decode_and_downscale(&bytes, 48, &mut r).unwrap();
         assert_eq!((small.w, small.h, small.path), (32, 48, ResizePath::GrayLinear));
+    }
+
+    /// A 40x20 JPEG tagged EXIF Orientation 6 (stored on its side): shown 20x40 on
+    /// the HQ and LQ paths, at full size and reduced, with the upright source size;
+    /// the info overlay's probe reports that size too.
+    #[test]
+    fn exif_rotated_jpeg_is_shown_upright() {
+        let (w, h) = (40u16, 20u16);
+        let rgb: Vec<u8> =
+            (0..w as usize * h as usize).flat_map(|i| [(i % 40 * 6) as u8, (i / 40 * 12) as u8, 90]).collect();
+        let mut bytes = Vec::new();
+        jpeg_encoder::Encoder::new(&mut bytes, 90).encode(&rgb, w, h, jpeg_encoder::ColorType::Rgb).unwrap();
+        // APP1 "Exif\0\0" + a little-endian TIFF header with one entry: Orientation = 6.
+        let mut app1 = vec![0xFF, 0xE1, 0x00, 0x22];
+        app1.extend_from_slice(b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0\x06\0\0\0\0\0\0\0");
+        assert_eq!(app1.len(), 0x22 + 2);
+        bytes.splice(2..2, app1);
+
+        let mut r = Resizer::new();
+        for lq in [false, true] {
+            for (target, size) in [(40, (20, 40)), (10, (5, 10))] {
+                let DecodedPage::Still(img) = decode_page(&bytes, target, lq, &mut r).unwrap() else { panic!() };
+                assert_eq!(((img.w, img.h), (img.src_w, img.src_h)), (size, (20, 40)), "lq={lq} target={target}");
+            }
+        }
+        let (pw, ph, detail) = crate::meta::probe(&bytes);
+        assert_eq!((pw, ph), (20, 40));
+        assert!(detail.ends_with("EXIF orientation 6"), "{detail}");
     }
 }
