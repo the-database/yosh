@@ -1,7 +1,7 @@
 //! The AI-upscaling profile editor (Settings → AI upscaling → Edit profiles…):
 //! the three built-in profiles to look at or copy, and the nine custom slots to
 //! fill — each an ordered rule list (first match wins, as `sr::rules`) of source
-//! height, gray/colour, target scale and model. Edits go to a draft; Save hands
+//! height, gray/colour, target scale, model and auto levels. Edits go to a draft; Save hands
 //! it to the app (`UiState::req_save_profiles`), which writes `rules.json` and
 //! applies it to the running upscaler.
 
@@ -87,7 +87,9 @@ impl Editor {
                     .map(|&(c, what)| match what {
                         mwf::Ignored::Width => (t.mwf_ignored_width)(c),
                         mwf::Ignored::PreResize => (t.mwf_ignored_resize)(c),
+                        mwf::Ignored::TileSize(px) => (t.mwf_ignored_tile)(c, px),
                     })
+                    .chain(imp.gray_threshold.map(t.mwf_ignored_threshold))
                     .collect();
                 if !ignored.is_empty() {
                     msg = format!("{msg}\n{}", (t.mwf_ignored)(&ignored.join(", ")));
@@ -129,7 +131,7 @@ impl Editor {
 
 /// A rule matching every page, with `model`.
 fn every_page(model: Option<String>) -> SrRule {
-    SrRule { min_h: 0, max_h: 0, gray: true, color: true, min_scale: 0.0, max_scale: 0.0, model }
+    SrRule { min_h: 0, max_h: 0, gray: true, color: true, min_scale: 0.0, max_scale: 0.0, model, auto_levels: false }
 }
 
 /// Draw the editor if it's open.
@@ -339,11 +341,14 @@ fn rules_table(ui: &mut egui::Ui, ed: &mut Editor) {
     let models = &ed.models;
     let models_dirs = &ed.models_dirs;
     let mut action: Option<(usize, i32)> = None; // (row, -1 up / 1 down / 0 remove)
-    egui::Grid::new(("rules", ed.selected.token())).striped(true).num_columns(6).spacing([10.0, 4.0]).show(
+    egui::Grid::new(("rules", ed.selected.token())).striped(true).num_columns(7).spacing([10.0, 4.0]).show(
         ui,
         |ui| {
-            for h in ["#", t.col_pages, t.col_height, t.col_scale, t.col_model, ""] {
-                ui.label(egui::RichText::new(h).weak().small());
+            for h in ["#", t.col_pages, t.col_height, t.col_scale, t.col_model, t.col_levels, ""] {
+                let r = ui.label(egui::RichText::new(h).weak().small());
+                if h == t.col_levels {
+                    r.on_hover_text(t.levels_hint);
+                }
             }
             ui.end_row();
             let len = rules.len();
@@ -393,6 +398,14 @@ fn rules_table(ui: &mut egui::Ui, ed: &mut Editor) {
                     });
                 });
                 ui.add_enabled_ui(editable, |ui| model_combo(ui, i, &mut r.model, models, models_dirs));
+                // Gray pages only (colour pages ignore it), and only where a model runs.
+                let applies = r.gray && r.model.is_some();
+                ui.add_enabled_ui(editable && applies, |ui| {
+                    let mut on = r.auto_levels && applies;
+                    if ui.checkbox(&mut on, "").on_hover_text(t.levels_hint).changed() {
+                        r.auto_levels = on;
+                    }
+                });
                 if editable {
                     ui.horizontal(|ui| {
                         if ui.add_enabled(i > 0, egui::Button::new("⏶").small()).on_hover_text(t.move_up).clicked() {

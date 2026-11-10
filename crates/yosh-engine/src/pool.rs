@@ -624,14 +624,15 @@ impl DecodePool {
                     // A kept output from the model the rules still pick at this size
                     // only needs re-sizing: no read, no decode, no inference.
                     let kept = masters.lock().unwrap_or_else(|e| e.into_inner()).get(index).filter(|m| {
+                        let scale = th as f32 / m.src_h as f32;
                         th > m.src_h
-                            && up.model_for(m.src_h, m.gray, th as f32 / m.src_h as f32).as_deref()
-                                == Some(&*m.model)
+                            && up.model_for(m.src_h, m.gray, scale).as_deref() == Some(&*m.model)
+                            && up.auto_levels(m.src_h, m.gray, scale) == m.levels
                     });
                     let reused = kept.is_some();
-                    let (img, model) = if let Some(m) = kept {
+                    let (img, model, levels) = if let Some(m) = kept {
                         match sr_from_master(&m, th, &mut resizer) {
-                            Ok(img) => (img, m.model.clone()),
+                            Ok(img) => (img, m.model.clone(), m.levels),
                             Err(e) => return skipped(SrSkip::Failed(e)),
                         }
                     } else {
@@ -645,9 +646,9 @@ impl DecodePool {
                         let cancel = || stale(index);
                         match decode_sr(&bytes, th, up.as_ref(), &cancel, &mut resizer) {
                             Ok(SrDecode::Page(img, master)) => {
-                                let model = master.model.clone();
+                                let (model, levels) = (master.model.clone(), master.levels);
                                 masters.lock().unwrap_or_else(|e| e.into_inner()).insert(index, master);
-                                (img, model)
+                                (img, model, levels)
                             }
                             Ok(SrDecode::Cancelled) => return None,
                             Ok(SrDecode::Skipped(reason)) => return skipped(reason),
@@ -676,6 +677,7 @@ impl DecodePool {
                     let mut page = PagePipeline::upload(&device, &queue, &img, &tex_pool, th);
                     page.sr = true;
                     page.sr_model = Some(model);
+                    page.sr_levels = levels;
                     Some(Msg::Done { index, page, thumb: false })
                 });
                 let msg = match std::panic::catch_unwind(body) {
@@ -1176,6 +1178,7 @@ mod tests {
             src_h: 1,
             gray: true,
             alpha: false,
+            levels: false,
             pixels: vec![0; bytes],
         })
     }

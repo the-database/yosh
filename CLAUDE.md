@@ -166,7 +166,12 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   Opaque pages take the unchanged path. Still skipped: GIFs, `.ico`s and animations (`SrSkip::Unsupported`,
   "AI ×" in the chip) and pages shown at or below source size (`SrSkip::NotNeeded`, "AI –").
 - **Model choice is data:** `sr::rules` mirrors MangaJaNaiConverterGui's chain rules (first match on
-  source height, gray/color, target scale). **Profiles** (`profiles.rs`, laid out like mpv-AnimeJaNai's
+  source height, gray/color, target scale), including a chain's "Auto Adjust Levels on Grayscale
+  Images" (`SrRule::auto_levels`, on in the default workflow's gray chains, so in all three built-in
+  profiles): `decode::decode_sr` stretches a gray page's luma with `sr::levels` (MangaJaNaiCLI's
+  `levels.rs`) before the model and before any alpha compositing; the kept `SrMaster` and the page
+  record it (`levels`/`sr_levels`), so a rule change that only flips it re-runs the page.
+  **Profiles** (`profiles.rs`, laid out like mpv-AnimeJaNai's
   slots) pick the rule table: built-in Quality / Balanced / Performance (Shift+1/2/3; `quality_rules`,
   `default_rules` = MangaJaNai GUI's default workflow, `performance_rules`) and nine custom slots
   (Ctrl+1..9) that the egui editor (`profile_editor.rs`, Settings → AI upscaling → Edit profiles) fills
@@ -175,8 +180,11 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   (`Settings::upscale_profile`, a plain string token). A switch hands the new rules to the running
   upscaler (`Upscaler::set_rules`) and `Reader::upscaler_rules_changed` re-runs pages upscaled with a
   model the new rules don't pick. Import .mwf (`mwf.rs`) reads a MangaJaNai GUI workflow export the
-  way MangaJaNaiCLI does; width limits and resize-before-upscale have no yosh equivalent and are
-  reported as not carried over.
+  way MangaJaNaiCLI does, auto levels included; width limits, resize-before-upscale, a model tile
+  size other than 512 px (yosh runs every model at libaji's default) and a grayscale detection
+  threshold other than 12 (`GRAYSCALE_THRESHOLD`) have no yosh equivalent and are reported in the
+  editor as not carried over. The editor's rule table has an *Auto levels* column (gray rules with
+  a model); `rules.json` stores `"auto_levels": true` only when on, so older files read as off.
   Model files are named after their ONNX precision, as MangaJaNai GUI 2.0 ships them (the defaults are
   all `_fp16`). The lookup (`sr::aji::lookup_order`) is variant-tolerant, so add-ons built from older or
   newer GUI model files both work and a `rules.json` naming older files keeps working. The exact name

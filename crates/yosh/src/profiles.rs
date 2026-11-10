@@ -167,6 +167,9 @@ struct RuleJson {
     max_scale: f32,
     #[serde(default)]
     model: Option<String>,
+    /// Left out when off, so a rule without it reads the same in an older yosh.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    auto_levels: bool,
 }
 
 impl From<RuleJson> for SrRule {
@@ -179,6 +182,7 @@ impl From<RuleJson> for SrRule {
             min_scale: r.min_scale,
             max_scale: r.max_scale,
             model: r.model,
+            auto_levels: r.auto_levels,
         }
     }
 }
@@ -193,6 +197,7 @@ impl From<&SrRule> for RuleJson {
             min_scale: r.min_scale,
             max_scale: r.max_scale,
             model: r.model.clone(),
+            auto_levels: r.auto_levels,
         }
     }
 }
@@ -389,6 +394,7 @@ mod tests {
                 min_scale: 0.0,
                 max_scale: 0.0,
                 model: Some("4x_general".into()),
+                auto_levels: false,
             }],
         });
         let back = parse(&to_json(&p)).unwrap();
@@ -406,6 +412,20 @@ mod tests {
                 ProfileId::Custom(5)
             ]
         );
+    }
+
+    #[test]
+    fn auto_levels_is_saved_only_when_on() {
+        let mut p = Profiles::default();
+        p.slots[0] = Some(Custom { name: "Copy".into(), rules: default_rules() });
+        let json = to_json(&p);
+        // The 14 gray rules carry it; the colour ones leave it out.
+        assert_eq!(json.matches("\"auto_levels\": true").count(), 14, "{json}");
+        assert!(!json.contains("\"auto_levels\": false"));
+        assert_eq!(parse(&json).unwrap().profiles, p);
+        // A rules.json from before it reads as off.
+        let l = parse(r#"{"profiles":[{"slot":2,"rules":[{"gray":true,"model":"a"}]}]}"#).unwrap();
+        assert!(!l.profiles.slot(2).unwrap().rules[0].auto_levels);
     }
 
     #[test]

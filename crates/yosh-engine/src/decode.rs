@@ -24,8 +24,11 @@ use image::AnimationDecoder;
 use crate::sr::{SrOutcome, SrSkip, Upscaler};
 use yosh_image::decode::{
     animation, color_manage, decode_jpeg_scaled, decode_raw, is_grayscale as rgba_is_grayscale, is_opaque,
-    premultiply_alpha, Animation, rgb_to_rgba, rgba_to_luma, rgba_to_rgb, GRAYSCALE_THRESHOLD,
+    premultiply_alpha, Animation, rgb_to_rgba, rgba_to_luma, rgba_to_rgb,
 };
+/// How far from gray a colour page may be and still count as gray (the gray path,
+/// and the gray models when it is AI-upscaled): MangaJaNai GUI's default threshold.
+pub use yosh_image::decode::GRAYSCALE_THRESHOLD;
 use yosh_image::resize;
 
 /// GPU `max_texture_dimension_2d`, published by `gpu.rs` at startup. A decoded page
@@ -290,6 +293,8 @@ pub struct SrMaster {
     /// The page has transparency: `pixels` carries straight alpha after the
     /// color (gray + alpha, or RGBA) instead of luma / packed RGB alone.
     pub alpha: bool,
+    /// The luma's levels were auto-adjusted before the model (`SrRule::auto_levels`).
+    pub levels: bool,
     pub pixels: Vec<u8>,
 }
 
@@ -332,18 +337,27 @@ pub fn decode_sr(
     let gray = p.gray_by_channels || rgba_is_grayscale(&p.full, GRAYSCALE_THRESHOLD);
     let target_scale = target_h as f32 / p.h as f32;
     let alpha = !p.opaque;
+    // Auto levels (gray pages, when the rule says so) go on the luma before the
+    // model and before any compositing, as MangaJaNaiCLI does.
+    let levels = gray && up.auto_levels(p.h, gray, target_scale);
     let outcome = if alpha {
         // Straight-alpha RGBA (a single-channel source is always opaque).
-        let input = if gray { luma_alpha(&p.full) } else { p.full };
+        let mut input = if gray { luma_alpha(&p.full) } else { p.full };
+        if levels {
+            crate::sr::levels::auto_adjust(&mut input, 2);
+        }
         upscale_with_alpha(up, p.w, p.h, gray, &input, target_scale, cancel)
     } else {
-        let input = if p.gray_by_channels {
+        let mut input = if p.gray_by_channels {
             p.full
         } else if gray {
             rgba_to_luma(&p.full)
         } else {
             rgba_to_rgb(&p.full)
         };
+        if levels {
+            crate::sr::levels::auto_adjust(&mut input, 1);
+        }
         up.upscale(p.w, p.h, if gray { 1 } else { 3 }, &input, target_scale, cancel)
     };
     let (scale, out, model) = match outcome {
@@ -353,7 +367,8 @@ pub fn decode_sr(
         SrOutcome::Cancelled => return Ok(SrDecode::Cancelled),
         SrOutcome::Failed(e) => return Err(e),
     };
-    let master = std::sync::Arc::new(SrMaster { model, scale, src_w: p.w, src_h: p.h, gray, alpha, pixels: out });
+    let master =
+        std::sync::Arc::new(SrMaster { model, scale, src_w: p.w, src_h: p.h, gray, alpha, levels, pixels: out });
     let img = sr_from_master(&master, target_h, resizer)?;
     Ok(SrDecode::Page(img, master))
 }
@@ -1039,6 +1054,7 @@ mod tests {
                 src_h: h,
                 gray: false,
                 alpha: true,
+                levels: false,
                 pixels: rgba.clone(),
             };
             check(&sr_from_master(&master, th, &mut resizer).unwrap(), "sr");
@@ -1069,11 +1085,13 @@ mod tests {
         scale: u32,
         outcome: fn() -> Option<SrOutcome>,
         seen: std::sync::Mutex<Vec<(u32, f32)>>,
+        /// What [`Upscaler::auto_levels`] answers.
+        levels: bool,
     }
 
     impl FakeUpscaler {
         fn new(scale: u32) -> Self {
-            Self { scale, outcome: || None, seen: Default::default() }
+            Self { scale, outcome: || None, seen: Default::default(), levels: false }
         }
     }
 
@@ -1099,6 +1117,45 @@ mod tests {
         fn model_for(&self, _: u32, _: bool, _: f32) -> Option<std::sync::Arc<str>> {
             Some("fake".into())
         }
+        fn auto_levels(&self, _: u32, gray: bool, _: f32) -> bool {
+            self.levels && gray
+        }
+    }
+
+    /// Auto levels: the model gets a faded gray page stretched to black ink and
+    /// white paper (opaque, and transparent, where the alpha is left alone);
+    /// colour pages and rules without levels go in as they are.
+    #[test]
+    fn sr_auto_levels_stretch_gray_pages_before_the_model() {
+        // Ink at 40 on paper at 230.
+        let gray: Vec<u8> = (0..40 * 60).map(|i| if i % 7 == 0 { 40 } else { 230 }).collect();
+        let bytes = png_bytes(40, 60, png::ColorType::Grayscale, &gray);
+        let mut up = FakeUpscaler::new(1);
+        up.levels = true;
+        let SrDecode::Page(_, m) = sr(&bytes, 120, &up) else { panic!("upscales") };
+        assert!(m.levels && m.gray);
+        assert_eq!((m.pixels.iter().min(), m.pixels.iter().max()), (Some(&0), Some(&255)));
+        // Off: untouched.
+        up.levels = false;
+        let SrDecode::Page(_, m) = sr(&bytes, 120, &up) else { panic!("upscales") };
+        assert!(!m.levels);
+        assert_eq!((m.pixels.iter().min(), m.pixels.iter().max()), (Some(&40), Some(&230)));
+        // Transparent gray: the luma is levelled, the alpha kept.
+        let la: Vec<u8> = gray.iter().enumerate().flat_map(|(i, &y)| [y, y, y, if i % 2 == 0 { 255 } else { 128 }]).collect();
+        let bytes = png_bytes(40, 60, png::ColorType::Rgba, &la);
+        up.levels = true;
+        let SrDecode::Page(_, m) = sr(&bytes, 120, &up) else { panic!("upscales") };
+        assert!(m.levels && m.gray && m.alpha);
+        let alphas: std::collections::BTreeSet<u8> = m.pixels.as_chunks::<2>().0.iter().map(|p| p[1]).collect();
+        assert_eq!(alphas.into_iter().collect::<Vec<_>>(), [128, 255]);
+        let opaque_luma: std::collections::BTreeSet<u8> =
+            m.pixels.as_chunks::<2>().0.iter().filter(|p| p[1] == 255).map(|p| p[0]).collect();
+        assert_eq!(opaque_luma.into_iter().collect::<Vec<_>>(), [0, 255]);
+        // Colour pages never.
+        let rgb: Vec<u8> = (0..40 * 60).flat_map(|i| [(i % 200) as u8 + 40, 10, 230]).collect();
+        let bytes = png_bytes(40, 60, png::ColorType::Rgb, &rgb);
+        let SrDecode::Page(_, m) = sr(&bytes, 120, &up) else { panic!("upscales") };
+        assert!(!m.levels && !m.gray);
     }
 
     fn png_bytes(w: u32, h: u32, color: png::ColorType, data: &[u8]) -> Vec<u8> {
