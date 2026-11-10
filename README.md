@@ -66,8 +66,9 @@ and the models (about 1 GB with an NVIDIA GPU).
   Windows. On Linux, NVIDIA only. Not on Android.
 - **Profiles:** `Shift`+`1` `2` `3` pick the built-in Quality, Balanced (the default) or Performance
   profiles. `Ctrl`+`1`…`9` are your own, set up in Settings → AI upscaling → *Edit profiles*: which
-  model upscales gray or colour pages at which source height and scale. You can also import a
-  MangaJaNai GUI workflow (`.mwf`). `U` turns upscaling off or on for the current book.
+  model upscales gray or colour pages at which source height and scale, and whether gray pages get
+  their levels auto-adjusted first (as MangaJaNai GUI does; the built-in profiles do). You can also
+  import a MangaJaNai GUI workflow (`.mwf`). `U` turns upscaling off or on for the current book.
 - **Removing it:** Settings → AI upscaling → *Remove the add-on* (the Windows uninstaller also
   removes it).
 
