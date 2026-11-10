@@ -825,12 +825,12 @@ pub struct Reader {
     sr_queued: Vec<usize>,
 }
 
-/// Whether page `i` is within AI-upscale reach of the pages in view `lo..=hi`:
-/// in view, or up to `ahead` pages after / `behind` pages before them.
 /// Pages past the AI-upscale reach whose kept model output still stays
 /// ([`DecodePool::retain_sr_masters`]).
 const SR_KEEP_SLACK: usize = 2;
 
+/// Whether page `i` is within AI-upscale reach of the pages in view `lo..=hi`:
+/// in view, or up to `ahead` pages after / `behind` pages before them.
 fn sr_in_reach(i: usize, lo: usize, hi: usize, ahead: usize, behind: usize) -> bool {
     (lo..=hi).contains(&i) || (i > hi && i - hi <= ahead) || (i < lo && lo - i <= behind)
 }
