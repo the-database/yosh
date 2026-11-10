@@ -90,4 +90,21 @@ pub trait Upscaler: Send + Sync {
     fn fallback(&self) -> Option<String> {
         None
     }
+
+    /// Give back the GPU memory the upscaler holds while nothing runs: close the
+    /// models and the backend's context, and free the device (on TensorRT, the
+    /// CUDA context its runtime keeps until the process exits). The next
+    /// [`Upscaler::upscale`] opens them again (models load from the engine cache).
+    /// `false` when there was nothing to give back, or work is running or an engine
+    /// is building (try again once it's idle).
+    fn release_gpu(&self) -> bool {
+        false
+    }
+
+    /// Since when the upscaler holds GPU memory with nothing to do (the last
+    /// upscale's end, or its start): `None` while one runs, or once released.
+    /// The shell releases it after a while idle ([`Upscaler::release_gpu`]).
+    fn idle_since(&self) -> Option<std::time::Instant> {
+        None
+    }
 }

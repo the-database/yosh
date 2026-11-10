@@ -153,6 +153,13 @@ const LOADING_INDICATOR_DELAY: Duration = Duration::from_millis(150);
 const EDGE_FRAC: f32 = 0.15;
 /// Max gap between two middle-zone clicks to count as a double-click.
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
+/// How long the AI-upscaling add-on may sit idle (no page upscaled) before it
+/// gives its GPU memory back (`Upscaler::release_gpu`); the next page reloads it
+/// from the engine cache. Long enough that reading never pays for it — each page
+/// turn upscales the next page ahead — short enough to free the GPU soon after
+/// reading stops. A minimized window releases at once.
+const SR_IDLE_RELEASE: Duration = Duration::from_secs(120);
+
 /// How long a transient toast (boundary hit, zoom level) stays on screen.
 const TOAST_DURATION: Duration = Duration::from_millis(1500);
 /// Minimum time a zoomed-page scroll must dwell parked at the top/bottom edge
@@ -1422,6 +1429,18 @@ impl ApplicationHandler for App {
             }
             if due {
                 state.window.request_redraw();
+            }
+            // AI upscaling idle for a while: release its GPU memory (nothing to draw;
+            // once released it reports no deadline, and a refusal waits for the next
+            // wake, so this never spins).
+            match state.sr_release_deadline() {
+                Some(t) if t <= now => {
+                    if let Some(up) = &state.reader.upscaler {
+                        up.release_gpu();
+                    }
+                }
+                Some(t) => next = Some(next.map_or(t, |n: Instant| n.min(t))),
+                None => {}
             }
         }
         event_loop.set_control_flow(match next {
@@ -2930,6 +2949,18 @@ impl State {
         if let Some(pool) = &self.reader.pool {
             pool.park();
         }
+        // AI upscaling: nothing new gets upscaled while hidden, so give its GPU
+        // memory back now (refused while a page is mid-inference or an engine is
+        // building: the idle release in `about_to_wait` gets it then).
+        if let Some(up) = &self.reader.upscaler {
+            up.release_gpu();
+        }
+    }
+
+    /// When the running upscaler, idle, gives its GPU memory back (`SR_IDLE_RELEASE`
+    /// after its last page): `about_to_wait` releases it then, with no frame.
+    fn sr_release_deadline(&self) -> Option<Instant> {
+        self.reader.upscaler.as_ref()?.idle_since().map(|t| t + SR_IDLE_RELEASE)
     }
 
     /// Thaw after [`Self::park`]. Decodes abandoned mid-flight during the park are
