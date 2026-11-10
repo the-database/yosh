@@ -299,6 +299,13 @@ pub struct Budget {
     /// window, which bounds it anyway. The pages in view are always upscaled.
     pub sr_ahead: usize,
     pub sr_behind: usize,
+    /// Ceiling (MB) on the AI-upscale lane's kept model outputs (the pool's
+    /// `MasterCache`), which let a resize, zoom or fullscreen switch re-size an
+    /// upscaled page instead of running the model again. The reach above decides
+    /// which pages are kept; this only stops a long reach of large outputs (4x,
+    /// colour) from growing without bound: the reader's own memory slice, at least
+    /// the former fixed 256 MB, at most 4 GB.
+    pub sr_master_mb: u64,
 }
 
 impl Budget {
@@ -328,6 +335,7 @@ impl Budget {
             // the reader gets its upscale ahead of the reader too.
             sr_ahead: fwd_max,
             sr_behind: back,
+            sr_master_mb: mem_budget_mb.clamp(256, 4096),
         }
     }
 
@@ -676,6 +684,9 @@ pub struct Reader {
     /// [`Budget::sr_ahead`] / [`Budget::sr_behind`] — the AI-upscale lookahead.
     pub sr_ahead: usize,
     pub sr_behind: usize,
+    /// [`Budget::sr_master_mb`]; the shell hands it to each pool it builds
+    /// ([`DecodePool::set_sr_master_budget`]).
+    pub sr_master_mb: u64,
     /// The shell's frame-wake callback, remembered so every pool the reader
     /// (re)builds gets it. Set once per window via [`Reader::set_waker`].
     pub waker: Option<Waker>,
@@ -816,6 +827,10 @@ pub struct Reader {
 
 /// Whether page `i` is within AI-upscale reach of the pages in view `lo..=hi`:
 /// in view, or up to `ahead` pages after / `behind` pages before them.
+/// Pages past the AI-upscale reach whose kept model output still stays
+/// ([`DecodePool::retain_sr_masters`]).
+const SR_KEEP_SLACK: usize = 2;
+
 fn sr_in_reach(i: usize, lo: usize, hi: usize, ahead: usize, behind: usize) -> bool {
     (lo..=hi).contains(&i) || (i > hi && i - hi <= ahead) || (i < lo && lo - i <= behind)
 }
@@ -935,6 +950,7 @@ impl Reader {
             lq_tier: budget.lq_tier,
             sr_ahead: budget.sr_ahead,
             sr_behind: budget.sr_behind,
+            sr_master_mb: budget.sr_master_mb,
             waker: None,
             upscaler: None,
             sr_on: true,
@@ -2257,16 +2273,22 @@ impl Reader {
         // through the model and swapped in place. Only once the view has settled,
         // so a resize drag doesn't churn inference. No upscaler → empty, no lane.
         if self.upscaler.is_some() && let Some(pool) = &self.pool {
+            // Within the window, only as far around the view as the performance
+            // tier allows (`Budget::sr_ahead`/`sr_behind`).
+            let (a, b) = if self.scroll_mode {
+                (self.index, None)
+            } else {
+                self.view_pages(self.index)
+            };
+            let (lo, hi) = (a.min(b.unwrap_or(a)), a.max(b.unwrap_or(a)));
+            let (ahead, behind) = (self.sr_ahead, self.sr_behind);
+            if sr_active {
+                // Kept model outputs: the reach, and a few pages past it so a step
+                // back across its edge doesn't run the model again.
+                let (ka, kb) = (ahead + SR_KEEP_SLACK, behind + SR_KEEP_SLACK);
+                pool.retain_sr_masters(|i| sr_in_reach(i, lo, hi, ka, kb));
+            }
             let sr_jobs: Vec<(usize, u32)> = if sr_active && settled {
-                // Within the window, only as far around the view as the
-                // performance tier allows (`Budget::sr_ahead`/`sr_behind`).
-                let (a, b) = if self.scroll_mode {
-                    (self.index, None)
-                } else {
-                    self.view_pages(self.index)
-                };
-                let (lo, hi) = (a.min(b.unwrap_or(a)), a.max(b.unwrap_or(a)));
-                let (ahead, behind) = (self.sr_ahead, self.sr_behind);
                 window
                     .iter()
                     .filter(|&&i| sr_in_reach(i, lo, hi, ahead, behind))
@@ -2535,6 +2557,12 @@ mod tests {
         assert_eq!((low.sr_ahead, low.sr_behind), (0, 0));
         let mid = Budget::for_tier(DeviceTier::Mid, 1024, 8);
         assert_eq!((mid.sr_ahead, mid.sr_behind), (3, 1));
+        // Kept model outputs: the reader's memory slice, never below the old fixed
+        // 256 MB, at most 4 GB; the tiers keep it (their reach decides what's kept).
+        for (mem, mb) in [(64u64, 256u64), (512, 512), (1024, 1024), (2048, 2048), (8192, 4096)] {
+            assert_eq!(Budget::derive(mem, 8).sr_master_mb, mb, "{mem} MB");
+            assert_eq!(Budget::for_tier(DeviceTier::Low, mem, 8).sr_master_mb, mb, "{mem} MB");
+        }
 
         let mid = Budget::for_tier(DeviceTier::Mid, 1024, 8);
         assert_eq!(
@@ -3771,6 +3799,7 @@ impl Reader {
                 // or landings from here on would never schedule a frame.
                 pool.set_waker(self.waker.clone());
                 pool.set_upscaler(self.upscaler.clone());
+                pool.set_sr_master_budget((self.sr_master_mb as usize) << 20);
                 self.pool = Some(pool);
                 self.source = Some(new);
                 // Re-pairing can move the anchor even though the file didn't.
