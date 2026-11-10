@@ -114,6 +114,14 @@ struct JobState {
     /// Indices the latest `set_sr_jobs` still wants (the SR lane's staleness set,
     /// like `wanted` for the window).
     sr_wanted: HashSet<usize>,
+    /// The SR lane's job `(index, target_h)` while it runs, and those whose
+    /// result it has sent but `poll` hasn't handed to the reader yet. The reader
+    /// still lists such a page (its cache doesn't show the result yet), so
+    /// `set_sr_jobs` leaves them out of the queue (not out of `sr_wanted`, which
+    /// would cancel the running one): queued again, the lane would only re-size
+    /// the page it just made and throw that away.
+    sr_inflight: Option<(usize, u32)>,
+    sr_sent: HashSet<(usize, u32)>,
 }
 
 pub struct DecodePool {
@@ -324,14 +332,42 @@ impl JobState {
     }
 
     /// The SR lane's next job, or `None` (its wait condition). Parked pools and
-    /// pools without an upscaler claim nothing.
+    /// pools without an upscaler claim nothing. The claimed job is in flight
+    /// until [`JobState::finish_sr`].
     fn claim_sr(&mut self) -> Option<(usize, u32, Arc<dyn Upscaler>)> {
         if self.paused {
             return None;
         }
         let up = self.upscaler.clone()?;
         let (i, h) = self.sr_jobs.pop_front()?;
+        self.sr_inflight = Some((i, h));
         Some((i, h, up))
+    }
+
+    /// The SR lane is done with its job: `sent` when it sent a result (a page or
+    /// a skip) that `poll` has yet to deliver ([`JobState::sr_delivered`]).
+    fn finish_sr(&mut self, sent: bool) {
+        if let Some(job) = self.sr_inflight.take()
+            && sent
+        {
+            self.sr_sent.insert(job);
+        }
+    }
+
+    /// `poll` handed the SR lane's result for `index` to the reader, which lists
+    /// the page by what it now shows from here on.
+    fn sr_delivered(&mut self, index: usize) {
+        self.sr_sent.retain(|&(i, _)| i != index);
+    }
+
+    /// Replace the SR queue with `jobs` (nearest-first), leaving out the job in
+    /// flight and results not delivered yet (see `sr_inflight`).
+    fn replace_sr_jobs(&mut self, jobs: Vec<(usize, u32)>) {
+        self.sr_wanted = jobs.iter().map(|(i, _)| *i).collect();
+        self.sr_jobs = jobs
+            .into_iter()
+            .filter(|j| self.sr_inflight != Some(*j) && !self.sr_sent.contains(j))
+            .collect();
     }
 
     /// Should the SR lane abandon `index`? Yes once parked, or once the reader no
@@ -365,6 +401,8 @@ impl DecodePool {
                 upscaler: None,
                 sr_jobs: VecDeque::new(),
                 sr_wanted: HashSet::new(),
+                sr_inflight: None,
+                sr_sent: HashSet::new(),
             }),
             Condvar::new(),
         ));
@@ -572,6 +610,7 @@ impl DecodePool {
         if up.is_none() {
             st.sr_jobs.clear();
             st.sr_wanted.clear();
+            st.sr_sent.clear();
         }
         st.upscaler = up;
         let has = st.upscaler.is_some();
@@ -622,8 +661,7 @@ impl DecodePool {
     pub fn set_sr_jobs(&self, jobs: Vec<(usize, u32)>) {
         let (m, _) = &*self.shared;
         let mut st = lock_jobs(m);
-        st.sr_wanted = jobs.iter().map(|(i, _)| *i).collect();
-        st.sr_jobs = jobs.into();
+        st.replace_sr_jobs(jobs);
         let any = !st.sr_jobs.is_empty();
         drop(st);
         if any {
@@ -732,14 +770,21 @@ impl DecodePool {
                     Some(Msg::Done { index, page, thumb: false })
                 });
                 let msg = match std::panic::catch_unwind(body) {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => continue,
+                    Ok(Some(msg)) => Some(msg),
+                    Ok(None) => None,
                     Err(_) => {
                         resizer = Resizer::new();
                         let reason = SrSkip::Failed("upscaler panicked".into());
-                        Msg::SrSkipped { index, target_h: th, reason }
+                        Some(Msg::SrSkipped { index, target_h: th, reason })
                     }
                 };
+                // Marked sent before the send, so `poll` can never deliver a
+                // result whose mark comes after it (which would leave the mark).
+                {
+                    let (m, _) = &*shared;
+                    lock_jobs(m).finish_sr(msg.is_some());
+                }
+                let Some(msg) = msg else { continue };
                 if tx.send(msg).is_err() {
                     return;
                 }
@@ -899,6 +944,17 @@ impl DecodePool {
         while let Ok(m) = self.results.try_recv() {
             out.push(m);
         }
+        // The SR lane's results are the reader's now (see `JobState::sr_sent`);
+        // locked only when there are some.
+        let mut st = None;
+        for msg in &out {
+            let index = match msg {
+                Msg::Done { index, page, .. } if page.sr => *index,
+                Msg::SrSkipped { index, .. } => *index,
+                _ => continue,
+            };
+            st.get_or_insert_with(|| lock_jobs(&self.shared.0)).sr_delivered(index);
+        }
         out
     }
 }
@@ -939,6 +995,7 @@ impl Drop for DecodePool {
         st.lq_cancel.clear();
         st.sr_jobs.clear();
         st.sr_wanted.clear();
+        st.sr_sent.clear();
         // Release the upscaler with the pool (the lane drops its own clone when
         // it notices `running = false`; one mid-inference finishes its tile).
         st.upscaler = None;
@@ -995,6 +1052,8 @@ mod tests {
             upscaler: None,
             sr_jobs: VecDeque::new(),
             sr_wanted: HashSet::new(),
+            sr_inflight: None,
+            sr_sent: HashSet::new(),
         }
     }
 
@@ -1307,6 +1366,50 @@ mod tests {
         st.paused = false;
         st.running = false;
         assert!(st.sr_stale(3), "pool dropped");
+    }
+
+    /// The page the SR lane is running, or whose result `poll` hasn't delivered
+    /// yet, still shows unupscaled to the reader, which lists it again: it stays
+    /// wanted (the running job isn't cancelled) but isn't queued again, so the
+    /// lane doesn't re-size the page it just made. Delivered, it can be queued
+    /// again; another target for it always can; an abandoned job leaves no mark.
+    #[test]
+    fn sr_queue_skips_the_running_job_and_undelivered_results() {
+        let mut st = job_state();
+        st.upscaler = Some(Arc::new(NoModel));
+        st.replace_sr_jobs(vec![(3, 1800), (4, 1800)]);
+        let (i, h, _) = st.claim_sr().unwrap();
+        assert_eq!((i, h), (3, 1800));
+
+        // A rebuild while 3 runs lists it first again.
+        st.replace_sr_jobs(vec![(3, 1800), (4, 1800), (5, 1800)]);
+        assert_eq!(Vec::from(st.sr_jobs.clone()), vec![(4, 1800), (5, 1800)]);
+        assert!(!st.sr_stale(3), "the running job stays wanted");
+
+        // Finished and sent, not delivered: still left out.
+        st.finish_sr(true);
+        st.replace_sr_jobs(vec![(3, 1800), (4, 1800), (5, 1800)]);
+        assert_eq!(st.sr_jobs.front(), Some(&(4, 1800)));
+        // The page at another target is new work.
+        st.replace_sr_jobs(vec![(3, 2400), (4, 1800)]);
+        assert_eq!(st.sr_jobs.front(), Some(&(3, 2400)));
+
+        // Delivered: the reader lists it by what it shows now.
+        st.sr_delivered(3);
+        st.replace_sr_jobs(vec![(3, 1800), (4, 1800)]);
+        assert_eq!(st.sr_jobs.front(), Some(&(3, 1800)));
+
+        // An abandoned (stale) job sends nothing and leaves no mark.
+        let (i, _, _) = st.claim_sr().unwrap();
+        st.finish_sr(false);
+        st.replace_sr_jobs(vec![(i, 1800)]);
+        assert_eq!(st.sr_jobs.front(), Some(&(i, 1800)));
+        assert!(st.sr_inflight.is_none() && st.sr_sent.is_empty());
+
+        // Cancelling still works: unlisted, the running job goes stale.
+        let (i, _, _) = st.claim_sr().unwrap();
+        st.replace_sr_jobs(vec![(9, 1800)]);
+        assert!(st.sr_stale(i));
     }
 
     /// The `wake_pending` protocol, exercised on the flag alone: a real
