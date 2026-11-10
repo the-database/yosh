@@ -21,7 +21,7 @@ avif = ["yosh-image/avif"]
 # loads libaji from the add-on directory at runtime via libloading (pure Rust —
 # no C toolchain, and no inference runtime linked). The `Upscaler` trait and the
 # SR lane are always built; without an installed add-on they stay inert.
-sr = ["yosh-image/aji"]
+sr = ["yosh-image/aji", "dep:libloading"]
 
 [dependencies]
 # The GPU-free imaging core: decoders, ICC, tone curves, HQ resize, page sources.
@@ -38,6 +38,11 @@ jxl-oxide = { version = "0.12", default-features = false }
 fast_image_resize = "6"
 # ICO container parsing (multi-image .ico → layered pages) and re-encoding.
 ico = "0.6"
+
+# `sr`: a portable Linux add-on's TensorRT libraries are loaded by full path before
+# libaji (`sr::aji::load_aji`); the same crate yosh-image loads libaji with.
+[target.'cfg(unix)'.dependencies]
+libloading = { version = "0.9", optional = true }
 
 [dev-dependencies]
 # Hand-building zips with raw (non-UTF-8) entry names in tests needs real CRCs;

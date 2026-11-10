@@ -13,6 +13,14 @@
 //! to TensorRT on the same GPU: the TensorRT context opens the first time that
 //! happens, and the other models stay on TensorRT-RTX.
 //!
+//! [`Upscaler::release_gpu`] (the shell calls it while upscaling is idle) closes the
+//! models and the contexts and has libaji (0.24.0+) free the device, which on the
+//! CUDA backends drops the CUDA context TensorRT's runtime would keep until exit;
+//! the next page reopens the context and reloads its model from the engine cache.
+//! Dropping the upscaler does the same. Opening a context and freeing a device are
+//! serialized process-wide ([`GPU`]): a device reset must never overlap another
+//! upscaler opening its context on the same GPU.
+//!
 //! A rule's model may be installed under another precision suffix (`_fp16`,
 //! `_bf16`, `_fp32`) than the rule names, or with none (older add-ons), or with one
 //! where the rule names none (an older `rules.json`): [`lookup_order`] finds
@@ -21,9 +29,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use yosh_image::aji::{Aji, Context, ContextParams, LoadParams, Model, ModelState, Pixels, PixelsMut, Upscaled};
 pub use yosh_image::aji::{Backend, Device};
@@ -32,9 +40,66 @@ use super::rules::{auto_levels, select, SrRule};
 use super::{SrOutcome, Upscaler};
 use crate::pool::Waker;
 
+/// Serializes opening a context, listing devices and freeing a device across the
+/// process: `aji_img_release_device` resets the device for everything in it.
+static GPU: Mutex<()> = Mutex::new(());
+
+fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+    GPU.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Load libaji from the add-on in `dir`. On Linux, first load the CUDA and
+/// TensorRT libraries a portable add-on keeps beside it (`mangajanai setup`
+/// without `--store`), by full path and globally: libaji_trt.so asks for them by
+/// soname with no search path of its own, so they would otherwise only be found
+/// in a system install, and TensorRT couldn't load. (A store install's packs are
+/// loaded by libaji itself, from `aji-runtime.json`; a system TensorRT works as
+/// before.) MangaJaNaiCLI's `load_aji` does the same.
+fn load_aji(dir: &Path) -> Result<Aji, String> {
+    #[cfg(unix)]
+    for lib in ["libcudart.so.13", "libnvinfer.so.11", "libnvinfer_plugin.so.11", "libnvonnxparser.so.11"] {
+        use libloading::os::unix::{Library, RTLD_GLOBAL, RTLD_NOW};
+        let path = dir.join(lib);
+        if path.is_file() {
+            // SAFETY: NVIDIA's libraries; their initializers only set up their own
+            // state. Kept loaded for the process's life (libaji uses them until exit).
+            match unsafe { Library::open(Some(&path), RTLD_NOW | RTLD_GLOBAL) } {
+                Ok(l) => std::mem::forget(l),
+                Err(e) => eprintln!("yosh: [upscale] {}: {e}", path.display()),
+            }
+        }
+    }
+    Aji::load(dir)
+}
+
+/// The `trtexec` that builds TensorRT engines, and an environment prefix for it
+/// (MangaJaNaiCLI's `trtexec`): `(None, None)` on Windows (libaji runs the one
+/// beside it, which finds its DLLs there). On Linux a `trtexec` beside libaji
+/// (a portable add-on) gets the add-on folder on `LD_LIBRARY_PATH`, or it can't
+/// find TensorRT's libraries; without one, a system TensorRT's
+/// (`/usr/src/tensorrt/bin`, which isn't on `PATH`, else `PATH`'s). A store
+/// install's comes from its TensorRT pack (libaji, `aji-runtime.json`).
+fn trtexec(dir: &Path) -> (Option<PathBuf>, Option<String>) {
+    if cfg!(windows) {
+        return (None, None);
+    }
+    if dir.join("trtexec").is_file() {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        // single-quoted for the shell; a ' inside becomes '\''
+        let quoted = dir.to_string_lossy().replace('\'', r"'\''");
+        return (None, Some(format!("LD_LIBRARY_PATH='{quoted}'${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}")));
+    }
+    let on_path = std::env::var_os("PATH")
+        .and_then(|p| std::env::split_paths(&p).map(|d| d.join("trtexec")).find(|t| t.is_file()));
+    let system = Some(PathBuf::from("/usr/src/tensorrt/bin/trtexec")).filter(|t| t.is_file()).or(on_path);
+    (system, None)
+}
+
 /// Devices `backend` can run on, from the add-on in `dir`.
 pub fn enum_devices(dir: &Path, backend: Backend) -> Result<Vec<Device>, String> {
-    Aji::load(dir)?.devices(backend)
+    let aji = load_aji(dir)?;
+    let _gpu = gpu_lock();
+    aji.devices(backend)
 }
 
 enum Slot {
@@ -47,8 +112,6 @@ enum Slot {
 
 /// The TensorRT context a TensorRT-RTX upscaler falls back to, opened on first need.
 struct Fallback {
-    dir: PathBuf,
-    device_id: u64,
     ctx: Mutex<Option<Result<Context, String>>>,
 }
 
@@ -61,7 +124,11 @@ struct Watch {
 }
 
 pub struct AjiUpscaler {
-    ctx: Context,
+    aji: Aji,
+    dir: PathBuf,
+    device_id: u64,
+    /// `None` once [`Upscaler::release_gpu`] closed it; the next model load reopens it.
+    ctx: Mutex<Option<Context>>,
     backend: Backend,
     /// The device's CUDA compute capability (TensorRT, TensorRT-RTX), for [`lookup_order`].
     compute_capability: Option<(i32, i32)>,
@@ -76,6 +143,20 @@ pub struct AjiUpscaler {
     rules: RwLock<Arc<Vec<SrRule>>>,
     slots: Mutex<HashMap<String, Slot>>,
     watch: Arc<Watch>,
+    /// Upscales running now: [`Upscaler::release_gpu`] waits for none.
+    active: AtomicUsize,
+    /// When the last one ended (or the upscaler opened): [`Upscaler::idle_since`].
+    last_used: Mutex<Instant>,
+}
+
+/// Counts an upscale as running until dropped, then stamps its end.
+struct Running<'a>(&'a AjiUpscaler);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        *self.0.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl AjiUpscaler {
@@ -88,14 +169,14 @@ impl AjiUpscaler {
         rules: Vec<SrRule>,
         waker: Option<Waker>,
     ) -> Result<Self, String> {
-        let ctx = open_context(dir, backend, device.id)?;
-        let fallback = (backend == Backend::TensorRtRtx).then(|| Fallback {
+        let aji = load_aji(dir)?;
+        let ctx = open_context(&aji, dir, backend, device.id)?;
+        let fallback = (backend == Backend::TensorRtRtx).then(|| Fallback { ctx: Mutex::new(None) });
+        Ok(Self {
+            aji,
             dir: dir.to_path_buf(),
             device_id: device.id,
-            ctx: Mutex::new(None),
-        });
-        Ok(Self {
-            ctx,
+            ctx: Mutex::new(Some(ctx)),
             backend,
             compute_capability: device.compute_capability,
             fallback,
@@ -109,7 +190,55 @@ impl AjiUpscaler {
                 epoch: AtomicU64::new(0),
                 waker,
             }),
+            active: AtomicUsize::new(0),
+            last_used: Mutex::new(Instant::now()),
         })
+    }
+
+    /// The primary context, reopened if [`Upscaler::release_gpu`] closed it.
+    fn primary(&self) -> Result<Context, String> {
+        let mut c = self.ctx.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ctx) = &*c {
+            return Ok(ctx.clone());
+        }
+        let ctx = open_context(&self.aji, &self.dir, self.backend, self.device_id)?;
+        eprintln!("yosh: [upscale] {} reopened after a GPU release", self.backend.label());
+        *c = Some(ctx.clone());
+        Ok(ctx)
+    }
+
+    /// Close the models and the contexts and free the device (see
+    /// [`Upscaler::release_gpu`]); `slots` is the locked slot map. Whether any
+    /// context was open.
+    fn close_all(&self, slots: &mut HashMap<String, Slot>) -> bool {
+        slots.clear();
+        self.watch.building.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let primary = self.ctx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let fallback = self
+            .fallback
+            .as_ref()
+            .and_then(|f| f.ctx.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .and_then(Result::ok);
+        if primary.is_none() && fallback.is_none() {
+            return false;
+        }
+        let mut backends = vec![self.backend];
+        if fallback.is_some() {
+            backends.push(Backend::TensorRt);
+        }
+        let _gpu = gpu_lock();
+        // The models are gone, so these were the contexts' last references.
+        drop(primary);
+        drop(fallback);
+        for b in backends {
+            match self.aji.release_device(b, self.device_id) {
+                Ok(true) => {}
+                // libaji before 0.24.0: the contexts closed, the CUDA context stays.
+                Ok(false) => eprintln!("yosh: [upscale] this libaji can't free the device; update the add-on"),
+                Err(e) => eprintln!("yosh: [upscale] {}: {e}", b.label()),
+            }
+        }
+        true
     }
 
     /// Also look up models in `dirs`, after the add-on's `models/` (e.g. the model packs of a
@@ -168,7 +297,8 @@ impl AjiUpscaler {
             let path = self.models_dirs[0].join(format!("{name}.onnx"));
             return Err(format!("model not installed: {}", path.display()));
         };
-        match self.load(&mut slots, &self.ctx, name, &path, false) {
+        let ctx = self.primary()?;
+        match self.load(&mut slots, &ctx, name, &path, false) {
             Err(e) => self.fall_back(&mut slots, name, &path, e),
             done => done,
         }
@@ -223,7 +353,7 @@ impl AjiUpscaler {
             .get_or_insert_with(|| format!("{name}: {err}"));
         let ctx = {
             let mut c = fb.ctx.lock().unwrap_or_else(|e| e.into_inner());
-            c.get_or_insert_with(|| open_context(&fb.dir, Backend::TensorRt, fb.device_id)).clone()
+            c.get_or_insert_with(|| open_context(&self.aji, &self.dir, Backend::TensorRt, self.device_id)).clone()
         };
         match ctx {
             Ok(ctx) => self.load(slots, &ctx, name, path, true),
@@ -312,15 +442,17 @@ fn lookup_order(name: &str, backend: Backend, compute_capability: Option<(i32, i
 
 /// Open `backend` on `device_id` with the add-on's engine cache, logging warnings
 /// and errors to stderr.
-fn open_context(dir: &Path, backend: Backend, device_id: u64) -> Result<Context, String> {
+fn open_context(aji: &Aji, dir: &Path, backend: Backend, device_id: u64) -> Result<Context, String> {
     let cache = dir.join("cache");
     let _ = std::fs::create_dir_all(&cache);
-    Aji::load(dir)?.context(&ContextParams {
+    let (trtexec, trtexec_env) = trtexec(dir);
+    let _gpu = gpu_lock();
+    aji.context(&ContextParams {
         backend,
         device_id,
         cache_dir: Some(cache),
-        trtexec: None,
-        trtexec_env: None,
+        trtexec,
+        trtexec_env,
         // TensorRT severities: 0 internal error, 1 error, 2 warning.
         log: Some(Arc::new(|level, msg| {
             if level <= 2 {
@@ -340,6 +472,8 @@ impl Upscaler for AjiUpscaler {
         target_scale: f32,
         cancel: &dyn Fn() -> bool,
     ) -> SrOutcome {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        let _running = Running(self);
         let rules = self.rules();
         let Some(name) = select(&rules, h, channels == 1, target_scale) else {
             return SrOutcome::Skip;
@@ -382,14 +516,40 @@ impl Upscaler for AjiUpscaler {
     fn fallback(&self) -> Option<String> {
         self.fell_back.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+
+    fn release_gpu(&self) -> bool {
+        // Holding the slots keeps a model load out until the contexts are closed;
+        // an upscale counts itself running before it asks for its model.
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let building = slots
+            .values()
+            .any(|s| matches!(s, Slot::Building { model, .. } if model.state() == ModelState::Building));
+        if self.active.load(Ordering::Acquire) > 0 || building {
+            return false;
+        }
+        let released = self.close_all(&mut slots);
+        if released {
+            eprintln!("yosh: [upscale] released the GPU (idle)");
+        }
+        released
+    }
+
+    fn idle_since(&self) -> Option<Instant> {
+        let open = self.ctx.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            || self.fallback.as_ref().is_some_and(|f| f.ctx.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+        (open && self.active.load(Ordering::Acquire) == 0)
+            .then(|| *self.last_used.lock().unwrap_or_else(|e| e.into_inner()))
+    }
 }
 
 impl Drop for AjiUpscaler {
     fn drop(&mut self) {
-        // Models hold the context and the context the library, so release order
-        // takes care of itself; just let a running watcher exit on its next tick
-        // (without waking anyone) instead of keeping building models alive.
-        self.watch.building.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // Close the models and contexts now (a running watcher then exits on its
+        // next tick without waking anyone) and free the device, so switching
+        // upscaling off gives back all of its GPU memory. A building engine's
+        // context is closed too: libaji stops the build.
+        let mut slots = std::mem::take(&mut *self.slots.lock().unwrap_or_else(|e| e.into_inner()));
+        self.close_all(&mut slots);
     }
 }
 
@@ -470,5 +630,91 @@ mod tests {
             }
         }
         assert_eq!(order("", Backend::TensorRt, Some((12, 0))), [String::new()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_portable_trtexec_gets_the_add_on_on_its_library_path() {
+        let dir = std::env::temp_dir().join(format!("yosh-trtexec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("trtexec"), b"").unwrap();
+        let (exe, env) = trtexec(&dir);
+        assert_eq!(exe, None, "libaji runs the one beside it");
+        let canon = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(
+            env.as_deref(),
+            Some(format!("LD_LIBRARY_PATH='{}'${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}", canon.display()).as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_leaves_trtexec_to_libaji() {
+        assert_eq!(trtexec(Path::new(r"C:\nowhere")), (None, None));
+    }
+
+    /// This process's dedicated GPU memory in MiB (Windows' "GPU Process Memory"
+    /// counter; nvidia-smi has no per-process numbers on WDDM).
+    #[cfg(windows)]
+    fn gpu_mib() -> f64 {
+        std::thread::sleep(Duration::from_secs(2)); // the counter lags
+        let q = format!(
+            r"((Get-Counter '\GPU Process Memory(pid_{}_*)\Dedicated Usage').CounterSamples | Measure-Object CookedValue -Sum).Sum",
+            std::process::id()
+        );
+        let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &q]).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0)
+    }
+
+    /// Manual (`--ignored`, Windows): `YOSH_TEST_ADDON` = an installed add-on folder
+    /// (`YOSH_TEST_BACKEND` = tensorrt (default), tensorrt-rtx or directml). Upscales a
+    /// gray page, releases the GPU, upscales it again (same output, reloaded from the
+    /// engine cache), then drops the upscaler; prints the process's GPU memory at
+    /// each step and checks a release gives back what the upscaler held.
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn release_gpu_frees_the_device_and_reloads() {
+        let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON").expect("YOSH_TEST_ADDON"));
+        let backend = match std::env::var("YOSH_TEST_BACKEND").as_deref() {
+            Ok("tensorrt-rtx") => Backend::TensorRtRtx,
+            Ok("directml") => Backend::DirectMl,
+            _ => Backend::TensorRt,
+        };
+        let device = enum_devices(&dir, backend).unwrap().into_iter().next().expect("a device");
+        let start = gpu_mib();
+        let up = AjiUpscaler::new(&dir, backend, &device, crate::sr::rules::default_rules(), None).unwrap();
+        let (w, h) = (840u32, 1200u32);
+        let px: Vec<u8> = (0..w * h).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        let run = || loop {
+            match up.upscale(w, h, 1, &px, 1.5, &|| false) {
+                SrOutcome::Done { pixels, scale, .. } => break (pixels, scale),
+                SrOutcome::NotReady => std::thread::sleep(Duration::from_millis(500)),
+                SrOutcome::Failed(e) => panic!("{e}"),
+                _ => panic!("no model for the page"),
+            }
+        };
+        let (first, scale) = run();
+        assert_eq!(scale, 2);
+        let loaded = gpu_mib();
+        assert!(up.idle_since().is_some());
+        assert!(up.release_gpu());
+        assert!(up.idle_since().is_none() && !up.release_gpu(), "nothing left to release");
+        let released = gpu_mib();
+        let t = Instant::now();
+        let (again, _) = run();
+        let reload_ms = t.elapsed().as_millis();
+        assert!(again == first, "the reloaded model upscales the same");
+        let reloaded = gpu_mib();
+        drop(up);
+        let dropped = gpu_mib();
+        eprintln!(
+            "{}: start {start:.0} MiB, loaded {loaded:.0}, released {released:.0}, reloaded {reloaded:.0} (first page after the release {reload_ms} ms), dropped {dropped:.0}",
+            backend.label()
+        );
+        assert!(loaded - released > 0.8 * (loaded - start), "a release gives back what the upscaler held");
+        assert!(reloaded - dropped > 0.8 * (reloaded - start), "dropping the upscaler does too");
     }
 }
