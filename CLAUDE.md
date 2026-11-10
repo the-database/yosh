@@ -211,6 +211,18 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   prints a `BACKEND_FALLBACK` line that MangaJaNaiConverterGui shows in its status bar. Stored as `upscale_backend: "tensorrt"` +
   `upscale_tensorrt_rtx: true` (`Settings::upscale_choice`), never as its own token: an older yosh
   fails the whole state.json parse on an unknown token, which would reset every setting.
+- **GPU memory is given back while idle** (`Upscaler::release_gpu`, libaji >= v0.24.0's
+  `aji_img_release_device`): `AjiUpscaler` closes its models and contexts and frees the device —
+  on TensorRT/TensorRT-RTX that drops the CUDA context the runtime would keep until exit (an RTX 5090
+  with a 2x MangaJaNai loaded: TensorRT 998 MiB → 0, TensorRT-RTX 818 → 0; dropping the upscaler used
+  to leave 562 / 432 MiB). The shell releases it when the window is minimized/occluded (`State::park`)
+  and after `SR_IDLE_RELEASE` (2 min) with no page upscaled (`about_to_wait`, from `idle_since`), and
+  dropping the upscaler (upscaling switched off, a restart) does the same. The next page reopens the
+  context and reloads its model from the engine cache (~0.7 s). A release is refused while an upscale
+  runs or an engine builds. Opening contexts, listing devices and freeing a device share one
+  process-wide lock (`sr::aji`), since a device reset must not overlap another context opening.
+  Manual test: `release_gpu_frees_the_device_and_reloads` (`--ignored`, `--features sr`, Windows;
+  `YOSH_TEST_ADDON` = an add-on folder, `YOSH_TEST_BACKEND`).
 - UI: Settings → AI upscaling (on/off, Auto = TensorRT-RTX if suited, then TensorRT, then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +
   corner spinner (`Reader::sr_view_state`; right-click = profile menu); key `U` = per-book switch; info overlay "AI model" row.
 - **Installing it (`addon_setup.rs`):** Settings → AI upscaling → *Install the add-on* makes the add-on

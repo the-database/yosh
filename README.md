@@ -71,6 +71,8 @@ and the models (about 1 GB with an NVIDIA GPU).
   import a MangaJaNai GUI workflow (`.mwf`). `U` turns upscaling off or on for the current book.
 - **Removing it:** Settings → AI upscaling → *Remove the add-on* (the Windows uninstaller also
   removes it).
+- **GPU memory:** when yosh is minimized, or two minutes after the last page it upscaled, the add-on
+  gives its GPU memory back; the next page that needs it loads it again (under a second).
 
 ## Controls (press <kbd>F1</kbd> in-app for the full list)
 | | |

@@ -5321,6 +5321,7 @@ dependencies = [
  "image",
  "jpeg-encoder",
  "jxl-oxide",
+ "libloading 0.9.0",
  "png",
  "pollster 1.0.1",
  "wgpu",
