@@ -16,8 +16,9 @@ Cargo workspace:
 - `crates/yosh-engine` — the reader engine: decode pool, page/texture/cache layer, reading math (also used
   by `crates/yosh-android`).
 - `crates/yosh-image` — the **GPU-free** imaging core the engine is built on: decoders, ICC, tone curves,
-  HQ resize, folder/archive page sources, whole-archive entry streaming (`archive`), and (feature `aji`)
-  safe runtime-loaded bindings to libaji's image ABI. No wgpu/winit/egui, so batch tools can depend on it
+  HQ resize, folder/archive page sources, whole-archive entry streaming (`archive`), libaji tile
+  sizing by page size and GPU memory (`tiles`), and (feature `aji`) safe runtime-loaded bindings to
+  libaji's image ABI. No wgpu/winit/egui, so batch tools can depend on it
   too; the engine re-exports `icc`, `source`, `tone`. **Its public API has other consumers**:
   [MangaJaNaiCLI](https://github.com/the-database/MangaJaNaiCLI) (MangaJaNai GUI's upscaling backend
   and the `mangajanai` command line) depends on it as a git dependency pinned to a commit of this
@@ -191,7 +192,7 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   upscaler (`Upscaler::set_rules`) and `Reader::upscaler_rules_changed` re-runs pages upscaled with a
   model the new rules don't pick. Import .mwf (`mwf.rs`) reads a MangaJaNai GUI workflow export the
   way MangaJaNaiCLI does, auto levels included; width limits, resize-before-upscale, a model tile
-  size other than 512 px (yosh runs every model at libaji's default) and a grayscale detection
+  size (yosh picks tiles itself, below) and a grayscale detection
   threshold other than 12 (`GRAYSCALE_THRESHOLD`) have no yosh equivalent and are reported in the
   editor as not carried over. The editor's rule table has an *Auto levels* column (gray rules with
   a model); `rules.json` stores `"auto_levels": true` only when on, so older files read as off.
@@ -204,6 +205,20 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   `rules.json`'s unsuffixed MangaJaNai names) then tries itself + each suffix in the same order, so
   `4x_MangaJaNai_1200p_V1_ESRGAN_70k` finds `..._70k_fp16.onnx`; for custom models those files don't
   exist, so nothing changes. When the file used isn't the named one, a log line says which.
+- **Tiles** (`sr::aji`, module docs) are sized to the GPU's free memory (`yosh_image::tiles::Budget`:
+  libaji 0.28.0's `aji_img_memory_get`, with NVML's device-wide free memory, since on Windows
+  libaji's own figure leaves out other processes'). Each model's measured memory use is recorded
+  in the add-on's `cache/` (`aji-model-memory.txt`), as MangaJaNaiCLI does. On TensorRT a model
+  loads as one even-tiles engine of up to 1024 (768/512 when memory is short) that serves every
+  page size. On TensorRT-RTX/DirectML it loads on the 512 square, and for a page size whose best
+  tile shape (`yosh_image::tiles::fit`) saves enough and fits in memory, an engine fitted to it
+  loads in the background from that size's second page; its pages switch to it when it's ready
+  (1200x1800 with 2x MangaJaNai on an RTX 5090, TensorRT-RTX: 1216x992, 122 ms a page against
+  239 ms), and back to the square if it's no faster on its first three pages or fails. One built
+  before loads at once (`aji-fitted-engines.txt` in `cache/`, which MangaJaNaiCLI writes too).
+  Mixed sizes build nothing; at most two stay loaded per model. Manual test:
+  `a_fitted_engine_takes_over_a_volume` (`--ignored`, `--features sr`; `YOSH_TEST_ADDON` = a *copy*
+  of an add-on, `YOSH_TEST_MODEL` = a 2x model stem, `YOSH_TEST_BACKEND`).
 - **TensorRT-RTX (Windows):** needs libaji >= v0.19.0 with `aji_trtrtx.dll` and its
   runtime (the `aji-trtrtx-windows-x64.zip` release asset) in the add-on. Engines build in ~5-10 s instead of
   TensorRT's ~35 s (2x MangaJaNai, 512 tiles, RTX 5090) and pages ran ~15% faster, output visually identical.
