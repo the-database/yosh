@@ -123,6 +123,27 @@ pub fn is_out_of_memory(err: &str) -> bool {
     err.starts_with("out of GPU memory") || err.starts_with("out of memory for ")
 }
 
+/// GPU memory in bytes, from libaji 0.28.0 ([`Context::memory`], [`Model::memory`]), for sizing
+/// tiles to fit: a model's activations and buffers grow with its tile's area.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    /// What can still be allocated on the device now: libaji's figure, or on an NVIDIA GPU NVML's
+    /// if lower (on Windows libaji's leaves out other processes' memory).
+    pub device_free: u64,
+    pub device_total: u64,
+    /// What the context holds for all its models (CUDA backends; 0 on DirectML): one activation
+    /// buffer as large as the largest loaded model's need, and the GPU tiling scratch.
+    pub ctx_activations: u64,
+    pub ctx_scratch: u64,
+    /// A ready model's weights (an estimate on DirectML), the activations its tile needs (with
+    /// even tiles, its largest), and its tile input/output buffers. 0 without a model.
+    pub model_weights: u64,
+    pub model_activations: u64,
+    pub model_buffers: u64,
+    /// The model's activations are in `ctx_activations` (CUDA), not held by the model (DirectML).
+    pub activations_shared: bool,
+}
+
 /// How [`Model::upscale`] ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Upscaled {
@@ -178,6 +199,19 @@ struct RawModelInfo {
 }
 
 #[repr(C)]
+#[derive(Default)]
+struct RawMemory {
+    device_free: u64,
+    device_total: u64,
+    ctx_activations: u64,
+    ctx_scratch: u64,
+    model_weights: u64,
+    model_activations: u64,
+    model_buffers: u64,
+    activations_shared: c_int,
+}
+
+#[repr(C)]
 struct RawBuffer {
     width: c_int,
     height: c_int,
@@ -200,6 +234,8 @@ struct Api {
     destroy: unsafe extern "C" fn(*mut *mut c_void),
     /// libaji 0.24.0+; `None` in an older one.
     release_device: Option<unsafe extern "C" fn(c_int, u64) -> c_int>,
+    /// libaji 0.28.0+; `None` in an older one.
+    memory: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut RawMemory) -> c_int>,
 }
 
 /// A context or model pointer. libaji allows a context from any thread and
@@ -258,6 +294,8 @@ impl Aji {
             destroy: sym!(b"aji_img_destroy\0"),
             // SAFETY: the type mirrors aji_image.h's aji_img_release_device.
             release_device: unsafe { lib.get(b"aji_img_release_device\0") }.ok().map(|f| *f),
+            // SAFETY: the type mirrors aji_image.h's aji_img_memory_get.
+            memory: unsafe { lib.get(b"aji_img_memory_get\0") }.ok().map(|f| *f),
         };
         Ok(Self(Arc::new(LibInner { api, _lib: lib })))
     }
@@ -329,7 +367,7 @@ impl Aji {
             let e = unsafe { CStr::from_ptr(err.as_ptr()) }.to_string_lossy().into_owned();
             return Err(if e.is_empty() { "upscaler initialization failed".into() } else { e });
         }
-        Ok(Context(Arc::new(CtxInner { lib: self.clone(), ptr: Handle(ptr), _log: log })))
+        Ok(Context(Arc::new(CtxInner { lib: self.clone(), ptr: Handle(ptr), device_id: params.device_id, _log: log })))
     }
 }
 
@@ -370,6 +408,8 @@ pub struct ContextParams {
 struct CtxInner {
     lib: Aji,
     ptr: Handle,
+    /// For [`Context::memory`]'s NVML lookup.
+    device_id: u64,
     _log: Option<Box<LogSink>>,
 }
 
@@ -416,6 +456,31 @@ impl Context {
             return Err(self.last_error());
         }
         Ok(Model { ctx: self.clone(), ptr: Handle(ptr) })
+    }
+
+    /// The device's memory and what this context holds; `None` from a libaji before 0.28.0 (or
+    /// a backend that can't tell).
+    pub fn memory(&self) -> Option<Memory> {
+        self.memory_of(std::ptr::null_mut())
+    }
+
+    fn memory_of(&self, model: *mut c_void) -> Option<Memory> {
+        let f = self.0.lib.0.api.memory?;
+        let mut m = RawMemory::default();
+        // SAFETY: a live context, and a live model of it or null; `m` is writable.
+        if unsafe { f(self.0.ptr.0, model, &mut m) } != OK {
+            return None;
+        }
+        Some(Memory {
+            device_free: crate::nvml::memory(self.0.device_id).map_or(m.device_free, |(free, _)| free.min(m.device_free)),
+            device_total: m.device_total,
+            ctx_activations: m.ctx_activations,
+            ctx_scratch: m.ctx_scratch,
+            model_weights: m.model_weights,
+            model_activations: m.model_activations,
+            model_buffers: m.model_buffers,
+            activations_shared: m.activations_shared != 0,
+        })
     }
 }
 
@@ -582,6 +647,11 @@ impl Model {
             CANCELLED => Ok(Upscaled::Cancelled),
             _ => Err(self.ctx.last_error()),
         }
+    }
+
+    /// [`Context::memory`] plus what this model needs, once it's ready.
+    pub fn memory(&self) -> Option<Memory> {
+        self.ctx.memory_of(self.ptr.0)
     }
 
     /// The context this model belongs to.

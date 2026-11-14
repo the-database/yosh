@@ -10,6 +10,8 @@
 //!   the `rar` feature, 7z/cb7), with legacy-codepage entry-name repair.
 //! - [`archive`]: every entry of an archive in archive order, with raw bytes
 //!   (for rewriting archives faithfully), and a natural-sort folder walker.
+//! - [`tiles`]: tile shapes fitted to a page size for libaji, and the record of
+//!   fitted engines built so far, shared by the apps on it.
 //! - [`aji`] (feature `aji`): safe bindings to libaji's still-image ABI
 //!   (TensorRT / DirectML super-resolution), loaded at runtime.
 //!
@@ -25,4 +27,5 @@ pub mod decode;
 pub mod icc;
 pub mod resize;
 pub mod source;
+pub mod tiles;
 pub mod tone;
