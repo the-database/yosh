@@ -23,6 +23,23 @@
 //! serialized process-wide ([`GPU`]): a device reset must never overlap another
 //! upscaler opening its context on the same GPU.
 //!
+//! **Tiles.** libaji's default 512 px square tiles suit some page sizes badly: 1200x1800 runs
+//! 1.82x its pixels on them. Tiles are sized to the GPU's free memory instead (yosh-image's
+//! [`yosh_image::tiles::Budget`], from what libaji 0.28.0+ reports about the loaded models,
+//! recorded in the add-on's `cache/` beside the engines, as MangaJaNaiCLI does):
+//!
+//! - On TensorRT a model loads as one even-tiles engine (`AJI_IMG_LOAD_EVEN_TILES`), tiles of at
+//!   most 1024 (less where memory is short, [`yosh_image::tiles::even_tile`]): each page is split
+//!   into the fewest even tiles, as fast as a fitted engine and good for any page size.
+//! - On TensorRT-RTX and DirectML, where an even-tiles engine is slow or missing, a model loads on
+//!   the square, and for a page size whose best tile shape ([`yosh_image::tiles::fit`]) saves
+//!   enough and fits in memory, an engine fitted to it (1216x992 there: about half the time) loads
+//!   in the background from the second page of that size (a volume's pages are one size), or at
+//!   once if it was built before (by yosh or MangaJaNaiCLI, [`yosh_image::tiles::fitted_known`]).
+//!   The pages of that size switch to it when it's ready, and back to the square if it isn't
+//!   faster on its first [`CHECK_PAGES`] pages or fails. At most [`MAX_FITTED`] stay loaded per
+//!   model.
+//!
 //! A rule's model may be installed under another precision suffix (`_fp16`,
 //! `_bf16`, `_fp32`) than the rule names, or with none (older add-ons), or with one
 //! where the rule names none (an older `rules.json`): [`lookup_order`] finds
@@ -37,6 +54,7 @@ use std::time::{Duration, Instant};
 
 use yosh_image::aji::{Aji, Context, ContextParams, LoadParams, Model, ModelState, Pixels, PixelsMut, Upscaled};
 pub use yosh_image::aji::{Backend, Device};
+use yosh_image::tiles::{self, Budget, MemoryUse, Shape};
 
 use super::rules::{auto_levels, select, SrRule};
 use super::{SrOutcome, Upscaler};
@@ -104,8 +122,41 @@ pub fn enum_devices(dir: &Path, backend: Backend) -> Result<Vec<Device>, String>
     aji.devices(backend)
 }
 
+/// libaji's default tile, which every model loads at first.
+const SQUARE: u32 = 512;
+
+/// Fitted engines kept loaded per model; past it, the least recently used is unloaded.
+const MAX_FITTED: usize = 2;
+
+/// A ready fitted engine is timed on this many pages, and kept if it's at least [`CHECK_GAIN`]
+/// faster per page than the square was.
+const CHECK_PAGES: u32 = 3;
+const CHECK_GAIN: f64 = 0.05;
+
+/// A fitted tile shape and the share of the square's work it saves ([`tiles::fit`]).
+type Fitted = (Shape, f64);
+
+/// A model's engine fitted to one page size (see the module docs). `square`: seconds per page on
+/// the square, for the fitted engine's check.
+enum Fit {
+    Renting { square: Option<f64> },
+    /// `bytes`: the memory it's predicted to take once loaded.
+    Building { model: Arc<Model>, bytes: u64, square: Option<f64> },
+    Ready { model: Arc<Model>, last_use: u64, check: Option<Check> },
+    Failed,
+}
+
+/// A ready fitted engine's first pages (`runs`, which took `took` seconds), against the square's
+/// `square` seconds per page.
+struct Check {
+    square: f64,
+    runs: u32,
+    took: f64,
+}
+
 enum Slot {
-    Ready { model: Arc<Model>, scale: u32 },
+    /// `fell_back`: on the TensorRT fallback context (no fitted engines then).
+    Ready { model: Arc<Model>, scale: u32, fell_back: bool },
     /// `fell_back`: already on the TensorRT fallback context. `path`: the file it
     /// loaded from, for that fallback.
     Building { model: Arc<Model>, fell_back: bool, path: PathBuf },
@@ -144,6 +195,19 @@ pub struct AjiUpscaler {
     /// Swapped whole by [`Upscaler::set_rules`] (a profile switch).
     rules: RwLock<Arc<Vec<SrRule>>>,
     slots: Mutex<HashMap<String, Slot>>,
+    /// Fitted engines, by model name and tile shape.
+    fitted: Mutex<HashMap<(String, Shape), Fit>>,
+    /// The fitted shape (and the share of the square's work it saves) by model name and page
+    /// size, decided on the first page of that size.
+    shapes: Mutex<HashMap<(String, Shape), Option<Fitted>>>,
+    /// Each model's memory use, by name, measured from its engines.
+    memory: Mutex<HashMap<String, MemoryUse>>,
+    /// Pages upscaled, for the fitted engines' least-recently-used order.
+    clock: AtomicU64,
+    /// The device's name, and the largest fitted tile area by its size for a libaji that can't
+    /// report memory.
+    device_name: String,
+    area_budget: u64,
     watch: Arc<Watch>,
     /// Upscales running now: [`Upscaler::release_gpu`] waits for none.
     active: AtomicUsize,
@@ -186,6 +250,12 @@ impl AjiUpscaler {
             models_dirs: vec![dir.join("models")],
             rules: RwLock::new(Arc::new(rules)),
             slots: Mutex::new(HashMap::new()),
+            fitted: Mutex::new(HashMap::new()),
+            shapes: Mutex::new(HashMap::new()),
+            memory: Mutex::new(HashMap::new()),
+            clock: AtomicU64::new(0),
+            device_name: device.name.clone(),
+            area_budget: tiles::area_budget(device.vram_bytes),
             watch: Arc::new(Watch {
                 building: Mutex::new(Vec::new()),
                 running: AtomicBool::new(false),
@@ -214,6 +284,8 @@ impl AjiUpscaler {
     /// context was open.
     fn close_all(&self, slots: &mut HashMap<String, Slot>) -> bool {
         slots.clear();
+        self.fitted.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.shapes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.watch.building.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let primary = self.ctx.lock().unwrap_or_else(|e| e.into_inner()).take();
         let fallback = self
@@ -268,8 +340,9 @@ impl AjiUpscaler {
         Some(path)
     }
 
-    /// The model and its scale once ready; loads it on first use.
-    fn model(&self, name: &str) -> Result<Option<(Arc<Model>, u32)>, String> {
+    /// The model, its scale and whether it fell back to TensorRT, once ready; loads it on first
+    /// use, for pages of `page` (w, h).
+    fn model(&self, name: &str, page: Shape) -> Result<Option<(Arc<Model>, u32, bool)>, String> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(Slot::Building { model, fell_back, path }) = slots.get(name) {
             let (m, fell_back, path) = (model.clone(), *fell_back, path.clone());
@@ -277,7 +350,8 @@ impl AjiUpscaler {
                 ModelState::Building => return Ok(None),
                 ModelState::Ready => {
                     let scale = m.info()?.scale;
-                    slots.insert(name.to_string(), Slot::Ready { model: m, scale });
+                    self.measure(name, &path, &m);
+                    slots.insert(name.to_string(), Slot::Ready { model: m, scale, fell_back });
                 }
                 ModelState::Failed => {
                     let e = m.context().last_error();
@@ -290,7 +364,7 @@ impl AjiUpscaler {
             }
         }
         match slots.get(name) {
-            Some(Slot::Ready { model, scale }) => return Ok(Some((model.clone(), *scale))),
+            Some(Slot::Ready { model, scale, fell_back }) => return Ok(Some((model.clone(), *scale, *fell_back))),
             Some(Slot::Failed) => return Err(format!("model {name} failed to load")),
             _ => {}
         }
@@ -300,15 +374,22 @@ impl AjiUpscaler {
             return Err(format!("model not installed: {}", path.display()));
         };
         let ctx = self.primary()?;
-        match self.load(&mut slots, &ctx, name, &path, false) {
+        // TensorRT: one even-tiles engine for every page size, as large as fits (module docs)
+        let even = (self.backend == Backend::TensorRt).then(|| {
+            let budget = self.budget(&ctx, name, &path, 0);
+            let t = tiles::even_tile(|t| budget.fits((t, t), page).0);
+            eprintln!("yosh: [upscale] {name}: even tiles of up to {t}");
+            t
+        });
+        match self.load(&mut slots, &ctx, name, &path, false, even) {
             Err(e) => self.fall_back(&mut slots, name, &path, e),
             done => done,
         }
     }
 
-    /// Load `path` on `ctx` into `name`'s slot. Library-default tile/overlap
-    /// (512 px, 32 px). Missing engines build in the background — a reader must
-    /// never stall on a first-use build; the watcher below picks up the result.
+    /// Load `path` on `ctx` into `name`'s slot: the library-default tile (512 px), or with
+    /// `even`, even tiles of at most that. Missing engines build in the background — a reader
+    /// must never stall on a first-use build; the watcher below picks up the result.
     fn load(
         &self,
         slots: &mut HashMap<String, Slot>,
@@ -316,8 +397,14 @@ impl AjiUpscaler {
         name: &str,
         path: &Path,
         fell_back: bool,
-    ) -> Result<Option<(Arc<Model>, u32)>, String> {
-        let params = LoadParams { async_build: true, ..LoadParams::new(path) };
+        even: Option<u32>,
+    ) -> Result<Option<(Arc<Model>, u32, bool)>, String> {
+        let params = LoadParams {
+            async_build: true,
+            tile: even.map(|t| (t, t)),
+            even_tiles: even.is_some(),
+            ..LoadParams::new(path)
+        };
         let m = match ctx.load_model(&params) {
             Ok(m) => Arc::new(m),
             Err(e) => {
@@ -331,8 +418,33 @@ impl AjiUpscaler {
             return Ok(None);
         }
         let scale = m.info()?.scale;
-        slots.insert(name.to_string(), Slot::Ready { model: m.clone(), scale });
-        Ok(Some((m, scale)))
+        self.measure(name, path, &m);
+        slots.insert(name.to_string(), Slot::Ready { model: m.clone(), scale, fell_back });
+        Ok(Some((m, scale, fell_back)))
+    }
+
+    /// Note `name`'s memory use from its ready engine `m` (file `path`), here and in the record
+    /// in the add-on's `cache/`.
+    fn measure(&self, name: &str, path: &Path, m: &Model) {
+        let Ok(info) = m.info() else { return };
+        let Some(use_) = m.memory().and_then(|mem| MemoryUse::measured(&mem, (info.tile_w, info.tile_h), info.scale)) else {
+            return;
+        };
+        if let Some(file) = path.file_name() {
+            tiles::record_memory(&self.dir.join("cache"), &file.to_string_lossy(), self.backend.label(), &self.device_name, &use_);
+        }
+        self.memory.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), use_);
+    }
+
+    /// The GPU's free memory on `ctx` now, to check `name`'s engines against (its memory use as
+    /// measured, recorded, or else guessed), less `reserved` for engines still building.
+    fn budget(&self, ctx: &Context, name: &str, path: &Path, reserved: u64) -> Budget {
+        let known = self.memory.lock().unwrap_or_else(|e| e.into_inner()).get(name).copied();
+        let use_ = known.or_else(|| {
+            let file = path.file_name()?.to_string_lossy().into_owned();
+            tiles::known_memory(&self.dir.join("cache"), &file, self.backend.label(), &self.device_name)
+        });
+        Budget { mem: ctx.memory(), reserved, area_budget: self.area_budget, use_: use_.unwrap_or_else(MemoryUse::guess) }
     }
 
     /// `name` failed on the primary backend with `err`: on TensorRT-RTX, retry it
@@ -344,7 +456,7 @@ impl AjiUpscaler {
         name: &str,
         path: &Path,
         err: String,
-    ) -> Result<Option<(Arc<Model>, u32)>, String> {
+    ) -> Result<Option<(Arc<Model>, u32, bool)>, String> {
         let Some(fb) = self.fallback.as_ref().filter(|_| !yosh_image::aji::is_out_of_memory(&err)) else {
             slots.insert(name.to_string(), Slot::Failed);
             return Err(err);
@@ -359,11 +471,160 @@ impl AjiUpscaler {
             c.get_or_insert_with(|| open_context(&self.aji, &self.dir, Backend::TensorRt, self.device_id)).clone()
         };
         match ctx {
-            Ok(ctx) => self.load(slots, &ctx, name, path, true),
+            Ok(ctx) => self.load(slots, &ctx, name, path, true, None),
             Err(e) => {
                 slots.insert(name.to_string(), Slot::Failed);
                 Err(format!("{err}; TensorRT fallback: {e}"))
             }
+        }
+    }
+
+    /// The engine a `w`x`h` page of model `name` runs on: its fitted one if that's ready (`Some`
+    /// of its shape), else `square` (the model as loaded), with the fitted shape it's renting
+    /// the square for, if any (see the module docs). Starts the fitted engine's load once it's
+    /// worth it. On TensorRT the model's even-tiles engine is the "square" and takes every page.
+    fn pick(&self, name: &str, square: &Arc<Model>, fell_back: bool, w: u32, h: u32) -> (Arc<Model>, Option<Shape>, Option<Shape>) {
+        let on_square = (square.clone(), None, None);
+        if fell_back || self.backend == Backend::TensorRt {
+            return on_square;
+        }
+        let Some(path) = self.resolve(name) else { return on_square };
+        let clock = self.clock.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut fitted = self.fitted.lock().unwrap_or_else(|e| e.into_inner());
+        let shape = *self.shapes.lock().unwrap_or_else(|e| e.into_inner()).entry((name.to_string(), (w, h))).or_insert_with(|| {
+            let budget = self.budget(square.context(), name, &path, building_bytes(&fitted));
+            tiles::fit(w, h, tiles::DEFAULT_OVERLAP, |s| budget.fits(s, (w, h)).0, SQUARE)
+        });
+        let Some((shape, _)) = shape else { return on_square };
+        let key = (name.to_string(), shape);
+        let cache = self.dir.join("cache");
+        let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let state = match fitted.remove(&key) {
+            Some(Fit::Building { model, bytes, square: sq }) => match model.state() {
+                ModelState::Building => Fit::Building { model, bytes, square: sq },
+                ModelState::Ready => {
+                    tiles::record_fitted(&cache, &file, self.backend.label(), &self.device_name, shape);
+                    self.measure(name, &path, &model);
+                    eprintln!("yosh: [upscale] {name}: engine fitted to tile {} ready", tiles::label(shape));
+                    Fit::Ready { model, last_use: 0, check: sq.map(|square| Check { square, runs: 0, took: 0.0 }) }
+                }
+                ModelState::Failed => {
+                    eprintln!(
+                        "yosh: [upscale] {name}: no engine fitted to tile {} ({}); staying on {SQUARE}",
+                        tiles::label(shape),
+                        model.context().last_error()
+                    );
+                    Fit::Failed
+                }
+            },
+            // the second page of this size: a volume
+            Some(Fit::Renting { square: sq }) => self.start_fitted(&mut fitted, &key, &path, square, (w, h), sq),
+            Some(state) => state,
+            None if tiles::fitted_known(&cache, &file, self.backend.label(), &self.device_name, shape) => {
+                self.start_fitted(&mut fitted, &key, &path, square, (w, h), None)
+            }
+            None => Fit::Renting { square: None },
+        };
+        let (state, pick) = match state {
+            Fit::Ready { model, check, .. } => (Fit::Ready { model: model.clone(), last_use: clock, check }, (model, None, Some(shape))),
+            Fit::Renting { square: sq } => (Fit::Renting { square: sq }, (square.clone(), Some(shape), None)),
+            other => (other, on_square),
+        };
+        fitted.insert(key, state);
+        pick
+    }
+
+    /// Load `key`'s fitted engine (file `path`) on `square`'s context for `page`-size pages: at
+    /// once if its engine is cached, else built in the background (the watcher picks it up).
+    /// Unloads the model's least recently used fitted engines past [`MAX_FITTED`], or while it
+    /// wouldn't fit in the GPU's free memory. `sq`: seconds per page on the square.
+    fn start_fitted(
+        &self,
+        fitted: &mut HashMap<(String, Shape), Fit>,
+        key: &(String, Shape),
+        path: &Path,
+        square: &Arc<Model>,
+        page: Shape,
+        sq: Option<f64>,
+    ) -> Fit {
+        let label = tiles::label(key.1);
+        let room = |fitted: &HashMap<(String, Shape), Fit>| self.budget(square.context(), &key.0, path, building_bytes(fitted)).fits(key.1, page);
+        let mut fits = room(fitted);
+        loop {
+            let loaded: Vec<_> = fitted
+                .iter()
+                .filter_map(|(k, f)| match f {
+                    Fit::Ready { last_use, .. } if k.0 == key.0 => Some((*last_use, k.clone())),
+                    _ => None,
+                })
+                .collect();
+            if loaded.is_empty() || (fits.0 && loaded.len() < MAX_FITTED) {
+                break;
+            }
+            let (_, oldest) = loaded.into_iter().min_by_key(|(t, _)| *t).expect("not empty");
+            // It's known now, so seeing its size again loads it at once.
+            fitted.remove(&oldest);
+            fits = room(fitted);
+        }
+        let (fits, bytes) = fits;
+        if !fits {
+            eprintln!("yosh: [upscale] {}: no room in GPU memory for tile {label} (~{} MB); staying on {SQUARE}", key.0, bytes >> 20);
+            return Fit::Failed;
+        }
+        let params = LoadParams { tile: Some(key.1), async_build: true, ..LoadParams::new(path) };
+        let check = sq.map(|square| Check { square, runs: 0, took: 0.0 });
+        match square.context().load_model(&params) {
+            Ok(m) => {
+                let m = Arc::new(m);
+                match m.state() {
+                    ModelState::Building => {
+                        eprintln!("yosh: [upscale] {}: building an engine fitted to tile {label} in the background", key.0);
+                        self.watch_build(m.clone());
+                        Fit::Building { model: m, bytes, square: sq }
+                    }
+                    ModelState::Ready => {
+                        if let Some(file) = path.file_name() {
+                            let cache = self.dir.join("cache");
+                            tiles::record_fitted(&cache, &file.to_string_lossy(), self.backend.label(), &self.device_name, key.1);
+                        }
+                        self.measure(&key.0, path, &m);
+                        Fit::Ready { model: m, last_use: 0, check }
+                    }
+                    ModelState::Failed => {
+                        eprintln!("yosh: [upscale] {}: no engine fitted to tile {label} ({})", key.0, square.context().last_error());
+                        Fit::Failed
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("yosh: [upscale] {}: no engine fitted to tile {label} ({e})", key.0);
+                Fit::Failed
+            }
+        }
+    }
+
+    /// Time a ready fitted engine's page (`secs`) against the square's, and drop it if it isn't
+    /// faster on its first [`CHECK_PAGES`].
+    fn check_fitted(&self, key: &(String, Shape), secs: f64) {
+        let mut fitted = self.fitted.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(Fit::Ready { check: Some(c), .. }) = fitted.get_mut(key) else { return };
+        c.runs += 1;
+        c.took += secs;
+        if c.runs < CHECK_PAGES {
+            return;
+        }
+        let (mean, square) = (c.took / c.runs as f64, c.square);
+        if mean > square * (1.0 - CHECK_GAIN) {
+            eprintln!(
+                "yosh: [upscale] {}: tile {} ran a page in {:.0} ms against {:.0} on {SQUARE}; staying on {SQUARE}",
+                key.0,
+                tiles::label(key.1),
+                mean * 1e3,
+                square * 1e3
+            );
+            fitted.insert(key.clone(), Fit::Failed);
+        } else if let Some(Fit::Ready { check, .. }) = fitted.get_mut(key) {
+            *check = None;
         }
     }
 
@@ -393,6 +654,11 @@ impl AjiUpscaler {
             }
         });
     }
+}
+
+/// The memory predicted for the fitted engines still building.
+fn building_bytes(fitted: &HashMap<(String, Shape), Fit>) -> u64 {
+    fitted.values().map(|f| if let Fit::Building { bytes, .. } = f { *bytes } else { 0 }).sum()
 }
 
 /// The precision suffixes of model file names: a file is named after its ONNX
@@ -481,18 +747,34 @@ impl Upscaler for AjiUpscaler {
         let Some(name) = select(&rules, h, channels == 1, target_scale) else {
             return SrOutcome::Skip;
         };
-        let (model, scale) = match self.model(name) {
+        let (square, scale, fell_back) = match self.model(name, (w, h)) {
             Ok(Some(m)) => m,
             Ok(None) => return SrOutcome::NotReady,
             Err(e) => return SrOutcome::Failed(e),
         };
+        let (model, rent, on_fitted) = self.pick(name, &square, fell_back, w, h);
         let (ow, oh) = (w * scale, h * scale);
         let mut out = vec![0u8; ow as usize * oh as usize * channels as usize];
-        let rc = model.upscale(
-            Pixels::packed(w, h, channels, pixels),
-            PixelsMut::packed(ow, oh, channels, &mut out),
-            Some(&mut |_, _| cancel()),
-        );
+        let run = |m: &Model, out: &mut [u8]| {
+            let start = Instant::now();
+            let rc = m.upscale(Pixels::packed(w, h, channels, pixels), PixelsMut::packed(ow, oh, channels, out), Some(&mut |_, _| cancel()));
+            (rc, start.elapsed().as_secs_f64())
+        };
+        let (mut rc, secs) = run(&model, &mut out);
+        if let (Some(shape), Err(e)) = (on_fitted, &rc) {
+            // the fitted engine failed (out of memory, say): drop it, and redo the page on the square
+            eprintln!("yosh: [upscale] {name}: tile {} failed ({e}); staying on {SQUARE}", tiles::label(shape));
+            self.fitted.lock().unwrap_or_else(|e| e.into_inner()).insert((name.to_string(), shape), Fit::Failed);
+            rc = run(&square, &mut out).0;
+        } else if let (Some(shape), Ok(Upscaled::Done)) = (on_fitted, &rc) {
+            self.check_fitted(&(name.to_string(), shape), secs);
+        }
+        if let (Some(shape), Ok(Upscaled::Done)) = (rent, &rc)
+            && let Some(Fit::Renting { square }) =
+                self.fitted.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&(name.to_string(), shape))
+        {
+            *square = Some(secs);
+        }
         match rc {
             Ok(Upscaled::Done) => SrOutcome::Done { scale, pixels: out, model: name.into() },
             Ok(Upscaled::Cancelled) => SrOutcome::Cancelled,
@@ -526,7 +808,13 @@ impl Upscaler for AjiUpscaler {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let building = slots
             .values()
-            .any(|s| matches!(s, Slot::Building { model, .. } if model.state() == ModelState::Building));
+            .any(|s| matches!(s, Slot::Building { model, .. } if model.state() == ModelState::Building))
+            || self
+                .fitted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .any(|f| matches!(f, Fit::Building { model, .. } if model.state() == ModelState::Building));
         if self.active.load(Ordering::Acquire) > 0 || building {
             return false;
         }
@@ -669,6 +957,106 @@ mod tests {
         );
         let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &q]).output().unwrap();
         String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / (1024.0 * 1024.0)
+    }
+
+    /// Manual (`--ignored`): `YOSH_TEST_ADDON` = an add-on folder (use a copy: this writes its
+    /// `cache/`), `YOSH_TEST_MODEL` = a 2x model stem in its `models/`, `YOSH_TEST_BACKEND` as
+    /// below. Upscales a 1200x1800 gray page over and over, as a volume would: the first pages
+    /// run on the square, then the fitted engine builds in the background and takes over. A
+    /// second upscaler on the same add-on then uses it from the first page (the fitted record),
+    /// and its output matches the square's but at the tile seams. On TensorRT: the model loads
+    /// as one even-tiles engine larger than the square, and nothing is fitted.
+    #[test]
+    #[ignore]
+    fn a_fitted_engine_takes_over_a_volume() {
+        let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON").expect("YOSH_TEST_ADDON"));
+        let model = std::env::var("YOSH_TEST_MODEL").expect("YOSH_TEST_MODEL");
+        let backend = match std::env::var("YOSH_TEST_BACKEND").as_deref() {
+            Ok("tensorrt") => Backend::TensorRt,
+            Ok("directml") => Backend::DirectMl,
+            _ => Backend::TensorRtRtx,
+        };
+        let device = enum_devices(&dir, backend).unwrap().into_iter().next().expect("a device");
+        let rules = vec![SrRule {
+            min_h: 0,
+            max_h: 0,
+            gray: true,
+            color: true,
+            min_scale: 0.0,
+            max_scale: 0.0,
+            model: Some(model.clone()),
+            auto_levels: false,
+        }];
+        let (w, h) = (1200u32, 1800u32);
+        let px: Vec<u8> = (0..w * h).map(|i| ((i % w) ^ (i / w)) as u8 / 2 + (i.wrapping_mul(2_654_435_761) >> 26) as u8).collect();
+        let run = |up: &AjiUpscaler| loop {
+            match up.upscale(w, h, 1, &px, 2.0, &|| false) {
+                SrOutcome::Done { pixels, .. } => break pixels,
+                SrOutcome::NotReady => std::thread::sleep(Duration::from_millis(200)),
+                SrOutcome::Failed(e) => panic!("{e}"),
+                _ => panic!("no model for the page"),
+            }
+        };
+        let on_fitted = |up: &AjiUpscaler| {
+            up.fitted.lock().unwrap().values().any(|f| matches!(f, Fit::Ready { .. }))
+        };
+
+        if backend == Backend::TensorRt {
+            // no fitted engines: one even-tiles engine for every page size, as large as fits
+            let up = AjiUpscaler::new(&dir, backend, &device, rules, None).unwrap();
+            let _ = run(&up);
+            let tile = match up.slots.lock().unwrap().get(&model) {
+                Some(Slot::Ready { model, .. }) => model.info().unwrap().tile_w,
+                _ => 0,
+            };
+            let t = Instant::now();
+            for _ in 0..10 {
+                let _ = run(&up);
+            }
+            eprintln!("TensorRT: even tiles of up to {tile}, {:.0} ms a page", t.elapsed().as_secs_f64() * 100.0);
+            assert!(tile > SQUARE, "an even tile larger than the square");
+            assert!(!on_fitted(&up), "no fitted engines on TensorRT");
+            return;
+        }
+
+        let up = AjiUpscaler::new(&dir, backend, &device, rules.clone(), None).unwrap();
+        let square_out = run(&up);
+        let (mut square_ms, mut fitted_ms, mut pages) = (Vec::new(), Vec::new(), 0);
+        let started = Instant::now();
+        while pages < 400 && fitted_ms.len() < 10 {
+            let fitted = on_fitted(&up);
+            let t = Instant::now();
+            let out = run(&up);
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if fitted && fitted_ms.is_empty() {
+                let diff = out.iter().zip(&square_out).map(|(a, b)| (*a as i32 - *b as i32).unsigned_abs() as u64).sum::<u64>() as f64
+                    / out.len() as f64;
+                eprintln!("fitted output: mean abs difference from the square's {diff:.3}");
+                assert!(diff < 1.0, "the fitted engine upscales the same but at seams");
+            }
+            if fitted { fitted_ms.push(ms) } else { square_ms.push(ms) }
+            pages += 1;
+        }
+        let med = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+        };
+        let (sq, fi) = (square_ms.len(), fitted_ms.len());
+        eprintln!(
+            "{}: {sq} pages on {SQUARE} (median {:.0} ms), then {fi} fitted (median {:.0} ms), {:.1} s",
+            backend.label(),
+            med(&mut square_ms),
+            med(&mut fitted_ms),
+            started.elapsed().as_secs_f64()
+        );
+        assert!(fi > 0, "the fitted engine took over");
+        drop(up);
+
+        let again = AjiUpscaler::new(&dir, backend, &device, rules, None).unwrap();
+        let _ = run(&again);
+        // A cached TensorRT-RTX engine still warms up in the background (a fraction of a second).
+        let loading = again.fitted.lock().unwrap().values().any(|f| matches!(f, Fit::Ready { .. } | Fit::Building { .. }));
+        assert!(loading, "a known fitted engine loads with the first page");
     }
 
     /// Manual (`--ignored`, Windows): `YOSH_TEST_ADDON` = an installed add-on folder

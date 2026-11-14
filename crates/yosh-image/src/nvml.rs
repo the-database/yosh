@@ -64,3 +64,50 @@ fn detect() -> Option<Vec<Gpu>> {
         Some(out)
     }
 }
+
+/// NVML's handle on the driver, opened on first use and kept for the process.
+struct Nvml {
+    _lib: libloading::Library,
+    by_bus_id: unsafe extern "C" fn(*const c_char, *mut Device) -> c_int,
+    memory: unsafe extern "C" fn(Device, *mut [u64; 3]) -> c_int,
+}
+
+// SAFETY: NVML is thread-safe once initialized; the function pointers are plain C entry points.
+unsafe impl Send for Nvml {}
+unsafe impl Sync for Nvml {}
+
+fn nvml() -> Option<&'static Nvml> {
+    static NVML: std::sync::OnceLock<Option<Nvml>> = std::sync::OnceLock::new();
+    NVML.get_or_init(|| {
+        let name = if cfg!(windows) { "nvml.dll" } else { "libnvidia-ml.so.1" };
+        // SAFETY: as in `detect`; nvmlDeviceGetHandleByPciBusId_v2 and nvmlDeviceGetMemoryInfo
+        // have these signatures since NVML 5.319 (2013). Initialized once, never shut down.
+        unsafe {
+            let lib = libloading::Library::new(name).ok()?;
+            let init: libloading::Symbol<unsafe extern "C" fn() -> c_int> = lib.get(b"nvmlInit_v2\0").ok()?;
+            let by_bus_id = *lib.get(b"nvmlDeviceGetHandleByPciBusId_v2\0").ok()?;
+            let memory = *lib.get(b"nvmlDeviceGetMemoryInfo\0").ok()?;
+            (init() == 0).then_some(Nvml { _lib: lib, by_bus_id, memory })
+        }
+    })
+    .as_ref()
+}
+
+/// The free and total memory of the NVIDIA GPU with libaji's device id `id` (its PCI location:
+/// bit 63 set, domain in bits 32-62, bus in 8-15, device in 0-7), counting every process's use:
+/// on Windows, libaji's own figure (CUDA's free memory, DirectML's budget) leaves out other
+/// processes', which WDDM would page out to make room at a heavy cost in speed. `None` without an
+/// NVIDIA driver, or for an id that isn't a PCI location (a DirectML adapter LUID).
+pub fn memory(id: u64) -> Option<(u64, u64)> {
+    if id >> 63 == 0 {
+        return None;
+    }
+    let nvml = nvml()?;
+    let bus_id = format!("{:08x}:{:02x}:{:02x}.0", (id >> 32) & 0x7fff_ffff, (id >> 8) & 0xff, id & 0xff);
+    let bus_id = std::ffi::CString::new(bus_id).ok()?;
+    let mut d: Device = std::ptr::null_mut();
+    // nvmlMemory_t: total, free, used
+    let mut m = [0u64; 3];
+    // SAFETY: a NUL-terminated bus id and writable outputs of the documented layouts.
+    unsafe { ((nvml.by_bus_id)(bus_id.as_ptr(), &mut d) == 0 && (nvml.memory)(d, &mut m) == 0).then_some((m[1], m[0])) }
+}
