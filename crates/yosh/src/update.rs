@@ -24,33 +24,37 @@ pub struct Update {
 
 /// Query the latest release; `Some` if it is newer than this build. Blocking —
 /// call on a background thread. `None` on any error or when already current.
+///
+/// Not through the REST API: without a token it allows 60 requests an hour per IP
+/// address, so on a shared connection the check failed and no update was offered. The
+/// tag comes from github.com's `/releases/latest` redirect to `.../releases/tag/<tag>`,
+/// and the asset from its download URL, which that limit doesn't cover.
 pub fn check() -> Option<Update> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    // `read_to_string` caps the body at ureq's 10 MB default — the release JSON is a
-    // few KB. `timeout_global` bounds the whole call, body read included.
-    let body = ureq::get(&url)
-        .header("User-Agent", UA)
-        .header("Accept", "application/vnd.github+json")
-        .config()
+    let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(10)))
         .build()
+        .into();
+    let latest_page = agent
+        .head(&format!("https://github.com/{REPO}/releases/latest"))
+        .header("User-Agent", UA)
         .call()
-        .ok()?
-        .body_mut()
-        .read_to_string()
         .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let latest = json["tag_name"].as_str()?.trim_start_matches('v').to_string();
+    let tag = tag_from_release_url(&ureq::ResponseExt::get_uri(&latest_page).to_string())?;
+    let latest = tag.trim_start_matches('v').to_string();
     if !newer(&latest, env!("CARGO_PKG_VERSION")) {
         return None;
     }
-    let download_url = json["assets"]
-        .as_array()?
-        .iter()
-        .find(|a| a["name"].as_str() == Some(ASSET))?["browser_download_url"]
-        .as_str()?
-        .to_string();
+    let download_url = format!("https://github.com/{REPO}/releases/download/{tag}/{ASSET}");
+    // A release without this platform's binary offers nothing.
+    agent.head(&download_url).header("User-Agent", UA).call().ok()?;
     Some(Update { version: latest, download_url })
+}
+
+/// The tag in a release page's URL (`https://github.com/<repo>/releases/tag/<tag>`).
+fn tag_from_release_url(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("/releases/tag/")?;
+    let tag = rest.split(['?', '#', '/']).next()?;
+    (!tag.is_empty()).then(|| tag.to_string())
 }
 
 /// Download the new binary and replace the running exe in place. Blocking — call
@@ -120,4 +124,33 @@ fn newer(a: &str, b: &str) -> bool {
             .collect()
     }
     parts(a) > parts(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_from_the_latest_release_redirect() {
+        assert_eq!(tag_from_release_url("https://github.com/the-database/yosh/releases/tag/v0.10.0").as_deref(), Some("v0.10.0"));
+        assert_eq!(tag_from_release_url("https://github.com/the-database/yosh/releases/tag/v0.11.0/").as_deref(), Some("v0.11.0"));
+        assert_eq!(tag_from_release_url("https://github.com/the-database/yosh/releases/tag/v1.2.3?x=1").as_deref(), Some("v1.2.3"));
+        // no release yet: /releases/latest lands on the releases list
+        assert_eq!(tag_from_release_url("https://github.com/the-database/yosh/releases"), None);
+        assert_eq!(tag_from_release_url("https://github.com/the-database/yosh/releases/tag/"), None);
+    }
+
+    /// Against github.com: the latest release's tag and this platform's binary, found without
+    /// the REST API (`cargo test -p yosh -- --ignored latest_release_without_the_api`).
+    #[test]
+    #[ignore]
+    fn latest_release_without_the_api() {
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(10))).build().into();
+        let page = agent.head(&format!("https://github.com/{REPO}/releases/latest")).header("User-Agent", UA).call().unwrap();
+        let tag = tag_from_release_url(&ureq::ResponseExt::get_uri(&page).to_string()).unwrap();
+        assert!(tag.starts_with('v'), "{tag}");
+        let url = format!("https://github.com/{REPO}/releases/download/{tag}/{ASSET}");
+        agent.head(&url).header("User-Agent", UA).call().unwrap();
+        eprintln!("latest {tag}: {url}");
+    }
 }
