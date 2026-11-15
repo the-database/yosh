@@ -40,6 +40,13 @@
 //!   faster on its first [`CHECK_PAGES`] pages or fails. At most [`MAX_FITTED`] stay loaded per
 //!   model.
 //!
+//! **Native kernels.** On TensorRT and TensorRT-RTX, libaji (0.29.0+) runs a model it
+//! recognises on its own GPU kernels instead of an engine, and says at each load whether it did
+//! (an info line, [`super::native`]). The contexts keep those lines instead of printing them; each
+//! load takes the one about its model (or, for a model libaji doesn't consider, the reason from
+//! its native probe) and keeps it per model file for [`Upscaler::native_kernels`], which the shell
+//! shows. Off when the shell runs libaji with `AJI_NATIVE=off` ([`AjiUpscaler::with_native_kernels`]).
+//!
 //! A rule's model may be installed under another precision suffix (`_fp16`,
 //! `_bf16`, `_fp32`) than the rule names, or with none (older add-ons), or with one
 //! where the rule names none (an older `rules.json`): [`lookup_order`] finds
@@ -56,6 +63,7 @@ use yosh_image::aji::{Aji, Context, ContextParams, LoadParams, Model, ModelState
 pub use yosh_image::aji::{Backend, Device};
 use yosh_image::tiles::{self, Budget, MemoryUse, Shape};
 
+use super::native::{self, NativeLog, NativeReport, NativeUse};
 use super::rules::{auto_levels, select, SrRule};
 use super::{SrOutcome, Upscaler};
 use crate::pool::Waker;
@@ -213,7 +221,16 @@ pub struct AjiUpscaler {
     active: AtomicUsize,
     /// When the last one ended (or the upscaler opened): [`Upscaler::idle_since`].
     last_used: Mutex<Instant>,
+    /// libaji's native-kernel log lines since the last model load took them ([`native`]),
+    /// from every context of this upscaler.
+    native_lines: NativeLines,
+    /// How each model loaded runs ([`Upscaler::native_kernels`]).
+    native: NativeLog,
+    /// Native kernels on (`AJI_NATIVE` not set to off by the shell).
+    native_on: bool,
 }
+
+type NativeLines = Arc<Mutex<Vec<String>>>;
 
 /// Counts an upscale as running until dropped, then stamps its end.
 struct Running<'a>(&'a AjiUpscaler);
@@ -236,7 +253,8 @@ impl AjiUpscaler {
         waker: Option<Waker>,
     ) -> Result<Self, String> {
         let aji = load_aji(dir)?;
-        let ctx = open_context(&aji, dir, backend, device.id)?;
+        let native_lines = NativeLines::default();
+        let ctx = open_context(&aji, dir, backend, device.id, &native_lines)?;
         let fallback = (backend == Backend::TensorRtRtx).then(|| Fallback { ctx: Mutex::new(None) });
         Ok(Self {
             aji,
@@ -264,7 +282,47 @@ impl AjiUpscaler {
             }),
             active: AtomicUsize::new(0),
             last_used: Mutex::new(Instant::now()),
+            native_lines,
+            native: NativeLog::default(),
+            native_on: true,
         })
+    }
+
+    /// Whether native kernels are on: the shell runs libaji with `AJI_NATIVE=off` when the
+    /// setting is off, and says so here, so [`Upscaler::native_kernels`] reports it as off.
+    pub fn with_native_kernels(mut self, on: bool) -> Self {
+        self.native_on = on;
+        self
+    }
+
+    /// The native-kernel lines libaji logged since the last call, as what they say about the
+    /// model of file `path` (the latest; `None` if none was about it). Lines about other
+    /// models are dropped.
+    fn native_said(&self, path: &Path) -> Option<NativeUse> {
+        let lines = std::mem::take(&mut *self.native_lines.lock().unwrap_or_else(|e| e.into_inner()));
+        let stem = path.file_stem()?.to_string_lossy();
+        lines.iter().rev().find_map(|l| native::parse(l, &stem))
+    }
+
+    /// Note how the model of file `path`, just loaded on `ctx` with `params`, runs: what libaji
+    /// logged at its load (`said`), or for a model it doesn't consider (no line: 1-channel, a
+    /// fixed input size), why, from its native probe (which then only reads the file's input).
+    fn note_native(&self, ctx: &Context, params: &LoadParams, path: &Path, said: Option<NativeUse>) {
+        if !self.native_on {
+            return;
+        }
+        let Some(stem) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else { return };
+        let use_ = said.or_else(|| {
+            if ctx.native_probe(params).is_some() {
+                return None;
+            }
+            native::probe_reason(&ctx.last_error(), &stem).map(NativeUse::NotUsed)
+        });
+        let Some(use_) = use_ else { return };
+        if let NativeUse::NotUsed(why) = &use_ {
+            eprintln!("yosh: [upscale] native kernels not used for {stem}: {why}");
+        }
+        self.native.set(&stem, use_);
     }
 
     /// The primary context, reopened if [`Upscaler::release_gpu`] closed it.
@@ -273,7 +331,7 @@ impl AjiUpscaler {
         if let Some(ctx) = &*c {
             return Ok(ctx.clone());
         }
-        let ctx = open_context(&self.aji, &self.dir, self.backend, self.device_id)?;
+        let ctx = open_context(&self.aji, &self.dir, self.backend, self.device_id, &self.native_lines)?;
         eprintln!("yosh: [upscale] {} reopened after a GPU release", self.backend.label());
         *c = Some(ctx.clone());
         Ok(ctx)
@@ -406,8 +464,14 @@ impl AjiUpscaler {
             even_tiles: even.is_some(),
             ..LoadParams::new(path)
         };
-        let m = match ctx.load_model(&params) {
-            Ok(m) => Arc::new(m),
+        self.native_said(path);
+        let loaded = ctx.load_model(&params);
+        let said = self.native_said(path);
+        let m = match loaded {
+            Ok(m) => {
+                self.note_native(ctx, &params, path, said);
+                Arc::new(m)
+            }
             Err(e) => {
                 slots.insert(name.to_string(), Slot::Failed);
                 return Err(e);
@@ -488,7 +552,7 @@ impl AjiUpscaler {
             .get_or_insert_with(|| format!("{name}: {err}"));
         let ctx = {
             let mut c = fb.ctx.lock().unwrap_or_else(|e| e.into_inner());
-            c.get_or_insert_with(|| open_context(&self.aji, &self.dir, Backend::TensorRt, self.device_id)).clone()
+            c.get_or_insert_with(|| open_context(&self.aji, &self.dir, Backend::TensorRt, self.device_id, &self.native_lines)).clone()
         };
         match ctx {
             Ok(ctx) => self.load(slots, &ctx, name, path, true, None),
@@ -593,7 +657,14 @@ impl AjiUpscaler {
         }
         let params = LoadParams { tile: Some(key.1), async_build: true, ..LoadParams::new(path) };
         let check = sq.map(|square| Check { square, runs: 0, took: 0.0 });
-        match square.context().load_model(&params) {
+        self.native_said(path);
+        let loaded = square.context().load_model(&params);
+        // What the model shows is its square's ([`AjiUpscaler::note_native`]); a fitted engine
+        // that isn't native, unlikely as it is, only gets a log line.
+        if let Some(NativeUse::NotUsed(why)) = self.native_said(path) {
+            eprintln!("yosh: [upscale] {}: native kernels not used for tile {label}: {why}", key.0);
+        }
+        match loaded {
             Ok(m) => {
                 let m = Arc::new(m);
                 match m.state() {
@@ -730,11 +801,12 @@ fn lookup_order(name: &str, backend: Backend, compute_capability: Option<(i32, i
 }
 
 /// Open `backend` on `device_id` with the add-on's engine cache, logging warnings
-/// and errors to stderr.
-fn open_context(aji: &Aji, dir: &Path, backend: Backend, device_id: u64) -> Result<Context, String> {
+/// and errors to stderr, and keeping libaji's native-kernel lines in `native_lines`.
+fn open_context(aji: &Aji, dir: &Path, backend: Backend, device_id: u64, native_lines: &NativeLines) -> Result<Context, String> {
     let cache = dir.join("cache");
     let _ = std::fs::create_dir_all(&cache);
     let (trtexec, trtexec_env) = trtexec(dir);
+    let native_lines = native_lines.clone();
     let _gpu = gpu_lock();
     aji.context(&ContextParams {
         backend,
@@ -742,10 +814,13 @@ fn open_context(aji: &Aji, dir: &Path, backend: Backend, device_id: u64) -> Resu
         cache_dir: Some(cache),
         trtexec,
         trtexec_env,
-        // TensorRT severities: 0 internal error, 1 error, 2 warning.
-        log: Some(Arc::new(|level, msg| {
+        // TensorRT severities: 0 internal error, 1 error, 2 warning, 3 info. A model load's
+        // native-kernel line (info) is kept for the load to read, not printed.
+        log: Some(Arc::new(move |level, msg| {
             if level <= 2 {
                 eprintln!("yosh: [upscale] {msg}");
+            } else if native::is_native_line(msg) {
+                native_lines.lock().unwrap_or_else(|e| e.into_inner()).push(msg.to_string());
             }
         })),
     })
@@ -820,6 +895,10 @@ impl Upscaler for AjiUpscaler {
 
     fn fallback(&self) -> Option<String> {
         self.fell_back.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn native_kernels(&self) -> Option<NativeReport> {
+        self.backend.is_cuda().then(|| self.native.report(!self.native_on))
     }
 
     fn release_gpu(&self) -> bool {

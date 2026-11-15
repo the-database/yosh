@@ -13,6 +13,7 @@ use std::sync::mpsc::Receiver;
 
 use yosh_engine::pool::Waker;
 use yosh_engine::sr::Upscaler;
+use yosh_engine::sr::native::{NativeReport, NativeUse};
 use yosh_engine::sr::rules::SrRule;
 
 use crate::config::UpscaleBackend;
@@ -45,6 +46,45 @@ pub struct Running {
 
 pub type Started = Result<Running, String>;
 
+/// What Settings and the AI chip say about libaji's native GPU kernels ([`native_text`]).
+#[derive(Debug, Default, PartialEq)]
+pub struct NativeText {
+    /// After the backend on the status line ("native kernels", "... for 1 of 2 models",
+    /// "... not used", "... off"); empty on DirectML or before a model loaded.
+    pub summary: String,
+    /// One line per model loaded, for the status line's hover.
+    pub models: Vec<String>,
+    /// The models that don't run on them, and why, shown under the status line.
+    pub not_used: Vec<String>,
+}
+
+/// [`NativeText`] for an upscaler's [`Upscaler::native_kernels`] report (`None`: DirectML).
+pub fn native_text(t: &yosh_engine::i18n::Strings, report: Option<&NativeReport>) -> NativeText {
+    let Some(r) = report else { return NativeText::default() };
+    if r.off {
+        return NativeText { summary: t.upscale_native_off.to_string(), ..Default::default() };
+    }
+    let (native, total) = (r.native(), r.models.len());
+    let summary = match native {
+        _ if total == 0 => String::new(),
+        n if n == total => t.upscale_native_on.to_string(),
+        0 => t.upscale_native_none.to_string(),
+        n => (t.upscale_native_some)(n, total),
+    };
+    let mut text = NativeText { summary, ..Default::default() };
+    for (model, use_) in &r.models {
+        match use_ {
+            NativeUse::Native(what) => text.models.push((t.upscale_native_model)(model, what)),
+            NativeUse::NotUsed(why) => {
+                let line = (t.upscale_native_not_used)(model, why);
+                text.models.push(line.clone());
+                text.not_used.push(line);
+            }
+        }
+    }
+    text
+}
+
 /// Where the add-on's models are: its `models/` (the user's own models go there), then, when
 /// setup put the add-on's packs in the shared pack store, the model pack folders the add-on's
 /// `aji-runtime.json` lists (its `models` key; MangaJaNaiCLI `setup --store`).
@@ -57,13 +97,15 @@ pub fn models_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// [`set_native_kernels`] last turned them off (`AJI_NATIVE=off`).
+static SET_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// libaji's native GPU kernels on or off for the models loaded from now on: libaji reads
 /// `AJI_NATIVE` on each model load and runs TensorRT engines for every model when it says
 /// `off`. Called before each upscaler start. With them on, only an `AJI_NATIVE` this
 /// function set is removed, so one the user set themselves still applies.
 pub fn set_native_kernels(on: bool) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static SET_OFF: AtomicBool = AtomicBool::new(false);
+    use std::sync::atomic::Ordering;
     if on {
         if SET_OFF.swap(false, Ordering::SeqCst) {
             set_env("AJI_NATIVE", None);
@@ -214,7 +256,8 @@ fn start_blocking(dir: &Path, backend: UpscaleBackend, rules: Vec<SrRule>, wake:
         };
         match AjiUpscaler::new(dir, b, &device, rules.clone(), Some(wake.clone())) {
             Ok(up) => {
-                let up = up.with_model_dirs(models_dirs(dir).into_iter().skip(1));
+                let native = !SET_OFF.load(std::sync::atomic::Ordering::SeqCst);
+                let up = up.with_model_dirs(models_dirs(dir).into_iter().skip(1)).with_native_kernels(native);
                 if let Some(why) = &rtx_failed {
                     eprintln!("yosh: [upscale] TensorRT-RTX failed ({why}); using {}", b.label());
                 }
@@ -294,6 +337,46 @@ mod tests {
             assert_eq!(candidates(UpscaleBackend::DirectMl, windows, cc), [DirectMl]);
             assert_eq!(candidates(UpscaleBackend::TensorRtRtx, windows, cc), [TensorRtRtx, TensorRt]);
         }
+    }
+}
+
+#[cfg(test)]
+mod native_text_tests {
+    use super::{NativeText, native_text};
+    use yosh_engine::sr::native::{NativeReport, NativeUse};
+
+    fn report(models: &[(&str, Option<&str>, &str)]) -> NativeReport {
+        let models = models
+            .iter()
+            .map(|&(m, native, why)| {
+                (m.to_string(), native.map_or_else(|| NativeUse::NotUsed(why.into()), |w| NativeUse::Native(w.into())))
+            })
+            .collect();
+        NativeReport { off: false, models }
+    }
+
+    #[test]
+    fn says_whether_the_models_run_on_native_kernels() {
+        let t = yosh_engine::i18n::tr();
+        // DirectML, and before a model loaded: nothing.
+        assert_eq!(native_text(t, None), NativeText::default());
+        assert_eq!(native_text(t, Some(&report(&[]))), NativeText::default());
+        let off = native_text(t, Some(&NativeReport { off: true, models: Vec::new() }));
+        assert_eq!((off.summary.as_str(), off.models.len(), off.not_used.len()), ("native kernels off", 0, 0));
+
+        let all = native_text(t, Some(&report(&[("a", Some("ESRGAN 2x"), ""), ("b", Some("ESRGAN 4x"), "")])));
+        assert_eq!(all.summary, "native kernels");
+        assert_eq!(all.models, ["a: native kernels (ESRGAN 2x)", "b: native kernels (ESRGAN 4x)"]);
+        assert!(all.not_used.is_empty());
+
+        let some = native_text(t, Some(&report(&[("a", Some("ESRGAN 2x"), ""), ("b", None, "not 3-channel")])));
+        assert_eq!(some.summary, "native kernels for 1 of 2 models");
+        assert_eq!(some.models, ["a: native kernels (ESRGAN 2x)", "Native kernels not used for b: not 3-channel"]);
+        assert_eq!(some.not_used, ["Native kernels not used for b: not 3-channel"]);
+
+        let none = native_text(t, Some(&report(&[("b", None, "needs an RTX 30 or newer")])));
+        assert_eq!(none.summary, "native kernels not used");
+        assert_eq!(none.not_used, ["Native kernels not used for b: needs an RTX 30 or newer"]);
     }
 }
 

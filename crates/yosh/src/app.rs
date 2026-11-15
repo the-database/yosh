@@ -3749,10 +3749,27 @@ impl State {
         self.ui.addon_present = self.addon_installed && !self.addon_needs_install;
         self.ui.upscale_backend = self.settings.upscale_choice();
         self.ui.upscale_native = self.settings.upscale_native;
+        // Whether the models run on libaji's native GPU kernels: on the status line (each
+        // model on its hover, the ones that don't and why under it) and the AI chip.
+        let native = match &self.upscale_status {
+            addon::Status::Ready(_) => {
+                addon::native_text(t, self.reader.upscaler.as_ref().and_then(|u| u.native_kernels()).as_ref())
+            }
+            _ => addon::NativeText::default(),
+        };
+        self.ui.upscale_native_chip = match &self.upscale_status {
+            addon::Status::Ready(d) if !native.summary.is_empty() => {
+                std::iter::once(format!("{d} · {}", native.summary)).chain(native.not_used.iter().cloned()).collect::<Vec<_>>().join("\n")
+            }
+            _ => String::new(),
+        };
+        self.ui.upscale_native_tip = native.models.join("\n");
+        self.ui.upscale_native_not_used = native.not_used;
         self.ui.upscale_status = match &self.upscale_status {
             addon::Status::Off => String::new(),
             addon::Status::NotInstalled => t.upscale_not_installed.to_string(),
             addon::Status::Starting => t.upscale_starting.to_string(),
+            addon::Status::Ready(d) if !native.summary.is_empty() => (t.upscale_ready)(&format!("{d} · {}", native.summary)),
             addon::Status::Ready(d) => (t.upscale_ready)(d),
             addon::Status::Error(e) => (t.upscale_error)(e),
             addon::Status::StoreMissing(folder) => (t.upscale_store_missing)(folder),
