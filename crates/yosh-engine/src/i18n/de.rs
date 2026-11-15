@@ -44,6 +44,8 @@ pub static DE: Strings = Strings {
     upscale_pages: "Vergrößerte Seiten mit KI hochskalieren",
     upscale_hint: "Optionales Add-on; benötigt eine leistungsfähige GPU. Seiten, die größer als ihre Quelle angezeigt werden, zeichnet kurz nach dem Erscheinen ein KI-Modell neu.",
     upscale_not_installed: "Add-on nicht installiert",
+    upscale_native: "Native GPU-Kernel",
+    upscale_native_hint: "RTX 30 und neuer: Modelle laufen auf eingebauten GPU-Kerneln statt auf TensorRT-Engines. Ausschalten, wenn ein Modell falsch aussieht oder fehlschlägt.",
     upscale_starting: "Wird gestartet…",
     upscale_ready: |d| format!("Bereit · {d}"),
     upscale_error: |e| format!("Nicht verfügbar: {e}"),
