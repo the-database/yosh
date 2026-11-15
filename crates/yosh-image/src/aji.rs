@@ -236,6 +236,8 @@ struct Api {
     release_device: Option<unsafe extern "C" fn(c_int, u64) -> c_int>,
     /// libaji 0.28.0+; `None` in an older one.
     memory: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut RawMemory) -> c_int>,
+    /// libaji 0.29.0+; `None` in an older one.
+    native_probe: Option<unsafe extern "C" fn(*mut c_void, *const RawModelParams, *mut RawMemory) -> c_int>,
 }
 
 /// A context or model pointer. libaji allows a context from any thread and
@@ -296,6 +298,8 @@ impl Aji {
             release_device: unsafe { lib.get(b"aji_img_release_device\0") }.ok().map(|f| *f),
             // SAFETY: the type mirrors aji_image.h's aji_img_memory_get.
             memory: unsafe { lib.get(b"aji_img_memory_get\0") }.ok().map(|f| *f),
+            // SAFETY: the type mirrors aji_image.h's aji_img_native_probe.
+            native_probe: unsafe { lib.get(b"aji_img_native_probe\0") }.ok().map(|f| *f),
         };
         Ok(Self(Arc::new(LibInner { api, _lib: lib })))
     }
@@ -441,15 +445,7 @@ impl Context {
     /// [`ModelState::Building`] instead.
     pub fn load_model(&self, params: &LoadParams) -> Result<Model, String> {
         let path = cstring(params.onnx)?;
-        let (tw, th) = params.tile.unwrap_or((0, 0));
-        let raw = RawModelParams {
-            onnx_path: path.as_ptr(),
-            tile_w: tw as c_int,
-            tile_h: th as c_int,
-            overlap: params.overlap.unwrap_or(0) as c_int,
-            flags: (if params.async_build { LOAD_ASYNC_BUILD } else { 0 })
-                | (if params.even_tiles { LOAD_EVEN_TILES } else { 0 }),
-        };
+        let raw = raw_params(params, &path);
         // SAFETY: a live context; `raw` and `path` outlive the call.
         let ptr = unsafe { (self.0.lib.0.api.load)(self.0.ptr.0, &raw) };
         if ptr.is_null() {
@@ -464,6 +460,24 @@ impl Context {
         self.memory_of(std::ptr::null_mut())
     }
 
+    /// Whether [`Context::load_model`] with `params` would run the model on libaji's native
+    /// kernels (no TensorRT engine to build), with the memory it would use there: `Some` with
+    /// the model's weights, its own tile buffers as `model_activations` (`activations_shared`
+    /// false) and the device's free memory without it. `None` when a load would build an engine
+    /// instead, on DirectML, or with a libaji before 0.29.0. Builds the native model at
+    /// `params`' tile and frees it again (seconds; nothing is built or kept).
+    pub fn native_probe(&self, params: &LoadParams) -> Option<Memory> {
+        let f = self.0.lib.0.api.native_probe?;
+        let path = cstring(params.onnx).ok()?;
+        let raw = raw_params(params, &path);
+        let mut m = RawMemory::default();
+        // SAFETY: a live context; `raw` and `path` outlive the call; `m` is writable.
+        if unsafe { f(self.0.ptr.0, &raw, &mut m) } != OK {
+            return None;
+        }
+        Some(self.memory_from(&m))
+    }
+
     fn memory_of(&self, model: *mut c_void) -> Option<Memory> {
         let f = self.0.lib.0.api.memory?;
         let mut m = RawMemory::default();
@@ -471,7 +485,11 @@ impl Context {
         if unsafe { f(self.0.ptr.0, model, &mut m) } != OK {
             return None;
         }
-        Some(Memory {
+        Some(self.memory_from(&m))
+    }
+
+    fn memory_from(&self, m: &RawMemory) -> Memory {
+        Memory {
             device_free: crate::nvml::memory(self.0.device_id).map_or(m.device_free, |(free, _)| free.min(m.device_free)),
             device_total: m.device_total,
             ctx_activations: m.ctx_activations,
@@ -480,7 +498,18 @@ impl Context {
             model_activations: m.model_activations,
             model_buffers: m.model_buffers,
             activations_shared: m.activations_shared != 0,
-        })
+        }
+    }
+}
+
+fn raw_params(params: &LoadParams, path: &CString) -> RawModelParams {
+    let (tw, th) = params.tile.unwrap_or((0, 0));
+    RawModelParams {
+        onnx_path: path.as_ptr(),
+        tile_w: tw as c_int,
+        tile_h: th as c_int,
+        overlap: params.overlap.unwrap_or(0) as c_int,
+        flags: (if params.async_build { LOAD_ASYNC_BUILD } else { 0 }) | (if params.even_tiles { LOAD_EVEN_TILES } else { 0 }),
     }
 }
 

@@ -135,7 +135,7 @@ pub const EVEN_TILES: [u32; 3] = [1024, 768, 512];
 
 /// How a model's GPU memory grows with its tile: measured from a loaded engine
 /// ([`MemoryUse::measured`]), recorded from an earlier run ([`known_memory`]), or guessed
-/// ([`MemoryUse::guess_for`]).
+/// ([`MemoryUse::guess`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MemoryUse {
     pub weights: u64,
@@ -164,19 +164,23 @@ impl MemoryUse {
         })
     }
 
-    /// For a model nothing is known about yet on a GPU of `compute_capability` (`None`: DirectML
-    /// or not reported): more than any MangaJaNai or IllustrationJaNai model measured there, so a
-    /// first build fits without overshooting much (a tile picked too small on TensorRT means a
-    /// second engine build once the model is measured). From sm_80 on, libaji (0.29.0) runs them
-    /// on native kernels, which keep their buffers per model rather than in the shared buffer
-    /// (HAT-L ~9.8 KB, DAT-2 ~10.3 KB per pixel), so the guess counts 11 KB whole; before sm_80
-    /// they build TensorRT engines, the most being 4x ESRGAN at ~4.5 KB per pixel, shared.
-    pub fn guess_for(compute_capability: Option<(i32, i32)>) -> Self {
-        if compute_capability.is_some_and(|cc| cc >= (8, 0)) {
-            Self { weights: 200 << 20, activations_per_px: 11000.0, buffers_per_px: 200.0, shared: false, scale: 4 }
-        } else {
-            Self { weights: 200 << 20, activations_per_px: 6000.0, buffers_per_px: 200.0, shared: true, scale: 4 }
-        }
+    /// From libaji's native probe ([`crate::aji::Context::native_probe`], 0.29.0) of a model
+    /// at tiles of `tile`: a native model is measured before it is loaded, so its tiles need no
+    /// guess. Its scale follows from its fp16 tile buffers, 3 x tile in plus scale² x that out.
+    #[cfg(feature = "aji")]
+    pub fn probed(mem: &Memory, tile: Shape) -> Option<Self> {
+        let in_bytes = 6.0 * tile.0 as f64 * tile.1 as f64;
+        let scale = if in_bytes > 0.0 { (mem.model_buffers as f64 / in_bytes - 1.0).max(1.0).sqrt().round() as u32 } else { 4 };
+        Self::measured(mem, tile, scale.clamp(1, 8))
+    }
+
+    /// For a model nothing is known about yet: more than any MangaJaNai or IllustrationJaNai model
+    /// measured on TensorRT (4x ESRGAN, ~4.5 KB per pixel), so a first build fits. Models libaji
+    /// runs on native kernels (0.29.0) are measured by its probe instead ([`MemoryUse::probed`]):
+    /// they take more (HAT-L ~9.8 KB per pixel) and build no engine, so a guess sized for them
+    /// would only shrink TensorRT's first tile (and cost it a second engine build).
+    pub fn guess() -> Self {
+        Self { weights: 200 << 20, activations_per_px: 6000.0, buffers_per_px: 200.0, shared: true, scale: 4 }
     }
 
     /// The bytes loading an engine with tiles of `tile` would add to a context holding
@@ -364,15 +368,25 @@ mod tests {
         assert!((250..300).contains(&mb(scratch((1200, 1800), 992, 4))), "{}", mb(scratch((1200, 1800), 992, 4)));
     }
 
+    #[cfg(feature = "aji")]
     #[test]
-    fn the_guess_follows_the_gpu() {
-        // sm_80 on: libaji's native kernels, per model; older GPUs and DirectML: TensorRT's, shared
-        let native = MemoryUse::guess_for(Some((8, 6)));
-        assert_eq!((native.activations_per_px, native.shared), (11000.0, false));
-        assert_eq!(MemoryUse::guess_for(Some((12, 0))).activations_per_px, 11000.0);
-        let turing = MemoryUse::guess_for(Some((7, 5)));
-        assert_eq!((turing.activations_per_px, turing.shared), (6000.0, true));
-        assert_eq!(MemoryUse::guess_for(None), turing);
+    fn a_native_probe_is_a_measurement() {
+        // libaji's probe of native HAT-L (4x) at 512: 88 MB weights, 2448 MB own buffers, 26 MB tile buffers
+        let mem = Memory {
+            model_weights: 88 << 20,
+            model_activations: 2448 << 20,
+            model_buffers: 6 * 512 * 512 * (1 + 16),
+            activations_shared: false,
+            ..Memory::default()
+        };
+        let u = MemoryUse::probed(&mem, (512, 512)).unwrap();
+        assert_eq!((u.scale, u.shared, u.weights), (4, false, 88 << 20));
+        assert!((u.activations_per_px - 9792.0).abs() < 1.0);
+        // a 2x model's buffers give scale 2
+        let two = Memory { model_buffers: 6 * 512 * 512 * (1 + 4), ..mem };
+        assert_eq!(MemoryUse::probed(&two, (512, 512)).unwrap().scale, 2);
+        // the TensorRT guess is the one from before native kernels
+        assert_eq!((MemoryUse::guess().activations_per_px, MemoryUse::guess().shared), (6000.0, true));
     }
 
     #[test]
