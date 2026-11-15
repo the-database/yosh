@@ -165,9 +165,11 @@ impl MemoryUse {
     }
 
     /// For a model nothing is known about yet: more than any MangaJaNai or IllustrationJaNai model
-    /// measured on TensorRT (4x ESRGAN, ~4.5 KB per pixel), so a first build fits.
+    /// measured, so a first build fits. On TensorRT the most is 4x ESRGAN, ~4.5 KB per pixel;
+    /// libaji's native kernels (0.29.0) take more and keep it per model instead of in the shared
+    /// buffer (HAT-L ~9.8 KB, DAT-2 ~10.3 KB per pixel), so the guess counts it whole.
     pub fn guess() -> Self {
-        Self { weights: 200 << 20, activations_per_px: 6000.0, buffers_per_px: 200.0, shared: true, scale: 4 }
+        Self { weights: 200 << 20, activations_per_px: 11000.0, buffers_per_px: 200.0, shared: false, scale: 4 }
     }
 
     /// The bytes loading an engine with tiles of `tile` would add to a context holding
