@@ -376,6 +376,7 @@ impl AjiUpscaler {
         let ctx = self.primary()?;
         // TensorRT: one even-tiles engine for every page size, as large as fits (module docs)
         let even = (self.backend == Backend::TensorRt).then(|| {
+            self.probe_native(&ctx, name, &path);
             let budget = self.budget(&ctx, name, &path, 0);
             let t = tiles::even_tile(|t| budget.fits((t, t), page).0);
             eprintln!("yosh: [upscale] {name}: even tiles of up to {t}");
@@ -436,6 +437,25 @@ impl AjiUpscaler {
         self.memory.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), use_);
     }
 
+    /// Before `name`'s first load with nothing measured or recorded: if libaji (0.29.0) would
+    /// run it on native kernels, note the memory its probe reports, so its tiles are sized from
+    /// that instead of the TensorRT guess. A model that would build an engine is left to the
+    /// guess.
+    fn probe_native(&self, ctx: &Context, name: &str, path: &Path) {
+        if self.memory.lock().unwrap_or_else(|e| e.into_inner()).contains_key(name) {
+            return;
+        }
+        let Some(file) = path.file_name().map(|f| f.to_string_lossy().into_owned()) else { return };
+        let cache = self.dir.join("cache");
+        if tiles::known_memory(&cache, &file, self.backend.label(), &self.device_name).is_some() {
+            return;
+        }
+        let params = LoadParams { tile: Some((SQUARE, SQUARE)), ..LoadParams::new(path) };
+        let Some(use_) = ctx.native_probe(&params).and_then(|mem| MemoryUse::probed(&mem, (SQUARE, SQUARE))) else { return };
+        tiles::record_memory(&cache, &file, self.backend.label(), &self.device_name, &use_);
+        self.memory.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), use_);
+    }
+
     /// The GPU's free memory on `ctx` now, to check `name`'s engines against (its memory use as
     /// measured, recorded, or else guessed), less `reserved` for engines still building.
     fn budget(&self, ctx: &Context, name: &str, path: &Path, reserved: u64) -> Budget {
@@ -444,7 +464,7 @@ impl AjiUpscaler {
             let file = path.file_name()?.to_string_lossy().into_owned();
             tiles::known_memory(&self.dir.join("cache"), &file, self.backend.label(), &self.device_name)
         });
-        Budget { mem: ctx.memory(), reserved, area_budget: self.area_budget, use_: use_.unwrap_or_else(|| MemoryUse::guess_for(self.compute_capability)) }
+        Budget { mem: ctx.memory(), reserved, area_budget: self.area_budget, use_: use_.unwrap_or_else(MemoryUse::guess) }
     }
 
     /// `name` failed on the primary backend with `err`: on TensorRT-RTX, retry it
