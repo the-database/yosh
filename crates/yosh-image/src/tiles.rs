@@ -135,7 +135,7 @@ pub const EVEN_TILES: [u32; 3] = [1024, 768, 512];
 
 /// How a model's GPU memory grows with its tile: measured from a loaded engine
 /// ([`MemoryUse::measured`]), recorded from an earlier run ([`known_memory`]), or guessed
-/// ([`MemoryUse::guess`]).
+/// ([`MemoryUse::guess_for`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MemoryUse {
     pub weights: u64,
@@ -164,12 +164,19 @@ impl MemoryUse {
         })
     }
 
-    /// For a model nothing is known about yet: more than any MangaJaNai or IllustrationJaNai model
-    /// measured, so a first build fits. On TensorRT the most is 4x ESRGAN, ~4.5 KB per pixel;
-    /// libaji's native kernels (0.29.0) take more and keep it per model instead of in the shared
-    /// buffer (HAT-L ~9.8 KB, DAT-2 ~10.3 KB per pixel), so the guess counts it whole.
-    pub fn guess() -> Self {
-        Self { weights: 200 << 20, activations_per_px: 11000.0, buffers_per_px: 200.0, shared: false, scale: 4 }
+    /// For a model nothing is known about yet on a GPU of `compute_capability` (`None`: DirectML
+    /// or not reported): more than any MangaJaNai or IllustrationJaNai model measured there, so a
+    /// first build fits without overshooting much (a tile picked too small on TensorRT means a
+    /// second engine build once the model is measured). From sm_80 on, libaji (0.29.0) runs them
+    /// on native kernels, which keep their buffers per model rather than in the shared buffer
+    /// (HAT-L ~9.8 KB, DAT-2 ~10.3 KB per pixel), so the guess counts 11 KB whole; before sm_80
+    /// they build TensorRT engines, the most being 4x ESRGAN at ~4.5 KB per pixel, shared.
+    pub fn guess_for(compute_capability: Option<(i32, i32)>) -> Self {
+        if compute_capability.is_some_and(|cc| cc >= (8, 0)) {
+            Self { weights: 200 << 20, activations_per_px: 11000.0, buffers_per_px: 200.0, shared: false, scale: 4 }
+        } else {
+            Self { weights: 200 << 20, activations_per_px: 6000.0, buffers_per_px: 200.0, shared: true, scale: 4 }
+        }
     }
 
     /// The bytes loading an engine with tiles of `tile` would add to a context holding
@@ -355,6 +362,17 @@ mod tests {
         assert!(mb(again) < 200, "{} MB", mb(again));
         // the scratch for a 1200-wide page with 992-high tiles at 4x: ~270 MB (measured 279)
         assert!((250..300).contains(&mb(scratch((1200, 1800), 992, 4))), "{}", mb(scratch((1200, 1800), 992, 4)));
+    }
+
+    #[test]
+    fn the_guess_follows_the_gpu() {
+        // sm_80 on: libaji's native kernels, per model; older GPUs and DirectML: TensorRT's, shared
+        let native = MemoryUse::guess_for(Some((8, 6)));
+        assert_eq!((native.activations_per_px, native.shared), (11000.0, false));
+        assert_eq!(MemoryUse::guess_for(Some((12, 0))).activations_per_px, 11000.0);
+        let turing = MemoryUse::guess_for(Some((7, 5)));
+        assert_eq!((turing.activations_per_px, turing.shared), (6000.0, true));
+        assert_eq!(MemoryUse::guess_for(None), turing);
     }
 
     #[test]
