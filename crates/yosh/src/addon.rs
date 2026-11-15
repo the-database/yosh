@@ -76,33 +76,45 @@ pub fn set_native_kernels(on: bool) {
 
 /// Set or remove a variable where libaji's `getenv` sees it.
 fn set_env(name: &str, value: Option<&str>) {
-    // Windows: libaji's getenv reads the C runtime's copy of the environment (the shared
-    // ucrtbase.dll, which yosh and libaji both use), which std::env::set_var
-    // (SetEnvironmentVariableW) doesn't update; _putenv_s updates both, and an empty value
-    // removes the variable.
+    // SAFETY: called on the UI thread before the upscaler thread starts loading models,
+    // which is where libaji reads the variable.
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+    }
+    // Windows: libaji reads it with getenv from ucrtbase.dll, whose copy of the environment is
+    // taken once and isn't updated by SetEnvironmentVariableW (what set_var calls). yosh's
+    // release build links its own C runtime statically (+crt-static), so its own _putenv_s
+    // wouldn't reach that copy either: call ucrtbase's. An empty value removes the variable.
     #[cfg(windows)]
     {
         use std::ffi::{CString, c_char, c_int};
-        unsafe extern "C" {
-            fn _putenv_s(name: *const c_char, value: *const c_char) -> c_int;
-        }
+        type PutenvS = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
         let (Ok(n), Ok(v)) = (CString::new(name), CString::new(value.unwrap_or(""))) else {
             return;
         };
-        // SAFETY: both are NUL-terminated strings that outlive the call; the CRT copies them.
-        unsafe { _putenv_s(n.as_ptr(), v.as_ptr()) };
-    }
-    #[cfg(not(windows))]
-    {
-        // SAFETY: called on the UI thread before the upscaler thread starts loading models,
-        // which is where libaji reads the variable.
-        unsafe {
-            match value {
-                Some(v) => std::env::set_var(name, v),
-                None => std::env::remove_var(name),
-            }
+        if let Some(f) = ucrt_proc(c"_putenv_s") {
+            // SAFETY: ucrtbase's _putenv_s has this signature (cdecl is the x64/arm64 ABI);
+            // both strings are NUL-terminated and outlive the call, and the CRT copies them.
+            unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, PutenvS>(f)(n.as_ptr(), v.as_ptr()) };
         }
     }
+}
+
+/// A function exported by ucrtbase.dll, the C runtime libaji uses (loaded and kept loaded).
+#[cfg(windows)]
+fn ucrt_proc(name: &std::ffi::CStr) -> Option<unsafe extern "system" fn() -> isize> {
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    let dll: Vec<u16> = "ucrtbase.dll\0".encode_utf16().collect();
+    // SAFETY: a NUL-terminated name of a system DLL.
+    let h = unsafe { LoadLibraryW(dll.as_ptr()) };
+    if h.is_null() {
+        return None;
+    }
+    // SAFETY: a live module handle and a NUL-terminated export name.
+    unsafe { GetProcAddress(h, name.as_ptr().cast()) }
 }
 
 /// Whether the add-on's library is present in `dir`.
@@ -289,12 +301,24 @@ mod tests {
 mod native_kernels_tests {
     use super::set_native_kernels;
 
-    /// What libaji's getenv sees: the C runtime's environment.
+    /// What libaji's getenv sees: ucrtbase.dll's environment on Windows (yosh's release build
+    /// links its own C runtime statically), the C library's elsewhere.
     fn c_getenv(name: &str) -> Option<String> {
         use std::ffi::{CStr, CString, c_char};
-        unsafe extern "C" {
-            fn getenv(name: *const c_char) -> *const c_char;
-        }
+        type Getenv = unsafe extern "C" fn(*const c_char) -> *const c_char;
+        #[cfg(windows)]
+        let getenv: Getenv = {
+            let f = super::ucrt_proc(c"getenv").expect("ucrtbase getenv");
+            // SAFETY: ucrtbase's getenv has this signature.
+            unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Getenv>(f) }
+        };
+        #[cfg(not(windows))]
+        let getenv: Getenv = {
+            unsafe extern "C" {
+                fn getenv(name: *const c_char) -> *const c_char;
+            }
+            getenv
+        };
         let n = CString::new(name).unwrap();
         // SAFETY: a NUL-terminated name; the result is copied before the environment changes.
         let v = unsafe { getenv(n.as_ptr()) };
@@ -302,7 +326,7 @@ mod native_kernels_tests {
     }
 
     #[test]
-    fn native_off_reaches_the_c_runtime_and_on_removes_only_ours() {
+    fn native_off_reaches_libajis_c_runtime_and_on_removes_only_ours() {
         set_native_kernels(true);
         assert_eq!(c_getenv("AJI_NATIVE"), None);
         set_native_kernels(false);
