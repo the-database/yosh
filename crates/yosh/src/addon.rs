@@ -57,6 +57,54 @@ pub fn models_dirs(dir: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// libaji's native GPU kernels on or off for the models loaded from now on: libaji reads
+/// `AJI_NATIVE` on each model load and runs TensorRT engines for every model when it says
+/// `off`. Called before each upscaler start. With them on, only an `AJI_NATIVE` this
+/// function set is removed, so one the user set themselves still applies.
+pub fn set_native_kernels(on: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SET_OFF: AtomicBool = AtomicBool::new(false);
+    if on {
+        if SET_OFF.swap(false, Ordering::SeqCst) {
+            set_env("AJI_NATIVE", None);
+        }
+    } else {
+        SET_OFF.store(true, Ordering::SeqCst);
+        set_env("AJI_NATIVE", Some("off"));
+    }
+}
+
+/// Set or remove a variable where libaji's `getenv` sees it.
+fn set_env(name: &str, value: Option<&str>) {
+    // Windows: libaji's getenv reads the C runtime's copy of the environment (the shared
+    // ucrtbase.dll, which yosh and libaji both use), which std::env::set_var
+    // (SetEnvironmentVariableW) doesn't update; _putenv_s updates both, and an empty value
+    // removes the variable.
+    #[cfg(windows)]
+    {
+        use std::ffi::{CString, c_char, c_int};
+        unsafe extern "C" {
+            fn _putenv_s(name: *const c_char, value: *const c_char) -> c_int;
+        }
+        let (Ok(n), Ok(v)) = (CString::new(name), CString::new(value.unwrap_or(""))) else {
+            return;
+        };
+        // SAFETY: both are NUL-terminated strings that outlive the call; the CRT copies them.
+        unsafe { _putenv_s(n.as_ptr(), v.as_ptr()) };
+    }
+    #[cfg(not(windows))]
+    {
+        // SAFETY: called on the UI thread before the upscaler thread starts loading models,
+        // which is where libaji reads the variable.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 /// Whether the add-on's library is present in `dir`.
 pub fn installed(dir: &Path) -> bool {
     dir.join(if cfg!(windows) { "aji.dll" } else { "libaji.so" }).is_file()
@@ -234,5 +282,32 @@ mod tests {
             assert_eq!(candidates(UpscaleBackend::DirectMl, windows, cc), [DirectMl]);
             assert_eq!(candidates(UpscaleBackend::TensorRtRtx, windows, cc), [TensorRtRtx, TensorRt]);
         }
+    }
+}
+
+#[cfg(test)]
+mod native_kernels_tests {
+    use super::set_native_kernels;
+
+    /// What libaji's getenv sees: the C runtime's environment.
+    fn c_getenv(name: &str) -> Option<String> {
+        use std::ffi::{CStr, CString, c_char};
+        unsafe extern "C" {
+            fn getenv(name: *const c_char) -> *const c_char;
+        }
+        let n = CString::new(name).unwrap();
+        // SAFETY: a NUL-terminated name; the result is copied before the environment changes.
+        let v = unsafe { getenv(n.as_ptr()) };
+        (!v.is_null()).then(|| unsafe { CStr::from_ptr(v) }.to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn native_off_reaches_the_c_runtime_and_on_removes_only_ours() {
+        set_native_kernels(true);
+        assert_eq!(c_getenv("AJI_NATIVE"), None);
+        set_native_kernels(false);
+        assert_eq!(c_getenv("AJI_NATIVE").as_deref(), Some("off"));
+        set_native_kernels(true);
+        assert_eq!(c_getenv("AJI_NATIVE"), None);
     }
 }

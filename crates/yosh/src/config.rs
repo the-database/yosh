@@ -175,6 +175,10 @@ pub struct Settings {
     /// With `upscale_backend` = TensorRT, run TensorRT-RTX instead (Windows). A
     /// separate key so an older yosh reads the choice as plain TensorRT.
     pub upscale_tensorrt_rtx: bool,
+    /// libaji's native GPU kernels (RTX 30 and newer) instead of TensorRT engines on the
+    /// TensorRT backends. On by default, and in settings saved before the key existed;
+    /// off runs the upscaler with `AJI_NATIVE=off` ([`crate::addon::set_native_kernels`]).
+    pub upscale_native: bool,
     /// The AI-upscaling profile yosh starts on (`profiles::ProfileId::token`:
     /// "quality", "balanced", "performance", "custom1".."custom9"). A plain string,
     /// so a token from a newer yosh reads as Balanced instead of failing the parse.
@@ -227,6 +231,7 @@ impl Default for Settings {
             upscale: false,
             upscale_backend: UpscaleBackend::Auto,
             upscale_tensorrt_rtx: false,
+            upscale_native: true,
             upscale_profile: "balanced".into(),
             upscale_off: HashSet::new(),
             addon_update_pending: false,
@@ -386,6 +391,15 @@ mod tests {
     /// TensorRT-RTX is stored as `tensorrt` + a flag, so an older build (which
     /// knows neither the variant nor the key) still parses the file and runs
     /// plain TensorRT, and this build reads the choice back.
+    #[test]
+    fn native_kernels_default_on_and_round_trip() {
+        let old: Settings = serde_json::from_str(r#"{"upscale":true}"#).unwrap();
+        assert!(old.upscale_native, "settings saved before the key keep native kernels on");
+        let s = Settings { upscale_native: false, ..Default::default() };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(!back.upscale_native);
+    }
+
     #[test]
     fn tensorrt_rtx_choice_stays_readable_by_older_builds() {
         let mut s = Settings::default();

@@ -40,6 +40,8 @@ pub static EN: Strings = Strings {
     upscale_pages: "Upscale enlarged pages with AI",
     upscale_hint: "Optional add-on; needs a capable GPU. Pages shown larger than their source are redrawn by an AI model a moment after they appear.",
     upscale_not_installed: "Add-on not installed",
+    upscale_native: "Native GPU kernels",
+    upscale_native_hint: "RTX 30 and newer: models run on built-in GPU kernels instead of TensorRT engines. Turn this off if a model looks wrong or fails.",
     upscale_starting: "Starting…",
     upscale_ready: |d| format!("Ready · {d}"),
     upscale_error: |e| format!("Unavailable: {e}"),

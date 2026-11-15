@@ -99,6 +99,7 @@ pub struct UiState {
     /// on/off, backend and profile controls shown.
     pub addon_present: bool,
     pub upscale_backend: crate::config::UpscaleBackend,
+    pub upscale_native: bool,
     pub upscale_status: String,
     /// "TensorRT-RTX failed (…); using TensorRT (or DirectML) instead", or empty.
     pub upscale_notice: String,
@@ -168,6 +169,7 @@ pub struct UiState {
     /// the add-on folder".
     pub req_set_upscale: Option<bool>,
     pub req_set_upscale_backend: Option<crate::config::UpscaleBackend>,
+    pub req_set_upscale_native: Option<bool>,
     pub req_open_addon_folder: bool,
     /// Install (or update) the add-on, and cancel a running install.
     pub req_addon_install: bool,
@@ -1317,6 +1319,13 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                         }
                     }
                 });
+                // Native kernels: an escape hatch to TensorRT engines (DirectML has none).
+                if st.upscale && st.upscale_backend != crate::config::UpscaleBackend::DirectMl {
+                    let mut native = st.upscale_native;
+                    if ui.checkbox(&mut native, t.upscale_native).on_hover_text(t.upscale_native_hint).changed() {
+                        st.req_set_upscale_native = Some(native);
+                    }
+                }
                 if st.upscale {
                     profile_row(ui, st);
                 }
