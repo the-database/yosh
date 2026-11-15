@@ -229,6 +229,9 @@ pub struct Strings {
     pub upscale_pages: &'static str,
     pub upscale_hint: &'static str,
     pub upscale_not_installed: &'static str,
+    /// The switch for libaji's native GPU kernels (TensorRT backends), and its hover text.
+    pub upscale_native: &'static str,
+    pub upscale_native_hint: &'static str,
     pub upscale_starting: &'static str,
     /// "Ready · {device}".
     pub upscale_ready: fn(&str) -> String,
