@@ -444,7 +444,7 @@ impl AjiUpscaler {
             let file = path.file_name()?.to_string_lossy().into_owned();
             tiles::known_memory(&self.dir.join("cache"), &file, self.backend.label(), &self.device_name)
         });
-        Budget { mem: ctx.memory(), reserved, area_budget: self.area_budget, use_: use_.unwrap_or_else(MemoryUse::guess) }
+        Budget { mem: ctx.memory(), reserved, area_budget: self.area_budget, use_: use_.unwrap_or_else(|| MemoryUse::guess_for(self.compute_capability)) }
     }
 
     /// `name` failed on the primary backend with `err`: on TensorRT-RTX, retry it
