@@ -18,6 +18,7 @@
 //! MangaJaNaiConverterGui's workflow chains so both apps pick identically.
 
 pub mod levels;
+pub mod native;
 pub mod rules;
 
 #[cfg(feature = "sr")]
@@ -97,6 +98,12 @@ pub trait Upscaler: Send + Sync {
     /// (TensorRT-RTX) to TensorRT: "<model>: <why>", for the first one. The
     /// shell shows it, so a fallback isn't only a log line.
     fn fallback(&self) -> Option<String> {
+        None
+    }
+
+    /// Whether the models loaded so far run on libaji's native GPU kernels, with what
+    /// libaji said about each ([`native`]). `None` where the backend has none (DirectML).
+    fn native_kernels(&self) -> Option<native::NativeReport> {
         None
     }
 

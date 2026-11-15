@@ -250,6 +250,16 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   process-wide lock (`sr::aji`), since a device reset must not overlap another context opening.
   Manual test: `release_gpu_frees_the_device_and_reloads` (`--ignored`, `--features sr`, Windows;
   `YOSH_TEST_ADDON` = an add-on folder, `YOSH_TEST_BACKEND`).
+- **Native kernels** (libaji >= 0.29.0, TensorRT/TensorRT-RTX; setting `upscale_native`, off =
+  `AJI_NATIVE=off` via `addon::set_native_kernels`): at each model load libaji logs (info)
+  `native kernels: <model> (<what>)` or `native kernels not used for <model>: <why>; using ...`.
+  `sr::aji`'s contexts keep those lines instead of printing them; each load takes the one about
+  its model (`sr::native::parse`), or for a model libaji doesn't consider (1-channel, fixed input
+  size: no line) the reason from its native probe, and keeps the latest per model file
+  (`Upscaler::native_kernels`). Settings' status line ends `· native kernels`, `· native kernels
+  for k of n models`, `· native kernels not used` or `· native kernels off` (`addon::native_text`),
+  with each model on its hover and the ones not on them, with libaji's reason, under it; the AI
+  chip's tooltip says the same. DirectML: nothing. A fitted engine's line only goes to stderr.
 - UI: Settings → AI upscaling (on/off, Auto = TensorRT-RTX if suited, then TensorRT, then DirectML; TensorRT-RTX on Windows); top-bar "AI" chip +
   corner spinner (`Reader::sr_view_state`; right-click = profile menu); key `U` = per-book switch; info overlay "AI model" row.
 - **Installing it (`addon_setup.rs`):** Settings → AI upscaling → *Install the add-on* makes the add-on

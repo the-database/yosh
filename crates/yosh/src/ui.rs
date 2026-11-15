@@ -103,6 +103,12 @@ pub struct UiState {
     pub upscale_status: String,
     /// "TensorRT-RTX failed (…); using TensorRT (or DirectML) instead", or empty.
     pub upscale_notice: String,
+    /// Native GPU kernels (`addon::native_text`): the status line's hover (one line per
+    /// model), the models not on them with why (shown under the status), and the AI chip's
+    /// line ("{device} · {summary}"; empty: nothing to say).
+    pub upscale_native_tip: String,
+    pub upscale_native_not_used: Vec<String>,
+    pub upscale_native_chip: String,
     /// The add-on install / update row (`addon_setup.rs`), and the last install's
     /// error (empty: none). Set by the app each frame.
     pub addon: AddonView,
@@ -1330,7 +1336,13 @@ fn settings_window(ctx: &egui::Context, st: &mut UiState) {
                     profile_row(ui, st);
                 }
                 if st.upscale && !st.upscale_status.is_empty() {
-                    ui.label(egui::RichText::new(&st.upscale_status).small());
+                    let r = ui.label(egui::RichText::new(&st.upscale_status).small());
+                    if !st.upscale_native_tip.is_empty() {
+                        r.on_hover_text(&st.upscale_native_tip);
+                    }
+                    for line in &st.upscale_native_not_used {
+                        ui.label(egui::RichText::new(line).weak().small());
+                    }
                 }
                 if st.upscale && !st.upscale_notice.is_empty() {
                     ui.label(
@@ -1547,6 +1559,7 @@ fn sr_chip(ui: &mut egui::Ui, st: &mut UiState) {
         }
     };
     let tip = if st.upscale_notice.is_empty() { tip } else { format!("{tip}\n\u{26a0} {}", st.upscale_notice) };
+    let tip = if st.upscale_native_chip.is_empty() { tip } else { format!("{tip}\n{}", st.upscale_native_chip) };
     let profile = match st.profile_current {
         Some(id) => st.profile_menu.iter().find(|(p, _)| *p == id).map(|(_, n)| (t.sr_profile)(n)),
         None => Some(t.sr_profile_off.to_string()),

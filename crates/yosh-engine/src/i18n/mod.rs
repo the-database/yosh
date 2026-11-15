@@ -240,6 +240,18 @@ pub struct Strings {
     /// "TensorRT-RTX failed ({why}); using {backend} instead" (TensorRT, or
     /// DirectML when Auto tried TensorRT-RTX and TensorRT didn't start either).
     pub upscale_fallback: fn(&str, &str) -> String,
+    /// Whether the models run on libaji's native GPU kernels, after the backend in the status
+    /// line ("Ready · {device} · native kernels"): all of them, `k` of `n` models, none, or
+    /// the setting is off.
+    pub upscale_native_on: &'static str,
+    pub upscale_native_some: fn(usize, usize) -> String,
+    pub upscale_native_none: &'static str,
+    pub upscale_native_off: &'static str,
+    /// One model, on the status line's hover: "{model}: native kernels ({what})", with
+    /// libaji's description of the build.
+    pub upscale_native_model: fn(&str, &str) -> String,
+    /// "Native kernels not used for {model}: {why}" (libaji's reason), under the status line.
+    pub upscale_native_not_used: fn(&str, &str) -> String,
     pub open_addon_folder: &'static str,
     /// Settings → AI upscaling: the button that installs the add-on (`mangajanai setup`), and
     /// the line under it.
