@@ -44,6 +44,8 @@ pub static JA: Strings = Strings {
     upscale_pages: "拡大表示されるページを AI で高画質化",
     upscale_hint: "オプションのアドオン（高性能な GPU が必要）。元より大きく表示されるページを、表示の少し後に AI モデルで描き直します。",
     upscale_not_installed: "アドオン未インストール",
+    upscale_native: "ネイティブGPUカーネル",
+    upscale_native_hint: "RTX 30シリーズ以降：TensorRTエンジンの代わりに内蔵のGPUカーネルでモデルを実行します。モデルの結果がおかしい場合や失敗する場合はオフにしてください。",
     upscale_starting: "起動中…",
     upscale_ready: |d| format!("準備完了 · {d}"),
     upscale_error: |e| format!("利用できません: {e}"),

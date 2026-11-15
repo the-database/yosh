@@ -44,6 +44,8 @@ pub static FR: Strings = Strings {
     upscale_pages: "Agrandir par IA les pages élargies",
     upscale_hint: "Module complémentaire facultatif ; nécessite un GPU performant. Les pages affichées plus grandes que leur source sont redessinées par un modèle d’IA peu après leur affichage.",
     upscale_not_installed: "Module non installé",
+    upscale_native: "Noyaux GPU natifs",
+    upscale_native_hint: "RTX 30 et plus récentes : les modèles tournent sur des noyaux GPU intégrés au lieu de moteurs TensorRT. Désactivez cette option si un modèle donne un mauvais résultat ou échoue.",
     upscale_starting: "Démarrage…",
     upscale_ready: |d| format!("Prêt · {d}"),
     upscale_error: |e| format!("Indisponible : {e}"),

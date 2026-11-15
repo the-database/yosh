@@ -44,6 +44,8 @@ pub static KO: Strings = Strings {
     upscale_pages: "확대 표시되는 페이지를 AI로 개선",
     upscale_hint: "선택형 애드온이며 성능 좋은 GPU가 필요합니다. 원본보다 크게 표시되는 페이지를 잠시 후 AI 모델이 다시 그립니다.",
     upscale_not_installed: "애드온이 설치되지 않음",
+    upscale_native: "네이티브 GPU 커널",
+    upscale_native_hint: "RTX 30 이후: TensorRT 엔진 대신 내장 GPU 커널로 모델을 실행합니다. 모델 결과가 이상하거나 실패하면 끄세요.",
     upscale_starting: "시작하는 중…",
     upscale_ready: |d| format!("준비됨 · {d}"),
     upscale_error: |e| format!("사용할 수 없음: {e}"),

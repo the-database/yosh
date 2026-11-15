@@ -44,6 +44,8 @@ pub static ZH_HANT: Strings = Strings {
     upscale_pages: "用 AI 強化放大顯示的頁面",
     upscale_hint: "選用附加元件，需要效能足夠的 GPU。顯示尺寸大於原圖的頁面會在出現片刻後由 AI 模型重新繪製。",
     upscale_not_installed: "未安裝附加元件",
+    upscale_native: "原生 GPU 核心",
+    upscale_native_hint: "RTX 30 及更新：使用內建 GPU 核心而非 TensorRT 引擎執行模型。如果模型效果異常或執行失敗，請關閉。",
     upscale_starting: "正在啟動…",
     upscale_ready: |d| format!("就緒 · {d}"),
     upscale_error: |e| format!("無法使用: {e}"),
