@@ -114,7 +114,7 @@ jobs:
       - name: Build dav1d static (Linux)
         if: runner.os == 'Linux'
         run: |
-          git clone --branch 1.5.0 --depth 1 https://code.videolan.org/videolan/dav1d.git
+          git clone --branch 1.5.5 --depth 1 https://code.videolan.org/videolan/dav1d.git
           cd dav1d
           meson setup build --prefix="$HOME/dav1d_install" -Ddefault_library=static -Denable_tools=false -Denable_examples=false --buildtype=release
           ninja -C build install
@@ -126,7 +126,7 @@ jobs:
           meson setup build --prefix=C:\build --buildtype=release
           ninja -C build install
           cd ..
-          git clone --branch 1.5.0 --depth 1 https://code.videolan.org/videolan/dav1d.git
+          git clone --branch 1.5.5 --depth 1 https://code.videolan.org/videolan/dav1d.git
           cd dav1d
           meson setup build --prefix=C:\build -Ddefault_library=static -Denable_tools=false -Denable_examples=false -Db_vscrt=mt --buildtype=release
           ninja -C build install
