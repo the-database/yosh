@@ -30,7 +30,11 @@
 //!
 //! - On TensorRT a model loads as one even-tiles engine (`AJI_IMG_LOAD_EVEN_TILES`), tiles of at
 //!   most 1024 (less where memory is short, [`yosh_image::tiles::even_tile`]): each page is split
-//!   into the fewest even tiles, as fast as a fitted engine and good for any page size.
+//!   into the fewest even tiles, as fast as a fitted engine and good for any page size. A model on
+//!   native kernels builds no engine, so for a page larger than 1024 it takes 1536 or 2048 instead
+//!   when its model, probed at that tile, fits the GPU's free memory and an eighth of the GPU
+//!   ([`yosh_image::tiles::big_tiles_for`]): fewer tiles, less overlap (a 1200x1000 page in one
+//!   tile, RTX 5090: 2x MangaJaNai 53.1 -> 43.9 ms, 4x 199.9 -> 173.7 ms).
 //! - On TensorRT-RTX and DirectML, where an even-tiles engine is slow or missing, a model loads on
 //!   the square, and for a page size whose best tile shape ([`yosh_image::tiles::fit`]) saves
 //!   enough and fits in memory, an engine fitted to it (1216x992 there: about half the time) loads
@@ -436,7 +440,13 @@ impl AjiUpscaler {
         let even = (self.backend == Backend::TensorRt).then(|| {
             self.probe_native(&ctx, name, &path);
             let budget = self.budget(&ctx, name, &path, 0);
-            let t = tiles::even_tile(|t| budget.fits((t, t), page).0);
+            let mut t = tiles::even_tile(|t| budget.fits((t, t), page).0);
+            // on native kernels (activations not shared), a page larger than that in fewer tiles
+            if t == tiles::EVEN_TILES[0] && !budget.use_.shared {
+                if let Some(big) = self.big_native_tile(&ctx, &path, page) {
+                    t = big;
+                }
+            }
             eprintln!("yosh: [upscale] {name}: even tiles of up to {t}");
             t
         });
@@ -518,6 +528,23 @@ impl AjiUpscaler {
         let Some(use_) = ctx.native_probe(&params).and_then(|mem| MemoryUse::probed(&mem, (SQUARE, SQUARE))) else { return };
         tiles::record_memory(&cache, &file, self.backend.label(), &self.device_name, &use_);
         self.memory.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), use_);
+    }
+
+    /// For a model on native kernels and pages of `page`: the first of [`tiles::big_tiles_for`]
+    /// whose model, probed at that tile (its exact memory: a per-pixel figure from a smaller
+    /// tile over-predicts a model whose upscale tail runs in strips), plus libaji's tiling
+    /// scratch for the page, fits the GPU's free memory and [`tiles::big_tile_cap`]; else `None`.
+    fn big_native_tile(&self, ctx: &Context, path: &Path, page: Shape) -> Option<u32> {
+        for t in tiles::big_tiles_for(page) {
+            let params = LoadParams { tile: Some((t, t)), even_tiles: true, ..LoadParams::new(path) };
+            let mem = ctx.native_probe(&params)?;
+            let scale = MemoryUse::probed(&mem, (t, t)).map_or(4, |u| u.scale);
+            let need = mem.model_weights + mem.model_activations + mem.model_buffers + tiles::scratch(page, t, scale);
+            if need <= tiles::big_tile_cap(mem.device_total) && tiles::fits_memory(need, mem.device_free, mem.device_total) {
+                return Some(t);
+            }
+        }
+        None
     }
 
     /// The GPU's free memory on `ctx` now, to check `name`'s engines against (its memory use as

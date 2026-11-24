@@ -133,6 +133,31 @@ pub fn fit(w: u32, h: u32, overlap: u32, allowed: impl Fn(Shape) -> bool, square
 /// new build every run.
 pub const EVEN_TILES: [u32; 3] = [1024, 768, 512];
 
+/// Larger even tiles for a model on libaji's native kernels (0.29.0+), smallest first: they build
+/// no engine, so a size costs only its memory, and a page in one tile skips the overlap's repeated
+/// work. A 1200x1000 page in one tile against even tiles of up to 1024 (RTX 5090, MangaJaNai
+/// ESRGAN, libaji with its upscale tail in strips): 2x 53.1 -> 43.9 ms, 4x 199.9 -> 173.7 ms.
+/// Only within [`big_tile_cap`] ([`big_tiles_for`] picks the ones a page can use).
+pub const NATIVE_BIG_TILES: [u32; 2] = [1536, 2048];
+
+/// The most a model on a big native tile may take: an eighth of the GPU, so a model kept loaded
+/// for a session never holds most of it.
+pub fn big_tile_cap(device_total: u64) -> u64 {
+    device_total / 8
+}
+
+/// The big native tiles worth trying for pages of `page` (w, h), first choice first: none when the
+/// largest of [`EVEN_TILES`] holds the page's longer side; else the smallest of
+/// [`NATIVE_BIG_TILES`] that holds it (the largest if none does), then the smaller ones.
+pub fn big_tiles_for((w, h): Shape) -> Vec<u32> {
+    let side = w.max(h);
+    if side <= EVEN_TILES[0] {
+        return Vec::new();
+    }
+    let first = NATIVE_BIG_TILES.iter().position(|&t| t >= side).unwrap_or(NATIVE_BIG_TILES.len() - 1);
+    NATIVE_BIG_TILES[..=first].iter().rev().copied().collect()
+}
+
 /// How a model's GPU memory grows with its tile: measured from a loaded engine
 /// ([`MemoryUse::measured`]), recorded from an earlier run ([`known_memory`]), or guessed
 /// ([`MemoryUse::guess`]).
@@ -201,7 +226,7 @@ impl MemoryUse {
 
 /// libaji's GPU tiling scratch for a `page` (w, h), taken as 3 channels, with tiles `tile_h` high
 /// (aji_image.h: about W*H*C + 5*C*(tile_h*scale)*(W*scale)).
-fn scratch((w, h): Shape, tile_h: u32, scale: u32) -> u64 {
+pub fn scratch((w, h): Shape, tile_h: u32, scale: u32) -> u64 {
     let (w, h, s) = (w as u64, h as u64, scale.max(1) as u64);
     let th = (tile_h as u64).min(h.max(1));
     3 * w * h + 15 * (th * s) * (w * s)
@@ -419,6 +444,16 @@ mod tests {
         let text = std::fs::read_to_string(dir.join(MEMORY_LIST)).unwrap();
         assert_eq!(text.lines().count(), 2, "replaced, not appended");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn big_native_tiles_by_page() {
+        assert!(big_tiles_for((1024, 1024)).is_empty(), "the largest even tile holds it");
+        assert!(big_tiles_for((800, 1000)).is_empty());
+        assert_eq!(big_tiles_for((1200, 1000)), vec![1536], "1536 holds it: no need for 2048");
+        assert_eq!(big_tiles_for((1131, 1600)), vec![2048, 1536]);
+        assert_eq!(big_tiles_for((3000, 2100)), vec![2048, 1536], "none holds it: the largest first");
+        assert_eq!(big_tile_cap(32 << 30), 4 << 30);
     }
 
     #[test]
