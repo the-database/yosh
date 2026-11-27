@@ -214,7 +214,9 @@ scripts/flipbench.ps1 -Base <ref> -Book "<book>" [-LibraryRoot "<dir>"]         
   builds no engine, so for a page larger than 1024 it loads with even tiles of 1536 or 2048
   (`tiles::big_tiles_for`) when the model, probed at that tile (`native_probe`), plus the page's
   tiling scratch fits free memory and an eighth of the GPU (`tiles::big_tile_cap`): fewer tiles,
-  less overlap. For a striped output or a scale of 4 or higher, that tile must hold the whole page.
+  less overlap. For a striped output or a scale of 4 or higher, that tile must hold the whole page. A
+  later oversized page switches to the ordinary even grid. A subsequent page that benefits from
+  the promotion restores it if memory still permits. The reader caches one grid per model.
   On TensorRT-RTX/DirectML it loads on the 512 square, and for a page size whose best
   tile shape (`yosh_image::tiles::fit`) saves enough and fits in memory, an engine fitted to it
   loads in the background from that size's second page; its pages switch to it when it's ready

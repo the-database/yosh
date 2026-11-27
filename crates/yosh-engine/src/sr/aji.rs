@@ -35,7 +35,9 @@
 //!   when its model, probed at that tile, fits the GPU's free memory and an eighth of the GPU
 //!   ([`yosh_image::tiles::big_tiles_for`]): fewer tiles, less overlap (a 1200x1000 page in one
 //!   tile, RTX 5090: 2x MangaJaNai 53.1 -> 43.9 ms, 4x 199.9 -> 173.7 ms). A striped model or
-//!   a model of scale 4 or higher takes a larger tile only when it holds the whole page.
+//!   a model of scale 4 or higher takes a larger tile only when it holds the whole page. If a later
+//!   page outgrows it, the reader switches to ordinary even tiles. It reloads the promotion for a
+//!   page that benefits again if it still fits in memory. Only one grid per model stays cached.
 //! - On TensorRT-RTX and DirectML, where an even-tiles engine is slow or missing, a model loads on
 //!   the square, and for a page size whose best tile shape ([`yosh_image::tiles::fit`]) saves
 //!   enough and fits in memory, an engine fitted to it (1216x992 there: about half the time) loads
@@ -135,9 +137,60 @@ pub fn enum_devices(dir: &Path, backend: Backend) -> Result<Vec<Device>, String>
     aji.devices(backend)
 }
 
+/// Memory measured at a native tile. Keep it for a whole-page promotion so returning
+/// from a spread only needs a free-memory check and a load, without another model probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeTile {
+    size: u32,
+    scale: u32,
+    model_bytes: u64,
+}
+
+impl NativeTile {
+    fn fits(self, page: Shape, mem: &Memory) -> bool {
+        let need = self.model_bytes + tiles::scratch(page, self.size, self.scale);
+        need <= tiles::big_tile_cap(mem.device_total) && tiles::fits_memory(need, mem.device_free, mem.device_total)
+    }
+
+    /// Choose the replacement after dropping the old grid and reading the current budget.
+    fn for_page(self, page: Shape, ordinary: u32, mem: Option<&Memory>) -> EvenTile {
+        if page.0.max(page.1) > self.size {
+            return EvenTile { size: ordinary, whole_page: Some(self) };
+        }
+        if ordinary == tiles::EVEN_TILES[0] && mem.is_some_and(|m| self.fits(page, m)) {
+            return EvenTile { size: self.size, whole_page: Some(self) };
+        }
+        // Memory got tighter. Keep the ordinary grid without retrying on every page.
+        EvenTile::any_page(ordinary)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvenTile {
+    size: u32,
+    /// The promotion, also remembered while its ordinary replacement serves oversized pages.
+    whole_page: Option<NativeTile>,
+}
+
+impl EvenTile {
+    fn any_page(size: u32) -> Self {
+        Self { size, whole_page: None }
+    }
+
+    fn switch_for(self, page: Shape) -> Option<NativeTile> {
+        let big = self.whole_page?;
+        let side = page.0.max(page.1);
+        // Either this grid covers the page, or we're already using ordinary tiles for a spread.
+        if side <= self.size || (self.size < big.size && side > big.size) {
+            return None;
+        }
+        Some(big)
+    }
+}
+
 /// A larger native tile must fit both memory limits. Moving a join in striped output can
 /// change screentone, and a partial promotion at 4x or higher costs memory for little gain.
-fn big_native_tile(page: Shape, recorded_scale: u32, mut probe: impl FnMut(Shape) -> Option<Memory>) -> Option<u32> {
+fn big_native_tile(page: Shape, recorded_scale: u32, mut probe: impl FnMut(Shape) -> Option<Memory>) -> Option<EvenTile> {
     let candidates = tiles::big_tiles_for(page);
     let side = page.0.max(page.1);
     if side > *candidates.first()? && recorded_scale >= 4 {
@@ -165,12 +218,13 @@ fn big_native_tile(page: Shape, recorded_scale: u32, mut probe: impl FnMut(Shape
             break; // later candidates are smaller still
         }
         let mem = probe((t, t))?;
-        if side > t && mem.model_buffers < full_io * u64::from(t).pow(2) {
+        let striped = mem.model_buffers < full_io * u64::from(t).pow(2);
+        if side > t && striped {
             continue;
         }
-        let need = mem.model_weights + mem.model_activations + mem.model_buffers + tiles::scratch(page, t, scale);
-        if need <= tiles::big_tile_cap(mem.device_total) && tiles::fits_memory(need, mem.device_free, mem.device_total) {
-            return Some(t);
+        let big = NativeTile { size: t, scale, model_bytes: mem.model_weights + mem.model_activations + mem.model_buffers };
+        if big.fits(page, &mem) {
+            return Some(EvenTile { size: t, whole_page: (striped || scale >= 4).then_some(big) });
         }
     }
     None
@@ -210,10 +264,10 @@ struct Check {
 
 enum Slot {
     /// `fell_back`: on the TensorRT fallback context (no fitted engines then).
-    Ready { model: Arc<Model>, scale: u32, fell_back: bool },
+    Ready { model: Arc<Model>, scale: u32, fell_back: bool, even: Option<EvenTile> },
     /// `fell_back`: already on the TensorRT fallback context. `path`: the file it
     /// loaded from, for that fallback.
-    Building { model: Arc<Model>, fell_back: bool, path: PathBuf },
+    Building { model: Arc<Model>, fell_back: bool, path: PathBuf, even: Option<EvenTile> },
     Failed,
 }
 
@@ -448,14 +502,14 @@ impl AjiUpscaler {
     /// use, for pages of `page` (w, h).
     fn model(&self, name: &str, page: Shape) -> Result<Option<(Arc<Model>, u32, bool)>, String> {
         let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(Slot::Building { model, fell_back, path }) = slots.get(name) {
-            let (m, fell_back, path) = (model.clone(), *fell_back, path.clone());
+        if let Some(Slot::Building { model, fell_back, path, even }) = slots.get(name) {
+            let (m, fell_back, path, even) = (model.clone(), *fell_back, path.clone(), *even);
             match m.state() {
                 ModelState::Building => return Ok(None),
                 ModelState::Ready => {
                     let scale = m.info()?.scale;
                     self.measure(name, &path, &m);
-                    slots.insert(name.to_string(), Slot::Ready { model: m, scale, fell_back });
+                    slots.insert(name.to_string(), Slot::Ready { model: m, scale, fell_back, even });
                 }
                 ModelState::Failed => {
                     let e = m.context().last_error();
@@ -467,35 +521,57 @@ impl AjiUpscaler {
                 }
             }
         }
-        match slots.get(name) {
-            Some(Slot::Ready { model, scale, fell_back }) => return Ok(Some((model.clone(), *scale, *fell_back))),
+        let switch = match slots.get(name) {
+            Some(Slot::Ready { model, scale, fell_back, even }) => {
+                let Some(big) = even.and_then(|t| t.switch_for(page)) else {
+                    return Ok(Some((model.clone(), *scale, *fell_back)));
+                };
+                slots.remove(name); // release the old model before budgeting its replacement
+                Some(big)
+            }
             Some(Slot::Failed) => return Err(format!("model {name} failed to load")),
-            _ => {}
-        }
+            _ => None,
+        };
         let Some(path) = self.resolve(name) else {
             slots.insert(name.to_string(), Slot::Failed);
             let path = self.models_dirs[0].join(format!("{name}.onnx"));
             return Err(format!("model not installed: {}", path.display()));
         };
         let ctx = self.primary()?;
-        // TensorRT: one even-tiles engine for every page size, as large as fits (module docs)
+        let ordinary_tile = |budget: &Budget| tiles::even_tile(|t| budget.fits((t, t), page).0);
+        // TensorRT: keep one even-tiles model loaded for this name (module docs).
         let even = (self.backend == Backend::TensorRt).then(|| {
             self.probe_native(&ctx, name, &path);
             let budget = self.budget(&ctx, name, &path, 0);
-            let mut t = tiles::even_tile(|t| budget.fits((t, t), page).0);
+            let ordinary = ordinary_tile(&budget);
             let probe = |tile| ctx.native_probe(&LoadParams {
                 tile: Some(tile), even_tiles: true, ..LoadParams::new(&path)
             });
-            if t == tiles::EVEN_TILES[0]
+            let tile = if let Some(big) = switch {
+                big.for_page(page, ordinary, budget.mem.as_ref())
+            } else if ordinary == tiles::EVEN_TILES[0]
                 && !budget.use_.shared
                 && let Some(big) = big_native_tile(page, budget.use_.scale, probe)
             {
-                t = big;
-            }
-            eprintln!("yosh: [upscale] {name}: even tiles of up to {t}");
-            t
+                big
+            } else {
+                EvenTile::any_page(ordinary)
+            };
+            eprintln!("yosh: [upscale] {name}: even tiles of up to {}", tile.size);
+            tile
         });
-        match self.load(&mut slots, &ctx, name, &path, false, even) {
+        let mut loaded = self.load(&mut slots, &ctx, name, &path, false, even);
+        if let Err(e) = &loaded
+            && switch.is_some()
+            && even.is_some_and(|t| t.size > tiles::EVEN_TILES[0])
+            && yosh_image::aji::is_out_of_memory(e)
+        {
+            // Another process can take memory between the check and the optional re-promotion.
+            let t = ordinary_tile(&self.budget(&ctx, name, &path, 0));
+            eprintln!("yosh: [upscale] {name}: could not restore the promoted tile ({e}); retrying with {t}");
+            loaded = self.load(&mut slots, &ctx, name, &path, false, Some(EvenTile::any_page(t)));
+        }
+        match loaded {
             Err(e) => self.fall_back(&mut slots, name, &path, e),
             done => done,
         }
@@ -511,11 +587,11 @@ impl AjiUpscaler {
         name: &str,
         path: &Path,
         fell_back: bool,
-        even: Option<u32>,
+        even: Option<EvenTile>,
     ) -> Result<Option<(Arc<Model>, u32, bool)>, String> {
         let params = LoadParams {
             async_build: true,
-            tile: even.map(|t| (t, t)),
+            tile: even.map(|t| (t.size, t.size)),
             even_tiles: even.is_some(),
             ..LoadParams::new(path)
         };
@@ -533,13 +609,13 @@ impl AjiUpscaler {
             }
         };
         if m.state() == ModelState::Building {
-            slots.insert(name.to_string(), Slot::Building { model: m.clone(), fell_back, path: path.to_path_buf() });
+            slots.insert(name.to_string(), Slot::Building { model: m.clone(), fell_back, path: path.to_path_buf(), even });
             self.watch_build(m);
             return Ok(None);
         }
         let scale = m.info()?.scale;
         self.measure(name, path, &m);
-        slots.insert(name.to_string(), Slot::Ready { model: m.clone(), scale, fell_back });
+        slots.insert(name.to_string(), Slot::Ready { model: m.clone(), scale, fell_back, even });
         Ok(Some((m, scale, fell_back)))
     }
 
@@ -1018,17 +1094,54 @@ mod tests {
         let striped = |tile| native_memory(tile, 2, 256);
         // The 512 probe can understate a striped 2x model's scale.
         assert_eq!(big_native_tile((1131, 1600), 1, striped), None);
-        assert_eq!(big_native_tile((1536, 1000), 1, striped), Some(1536));
+        assert_eq!(big_native_tile((1536, 1000), 1, striped).map(|t| t.size), Some(1536));
         // A full-output 2x model may still use 1536 when 2048 is over budget.
-        assert_eq!(big_native_tile((1131, 1600), 2, |tile| native_memory(tile, 2, u32::MAX)), Some(1536));
+        assert_eq!(big_native_tile((1131, 1600), 2, |tile| native_memory(tile, 2, u32::MAX)), Some(EvenTile::any_page(1536)));
     }
 
     #[test]
     fn fourfold_native_tiles_must_hold_the_whole_page() {
         let full = |tile| native_memory(tile, 4, u32::MAX);
         assert_eq!(big_native_tile((1600, 1131), 4, full), None);
-        assert_eq!(big_native_tile((1200, 1000), 4, full), Some(1536));
+        let big = big_native_tile((1200, 1000), 4, full).unwrap();
+        assert_eq!(big.size, 1536);
+        assert!(big.switch_for((1131, 1600)).is_some());
         assert_eq!(big_native_tile((1131, 2160), 4, |_| panic!("no candidate holds the page")), None);
+    }
+
+    #[test]
+    fn a_promoted_model_switches_grids_for_a_spread_and_back() {
+        let portrait = (1131, 1600);
+        let spread = (2262, 1600);
+        let striped = |shape| native_memory(shape, 2, 256).map(|m| Memory { model_activations: 1 << 30, ..m });
+        let mem = striped((512, 512)).unwrap();
+        let first = big_native_tile(portrait, 1, striped).unwrap();
+        assert_eq!(first.size, 2048);
+        assert!(first.switch_for(portrait).is_none());
+
+        let big = first.switch_for(spread).expect("the promoted grid would introduce a join");
+        let wide = big.for_page(spread, 1024, Some(&mem));
+        assert_eq!(wide.size, 1024);
+        assert!(wide.switch_for(spread).is_none());
+        assert!(wide.switch_for((800, 900)).is_none()); // ordinary tiles already hold this one
+        let restore = wide.switch_for(portrait).unwrap();
+        assert_eq!(restore.for_page(portrait, 1024, Some(&mem)), first);
+        let tight = Memory { device_free: 512 << 20, ..mem };
+        assert_eq!(big.for_page(spread, 768, Some(&tight)).size, 768);
+        assert_eq!(restore.for_page(portrait, 1024, Some(&tight)), EvenTile::any_page(1024));
+    }
+
+    #[test]
+    #[ignore = "needs a TensorRT add-on with striped 2x MangaJaNai and room for a 2048 tile"]
+    fn ready_model_reloads_on_a_mixed_size_volume() {
+        let dir = PathBuf::from(std::env::var_os("YOSH_TEST_ADDON").expect("YOSH_TEST_ADDON"));
+        let device = enum_devices(&dir, Backend::TensorRt).unwrap().remove(0);
+        let reader = AjiUpscaler::new(&dir, Backend::TensorRt, &device, vec![], None).unwrap();
+        let tile = |page| {
+            let (model, _, _) = reader.model("2x_MangaJaNai_2048p_V1_ESRGAN_95k_fp16", page).unwrap().unwrap();
+            model.info().unwrap().tile_w
+        };
+        assert_eq!([tile((1131, 1600)), tile((2262, 1600)), tile((1131, 1600))], [2048, 1024, 2048]);
     }
 
     fn order(name: &str, backend: Backend, cc: Option<(i32, i32)>) -> Vec<String> {
