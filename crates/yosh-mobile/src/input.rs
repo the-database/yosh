@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// Tap-zone fractions, shared with `on_tap`: top strip opens the library, the side
+/// edges flip.
+pub(crate) const TOP_ZONE: f32 = 0.10;
+pub(crate) const EDGE_ZONE: f32 = 0.20;
+
 impl Shell {
     /// Route a touch event into the shared gesture machine, then apply the
     /// shell-specific decisions it hands back. Everything the reader does — locks,
@@ -282,9 +287,3 @@ impl Shell {
         }
     }
 }
-
-/// Tap-zone fractions, shared with `on_tap`: top strip opens the library, the side
-/// edges flip.
-pub(crate) const TOP_ZONE: f32 = 0.10;
-
-pub(crate) const EDGE_ZONE: f32 = 0.20;

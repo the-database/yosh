@@ -2,6 +2,10 @@
 
 use super::*;
 
+/// The mobile shell: winit's `ApplicationHandler` for a platform crate's event
+/// loop. Build it with [`Shell::new`] over a [`Platform`] and hand it to
+/// `EventLoop::run_app`; it owns the window, GPU, reader and every piece of
+/// persisted state, and rebuilds the window + GPU on each `resumed`.
 pub struct Shell {
     pub(crate) app: Option<App>,
     /// Everything the shell asks of the OS (storage, picker, window flags, device

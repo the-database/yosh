@@ -304,19 +304,6 @@ pub(crate) fn load_recents(path: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// True if `key` is a filesystem path we can silently rebuild a source from on
-/// launch (not a picked document, and still present on disk).
-pub(crate) fn is_reopenable_fs(key: &str) -> bool {
-    !is_document_key(key) && std::path::Path::new(key).exists()
-}
-
-/// True if `key` names a document the platform picker handed us (a SAF
-/// `content://` URI) rather than a filesystem path: it has no folder to walk for
-/// next/prev book and can't be silently reopened on launch.
-pub(crate) fn is_document_key(key: &str) -> bool {
-    key.starts_with("content://")
-}
-
 pub(crate) fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
     let mut map = HashMap::new();
     if let Ok(s) = std::fs::read_to_string(path) {

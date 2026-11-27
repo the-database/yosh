@@ -1066,7 +1066,7 @@ pub fn chrome(
 }
 
 /// The Settings panel (top-bar ⚙ button): a full mirror of the Android view-options
-/// popup (`yosh-android` `options_popup`). Frequently-changed view controls
+/// popup (`yosh-mobile` `options_popup`). Frequently-changed view controls
 /// (direction/layout/fit) also have quick top-bar buttons; the set-and-forget ones
 /// (page-turn / resume / theme / performance) live only here. Each control sets a
 /// `req_*` flag that the app drains after the frame. `.open` takes a local copy so

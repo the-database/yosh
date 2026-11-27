@@ -63,4 +63,7 @@ re-run that script only when the logo changes.
 
 A host `cargo build` over the workspace compiles this crate to an empty cdylib
 (its deps are gated to `cfg(target_os = "android")`), so it doesn't affect desktop
-builds or CI.
+builds. yosh-mobile, though, is platform-neutral: CI builds, clippy-lints
+(`-D warnings`) and tests it on ubuntu like the rest of the workspace, so the
+shell's code is checked on every push even though the APK is built only by the
+release workflow.

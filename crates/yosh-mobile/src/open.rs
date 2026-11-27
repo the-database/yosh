@@ -291,7 +291,7 @@ fn ext_lower(p: &Path) -> Option<String> {
         .map(|s| s.to_ascii_lowercase())
 }
 
-/// Is this a comic archive yosh can open on Android (RAR excluded)?
+/// Is this a comic archive yosh can open (RAR/CBR only with the `rar` feature)?
 pub(crate) fn is_comic_archive(p: &Path) -> bool {
     match ext_lower(p).as_deref() {
         Some("cbz" | "zip" | "cb7" | "7z") => true,
@@ -322,4 +322,17 @@ pub(crate) fn build_source(path: &Path) -> Option<Arc<dyn PageSource>> {
             _ => None,
         }
     }
+}
+
+/// True if `key` is a filesystem path we can silently rebuild a source from on
+/// launch (not a picked document, and still present on disk).
+pub(crate) fn is_reopenable_fs(key: &str) -> bool {
+    !is_document_key(key) && std::path::Path::new(key).exists()
+}
+
+/// True if `key` names a document the platform picker handed us (a SAF
+/// `content://` URI) rather than a filesystem path: it has no folder to walk for
+/// next/prev book and can't be silently reopened on launch.
+pub(crate) fn is_document_key(key: &str) -> bool {
+    key.starts_with("content://")
 }
