@@ -442,10 +442,11 @@ impl AjiUpscaler {
             let budget = self.budget(&ctx, name, &path, 0);
             let mut t = tiles::even_tile(|t| budget.fits((t, t), page).0);
             // on native kernels (activations not shared), a page larger than that in fewer tiles
-            if t == tiles::EVEN_TILES[0] && !budget.use_.shared {
-                if let Some(big) = self.big_native_tile(&ctx, &path, page) {
-                    t = big;
-                }
+            if t == tiles::EVEN_TILES[0]
+                && !budget.use_.shared
+                && let Some(big) = self.big_native_tile(&ctx, &path, page)
+            {
+                t = big;
             }
             eprintln!("yosh: [upscale] {name}: even tiles of up to {t}");
             t
