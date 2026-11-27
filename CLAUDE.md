@@ -14,7 +14,12 @@ gray / ~175 pps color at a 1440-px target with `seek_bench`, and page turns are 
 Cargo workspace:
 - `crates/yosh` — the desktop application shell (window, input, egui chrome).
 - `crates/yosh-engine` — the reader engine: decode pool, page/texture/cache layer, reading math (also used
-  by `crates/yosh-android`).
+  by `crates/yosh-mobile`).
+- `crates/yosh-mobile` — the touch-first mobile shell (winit frame loop, library, egui chrome,
+  persistence). Platform-neutral and builds on the host (`cargo check -p yosh-mobile`); everything it
+  needs from the OS goes through its `Platform` trait.
+- `crates/yosh-android` — the Android glue under yosh-mobile: `android_main`, `AndroidPlatform` (JNI
+  to the `YoshActivity` Java bridge, `/proc` + sysfs probes). Compiles empty off Android; see its README.
 - `crates/yosh-image` — the **GPU-free** imaging core the engine is built on: decoders, ICC, tone curves,
   HQ resize, folder/archive page sources, whole-archive entry streaming (`archive`), libaji tile
   sizing by page size and GPU memory (`tiles`), and (feature `aji`) safe runtime-loaded bindings to

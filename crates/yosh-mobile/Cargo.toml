@@ -1,0 +1,37 @@
+[package]
+name = "yosh-mobile"
+version = "0.1.0"
+edition = "2024"
+description = "yosh's touch-first mobile shell: the frame loop, library and egui chrome shared by the platform crates"
+
+[lib]
+name = "yosh_mobile"
+
+[features]
+# RAR/CBR support, OFF by default (forwarded to the engine). The platform crate
+# decides: Android turns it on only where UnRAR's C++ cross-compiles (see
+# crates/yosh-android/Cargo.toml).
+rar = ["yosh-engine/rar"]
+
+# Platform-neutral, so it builds on the host too: `cargo check -p yosh-mobile` and
+# `cargo test -p yosh-mobile` work without an NDK. The OS goes through `Platform`.
+[dependencies]
+# default-features off so the `rar` feature above decides.
+yosh-engine = { path = "../yosh-engine", default-features = false }
+wgpu = "30"
+winit = "0.30.13"
+log = "0.4"
+# egui chrome (seekbar / library). egui-winit's default features pull arboard
+# (clipboard) + webbrowser (links) — neither applies on mobile, so disable them.
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = { version = "0.36", default-features = false }
+# Phosphor icon font for the seekbar buttons. Pure-Rust (embeds a TTF, no C deps).
+# Use the solid `fill` weight (chunky, PerfectViewer-style) only — not the default
+# thin `regular`. Installed as a Proportional-family fallback (see the font setup)
+# so icon glyphs render in normal labels/buttons.
+egui-phosphor = { version = "0.14", default-features = false, features = ["fill"] }
+# Natural-order sort for the library (vol 2 before vol 10).
+natord = "1"
+# Resizer for the engine's decode_and_downscale (library cover thumbnails).
+fast_image_resize = "6"

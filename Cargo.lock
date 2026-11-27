@@ -5297,17 +5297,11 @@ name = "yosh-android"
 version = "0.1.0"
 dependencies = [
  "android_logger",
- "egui",
- "egui-phosphor",
- "egui-wgpu",
- "egui-winit",
- "fast_image_resize",
  "jni",
  "log",
- "natord",
- "wgpu",
  "winit",
  "yosh-engine",
+ "yosh-mobile",
 ]
 
 [[package]]
@@ -5347,6 +5341,22 @@ dependencies = [
  "sevenz-rust2",
  "unrar",
  "zip",
+]
+
+[[package]]
+name = "yosh-mobile"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-phosphor",
+ "egui-wgpu",
+ "egui-winit",
+ "fast_image_resize",
+ "log",
+ "natord",
+ "wgpu",
+ "winit",
+ "yosh-engine",
 ]
 
 [[package]]

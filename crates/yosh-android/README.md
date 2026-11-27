@@ -1,8 +1,18 @@
 # yosh-android
 
-The Android shell for yosh — a `cdylib` that loads as a NativeActivity and drives
-the reusable [`yosh-engine`](../yosh-engine) (decode pipeline + reading machine)
-through winit + wgpu, the same way the desktop shell (`crates/yosh`) does.
+The Android shell for yosh — a `cdylib` that loads as a NativeActivity and runs
+the shared mobile shell, [`yosh-mobile`](../yosh-mobile), which drives the reusable
+[`yosh-engine`](../yosh-engine) (decode pipeline + reading machine) through
+winit + wgpu, the same way the desktop shell (`crates/yosh`) does.
+
+This crate is only the Android glue: `android_main` (event loop + the
+one-loop-per-process guard) and `AndroidPlatform`, yosh-mobile's `Platform` trait
+over the `YoshActivity` Java bridge (document picker, all-files access, window
+flags, theme, locale, volume keys), the app's private data dir, and the `/proc` +
+sysfs files the device tier reads. The frame loop, library, egui chrome and
+persisted state all live in yosh-mobile, which builds on the host:
+`cargo check -p yosh-mobile` needs no NDK. Logcat lines from the shell are tagged
+by module (`yosh_mobile::…`), the glue's `yosh_android`.
 
 **Status:** feature-complete for reading. The shell drives the engine `Reader` in
 the winit frame loop (poll → decode-view debounce → prefetch → build-quads → draw,
@@ -53,4 +63,7 @@ re-run that script only when the logo changes.
 
 A host `cargo build` over the workspace compiles this crate to an empty cdylib
 (its deps are gated to `cfg(target_os = "android")`), so it doesn't affect desktop
-builds or CI.
+builds. yosh-mobile, though, is platform-neutral: CI builds, clippy-lints
+(`-D warnings`) and tests it on ubuntu like the rest of the workspace, so the
+shell's code is checked on every push even though the APK is built only by the
+release workflow.
