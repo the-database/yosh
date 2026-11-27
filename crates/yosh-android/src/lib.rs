@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
@@ -63,105 +64,16 @@ fn android_main(app: AndroidApp) {
         log::warn!("android_main re-entered in a live process; exiting for a clean restart");
         std::process::exit(0);
     }
-    // KEEP_SCREEN_ON is *not* set here: it's applied per frame from the reading
-    // state (see the `applied_keep_on` block in `RedrawRequested`), because holding
-    // the screen awake while the user is browsing the library — or staring at the
-    // empty state — is just battery drain with no page to read.
-    // Per-comic reading positions persist in the app's private dir.
-    let pos_path = app.internal_data_path().map(|p| p.join("positions.tsv"));
-    let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
-    // Reading progress (furthest page seen + total) → the library's read states.
-    let progress_path = app.internal_data_path().map(|p| p.join("progress.tsv"));
-    let progress = progress_path.as_deref().map(load_progress).unwrap_or_default();
-    // Series the user collapsed in the library (default expanded).
-    let collapsed_path = app.internal_data_path().map(|p| p.join("collapsed.txt"));
-    let collapsed = collapsed_path.as_deref().map(load_collapsed).unwrap_or_default();
-    // Most-recently-read volume keys (MRU, newest first): resume target + shelf.
-    let recents_path = app.internal_data_path().map(|p| p.join("recents.txt"));
-    let recents = recents_path.as_deref().map(load_recents).unwrap_or_default();
-    let lib_dir_file = app.internal_data_path().map(|p| p.join("libroot.txt"));
-    let init_lib_dir = lib_dir_file
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| PathBuf::from(s.trim()))
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(|| PathBuf::from("/storage/emulated/0"));
-    // Persisted viewing options (direction / layout / fit); default RTL manga order.
-    let view_file = app.internal_data_path().map(|p| p.join("view.txt"));
-    let init_view = view_file
-        .as_deref()
-        .map(load_view)
-        .unwrap_or((
-            Direction::Rtl,
-            LayoutMode::Single,
-            FitMode::Window,
-            true,
-            false,
-            true,
-            ThemePref::System,
-            PerfPref::Auto,
-            false,
-            DEFAULT_SPINE_STRENGTH,
-            false,
-            VolKeys::Off,
-            None,
-        ));
+    let platform: Rc<dyn Platform> = Rc::new(AndroidPlatform { app: app.clone() });
+    let mut shell = Shell::new(platform);
     // Volume keys are delivered to us (winit's default hands them straight to the
     // OS): with the "Volume keys turn pages" option on they flip while reading.
     // Every other press is passed back to the system via `adjust_volume`.
     let event_loop = EventLoop::builder()
-        .with_android_app(app.clone())
+        .with_android_app(app)
         .handle_volume_keys()
         .build()
         .expect("build event loop");
-    let (open_tx, open_rx) = std::sync::mpsc::channel();
-    let (sib_tx, sib_rx) = std::sync::mpsc::channel();
-    let (recents_ok_tx, recents_ok_rx) = std::sync::mpsc::channel();
-    let mut shell = Shell {
-        app: None,
-        android_app: app,
-        frame_waker: None,
-        picker_pending: false,
-        open_gen: 0,
-        opening: None,
-        opening_key: None,
-        open_tx,
-        open_rx,
-        resume_fallback: false,
-        sib_cache: None,
-        sib_tx,
-        sib_rx,
-        pending_book_nav: None,
-        recents_ok: HashSet::new(),
-        recents_ok_tx,
-        recents_ok_rx,
-        dirty_positions: false,
-        dirty_progress: false,
-        dirty_recents: false,
-        dirty_collapsed: false,
-        dirty_view: false,
-        dirty_libroot: false,
-        dirty_since: None,
-        positions,
-        pos_path,
-        progress,
-        progress_path,
-        collapsed,
-        collapsed_path,
-        recents,
-        recents_path,
-        current_key: None,
-        has_files: false,
-        init_lib_dir,
-        lib_dir_file,
-        init_view,
-        view_file,
-        gestures: TouchGestures::new(),
-        applied_immersive: None,
-        applied_keep_on: None,
-        parked_source: None,
-        status_bar_px: None,
-    };
     if let Err(e) = event_loop.run_app(&mut shell) {
         log::error!("event loop exited with error: {e}");
     }
@@ -171,6 +83,54 @@ fn android_main(app: AndroidApp) {
     // would re-enter android_main and hit the one-EventLoop-per-process limit.
     log::info!("yosh-android event loop ended; exiting process");
     std::process::exit(0);
+}
+
+/// The slow half of opening a picked document: read and parse it into a page
+/// source. Built on the UI thread by [`Platform::open_picked`], run on the open
+/// worker.
+type PickedJob = Box<dyn FnOnce() -> Result<Arc<dyn PageSource>, String> + Send>;
+
+/// Everything the mobile shell asks of the OS. Android implements it over JNI to
+/// `YoshActivity` plus `/proc` and sysfs probes ([`AndroidPlatform`]).
+///
+/// Every method is called on the event-loop thread, so an implementation may hold
+/// thread-bound OS objects; only the [`PickedJob`] it returns crosses threads.
+trait Platform: 'static {
+    /// The app-private directory the shell's state files live in.
+    fn data_dir(&self) -> Option<PathBuf>;
+    /// The library folder used until the user picks one (and the test for "no
+    /// library configured yet").
+    fn default_library_root(&self) -> PathBuf;
+    /// Whether the app may browse the library folder by path.
+    fn has_library_access(&self) -> bool;
+    /// Ask the user for that access (Android: the all-files settings screen).
+    fn request_library_access(&self);
+    /// Show the system document picker; its result is collected by `take_picked`.
+    fn launch_picker(&self);
+    /// The identity key of a document the picker has returned, if one has.
+    fn take_picked(&self) -> Option<String>;
+    /// Resolve a picked document's key on this thread and return the job that
+    /// reads it. `None` = it couldn't be opened (already logged).
+    fn open_picked(&self, key: &str) -> Option<PickedJob>;
+    /// The OS is in dark mode (resolves the `System` theme).
+    fn system_dark(&self) -> bool;
+    /// The UI locale's BCP-47 tag ("" if unknown, which resolves to English).
+    fn locale_tag(&self) -> String;
+    /// Hold (true) / release (false) the screen awake.
+    fn set_keep_screen_on(&self, on: bool);
+    /// Hide (true) / show (false) the system bars.
+    fn set_immersive(&self, on: bool);
+    /// How far chrome must sit below the top edge while the bars show, in px.
+    fn top_inset_px(&self) -> i32;
+    /// `(total, available)` device RAM in MB.
+    fn mem_mb(&self) -> (u64, u64);
+    /// Highest CPU clock the device advertises, in kHz, if readable.
+    fn max_cpu_khz(&self) -> Option<u64>;
+    /// A CJK font collection (Noto Sans CJK face order) for the UI's fallback.
+    fn cjk_font_bytes(&self) -> Option<Vec<u8>>;
+    /// A key press the shell didn't use (Android: a volume key goes back to the
+    /// system volume).
+    fn unused_key(&self, code: KeyCode);
 }
 
 /// Cap on the most-recently-read list (`recents.txt`); the head is the resume target.
@@ -205,8 +165,9 @@ enum SibLookup {
 
 struct Shell {
     app: Option<App>,
-    /// Kept for JNI into the `YoshActivity` Java bridge (vm + activity pointers).
-    android_app: AndroidApp,
+    /// Everything the shell asks of the OS (storage, picker, window flags, device
+    /// probes). On Android: JNI into the `YoshActivity` Java bridge.
+    platform: Rc<dyn Platform>,
     /// "Something new to draw" callback for off-thread producers: it just calls
     /// `Window::request_redraw`, which is thread-safe (it flags the window and
     /// wakes the ALooper). Handed to the decode pool via `Reader::set_waker` and to
@@ -479,6 +440,8 @@ struct App {
     cpus: usize,
     /// Cached OS night-mode flag (re-read on resume); resolves `ThemePref::System`.
     system_dark: bool,
+    /// The shell's platform hooks (the font reload on a language switch needs them).
+    platform: Rc<dyn Platform>,
     /// Light/dark actually pushed into the egui context (`ctx.set_visuals` is
     /// persistent state, so re-applying it every frame just rebuilds a `Visuals`
     /// for nothing). `None` ⇒ not applied yet. Mirrors `Shell::applied_immersive`.
@@ -826,6 +789,104 @@ struct FrameReqs {
     to_library: bool,
 }
 
+impl Shell {
+    /// Load the persisted state from the platform's data dir and build the shell.
+    /// No window or GPU yet: those come with the first `resumed`.
+    fn new(platform: Rc<dyn Platform>) -> Shell {
+        // KEEP_SCREEN_ON is *not* set here: it's applied per frame from the reading
+        // state (see the `applied_keep_on` block in `RedrawRequested`), because holding
+        // the screen awake while the user is browsing the library — or staring at the
+        // empty state — is just battery drain with no page to read.
+        // Per-comic reading positions persist in the app's private dir.
+        let pos_path = platform.data_dir().map(|p| p.join("positions.tsv"));
+        let positions = pos_path.as_deref().map(load_positions).unwrap_or_default();
+        // Reading progress (furthest page seen + total) → the library's read states.
+        let progress_path = platform.data_dir().map(|p| p.join("progress.tsv"));
+        let progress = progress_path.as_deref().map(load_progress).unwrap_or_default();
+        // Series the user collapsed in the library (default expanded).
+        let collapsed_path = platform.data_dir().map(|p| p.join("collapsed.txt"));
+        let collapsed = collapsed_path.as_deref().map(load_collapsed).unwrap_or_default();
+        // Most-recently-read volume keys (MRU, newest first): resume target + shelf.
+        let recents_path = platform.data_dir().map(|p| p.join("recents.txt"));
+        let recents = recents_path.as_deref().map(load_recents).unwrap_or_default();
+        let lib_dir_file = platform.data_dir().map(|p| p.join("libroot.txt"));
+        let init_lib_dir = lib_dir_file
+            .as_deref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| PathBuf::from(s.trim()))
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| platform.default_library_root());
+        // Persisted viewing options (direction / layout / fit); default RTL manga order.
+        let view_file = platform.data_dir().map(|p| p.join("view.txt"));
+        let init_view = view_file
+            .as_deref()
+            .map(load_view)
+            .unwrap_or((
+                Direction::Rtl,
+                LayoutMode::Single,
+                FitMode::Window,
+                true,
+                false,
+                true,
+                ThemePref::System,
+                PerfPref::Auto,
+                false,
+                DEFAULT_SPINE_STRENGTH,
+                false,
+                VolKeys::Off,
+                None,
+            ));
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        let (sib_tx, sib_rx) = std::sync::mpsc::channel();
+        let (recents_ok_tx, recents_ok_rx) = std::sync::mpsc::channel();
+        Shell {
+            app: None,
+            platform,
+            frame_waker: None,
+            picker_pending: false,
+            open_gen: 0,
+            opening: None,
+            opening_key: None,
+            open_tx,
+            open_rx,
+            resume_fallback: false,
+            sib_cache: None,
+            sib_tx,
+            sib_rx,
+            pending_book_nav: None,
+            recents_ok: HashSet::new(),
+            recents_ok_tx,
+            recents_ok_rx,
+            dirty_positions: false,
+            dirty_progress: false,
+            dirty_recents: false,
+            dirty_collapsed: false,
+            dirty_view: false,
+            dirty_libroot: false,
+            dirty_since: None,
+            positions,
+            pos_path,
+            progress,
+            progress_path,
+            collapsed,
+            collapsed_path,
+            recents,
+            recents_path,
+            current_key: None,
+            has_files: false,
+            init_lib_dir,
+            lib_dir_file,
+            init_view,
+            view_file,
+            gestures: TouchGestures::new(),
+            applied_immersive: None,
+            applied_keep_on: None,
+            parked_source: None,
+            status_bar_px: None,
+        }
+    }
+}
+
 impl ApplicationHandler for Shell {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = Arc::new(
@@ -833,7 +894,7 @@ impl ApplicationHandler for Shell {
                 .create_window(Window::default_attributes().with_title("yosh"))
                 .expect("create window"),
         );
-        self.has_files = has_all_files(&self.android_app);
+        self.has_files = self.platform.has_library_access();
         // Anything still dirty belongs to the App that's about to be torn down (the
         // view options are read back off it), so write it out before `init_view` is
         // re-read below — otherwise a pending options change would be reverted by
@@ -932,9 +993,9 @@ impl ApplicationHandler for Shell {
         // Japanese comic / file names render instead of tofu squares.
         // The UI language is resolved first: it picks the CJK face (Japanese vs.
         // Korean vs. Simplified/Traditional Chinese glyph forms).
-        let system_lang = Lang::from_tag(&locale_tag(&self.android_app));
+        let system_lang = Lang::from_tag(&self.platform.locale_tag());
         i18n::set_lang(self.init_view.12.unwrap_or(system_lang));
-        install_fonts(&egui_ctx, i18n::lang().cjk_face());
+        install_fonts(&egui_ctx, self.platform.as_ref(), i18n::lang().cjk_face());
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -949,8 +1010,8 @@ impl ApplicationHandler for Shell {
             egui_wgpu::RendererOptions::default(),
         );
         let cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let (mem_budget_mb, total_mb) = device_mem();
-        let max_khz = max_cpu_khz();
+        let (mem_budget_mb, total_mb) = device_mem(self.platform.as_ref());
+        let max_khz = self.platform.max_cpu_khz();
         let auto_tier = device_tier(total_mb, max_khz);
         let perf = self.init_view.7;
         let tier = perf.tier().unwrap_or(auto_tier);
@@ -994,7 +1055,7 @@ impl ApplicationHandler for Shell {
         // On-disk cover-thumbnail cache dir (app-private `…/thumbs`): covers load
         // from here instead of re-decoding the full first page on every open. It's
         // owned by the cover worker, the only thing that touches it.
-        let thumb_cache_dir = self.android_app.internal_data_path().map(|p| p.join("thumbs"));
+        let thumb_cache_dir = self.platform.data_dir().map(|p| p.join("thumbs"));
         let cover_tx = spawn_cover_worker(thumb_cache_dir, thumb_tx, self.frame_waker.clone());
         self.app = Some(App {
             window: window.clone(),
@@ -1052,20 +1113,21 @@ impl ApplicationHandler for Shell {
             auto_tier,
             mem_budget_mb,
             cpus,
-            system_dark: system_dark(&self.android_app),
+            system_dark: self.platform.system_dark(),
+            platform: self.platform.clone(),
             applied_light: None,
         });
         // Pick up where we left off: with resume on, reopen the most-recent
         // reopenable book (at its saved page); else, if a library is configured, open
         // it as the home; else fall through to the empty-state card (onboarding). SAF
         // content:// one-offs can't be silently rebuilt, so resume skips them.
-        let lib_configured = self.init_lib_dir != PathBuf::from("/storage/emulated/0");
+        let lib_configured = self.init_lib_dir != self.platform.default_library_root();
         // Reopen after the (re)build. Priority: a SAF picker return opens the picked file;
         // a resume-rebuild restores what was showing (the open book at its page, else the
         // library if it was up / is the home, else the empty-state card); a true first
         // launch resumes the most-recent book, else the configured library, else the card.
         if self.picker_pending
-            && let Some(uri) = take_picked_uri(&self.android_app)
+            && let Some(uri) = self.platform.take_picked()
         {
             self.picker_pending = false;
             self.open_picked(&uri);
@@ -1214,7 +1276,7 @@ impl ApplicationHandler for Shell {
             WindowEvent::RedrawRequested => {
                 // A picker result may have landed while we were backgrounded.
                 if self.picker_pending {
-                    if let Some(uri) = take_picked_uri(&self.android_app) {
+                    if let Some(uri) = self.platform.take_picked() {
                         self.picker_pending = false;
                         self.open_picked(&uri);
                     }
@@ -1229,7 +1291,7 @@ impl ApplicationHandler for Shell {
                 // while the bars are shown so they don't cover the top buttons.
                 let status_px = *self
                     .status_bar_px
-                    .get_or_insert_with(|| status_bar_height(&self.android_app));
+                    .get_or_insert_with(|| self.platform.top_inset_px());
                 let opening = self.opening.clone();
                 let open_gen = self.open_gen;
                 let reqs = match &mut self.app {
@@ -1281,10 +1343,10 @@ impl ApplicationHandler for Shell {
                     }
                 }
                 if reqs.grant {
-                    request_all_files(&self.android_app);
+                    self.platform.request_library_access();
                 }
                 if reqs.open_picker {
-                    launch_picker(&self.android_app);
+                    self.platform.launch_picker();
                     self.picker_pending = true;
                 }
                 if reqs.open_library {
@@ -1310,7 +1372,7 @@ impl ApplicationHandler for Shell {
                         .as_ref()
                         .is_some_and(|a| !a.controls && !a.library_view);
                 if self.applied_immersive != Some(immersive) {
-                    set_immersive(&self.android_app, immersive);
+                    self.platform.set_immersive(immersive);
                     self.applied_immersive = Some(immersive);
                 }
                 // Hold the screen awake only while there is actually a page to read
@@ -1322,7 +1384,7 @@ impl ApplicationHandler for Shell {
                 let keep_on = self.current_key.is_some()
                     && self.app.as_ref().is_some_and(|a| !a.library_view);
                 if self.applied_keep_on != Some(keep_on) {
-                    set_keep_screen_on(&self.android_app, keep_on);
+                    self.platform.set_keep_screen_on(keep_on);
                     self.applied_keep_on = Some(keep_on);
                 }
                 // Opportunistic: writes what has been dirty long enough. Frames stop
@@ -1404,9 +1466,7 @@ impl Shell {
         let PhysicalKey::Code(code) = ev.physical_key else { return };
         let Some(app) = self.app.as_ref() else {
             // No reader yet: still let the rocker work.
-            if let Some(adj) = volume_adjust(code) {
-                adjust_volume(&self.android_app, adj);
-            }
+            self.platform.unused_key(code);
             return;
         };
         let reading = !egui_consumed && self.current_key.is_some() && !app.library_view;
@@ -1434,9 +1494,7 @@ impl Shell {
             _ => None,
         };
         let Some(dir) = dir.filter(|_| reading) else {
-            if let Some(adj) = volume_adjust(code) {
-                adjust_volume(&self.android_app, adj);
-            }
+            self.platform.unused_key(code);
             return;
         };
         if scroll {
@@ -1571,7 +1629,7 @@ impl Shell {
 
     /// the top-strip tap and the empty-state "Browse library" button.
     fn open_library(&mut self) {
-        self.has_files = has_all_files(&self.android_app);
+        self.has_files = self.platform.has_library_access();
         // Which recents still exist is decided once here, off-thread, instead of
         // stat-ing all 32 of them on every library frame.
         self.refresh_recents_ok();
@@ -1700,7 +1758,7 @@ impl Shell {
         let Some(parent) = cur_path.parent().map(|p| p.to_path_buf()) else {
             return SibLookup::Missing;
         };
-        if cur.starts_with("content://") {
+        if is_document_key(&cur) {
             return SibLookup::Missing; // SAF one-off: no folder to walk
         }
         if !matches!(&self.sib_cache, Some((p, _)) if *p == parent) {
@@ -1941,7 +1999,7 @@ impl Shell {
         // can show it without waiting for another existence pass, and its folder is
         // worth warming for the first next/prev-book request. (SAF one-offs are
         // neither reopenable nor inside a browsable folder, so they get neither.)
-        if !key.starts_with("content://") {
+        if !is_document_key(&key) {
             self.recents_ok.insert(key.clone());
             self.warm_sib_cache(Path::new(&key));
         }
@@ -2081,28 +2139,15 @@ impl Shell {
         }
     }
 
-    /// Read the chosen content:// file's bytes off its descriptor and open it.
-    /// The JNI call that hands us the descriptor stays here (it wants the activity),
-    /// but the descriptor is just an integer — reading a whole archive off it, and
-    /// parsing it, happen on the open worker. A multi-hundred-MB SAF archive used to
-    /// slurp on the UI thread, which is an ANR with a progress bar drawn on it.
+    /// Open a picked document by its identity key. The platform resolves the key
+    /// on this thread (Android: a JNI call for the descriptor) and hands back the
+    /// slow part — reading and parsing the whole archive — which runs on the open
+    /// worker. A multi-hundred-MB SAF archive used to slurp on the UI thread, which
+    /// is an ANR with a progress bar drawn on it.
     fn open_picked(&mut self, uri: &str) {
-        let fd = open_fd(&self.android_app, uri);
-        if fd < 0 {
-            log::warn!("openFd failed for {uri}");
-            return;
-        }
+        let Some(job) = self.platform.open_picked(uri) else { return };
         let key = uri.to_string();
-        self.start_open(Some(key.clone()), move || {
-            // We own the fd (Java detachFd'd it); reading to end + drop closes it.
-            let mut file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
-            let mut bytes = Vec::new();
-            std::io::Read::read_to_end(&mut file, &mut bytes)
-                .map_err(|e| format!("read picked fd: {e}"))?;
-            drop(file);
-            let src = ZipSource::from_bytes(bytes).map_err(|e| format!("from_bytes: {e}"))?;
-            Ok((key, Arc::new(src) as Arc<dyn PageSource>))
-        });
+        self.start_open(Some(key.clone()), move || Ok((key, job()?)));
     }
 }
 
@@ -2303,9 +2348,16 @@ fn load_recents(path: &std::path::Path) -> Vec<String> {
 }
 
 /// True if `key` is a filesystem path we can silently rebuild a source from on
-/// launch (not a SAF `content://` URI, and still present on disk).
+/// launch (not a picked document, and still present on disk).
 fn is_reopenable_fs(key: &str) -> bool {
-    !key.starts_with("content://") && std::path::Path::new(key).exists()
+    !is_document_key(key) && std::path::Path::new(key).exists()
+}
+
+/// True if `key` names a document the platform picker handed us (a SAF
+/// `content://` URI) rather than a filesystem path: it has no folder to walk for
+/// next/prev book and can't be silently reopened on launch.
+fn is_document_key(key: &str) -> bool {
+    key.starts_with("content://")
 }
 
 fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
@@ -2335,10 +2387,10 @@ fn load_positions(path: &std::path::Path) -> HashMap<String, usize> {
 /// The bytes are leaked once (process lifetime anyway) so each egui context — and
 /// each language switch — can borrow them as a `FontData` for whichever face of
 /// the collection the UI language wants, with no 31 MB copy.
-fn cjk_font(face: u32) -> Option<Arc<egui::FontData>> {
+fn cjk_font(platform: &dyn Platform, face: u32) -> Option<Arc<egui::FontData>> {
     static CJK_BYTES: std::sync::OnceLock<Option<&'static [u8]>> = std::sync::OnceLock::new();
     let bytes = (*CJK_BYTES.get_or_init(|| {
-        let bytes = std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()?;
+        let bytes = platform.cjk_font_bytes()?;
         log::info!("loaded CJK fallback font ({} KB)", bytes.len() / 1024);
         Some(&*Box::leak(bytes.into_boxed_slice()))
     }))?;
@@ -2352,10 +2404,10 @@ fn cjk_font(face: u32) -> Option<Arc<egui::FontData>> {
 /// bundled fonts have no CJK glyphs, so the system Noto Sans CJK goes in as a
 /// fallback when present, for the UI's own CJK text and Japanese comic / file
 /// names. Re-run on a language switch that changes the face.
-fn install_fonts(ctx: &egui::Context, cjk_face: u32) {
+fn install_fonts(ctx: &egui::Context, platform: &dyn Platform, cjk_face: u32) {
     let mut fonts = egui::FontDefinitions::default();
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Fill);
-    if let Some(cjk) = cjk_font(cjk_face) {
+    if let Some(cjk) = cjk_font(platform, cjk_face) {
         fonts.font_data.insert("cjk".to_owned(), cjk);
         for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             fonts.families.entry(fam).or_default().push("cjk".to_owned());
@@ -2394,13 +2446,10 @@ fn meminfo_mb(text: &str, field: &str) -> Option<u64> {
 /// transiently inflated). First-launch `MemAvailable` is as good a sample as any,
 /// and it keeps the resume path off `/proc`. The real answer to a squeeze is
 /// [`Shell::memory_warning`], which sheds caches on demand rather than guessing.
-fn device_mem() -> (u64, u64) {
+fn device_mem(platform: &dyn Platform) -> (u64, u64) {
     static DEVICE_MEM: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *DEVICE_MEM.get_or_init(|| {
-        let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-        let total = meminfo_mb(&info, "MemTotal:").unwrap_or(4096);
-        // Older kernels lack MemAvailable; fall back to the total-only estimate.
-        let avail = meminfo_mb(&info, "MemAvailable:").unwrap_or(total / 2);
+        let (total, avail) = platform.mem_mb();
         let budget = (total / 8).min(avail / 3).clamp(192, 1024);
         (budget, total)
     })
@@ -3481,6 +3530,88 @@ fn options_popup(
                 });
             });
         });
+}
+
+// --- AndroidPlatform ---------------------------------------------------------
+
+/// [`Platform`] over the `YoshActivity` Java bridge and the kernel's `/proc` and
+/// sysfs files.
+struct AndroidPlatform {
+    /// The vm + activity pointers JNI calls need.
+    app: AndroidApp,
+}
+
+impl Platform for AndroidPlatform {
+    fn data_dir(&self) -> Option<PathBuf> {
+        self.app.internal_data_path()
+    }
+    fn default_library_root(&self) -> PathBuf {
+        PathBuf::from("/storage/emulated/0")
+    }
+    fn has_library_access(&self) -> bool {
+        has_all_files(&self.app)
+    }
+    fn request_library_access(&self) {
+        request_all_files(&self.app)
+    }
+    fn launch_picker(&self) {
+        launch_picker(&self.app)
+    }
+    fn take_picked(&self) -> Option<String> {
+        take_picked_uri(&self.app)
+    }
+    /// The JNI call that hands us the descriptor stays on this thread (it wants
+    /// the activity), but the descriptor is just an integer, so the job owns it.
+    fn open_picked(&self, uri: &str) -> Option<PickedJob> {
+        let fd = open_fd(&self.app, uri);
+        if fd < 0 {
+            log::warn!("openFd failed for {uri}");
+            return None;
+        }
+        Some(Box::new(move || {
+            // We own the fd (Java detachFd'd it); reading to end + drop closes it.
+            let mut file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut file, &mut bytes)
+                .map_err(|e| format!("read picked fd: {e}"))?;
+            drop(file);
+            let src = ZipSource::from_bytes(bytes).map_err(|e| format!("from_bytes: {e}"))?;
+            Ok(Arc::new(src) as Arc<dyn PageSource>)
+        }))
+    }
+    fn system_dark(&self) -> bool {
+        system_dark(&self.app)
+    }
+    fn locale_tag(&self) -> String {
+        locale_tag(&self.app)
+    }
+    fn set_keep_screen_on(&self, on: bool) {
+        set_keep_screen_on(&self.app, on)
+    }
+    fn set_immersive(&self, on: bool) {
+        set_immersive(&self.app, on)
+    }
+    fn top_inset_px(&self) -> i32 {
+        status_bar_height(&self.app)
+    }
+    fn mem_mb(&self) -> (u64, u64) {
+        let info = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let total = meminfo_mb(&info, "MemTotal:").unwrap_or(4096);
+        // Older kernels lack MemAvailable; fall back to the total-only estimate.
+        let avail = meminfo_mb(&info, "MemAvailable:").unwrap_or(total / 2);
+        (total, avail)
+    }
+    fn max_cpu_khz(&self) -> Option<u64> {
+        max_cpu_khz()
+    }
+    fn cjk_font_bytes(&self) -> Option<Vec<u8>> {
+        std::fs::read("/system/fonts/NotoSansCJK-Regular.ttc").ok()
+    }
+    fn unused_key(&self, code: KeyCode) {
+        if let Some(adj) = volume_adjust(code) {
+            adjust_volume(&self.app, adj);
+        }
+    }
 }
 
 // --- JNI bridge to YoshActivity ---------------------------------------------
@@ -4683,7 +4814,7 @@ impl App {
             self.lang_pref = v;
             let lang = v.unwrap_or(self.system_lang);
             if lang.cjk_face() != i18n::lang().cjk_face() {
-                install_fonts(&self.egui_ctx, lang.cjk_face());
+                install_fonts(&self.egui_ctx, self.platform.as_ref(), lang.cjk_face());
             }
             i18n::set_lang(lang);
             self.info_for = None;
@@ -4834,7 +4965,7 @@ fn name_of(p: &Path) -> String {
 /// content:// URI). Paths → basename; SAF document URIs (e.g.
 /// `…/document/primary:Manga/Title.cbz`) → last decoded segment after `/` or `:`.
 fn book_display_name(key: &str) -> String {
-    if key.starts_with("content://") {
+    if is_document_key(key) {
         // Minimal percent-decode of just the separators SAF uses, then take the
         // final component. Good enough for a display name; fall back to the raw
         // key if there's nothing better to show.
